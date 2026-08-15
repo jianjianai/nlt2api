@@ -6,13 +6,14 @@
 
 结论不是“完全兼容 OpenAI v1/chat/completions”，而是：
 
-1. 基础文本聊天、流式 SSE、非流式 JSON、系统消息、助手/工具历史、文本内容数组、最小图片输入、JSON Object 和 JSON Schema 输出均可用。
-2. 请求体对许多未知或当前未实现字段采取宽松接受策略。HTTP 200 只能说明网关接受了请求，不能说明字段语义生效。
-3. 当前链路中，标准工具调用没有真正工作：请求包含 tools、强制 tool_choice 和 parallel_tool_calls 时，响应没有 tool_calls 增量，模型还明确回答当前没有可用函数。
-4. developer role 会导致 SSE 内嵌错误，网页显示 Gateway returned status 400；传输层本身仍可能是 HTTP 200。
-5. n: 2 的流式和非流式测试都只观察到一个 choice（index 0），不能按标准多候选语义使用。
-6. logprobs/top_logprobs 请求被接受，但没有观察到非空 logprobs 数据。
-7. 音频输入被接受后，模型明确表示不能处理音频；音频输出请求只返回文本，没有 audio 增量。
+1. 基础文本聊天、流式 SSE、非流式 JSON、system/assistant/tool/function 历史、文本 content parts、真实图片输入和普通 JSON Object 输出可用。
+2. 网关对大量字段采取宽松接受策略。HTTP 200 只代表请求被放行，不代表字段语义生效；本轮已用成对和反例把多数字段分为“生效”“被忽略”或“只能观察到接受”。
+3. `max_tokens` 才是当前 Kimi K3 路径的实际输出上限；同时发送时它覆盖 `max_completion_tokens`，后者不能直接映射。
+4. `json_schema` 的 JSON 外形可以返回，但 `strict`/enum 约束没有执行；冲突提示下仍返回了 schema 禁止的值。
+5. 标准工具调用、web search、moderation、文件输入、音频输入/输出、缓存、prediction、n>1、logprobs 和 developer role 当前不能按 OpenAI 语义使用。
+6. `stop`、`seed`、`service_tier`、`reasoning_effort`、`stream_options` 等字段会被接受，但对当前响应没有观察到标准语义；service tier 始终回显 `standard`。
+7. developer role 会导致 SSE 内嵌错误，网页显示 Gateway returned status 400；传输层本身仍可能是 HTTP 200。
+8. n: 2 的流式和非流式测试都只观察到一个 choice（index 0），不能按标准多候选语义使用。
 
 因此，/api/chat 可以作为自建 OpenAI 兼容代理的后端之一，但不应作为无条件的 drop-in endpoint。代理必须做字段过滤、错误归一化、SSE/JSON 响应转换，并对不支持的能力显式拒绝。
 
@@ -42,14 +43,18 @@
 
 ### 2.3 时间和环境
 
-- 测试时间：2026-08-16 00:54（UTC+08:00 附近，测试持续期间页面时间会有自然变化）
+- 测试时间：2026-08-16 00:54-01:46（UTC+08:00）
 - 页面：https://portal.neuralwatt.com/playground
 - 后端路径：https://portal.neuralwatt.com/api/chat
 - 模型：kimi-k3
-- 用例数量：40 个独立或补充捕获用例
+- 用例数量：原始基线 40 个 + 本轮 65 个有效补充捕获（并行拦截失败样本未计入）
 - 登录方式：使用浏览器已有登录状态；未读取或输出 Cookie、Authorization、账户标识和会话存储
 
-当前 Neuralwatt 文档页面展示的公开 API 示例路径是 https://api.neuralwatt.com/v1/chat/completions。本报告测试的是门户页面使用的 /api/chat，两者是不同路径和不同认证上下文，不能因为名字相似就认为可以直接互换。
+当前 Neuralwatt 文档页面展示的公开 API 示例路径是 https://api.neuralwatt.com/v1/chat/completions。本报告测试的是门户页面使用的 /api/chat，两者是不同路径和不同认证上下文，不能因为名字相似就认为可以直接互换。标准字段基准采用 [OpenAI Chat Completions create reference](https://developers.openai.com/api/reference/resources/chat/subresources/completions/methods/create)；该页面明确说明参数支持还可能随模型变化。
+
+### 2.4 关于“全部功能”的边界
+
+本报告已经覆盖 Chat Completions `create` 请求的全部公开 body 参数类别和消息 content 类型。OpenAI 当前参考还列出 chat completion 的 retrieve、update、delete、list 等资源操作；门户页面实际观察到的是单一 POST `/api/chat` 生成入口，没有可安全关联的 completion ID 或对应资源路由，因此这些资源管理操作不能从本 endpoint 推断为支持，也没有执行删除或更新请求。Responses、Files、Audio、Moderations 等独立产品接口同样不可能通过 `/api/chat` 的 body 映射得到，仍按第 2.2 节列为未测试/不适用。
 
 ## 3. 方法和证据规则
 
@@ -80,35 +85,39 @@
 | stream | 支持 | true 返回 SSE；false 返回 JSON。两种响应都在登录态下实测。 |
 | temperature | 支持基础传输 | 页面默认请求带 0.7，测试中多次改为 0 并正常生成；数值效果未做统计学对照。 |
 | top_p | 支持基础传输 | 页面默认请求带 1，与其他测试组合发送并正常生成；采样效果未单独测量。 |
-| max_tokens | 部分支持 | 页面默认值可用；低上限会产生 finish_reason: length。与 max_completion_tokens 同时发送时没有严格冲突报错。 |
-| max_completion_tokens | 支持基础语义 | 删除 max_tokens 后单独发送 max_completion_tokens: 256，得到预期短回答并以 stop 结束。 |
+| max_tokens | 支持 | 低上限产生 finish_reason: length；与 max_completion_tokens 同时发送的对照中，实际 completion_tokens 分别受 32 和 256 的 max_tokens 控制。 |
+| max_completion_tokens | 当前路径不支持标准语义 | 同时发送 max_tokens=256、max_completion_tokens=32 仍生成到 completion_tokens=256；删除 max_tokens 后分别发送 32/256 也都得到 completion_tokens=256。应在代理中显式映射或拒绝。 |
 | n | 不支持标准多候选语义 | 流式 n: 2 只观察到 choice index 0；非流式 n: 2 的 JSON 也只有一个 choice。 |
-| stop | 接受但语义无效迹象 | 发送 stop: ["STOP"] 后页面仍显示 ALPHA STOP OMEGA，没有按停止词截断。不能依赖该字段。 |
-| presence_penalty | 接受但未验证效果 | 与 frequency_penalty 一起发送，HTTP 200；没有可证明的对照结果。 |
-| frequency_penalty | 接受但未验证效果 | 与 presence_penalty 一起发送，HTTP 200；没有可证明的对照结果。 |
-| logit_bias | 接受但未验证效果 | 发送非空 token map，HTTP 200；没有对指定 token 的可重复影响证据。 |
-| user | 接受但未验证效果 | 发送不含敏感信息的测试标识，HTTP 200；没有观察到响应中的用户关联行为。 |
-| seed | 接受但未验证确定性 | 发送固定 seed，HTTP 200；没有执行足够的重复对照来证明确定性。 |
-| service_tier | 接受但未验证路由效果 | 发送 service_tier: "auto"，HTTP 200；没有可见 tier 回显或可证明的路由差异。 |
-| stream_options | 部分支持 | include_usage: true 请求成功；但未带该字段的流也已经包含 usage，所以没有观察到额外效果。 |
+| stop | 明确无效迹象 | 无 stop 与 stop: "ZZSTOPZZ" 的同提示对照得到完全相同的 `ALPHAZZSTOPZZOMEGA`，不能依赖该字段。 |
+| presence_penalty | 接受但不做标准范围校验 | 发送超出官方范围的 3 仍 HTTP 200；当前没有可靠证据证明惩罚语义生效。 |
+| frequency_penalty | 接受但不做标准范围校验 | 发送超出官方范围的 -3 仍 HTTP 200；当前没有可靠证据证明惩罚语义生效。 |
+| logit_bias | 接受但无法验证标准效果 | 非空 token map 请求成功，但 provider 没有提供可用生成 token_ids，无法建立可靠的 token 反事实对照；代理不应宣称已支持。 |
+| user | 接受但不可从响应验证 | 发送不含敏感信息的测试标识，HTTP 200；该字段若只用于服务端治理/缓存，/api/chat 响应本身无法证明其后台效果。 |
+| seed | 不支持确定性语义 | 相同提示、参数和 seed=987654321 的两次请求分别返回 `morning light` 与 `morning sunlight`，usage 也不同。 |
+| service_tier | 请求字段被忽略/归一化 | auto/default/flex/scale/priority/fast 以及非法值均 200，所有响应 `service_tier` 都是 `standard`。 |
+| stream_options | 当前路径忽略相关语义 | 未发送、`include_usage:false`、`include_usage:true` 三次均只有 1 个非空 usage chunk、0 个 null usage chunk、无 obfuscation。 |
 | response_format: text | 支持 | 返回普通文本 SSE。 |
 | response_format: json_object | 支持 | 页面显示合法 JSON：{"answer":"JSON_OK"}。 |
-| response_format: json_schema | 支持基础语义 | 严格 schema 请求返回 {"status":"SCHEMA_OK","count":1}，页面以代码块显示。更复杂 schema 未测。 |
+| response_format: json_schema | 仅支持 JSON 外形，不支持严格约束 | strict=true 的 enum 只允许 `SCHEMA_ENFORCED`，但冲突提示下仍返回 `{"status":"WRONG_VALUE"}`；不能把它当 Structured Outputs。 |
 | modalities: ["text"] | 支持基础传输 | 返回普通文本；没有额外能力可验证。 |
 | modalities: ["text","audio"] | 部分支持/音频无效 | HTTP 200 且返回文本，但没有 audio 增量或音频字段。 |
 | audio | 不支持当前模型的音频输出 | 发送 voice/format 后只有 text/reasoning delta。 |
-| tools | 不支持当前登录态链路中的实际工具调用 | 请求字段被放行，但响应没有 tool_calls，模型明确说没有可用工具。 |
-| tool_choice | 接受但无效 | 强制指定函数后仍没有工具调用；单独发送 "none" 能正常生成普通文本。 |
-| parallel_tool_calls | 未实现可用工具语义 | 与 tools 一起发送 false，没有 tool call 可供并行控制。 |
+| tools | 不支持实际工具调用 | function、custom 工具均被放行，但强制调用、提高 max_tokens 到 512、非流式请求都没有 tool_calls。 |
+| tool_choice | 接受但无效 | required、指定函数、allowed_tools.required 都没有产生调用；模型明确说只有内部 thinking 工具。 |
+| parallel_tool_calls | 无可用工具语义 | 与 tools 一起发送 true/false 都没有 tool call，无法验证并行控制。 |
 | functions | 不支持实际函数调用 | 旧版 functions 请求被接受，但模型明确说没有提供函数。 |
 | function_call | 不支持实际函数调用 | 强制指定旧版函数没有产生 function_call 增量。 |
-| reasoning_effort | 接受但等级效果未验证 | low 请求成功；响应包含 provider 的 reasoning 增量，但没有对比不同等级。 |
+| reasoning_effort | 接受但等级/非法值均无可见标准语义 | none/minimal/low/medium/high/xhigh/max 及非法 `ultra` 均 200；对照输出没有可靠等级差异。 |
 | logprobs | 无有效结果 | logprobs: true 请求成功，但 0 个 choice 带非空 logprobs。 |
 | top_logprobs | 无有效结果 | 与 logprobs: true、值 5 一起发送，响应仍没有 logprob 数据。 |
-| prediction | 接受但未验证推测加速 | 请求成功，普通回答正常；没有观察到 prediction 命中或专用响应字段。 |
-| store | 接受但未验证存储行为 | 发送 store: false，请求成功；没有查询或持久化证据。 |
-| metadata | 接受但未验证存储/检索行为 | 发送测试 metadata，响应正常；没有回显或查询证据。 |
-| web_search_options | 接受但未验证搜索行为 | 发送低上下文搜索选项，响应正常；没有搜索调用、引用或联网证据。 |
+| prediction | 请求字段被忽略/无可见加速语义 | prediction 命中和故意错误两种请求都正常返回普通文本；没有 accepted/rejected prediction token 统计或专用响应字段。 |
+| store | 接受但无法证明存储 | store=true 成功，但响应没有存储标识，/api/chat 也没有可验证的 retrieve/list 入口。 |
+| metadata | 接受但无法证明存储/检索 | metadata 成功但不回显；没有可验证的查询入口。 |
+| web_search_options | 不支持 web search 语义 | 高上下文、上海位置请求 200，但模型明确说没有实时信息/搜索能力，也没有引用或搜索事件。 |
+| moderation | 请求字段被忽略 | score/block 两种 policy 都 200、正文和 usage 相同，响应没有 moderation 对象。 |
+| verbosity | 请求字段被忽略迹象 | low/medium/high 在同一提示、temperature=0 下返回完全相同文本和 usage。 |
+| safety_identifier | 接受但无可观测响应语义 | 合成标识请求成功；无回显、隔离或策略变化证据。 |
+| prompt_cache_key / prompt_cache_options / prompt_cache_retention | 不支持可观测缓存语义 | key、explicit/30m 断点和 24h retention 均 200；重复请求 `cached_tokens`、`cache_write_tokens` 都为 0。 |
 
 ### 4.1 页面实际基线请求
 
@@ -136,13 +145,14 @@
 | system role | 支持 | 注入 system + user 后得到 SYSTEM_OK；可见 System Prompt 控件也确实使真实请求出现 system role。 |
 | developer role | 不支持 | SSE 传输层为 200，但第一条数据是错误，页面显示 Gateway returned status 400。 |
 | user role | 支持 | 所有基础用例均使用并正常返回。 |
-| assistant role | 支持 | 带 assistant 历史消息的请求得到 ASSISTANT_OK。 |
+| assistant role | 支持 | 带 assistant 历史消息的请求得到 ASSISTANT_OK；audio:null 和 refusal content part 历史也能被接受并继续生成。 |
 | tool role | 部分支持 | 带 assistant tool_calls 历史和 tool 结果的消息可被接受并生成文本；没有证明服务能主动产生或执行工具调用。 |
 | function role | 部分支持（旧版历史） | 带 function 历史消息的请求成功并得到 FUNCTION_CONTEXT_OK；仅说明历史可读，不说明 function_call 可用。 |
 | 普通字符串 content | 支持 | 基础聊天验证。 |
 | text content part 数组 | 支持 | content: [{type:"text",...}] 成功得到 TEXT_PART_OK。 |
-| image_url content part | 部分支持 | 1x1 PNG data URI 请求成功并得到 VISION_OK；只验证最小协议和响应路径，没有做复杂图像准确率测试。 |
+| image_url content part | 支持基础视觉输入 | 真实生成的 32x32 红色 PNG 在 detail=auto/low/high 下均被回答为 Red，usage 出现 `multimodal_tokens.image=12`；不代表复杂视觉准确率。 |
 | input_audio content part | 不支持当前模型能力 | 使用极小静音 WAV 样本，网关返回 200，但模型明确表示是文本助手、不能处理音频。 |
+| file content part | 不支持当前模型能力 | 标准 base64 和 data URL 两种 file_data 编码都被 HTTP 200 放行，但模型均明确说没有看到附件；没有 file token 或文件内容证据。 |
 | 消息 name | 部分验证 | 旧版 function role 用例包含 name 并成功；没有对每一种 role 的 name 语义单独验证。 |
 
 ## 6. 工具调用专项结果
@@ -175,13 +185,13 @@
 
 观察结果：
 
-- HTTP 传输返回 200 SSE；
-- SSE 增量字段只有 role、content、reasoning；
-- tool_calls 增量数量为 0；
-- finish reason 为 stop；
-- 模型文本表示没有可用的 get_weather 函数。
+- function 工具使用 `tool_choice: required`、命名工具和 `allowed_tools.required` 均返回 HTTP 200，但没有 `tool_calls` 增量；
+- 将 `max_tokens` 提高到 512 后仍没有调用，模型明确说只有内部 thinking 工具；
+- custom tool 也没有产生 custom tool call；
+- 非流式强制调用返回一个普通 `chat.completion`，message 虽带有 provider 的 `function_call` 键，但正文明确表示没有可用函数，未观察到实际调用对象；
+- 旧版 functions + function_call 也做了同样的强制调用测试，结论一致。
 
-旧版 functions + function_call 也做了同样的强制调用测试，结论一致。故不能在代理中把“请求体接受 tools”标成工具调用支持。若上游客户端使用 tools，建议代理明确返回标准错误，或在文档中声明该能力不可用。
+故不能在代理中把“请求体接受 tools”标成工具调用支持。若上游客户端使用 tools，代理应明确返回标准错误，或在文档中声明该能力不可用；不能静默转成普通文本。
 
 ## 7. 响应协议形状
 
@@ -194,7 +204,7 @@
 - data 对象数量随回答变化；
 - 包含 chat.completion.chunk 风格对象；
 - 最终有 data: [DONE]；
-- usage 通常存在；
+- 不论是否发送 `stream_options.include_usage`，都只有最后 1 个非空 usage chunk，其余 chunk 没有 usage；
 - delta 中观察到 role、content、reasoning；
 - provider 还附带 token ids、stop reason 等字段。
 
@@ -226,6 +236,8 @@ stop_reason
 
 响应中还出现了 SSE 注释行形式的 pricing 和 energy 信息。SSE 注释本身通常可被标准解析器忽略，但非标准 JSON 键和 reasoning delta 需要代理或客户端采取宽容解析策略。
 
+`stream_options.include_obfuscation` 也没有产生任何 obfuscation delta。对未发送、false、true 三种请求，响应形状和 usage 行为相同，说明这些选项在当前路径没有可见作用。
+
 ### 7.2 非流式响应
 
 登录态 stream: false 的网络响应：
@@ -240,6 +252,8 @@ stop_reason
 
 这说明后端有非流式 JSON 响应，但当前 Playground 客户端按流式读取器处理页面请求；改写为 stream:false 后页面没有正常显示正文，指标也显示为 0。自建代理应根据客户端请求的 stream 值分别处理，不能简单复用 Playground 的解析逻辑。
 
+非流式强制工具调用同样没有返回标准 `tool_calls`；它只返回普通文本 message。非流式响应还包含 provider 扩展键，例如 `prompt_logprobs`、`energy`、`cost` 和 `_latency`，不应直接当作 OpenAI 标准字段依赖。
+
 ### 7.3 错误传输
 
 developer role 的错误不是一个干净的 HTTP 4xx：
@@ -250,25 +264,29 @@ developer role 的错误不是一个干净的 HTTP 4xx：
 
 这会误导只根据 HTTP 状态判断成功的 OpenAI 客户端。代理层应把 SSE 内嵌错误转换成标准 HTTP 错误状态和标准 error object。
 
-## 8. 40 个测试用例清单
+### 7.4 结构化输出反例
 
-以下是本轮实际执行的用例 ID 和结论。补充捕获用例用于读取响应 body 结构，不代表重复计费功能。
+请求使用 `response_format.type=json_schema`、`strict=true`，schema 只允许 `status=SCHEMA_ENFORCED`，同时在用户提示中要求 `status=WRONG_VALUE`。服务返回 HTTP 200 SSE 和合法 JSON 外形 `{"status":"WRONG_VALUE"}`。因此当前路径的 json_schema 只是“让模型输出 JSON”的提示性能力，不能提供 OpenAI Structured Outputs 的严格保证。
+
+## 8. 测试用例清单
+
+以下是原始基线用例和本轮补充用例的 ID 与结论。补充捕获用例都通过已登录页面实际发出请求，并在拿到完整响应后才计入；并行拦截产生的 `Invalid InterceptionId` 样本未计入。
 
 | ID | 分类 | 结论 |
 | --- | --- | --- |
 | response_format-json_object | 结构化输出 | 200 SSE；合法 JSON |
-| core-max_completion_tokens | token 上限 | 200；短回答成功 |
+| core-max_completion_tokens | token 上限 | 200；与 max_tokens 对照后确认当前路径实际按 max_tokens 控制 |
 | core-stop | stop | 200；停止词后文本仍出现 |
 | core-n | 多候选 | 200；页面只显示一个结果 |
 | core-penalties | 惩罚项 | 200；效果未做对照 |
-| core-seed | seed | 200；确定性未验证 |
+| core-seed | seed | 200；补充重复对照确认不提供确定性 |
 | core-logit_bias | logit bias | 200；效果未验证 |
 | stream-options-usage | stream options | 200；usage 已存在 |
 | core-user | user | 200；效果未验证 |
-| core-service_tier | service tier | 200；路由未验证 |
-| reasoning-effort | 推理参数 | 200；等级差异未验证 |
+| core-service_tier | service tier | 200；补充各值对照均回显 standard |
+| reasoning-effort | 推理参数 | 200；补充官方值及非法值对照无可见等级语义 |
 | logprobs | logprobs | 200；没有非空 logprobs |
-| response_format-json_schema | JSON Schema | 200；严格 schema 输出成功 |
+| response_format-json_schema | JSON Schema | 200；补充冲突反例确认 strict 未执行 |
 | response_format-text | 文本模式 | 200；文本成功 |
 | tools-forced-function | 现代工具 | 200；没有 tool call |
 | legacy-functions-forced | 旧版函数 | 200；没有 function call |
@@ -281,9 +299,9 @@ developer role 的错误不是一个干净的 HTTP 4xx：
 | content-input-audio | 音频输入 | 200；模型不能处理 |
 | modalities-audio-output | 音频输出 | 200；只有文本 |
 | stream-false | 非流式 | 200 JSON；后端成功，页面解析不匹配 |
-| modern-metadata | metadata/store | 200；存储行为未验证 |
-| modern-prediction | prediction | 200；命中效果未验证 |
-| modern-web-search-options | web search | 200；未观察到搜索 |
+| modern-metadata | metadata/store | 200；无回显或存储可见证据 |
+| modern-prediction | prediction | 200；命中/错误对照无专用语义 |
+| modern-web-search-options | web search | 200；模型明确无搜索能力 |
 | modern-modalities-text | text modality | 200；文本成功 |
 | detail-n-and-stop | n/stop body | 200；仅 index 0，stop 无效迹象 |
 | detail-stream-false | 非流式 body | 标准 JSON；正文可读 |
@@ -296,6 +314,30 @@ developer role 的错误不是一个干净的 HTTP 4xx：
 | detail-n-nonstream | 非流式 n=2 | choices 数量为 1 |
 | messages-function-role | function 历史 | 200；历史可读 |
 | detail-developer-error | developer 错误 body | HTTP 200 SSE 内嵌错误 |
+
+### 8.1 本轮补充对照用例
+
+| 用例 ID（同一行表示同一测试组） | 结果 |
+| --- | --- |
+| followup-stop-baseline / followup-stop-controlled | 无 stop 与 `stop="ZZSTOPZZ"` 返回完全相同的 `ALPHAZZSTOPZZOMEGA`；stop 无效迹象 |
+| followup-seed-a / followup-seed-b | 相同 seed 的重复请求输出不同，seed 不提供确定性 |
+| followup-usage-default / followup-usage-false / followup-usage-true | 三次均 1 个非空 usage、0 个 null usage、0 个 obfuscation；stream_options 语义被忽略 |
+| followup-reasoning-none/minimal/low/medium/high/xhigh/max/invalid | 官方值和非法 `ultra` 都 200；无可靠等级差异 |
+| followup-service-tier-auto/default/flex/scale/priority/fast/unsupported-tier | 全部 200，响应 service_tier 均为 `standard` |
+| followup-verbosity-low/medium/high-retry | 同一提示下正文和 usage 完全相同；verbosity 无可见作用 |
+| followup-cache-baseline / followup-cache-key / followup-cache-explicit-1 / followup-cache-explicit-2 / followup-prompt-cache-retention | 均 200；重复显式缓存请求的 cached_tokens 和 cache_write_tokens 均为 0 |
+| followup-safety-identifier / followup-metadata / followup-store | 均 200；无回显、持久化或隔离的可见证据 |
+| followup-prediction-exact / followup-prediction-mismatch | 命中与错误 prediction 都返回普通文本；无 prediction token 统计或加速证据 |
+| followup-moderation-score / followup-moderation-block | 正文、usage 相同且 moderation 对象数为 0；字段被忽略迹象 |
+| followup-file-content / followup-file-data-url | 两种 file_data 编码都被放行，但模型均说没有附件 |
+| followup-vision-red-square / followup-image-detail-auto / followup-image-detail-low | 红色 PNG 均识别为 Red，image token 计数为 12；基础视觉输入可用 |
+| followup-tool-required / followup-tool-named / followup-allowed-tools-required / followup-custom-tool-required / followup-tool-required-512 / followup-tool-required-nonstream | 强制 function/custom/allowed tool 均无 tool_calls；流式和非流式一致 |
+| followup-schema-strict-conflict / followup-schema-nonstrict-conflict | strict 与 nonstrict 都返回 schema 禁止的 WRONG_VALUE；严格 schema 不生效 |
+| followup-max-tokens-wins / followup-max-completion-wins / followup-max-completion-only-32 / followup-max-completion-only-256 | 同传两个长度字段时分别按 max_tokens=32/256 截断；删除 max_tokens 后 max_completion_tokens=32/256 都得到 completion_tokens=256，说明该字段被忽略 |
+| followup-invalid-temperature / followup-invalid-top-p / followup-invalid-presence-penalty / followup-invalid-frequency-penalty | 超出官方范围仍 HTTP 200，网关不做严格参数校验 |
+| followup-assistant-audio-null / followup-assistant-refusal-part | assistant audio:null 和 refusal content part 历史可读并能继续生成 |
+| followup-web-search-options | 200，但模型明确无实时搜索能力，无引用或搜索结果 |
+| raw-logit-baseline | provider choice 中没有可用生成 token_ids，无法建立可靠的 logit_bias token 反事实对照 |
 
 ## 9. 对 OpenAI 兼容代理的建议
 
@@ -310,11 +352,12 @@ stream
 temperature
 top_p
 max_tokens
-max_completion_tokens
-response_format: text/json_object/json_schema
+response_format: text/json_object
 text content parts
 image_url content parts（仅基础验证）
 ~~~
+
+`max_completion_tokens` 不能直接透传：代理需要把它转换为 `max_tokens`，并定义两个字段同时存在时的冲突策略。`json_schema` 只能作为“尽量输出 JSON”的请求转发，不能承诺 strict schema；需要严格结构时应在代理侧校验并在失败时返回标准错误。
 
 ### 9.2 代理必须做的转换
 
@@ -323,9 +366,10 @@ image_url content parts（仅基础验证）
 3. reasoning、prompt_token_ids、token_ids、stop_reason 等扩展放入可选扩展，不能让严格 OpenAI 客户端依赖它们。
 4. stream:false 时直接返回规范 JSON；不要让调用方误以为网页的 SSE 解析器也能处理它。
 5. 把 SSE 内嵌错误转换成 HTTP 4xx/5xx 和标准 error object。
-6. 对 tools、functions、developer、logprobs、音频和 n>1 显式拒绝，或在兼容层文档中清楚标为 unsupported；不要静默返回成功后让调用方误判。
-7. 对 max_tokens 与 max_completion_tokens 做自己的冲突校验，因为上游没有严格拒绝。
-8. 不要把浏览器 Cookie 转发给外部 API 调用者。代理应在服务端管理登录态或使用正式 API key，并隔离用户会话。
+6. 对 tools、functions、developer、logprobs、音频、文件、web search、moderation、prompt cache、prediction 和 n>1 显式拒绝，或在兼容层文档中清楚标为 unsupported；不要静默返回成功后让调用方误判。
+7. 对 max_tokens 与 max_completion_tokens 做自己的映射和冲突校验；当前上游只按 max_tokens 控制。
+8. 对 json_schema 做本地 schema 校验；上游 strict 不可靠，不能把返回的 JSON 外形当作约束通过。
+9. 不要把浏览器 Cookie 转发给外部 API 调用者。代理应在服务端管理登录态或使用正式 API key，并隔离用户会话。
 
 ### 9.3 不应做的承诺
 
@@ -340,17 +384,19 @@ image_url content parts（仅基础验证）
 - metadata/store 的持久化；
 - seed 的确定性；
 - service tier 的计费或路由保证。
+- 严格 JSON Schema、prompt caching、Predicted Outputs 或 moderation 结果。
 
 ## 10. 限制、未决问题和后续验证
 
 1. 本轮只测试 kimi-k3，不能代表 Kimi K3 Fast 或其他模型。
 2. 本轮使用一个已登录浏览器会话，没有验证正式 API key 的 Authorization 流程、跨用户隔离、匿名访问、配额和限流。
 3. 没有进行压力测试、长上下文极限、并发、断线重连、取消请求或重试语义测试。
-4. seed、penalty、logit bias、reasoning effort、service tier、prediction、metadata 和 store 只验证了请求接受，尚未做严格的成对统计或持久化验证。
-5. 图片测试使用 1x1 PNG，仅验证最小请求路径；不能替代真实视觉准确率测试。
+4. penalty 和 logit bias 的具体 token 分布影响仍无法从少量黑盒请求可靠量化；本轮已确认越界值也不被网关拒绝。
+5. 图片已用真实 32x32 红色 PNG 复核 auto/low/high，但不能替代复杂视觉准确率、URL 图片和大图压力测试。
 6. 音频输入使用极小静音 WAV，结果反映当前模型链路不能处理音频，不代表其他模型一定相同。
-7. 官方 OpenAI 当前参考页面本轮无法稳定访问（官方页面在浏览器中返回 403，搜索回源返回 424）。因此字段清单按 Chat Completions 的标准契约和实测结果整理；部署前应再次对照官方当前 schema。
-8. 本报告没有把浏览器中的任何账户标识、Cookie、Authorization 头或内部身份值写入文件。
+7. `user`、`safety_identifier`、`store`、`metadata` 等主要影响服务端治理或持久化的字段，黑盒响应无法证明后台是否记录；报告只给出客户端可观测结论。
+8. OpenAI 当前参考页面可直接访问，字段清单以该官方 create reference 为基准；官方文档也提示参数支持可能随模型变化。
+9. 本报告没有把浏览器中的任何账户标识、Cookie、Authorization 头或内部身份值写入文件；也没有导出登录凭据。
 
 ## 11. 最终判断
 
@@ -359,9 +405,10 @@ image_url content parts（仅基础验证）
 - 基础聊天代理：可以实现；
 - 流式文本代理：可以实现，但需要 SSE 兼容处理；
 - 非流式文本代理：后端可以实现，需单独处理 JSON；
-- JSON Object/JSON Schema 代理：可以实现；
+- JSON Object 代理：可以实现；
+- JSON Schema 代理：只能做非严格转发，严格约束需代理侧校验；
 - 基础图片输入代理：可以试用，但应标注验证范围；
 - 完整 OpenAI Chat Completions drop-in：目前不能声称；
-- 工具调用、developer role、logprobs、n>1、音频：当前实测不应宣称支持。
+- 工具调用、developer role、logprobs、n>1、音频、文件、web search、moderation、prompt cache、prediction：当前实测不应宣称支持。
 
 最稳妥的生产策略是建立一个“支持子集 + 显式拒绝列表”的适配层，而不是把所有外部字段原样透传。
