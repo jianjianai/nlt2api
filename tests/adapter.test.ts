@@ -1,8 +1,8 @@
 import assert from "node:assert/strict"
 import test from "node:test"
 import { AppError } from "../server/utils/errors"
-import { validateChatRequest } from "../server/utils/openai"
-import { createSseRelay, createToolSseRelay, normalizeCompletion, normalizeToolCompletion, prepareSse } from "../server/utils/response"
+import { validateChatRequest, TOOL_PROTOCOL_MIN_MAX_TOKENS } from "../server/utils/openai"
+import { createSseRelay, createToolSseRelay, normalizeCompletion, normalizeToolCompletion, prepareSse, type PreparedSse } from "../server/utils/response"
 
 const weatherTool = {
   type: "function",
@@ -42,6 +42,26 @@ test("maps max_completion_tokens to the portal max_tokens field", () => {
 
   assert.equal(result.portalPayload.max_tokens, 32)
   assert.equal(result.portalPayload.max_completion_tokens, undefined)
+})
+
+test("raises a tiny max_tokens to a floor for tool-protocol requests", () => {
+  const result = validateChatRequest({
+    model: "kimi-k3",
+    messages: [{ role: "user", content: "hello" }],
+    max_tokens: 32,
+    tools: [weatherTool],
+    tool_choice: "required"
+  })
+  assert.equal(result.portalPayload.max_tokens, TOOL_PROTOCOL_MIN_MAX_TOKENS)
+})
+
+test("keeps a tiny max_tokens when no tool protocol is active", () => {
+  const result = validateChatRequest({
+    model: "kimi-k3",
+    messages: [{ role: "user", content: "hello" }],
+    max_tokens: 32
+  })
+  assert.equal(result.portalPayload.max_tokens, 32)
 })
 
 test("maps historical assistant reasoning_content to the portal reasoning field", () => {
@@ -360,5 +380,43 @@ test("streams reasoning but buffers and converts the JSON action into tool call 
   assert.deepEqual(events[2].choices, [])
   assert.deepEqual(events[2].usage, { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 })
   assert.doesNotMatch(output, /\\\"type\\\":\\\"tool_calls\\\"/)
+  assert.match(output, /data: \[DONE\]/)
+})
+
+test("retries with a corrective nudge when the model streams reasoning but no JSON action", async () => {
+  const request = validateChatRequest({
+    model: "kimi-k3",
+    messages: [{ role: "user", content: "Weather in Paris" }],
+    stream: true,
+    tools: [weatherTool],
+    tool_choice: "required",
+    parallel_tool_calls: false
+  })
+  assert.ok(request.toolPlan)
+
+  let refetchCalls = 0
+  const refetch = async (nudge: string): Promise<PreparedSse> => {
+    refetchCalls += 1
+    assert.match(nudge, /JSON action/)
+    const upstream = new Response([
+      'data: {"id":"retry","model":"kimi-k3","choices":[{"index":0,"delta":{"role":"assistant","content":"{\\\"type\\\":\\\"tool_calls\\\",\\\"tool_calls\\\":[{\\\"name\\\":\\\"get_weather\\\",\\\"arguments\\\":{\\\"city\\\":\\\"Paris\\\"}}]}"},"finish_reason":"stop"}]}\n\n',
+      "data: [DONE]\n\n"
+    ].join(""))
+    return prepareSse(upstream.body)
+  }
+
+  const upstream = new Response([
+    'data: {"id":"empty","model":"kimi-k3","choices":[{"index":0,"delta":{"role":"assistant","reasoning":"thinking hard"},"finish_reason":null}]}\n\n',
+    'data: {"id":"empty","model":"kimi-k3","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n',
+    "data: [DONE]\n\n"
+  ].join(""))
+  const prepared = await prepareSse(upstream.body)
+  const relay = createToolSseRelay(prepared, "kimi-k3", false, request.toolPlan, refetch)
+  const output = await new Response(relay).text()
+
+  assert.equal(refetchCalls, 1)
+  assert.match(output, /tool_calls/)
+  assert.match(output, /get_weather/)
+  assert.doesNotMatch(output, /invalid tool action/)
   assert.match(output, /data: \[DONE\]/)
 })

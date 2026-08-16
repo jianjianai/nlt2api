@@ -1,7 +1,15 @@
 import { AccountAuthError, AppError } from "./errors"
 import { validateChatRequest, type ValidatedChatRequest } from "./openai"
 import { checkPortalSession, ensurePortalLogin, fetchPortalChat } from "./portal"
-import { createSseRelay, createToolSseRelay, normalizeCompletion, normalizeToolCompletion, prepareSse, type UpstreamStreamError } from "./response"
+import {
+  createSseRelay,
+  createToolSseRelay,
+  normalizeCompletion,
+  normalizeToolCompletion,
+  prepareSse,
+  type PreparedSse,
+  type UpstreamStreamError
+} from "./response"
 import {
   getAccount,
   getEnabledAccounts,
@@ -78,7 +86,7 @@ async function fetchWithAuthRecovery(account: StoredAccount, request: ValidatedC
   return response
 }
 
-async function proxyForAccount(account: StoredAccount, request: ValidatedChatRequest): Promise<ProxyResult> {
+async function preparePortalSse(account: StoredAccount, request: ValidatedChatRequest): Promise<PreparedSse> {
   let response: Response
   try {
     response = await fetchWithAuthRecovery(account, request)
@@ -93,21 +101,6 @@ async function proxyForAccount(account: StoredAccount, request: ValidatedChatReq
     const status = response.status === 429 ? 429 : response.status >= 500 ? 502 : response.status
     await discardResponse(response)
     throw new AppError(`Neuralwatt rejected the request with HTTP ${response.status}`, status, "upstream_http_error", undefined, status === 429 ? "rate_limit_error" : "server_error")
-  }
-
-  if (!request.stream) {
-    try {
-      const value: unknown = await response.json()
-      return {
-        kind: "json",
-        body: request.toolPlan
-          ? normalizeToolCompletion(value, request.model, request.toolPlan)
-          : normalizeCompletion(value, request.model)
-      }
-    } catch (error) {
-      if (error instanceof AppError) throw error
-      throw new AppError("The upstream returned invalid JSON", 502, "invalid_upstream_json")
-    }
   }
 
   const prepared = await prepareSse(response.body)
@@ -127,11 +120,59 @@ async function proxyForAccount(account: StoredAccount, request: ValidatedChatReq
     throw new AppError(streamError.message, 502, "upstream_stream_error")
   }
 
+  return prepared
+}
+
+async function proxyForAccount(account: StoredAccount, request: ValidatedChatRequest): Promise<ProxyResult> {
+  if (!request.stream) {
+    let response: Response
+    try {
+      response = await fetchWithAuthRecovery(account, request)
+    } catch (error) {
+      if (error instanceof AccountAuthError) {
+        await recordAccountStatus(account.id, error.code === "manual_cookie_required" ? "manual_cookie_required" : "login_failed", error.message)
+      }
+      throw error
+    }
+
+    if (!response.ok) {
+      const status = response.status === 429 ? 429 : response.status >= 500 ? 502 : response.status
+      await discardResponse(response)
+      throw new AppError(`Neuralwatt rejected the request with HTTP ${response.status}`, status, "upstream_http_error", undefined, status === 429 ? "rate_limit_error" : "server_error")
+    }
+
+    try {
+      const value: unknown = await response.json()
+      return {
+        kind: "json",
+        body: request.toolPlan
+          ? normalizeToolCompletion(value, request.model, request.toolPlan)
+          : normalizeCompletion(value, request.model)
+      }
+    } catch (error) {
+      if (error instanceof AppError) throw error
+      throw new AppError("The upstream returned invalid JSON", 502, "invalid_upstream_json")
+    }
+  }
+
+  const prepared = await preparePortalSse(account, request)
+  if (request.toolPlan) {
+    const refetch = async (nudge: string): Promise<PreparedSse> => {
+      const portalPayload: Record<string, unknown> = {
+        ...request.portalPayload,
+        messages: [...(request.portalPayload.messages as unknown[]), { role: "user", content: nudge }]
+      }
+      return preparePortalSse(account, { ...request, portalPayload })
+    }
+    return {
+      kind: "stream",
+      body: createToolSseRelay(prepared, request.model, request.includeUsage, request.toolPlan, refetch)
+    }
+  }
+
   return {
     kind: "stream",
-    body: request.toolPlan
-      ? createToolSseRelay(prepared, request.model, request.includeUsage, request.toolPlan)
-      : createSseRelay(prepared, request.model, request.includeUsage)
+    body: createSseRelay(prepared, request.model, request.includeUsage)
   }
 }
 

@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto"
 import { AppError } from "./errors"
-import { parseToolAction, type ToolPlan } from "./tools"
+import { parseToolAction, type ParsedToolAction, type ToolPlan } from "./tools"
 
 type JsonObject = Record<string, unknown>
 
@@ -14,7 +14,7 @@ export class UpstreamStreamError extends Error {
   }
 }
 
-interface PreparedSse {
+export interface PreparedSse {
   reader: ReadableStreamDefaultReader<Uint8Array>
   pending: string
   firstChunk?: JsonObject
@@ -242,12 +242,24 @@ function completionChunkIdentity(value: JsonObject, model: string): JsonObject {
   }
 }
 
-export function createToolSseRelay(prepared: PreparedSse, model: string, includeUsage: boolean, plan: ToolPlan): ReadableStream<Uint8Array> {
+export interface ToolSseRefetch {
+  (nudge: string): Promise<PreparedSse>
+}
+
+const TOOL_ACTION_MAX_RETRIES = 1
+
+export function createToolSseRelay(
+  prepared: PreparedSse,
+  model: string,
+  includeUsage: boolean,
+  plan: ToolPlan,
+  refetch?: ToolSseRefetch
+): ReadableStream<Uint8Array> {
   return new ReadableStream<Uint8Array>({
     start(controller) {
       void (async () => {
         const decoder = new TextDecoder()
-        let pending = prepared.pending
+        let current = prepared
         let content = ""
         let identity: JsonObject | undefined
         let usage: JsonObject | undefined
@@ -293,45 +305,77 @@ export function createToolSseRelay(prepared: PreparedSse, model: string, include
         }
 
         try {
-          if (prepared.firstChunk) processToolChunk(prepared.firstChunk)
-          let upstreamDone = prepared.firstDone
-          while (!upstreamDone) {
-            const frame = takeFrame(pending)
-            if (frame) {
-              pending = frame.rest
-              upstreamDone = processToolFrame(frame.frame)
-              continue
-            }
+          let retries = 0
+          let action: ParsedToolAction | undefined
+          while (true) {
+            let pending = current.pending
+            if (current.firstChunk) processToolChunk(current.firstChunk)
+            let upstreamDone = current.firstDone
+            while (!upstreamDone) {
+              const frame = takeFrame(pending)
+              if (frame) {
+                pending = frame.rest
+                upstreamDone = processToolFrame(frame.frame)
+                continue
+              }
 
-            const next = await prepared.reader.read()
-            if (next.done) {
-              pending += decoder.decode()
-              if (pending) {
-                pending += "\n\n"
-                while (true) {
-                  const finalFrame = takeFrame(pending)
-                  if (!finalFrame) break
-                  pending = finalFrame.rest
-                  if (processToolFrame(finalFrame.frame)) {
-                    upstreamDone = true
-                    break
+              const next = await current.reader.read()
+              if (next.done) {
+                pending += decoder.decode()
+                if (pending) {
+                  pending += "\n\n"
+                  while (true) {
+                    const finalFrame = takeFrame(pending)
+                    if (!finalFrame) break
+                    pending = finalFrame.rest
+                    if (processToolFrame(finalFrame.frame)) {
+                      upstreamDone = true
+                      break
+                    }
                   }
                 }
+                break
               }
-              break
+              pending += decoder.decode(next.value, { stream: true })
             }
-            pending += decoder.decode(next.value, { stream: true })
+            current.reader.releaseLock()
+
+            try {
+              action = parseToolAction(content, plan)
+              break
+            } catch (error) {
+              const invalidAction = error instanceof AppError && error.code === "invalid_tool_action"
+              if (!invalidAction || !refetch || retries >= TOOL_ACTION_MAX_RETRIES) {
+                throw error
+              }
+            }
+
+            // The reasoning model finished without a usable JSON action
+            // (empty content, prose, unknown tool, or bad arguments).
+            // Reasoning from this attempt was already streamed; give it one
+            // corrective turn so the client still receives a usable result.
+            retries += 1
+            content = ""
+            identity = undefined
+            usage = undefined
+            roleSent = false
+            upstreamFinishReason = "stop"
+            current = await refetch(
+              'Your previous response did not provide the required JSON action, so nothing was delivered. ' +
+              'Now emit exactly one JSON object and no prose: {"type":"tool_calls","tool_calls":[{"id":"call_0","name":"<tool>","arguments":{}}]} to call a tool, ' +
+              'or {"type":"final","content":"..."} to answer directly.'
+            )
           }
 
-          const action = parseToolAction(content, plan)
           identity ??= completionChunkIdentity({}, model)
           const delta: JsonObject = roleSent ? {} : { role: "assistant" }
           let finishReason: unknown = upstreamFinishReason
-          if (action.kind === "tool_calls") {
-            delta.tool_calls = action.toolCalls.map((call, index) => ({ index, ...call }))
+          const parsedAction = action as ParsedToolAction
+          if (parsedAction.kind === "tool_calls") {
+            delta.tool_calls = parsedAction.toolCalls.map((call, index) => ({ index, ...call }))
             finishReason = "tool_calls"
           } else {
-            delta.content = action.content
+            delta.content = parsedAction.content
           }
           controller.enqueue(formatSse({
             ...identity,
@@ -345,7 +389,6 @@ export function createToolSseRelay(prepared: PreparedSse, model: string, include
         } catch (error) {
           controller.enqueue(formatSseError(error))
         } finally {
-          prepared.reader.releaseLock()
           controller.close()
         }
       })()

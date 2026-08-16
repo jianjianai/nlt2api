@@ -3,6 +3,10 @@ import { buildToolProtocol, encodeAssistantToolCalls, parseToolPlan, type ToolPl
 
 type JsonObject = Record<string, unknown>
 
+// The Kimi reasoning path spends output tokens on thinking before the JSON
+// action; below this floor a tool request is likely to return no action.
+export const TOOL_PROTOCOL_MIN_MAX_TOKENS = 256
+
 export interface ValidatedChatRequest {
   model: string
   stream: boolean
@@ -213,6 +217,13 @@ export function validateChatRequest(input: unknown): ValidatedChatRequest {
     while (insertionIndex < messages.length && messages[insertionIndex].role === "system") insertionIndex += 1
     messages.splice(insertionIndex, 0, { role: "system", content: buildToolProtocol(toolPlan) })
     portalPayload.response_format = { type: "json_object" }
+
+    // Kimi K3 reasons before emitting the JSON action; a tiny client cap would
+    // spend the whole budget on thinking and return no action at all.
+    const maxTokens = portalPayload.max_tokens
+    if (typeof maxTokens === "number" && maxTokens < TOOL_PROTOCOL_MIN_MAX_TOKENS) {
+      portalPayload.max_tokens = TOOL_PROTOCOL_MIN_MAX_TOKENS
+    }
   } else if (hasOwn(input, "response_format")) {
     portalPayload.response_format = input.response_format
   }
