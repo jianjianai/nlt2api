@@ -299,6 +299,28 @@ function buildRetryNudge(content: string, error: unknown, choice: "auto" | "requ
   return 'Your previous response did not provide a usable JSON action. Now emit exactly one JSON object and no prose: {"type":"tool_calls","tool_calls":[{"id":"call_0","name":"<tool>","arguments":{}}]} to call a tool' + finalHint + "."
 }
 
+// A short, model-facing diagnosis of why the previous action failed. Unlike
+// the human-facing AppError message (proxy jargon), this is phrased for the
+// model so it can correct the specific failure when the context is echoed
+// back in a later turn.
+function buildErrorDiagnosis(content: string, error: unknown, choice: "auto" | "required"): string {
+  const message = error instanceof AppError ? error.message : ""
+  const text = content.trim()
+  if (message.includes("content was empty")) return "your previous reply was empty"
+  if (message.includes("was not valid JSON") && text && !/^[{[]/.test(text)) {
+    return "your previous reply was prose, not the required JSON action"
+  }
+  if (message.includes("was not valid JSON")) {
+    const detail = message.split("was not valid JSON")[1]?.trim().replace(/^: /, "") || ""
+    return `your previous reply was not valid JSON${detail ? ` (${detail})` : ""}`
+  }
+  if (message.includes("unknown function")) return "you called a tool that is not in the list"
+  if (message.includes("failed schema validation")) return "your tool arguments did not satisfy the tool's parameters schema"
+  if (message.includes("arguments")) return "your tool arguments were invalid"
+  if (message.includes("tool_choice requires a tool call")) return "a final response was returned when a tool call was required"
+  return "your previous reply did not provide a usable JSON action"
+}
+
 export function createToolSseRelay(
   prepared: PreparedSse,
   model: string,
@@ -436,7 +458,7 @@ export function createToolSseRelay(
               if (failedContent || failedReasoning) {
                 controller.enqueue(formatSse({
                   ...(identity ?? completionChunkIdentity({}, model)),
-                  choices: [{ index: 0, delta: { reasoning_content: encodeErrorBlock(failedContent, error instanceof AppError ? error.message : "") }, finish_reason: null }]
+                  choices: [{ index: 0, delta: { reasoning_content: encodeErrorBlock(failedContent, buildErrorDiagnosis(content, error, plan.choice)) }, finish_reason: null }]
                 }))
               }
               content = ""

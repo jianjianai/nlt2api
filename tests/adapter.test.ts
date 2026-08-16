@@ -518,7 +518,8 @@ test("encodes the failed attempt into the reasoning stream on retry", async () =
   const output = await new Response(relay).text()
 
   assert.match(output, /NWERR-START/)
-  assert.match(output, /Kimi returned an invalid tool action/)
+  assert.match(output, /reply was empty/)
+  assert.doesNotMatch(output, /Kimi returned an invalid tool action/)
   assert.match(output, /tool_calls/)
 })
 
