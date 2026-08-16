@@ -1,0 +1,10 @@
+services:
+  nlt2api:
+    image: ghcr.io/jianjianai/nlt2api:latest
+    container_name: nlt2api
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    volumes:
+      # Account data persists on the host at ./data/neuralwatt-accounts.yaml
+      - ./data:/app/.data

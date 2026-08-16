@@ -1,0 +1,14 @@
+.git
+.github
+.breezell
+node_modules
+.output
+.nitro
+.data
+.env
+.env.local
+compose.yaml
+Dockerfile
+.dockerignore
+tests
+*.md
