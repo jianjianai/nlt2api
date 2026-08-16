@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto"
 import { AppError } from "./errors"
-import { parseToolAction, type ParsedToolAction, type ToolPlan } from "./tools"
+import { TOOL_PROSE_FINAL_PREFIX, parseToolAction, type ParsedToolAction, type ToolPlan } from "./tools"
 
 type JsonObject = Record<string, unknown>
 
@@ -248,19 +248,23 @@ export interface ToolSseRefetch {
 }
 
 const TOOL_ACTION_MAX_RETRIES = 2
+const UNMARKED_PROSE_MAX_RETRIES = 1
 
-// If the model answered in prose instead of an attempted JSON action, returns
-// the trimmed prose so the caller can deliver it as a final message; otherwise
-// returns null. "Attempted JSON" (starts with { or [) is a broken action and
-// must not be mistaken for a final answer.
-// Encodes the failed attempt (error output + reason) as a self-contained
-// marker block appended to the reasoning stream. Echoing clients carry it
-// verbatim into the next turn, where decodeErrorBlock re-materializes the
-// failed attempt so the model can see its own previous error.
-function encodeErrorBlock(content: string, reason: string): string {
-  return `[NWERR-START]${JSON.stringify({ v: 1, out: content, reason })}[NWERR-END]`
+function allowsMarkedProse(plan: ToolPlan): boolean {
+  return plan.choice === "auto" && plan.finalResponseFormat === "text"
 }
 
+function markedProseFinal(content: unknown, plan: ToolPlan): string | null {
+  if (!allowsMarkedProse(plan) || typeof content !== "string" || !content.startsWith(TOOL_PROSE_FINAL_PREFIX)) {
+    return null
+  }
+  const prose = content.slice(TOOL_PROSE_FINAL_PREFIX.length)
+  return prose.trim() ? prose : null
+}
+
+// If the model answered in bare prose instead of an attempted JSON action,
+// returns it so the caller can request the explicit direct-answer marker.
+// "Attempted JSON" (starts with { or [) is a broken action, not a final answer.
 function proseCandidate(content: string, error: unknown): string | null {
   const text = content.trim()
   if (!text) return null
@@ -270,18 +274,33 @@ function proseCandidate(content: string, error: unknown): string | null {
   return message.includes("was not valid JSON") ? text : null
 }
 
+// Encodes the failed attempt (error output + reason) as a self-contained
+// marker block appended to the reasoning stream. Echoing clients carry it
+// verbatim into the next turn, where decodeErrorBlock re-materializes the
+// failed attempt so the model can see its own previous error.
+function encodeErrorBlock(content: string, reason: string): string {
+  return `[NWERR-START]${JSON.stringify({ v: 1, out: content, reason })}[NWERR-END]`
+}
+
 // A corrective nudge tuned to the failure type so the retry has the best
 // chance of producing a usable JSON action.
-function buildRetryNudge(content: string, error: unknown, choice: "auto" | "required"): string {
+function buildRetryNudge(content: string, error: unknown, plan: ToolPlan): string {
   const text = content.trim()
   const message = error instanceof AppError ? error.message : ""
-  const finalHint = choice === "auto" ? ', or {"type":"final","content":"..."} to answer directly' : ""
+  const finalHint = allowsMarkedProse(plan)
+    ? `, or begin a committed direct final answer with "${TOOL_PROSE_FINAL_PREFIX}" when no tool is needed`
+    : plan.choice === "auto"
+      ? ', or {"type":"final","content":"..."} to answer directly'
+      : ""
 
   if (message.includes("content was empty")) {
     return 'Your previous reply was empty. Now emit exactly one JSON object and no prose: {"type":"tool_calls","tool_calls":[{"id":"call_0","name":"<tool>","arguments":{}}]} to call a tool' + finalHint + ". Do not return an empty turn."
   }
+  if (text === TOOL_PROSE_FINAL_PREFIX) {
+    return `Your previous reply contained only the direct-answer marker "${TOOL_PROSE_FINAL_PREFIX}". Emit a non-empty final answer beginning with that marker, or emit exactly one JSON object to call a tool.`
+  }
   if (message.includes("was not valid JSON") && text && !/^[{[]/.test(text)) {
-    return 'Your previous reply was prose, not the required JSON action. Emit ONLY exactly one JSON object and no prose: {"type":"tool_calls","tool_calls":[{"id":"call_0","name":"<tool>","arguments":{}}]} to call a tool' + finalHint + "."
+    return `Your previous reply was unmarked prose, so it cannot be treated as a final answer. If it is a completed answer and no tool is needed, re-emit it with "${TOOL_PROSE_FINAL_PREFIX}" as its first character. Otherwise emit exactly one JSON object and no prose: {"type":"tool_calls","tool_calls":[{"id":"call_0","name":"<tool>","arguments":{}}]} to call a tool.`
   }
   if (message.includes("was not valid JSON")) {
     // Broken/truncated JSON: surface the parser's reason so the model can fix
@@ -339,6 +358,8 @@ export function createToolSseRelay(
         let roleSent = false
         let upstreamFinishReason: unknown = "stop"
         let reasoningText = ""
+        let markedProse = false
+        let markedProseContent = ""
 
         const processToolChunk = (value: JsonObject): void => {
           identity ??= completionChunkIdentity(value, model)
@@ -348,8 +369,22 @@ export function createToolSseRelay(
           if (!isRecord(rawChoice)) return
           if (rawChoice.finish_reason !== undefined && rawChoice.finish_reason !== null) upstreamFinishReason = rawChoice.finish_reason
           const rawDelta = isRecord(rawChoice.delta) ? rawChoice.delta : {}
-          if (typeof rawDelta.content === "string") content += rawDelta.content
-          else if (rawDelta.content !== undefined && rawDelta.content !== null) {
+          let visibleContent: string | undefined
+          if (typeof rawDelta.content === "string") {
+            const chunk = rawDelta.content
+            content += chunk
+            if (markedProse) {
+              markedProseContent += chunk
+              visibleContent = chunk
+            } else {
+              const prose = markedProseFinal(content, plan)
+              if (prose !== null) {
+                markedProse = true
+                markedProseContent = prose
+                visibleContent = prose
+              }
+            }
+          } else if (rawDelta.content !== undefined && rawDelta.content !== null) {
             throw new UpstreamStreamError("The upstream returned a non-text tool action delta")
           }
 
@@ -362,6 +397,13 @@ export function createToolSseRelay(
           if (reasoningContent !== undefined) {
             if (typeof reasoningContent === "string") reasoningText += reasoningContent
             delta.reasoning_content = reasoningContent
+          }
+          if (visibleContent !== undefined && visibleContent.length > 0) {
+            if (!roleSent && delta.role === undefined) {
+              delta.role = "assistant"
+              roleSent = true
+            }
+            delta.content = visibleContent
           }
           if (rawDelta.refusal !== undefined) delta.refusal = rawDelta.refusal
           if (Object.keys(delta).length > 0) {
@@ -417,6 +459,11 @@ export function createToolSseRelay(
             }
             current.reader.releaseLock()
 
+            if (markedProse) {
+              action = { kind: "final", content: markedProseContent }
+              break
+            }
+
             try {
               action = parseToolAction(content, plan)
               break
@@ -426,13 +473,13 @@ export function createToolSseRelay(
                 throw error
               }
 
-              // Auto choice with no useful retry left: the model answered in
-              // prose instead of a JSON action. Deliver the prose as the final
-              // message instead of failing the whole request.
+              // Bare prose is ambiguous: ask once for the direct-answer
+              // marker or a JSON action, then preserve availability by
+              // delivering any remaining prose instead of spending more calls.
               if (plan.choice === "auto" && plan.finalResponseFormat === "text") {
                 const prose = proseCandidate(content, error)
-                if (prose !== null && (!refetch || retries >= TOOL_ACTION_MAX_RETRIES)) {
-                  console.warn(`[proxy] tool action fallback: delivering prose as final (auto choice) content_chars=${content.length}`)
+                if (prose !== null && (!refetch || retries >= UNMARKED_PROSE_MAX_RETRIES)) {
+                  console.warn(`[proxy] tool action fallback: delivering unmarked prose as final (auto choice) content_chars=${content.length}`)
                   action = { kind: "final", content: prose }
                   break
                 }
@@ -450,7 +497,7 @@ export function createToolSseRelay(
               console.warn(`[proxy] tool action invalid, retry ${retries}/${TOOL_ACTION_MAX_RETRIES}: ${error instanceof Error ? error.message : "unknown"} finish=${String(upstreamFinishReason)} reasoning_chars=${reasoningText.length} content_chars=${content.length} content_head=${JSON.stringify(content.slice(0, 160))}`)
               // Preserve the failed attempt (thinking + output) so the retry
               // sees its own previous turn and can correct it precisely.
-              const nudge = buildRetryNudge(content, error, plan.choice)
+              const nudge = buildRetryNudge(content, error, plan)
               const failedReasoning = reasoningText.slice(-2000)
               const failedContent = content.slice(-1500)
               // Encode the failed attempt into the reasoning stream so echoing
@@ -467,6 +514,8 @@ export function createToolSseRelay(
               roleSent = false
               upstreamFinishReason = "stop"
               reasoningText = ""
+              markedProse = false
+              markedProseContent = ""
               current = await refetch({ reasoning: failedReasoning, content: failedContent, nudge })
             }
           }
@@ -478,7 +527,7 @@ export function createToolSseRelay(
           if (parsedAction.kind === "tool_calls") {
             delta.tool_calls = parsedAction.toolCalls.map((call, index) => ({ index, ...call }))
             finishReason = "tool_calls"
-          } else {
+          } else if (!markedProse) {
             delta.content = parsedAction.content
           }
           console.info(`[proxy] tool action delivered kind=${parsedAction.kind} attempts=${retries + 1} finish=${String(upstreamFinishReason)} reasoning_chars=${reasoningText.length} content_chars=${content.length} tools=${plan.tools.length} choice=${plan.choice}`)
@@ -545,6 +594,12 @@ export function normalizeToolCompletion(value: unknown, model: string, plan: Too
   const message = choice && isRecord(choice.message) ? choice.message : undefined
   if (!choice || !message) {
     throw new AppError("The upstream returned no completion for the tool request", 502, "invalid_tool_action")
+  }
+
+  const directProse = markedProseFinal(message.content, plan)
+  if (directProse !== null) {
+    message.content = directProse
+    return normalized
   }
 
   const action = parseToolAction(message.content, plan)

@@ -270,7 +270,11 @@ export function validateChatRequest(input: unknown): ValidatedChatRequest {
     let insertionIndex = 0
     while (insertionIndex < messages.length && messages[insertionIndex].role === "system") insertionIndex += 1
     messages.splice(insertionIndex, 0, { role: "system", content: buildToolProtocol(toolPlan) })
-    portalPayload.response_format = { type: "json_object" }
+    // Auto text mode permits an explicitly marked direct answer, so forcing
+    // JSON upstream would make that protocol branch impossible to produce.
+    if (toolPlan.choice !== "auto" || toolPlan.finalResponseFormat !== "text") {
+      portalPayload.response_format = { type: "json_object" }
+    }
 
     // Kimi K3 reasons before emitting the JSON action; a tiny client cap would
     // spend the whole budget on thinking and return no action at all.
