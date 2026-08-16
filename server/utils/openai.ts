@@ -222,6 +222,7 @@ export function validateChatRequest(input: unknown): ValidatedChatRequest {
     // spend the whole budget on thinking and return no action at all.
     const maxTokens = portalPayload.max_tokens
     if (typeof maxTokens === "number" && maxTokens < TOOL_PROTOCOL_MIN_MAX_TOKENS) {
+      console.info(`[proxy] raised max_tokens ${maxTokens} -> ${TOOL_PROTOCOL_MIN_MAX_TOKENS} for tool protocol`)
       portalPayload.max_tokens = TOOL_PROTOCOL_MIN_MAX_TOKENS
     }
   } else if (hasOwn(input, "response_format")) {

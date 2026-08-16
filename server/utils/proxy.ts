@@ -73,12 +73,14 @@ async function fetchWithAuthRecovery(account: StoredAccount, request: ValidatedC
   let response = await fetchPortalChat(cookie, request.portalPayload)
 
   if (isAuthStatus(response.status)) {
+    console.warn(`[proxy] portal returned ${response.status} for account=${account.label}; refreshing session`)
     await discardResponse(response)
     cookie = await refreshAccount(account)
     response = await fetchPortalChat(cookie, request.portalPayload)
   }
 
   if (isAuthStatus(response.status)) {
+    console.error(`[proxy] account=${account.label} session still invalid after refresh; aborting request`)
     await discardResponse(response)
     throw new AccountAuthError("The cached account session is not valid", "session_expired")
   }
@@ -99,6 +101,7 @@ async function preparePortalSse(account: StoredAccount, request: ValidatedChatRe
 
   if (!response.ok) {
     const status = response.status === 429 ? 429 : response.status >= 500 ? 502 : response.status
+    console.error(`[proxy] portal rejected streaming request account=${account.label} status=${response.status}`)
     await discardResponse(response)
     throw new AppError(`Neuralwatt rejected the request with HTTP ${response.status}`, status, "upstream_http_error", undefined, status === 429 ? "rate_limit_error" : "server_error")
   }
@@ -114,9 +117,11 @@ async function preparePortalSse(account: StoredAccount, request: ValidatedChatRe
     }
     const streamError: UpstreamStreamError = prepared.firstError
     if (streamError.isAuthError) {
+      console.error(`[proxy] portal stream auth error account=${account.label} message=${streamError.message}`)
       await recordAccountStatus(account.id, "expired", streamError.message)
       throw new AccountAuthError("The upstream reported an expired session", "session_expired")
     }
+    console.error(`[proxy] portal stream error account=${account.label} message=${streamError.message}`)
     throw new AppError(streamError.message, 502, "upstream_stream_error")
   }
 
@@ -124,6 +129,7 @@ async function preparePortalSse(account: StoredAccount, request: ValidatedChatRe
 }
 
 async function proxyForAccount(account: StoredAccount, request: ValidatedChatRequest): Promise<ProxyResult> {
+  console.info(`[proxy] chat request account=${account.label} model=${request.model} stream=${request.stream} tools=${request.toolPlan ? "yes" : "no"} max_tokens=${request.portalPayload.max_tokens ?? "default"}`)
   if (!request.stream) {
     let response: Response
     try {
@@ -158,6 +164,7 @@ async function proxyForAccount(account: StoredAccount, request: ValidatedChatReq
   const prepared = await preparePortalSse(account, request)
   if (request.toolPlan) {
     const refetch = async (nudge: string): Promise<PreparedSse> => {
+      console.warn(`[proxy] tool action retry account=${account.label} model=${request.model}`)
       const portalPayload: Record<string, unknown> = {
         ...request.portalPayload,
         messages: [...(request.portalPayload.messages as unknown[]), { role: "user", content: nudge }]
@@ -196,6 +203,7 @@ export async function handleChatRequest(input: unknown): Promise<ProxyResult> {
     }
   }
 
+  console.error(`[proxy] all ${authFailures} enabled account session(s) unavailable`)
   throw new AppError(
     `All ${authFailures} enabled account session${authFailures === 1 ? " is" : "s are"} unavailable`,
     401,

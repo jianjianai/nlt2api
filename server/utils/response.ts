@@ -223,6 +223,7 @@ export function createSseRelay(prepared: PreparedSse, model: string, includeUsag
           }
           controller.enqueue(new TextEncoder().encode("data: [DONE]\n\n"))
         } catch (error) {
+          console.error(`[proxy] stream relay failed: ${error instanceof Error ? error.message : "unknown"}`)
           controller.enqueue(formatSseError(error))
         } finally {
           prepared.reader.releaseLock()
@@ -348,23 +349,24 @@ export function createToolSseRelay(
               if (!invalidAction || !refetch || retries >= TOOL_ACTION_MAX_RETRIES) {
                 throw error
               }
-            }
 
-            // The reasoning model finished without a usable JSON action
-            // (empty content, prose, unknown tool, or bad arguments).
-            // Reasoning from this attempt was already streamed; give it one
-            // corrective turn so the client still receives a usable result.
-            retries += 1
-            content = ""
-            identity = undefined
-            usage = undefined
-            roleSent = false
-            upstreamFinishReason = "stop"
-            current = await refetch(
-              'Your previous response did not provide the required JSON action, so nothing was delivered. ' +
-              'Now emit exactly one JSON object and no prose: {"type":"tool_calls","tool_calls":[{"id":"call_0","name":"<tool>","arguments":{}}]} to call a tool, ' +
-              'or {"type":"final","content":"..."} to answer directly.'
-            )
+              // The reasoning model finished without a usable JSON action
+              // (empty content, prose, unknown tool, or bad arguments).
+              // Reasoning from this attempt was already streamed; give it one
+              // corrective turn so the client still receives a usable result.
+              retries += 1
+              console.warn(`[proxy] tool action invalid, retry ${retries}/${TOOL_ACTION_MAX_RETRIES}: ${error instanceof Error ? error.message : "unknown"}`)
+              content = ""
+              identity = undefined
+              usage = undefined
+              roleSent = false
+              upstreamFinishReason = "stop"
+              current = await refetch(
+                'Your previous response did not provide the required JSON action, so nothing was delivered. ' +
+                'Now emit exactly one JSON object and no prose: {"type":"tool_calls","tool_calls":[{"id":"call_0","name":"<tool>","arguments":{}}]} to call a tool, ' +
+                'or {"type":"final","content":"..."} to answer directly.'
+              )
+            }
           }
 
           identity ??= completionChunkIdentity({}, model)
@@ -377,6 +379,7 @@ export function createToolSseRelay(
           } else {
             delta.content = parsedAction.content
           }
+          console.info(`[proxy] tool action delivered kind=${parsedAction.kind} attempts=${retries + 1}`)
           controller.enqueue(formatSse({
             ...identity,
             choices: [{ index: 0, delta, finish_reason: finishReason ?? "stop" }]
@@ -387,6 +390,7 @@ export function createToolSseRelay(
           }
           controller.enqueue(new TextEncoder().encode("data: [DONE]\n\n"))
         } catch (error) {
+          console.error(`[proxy] tool stream failed: ${error instanceof Error ? error.message : "unknown"}`)
           controller.enqueue(formatSseError(error))
         } finally {
           controller.close()

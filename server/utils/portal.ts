@@ -59,11 +59,14 @@ export async function checkPortalSession(cookie: string): Promise<SessionCheck> 
     }
 
     if (response.status === 401 || response.status === 403) {
+      console.warn(`[portal] session check expired status=${response.status}`)
       return { ok: false, status: response.status, reason: "session_expired" }
     }
 
+    console.warn(`[portal] session check failed status=${response.status}`)
     return { ok: false, status: response.status, reason: "session_check_failed" }
   } catch {
+    console.warn("[portal] session check failed: portal unreachable")
     return { ok: false, status: 502, reason: "portal_unreachable" }
   }
 }
@@ -89,23 +92,27 @@ export async function loginToPortal(account: Pick<StoredAccount, "email" | "pass
 
     if (!cookie) {
       const reason = response.status === 403 || response.status === 429 ? "manual_cookie_required" : "invalid_credentials"
+      console.warn(`[portal] login failed email=${account.email} status=${response.status} reason=${reason}`)
       return { ok: false, status: response.status, reason }
     }
 
     const session = await checkPortalSession(cookie)
     if (!session.ok) {
+      console.warn(`[portal] post-login session check failed email=${account.email} status=${session.status} reason=${session.reason}`)
       return { ok: false, status: session.status, reason: session.reason }
     }
 
+    console.info(`[portal] login ok email=${account.email}`)
     return { ok: true, cookie, status: response.status }
   } catch {
+    console.warn(`[portal] login failed email=${account.email}: portal unreachable`)
     return { ok: false, status: 502, reason: "portal_unreachable" }
   }
 }
 
 export async function fetchPortalChat(cookie: string, payload: Record<string, unknown>): Promise<Response> {
   try {
-    return await fetch(CHAT_URL, {
+    const response = await fetch(CHAT_URL, {
       method: "POST",
       headers: {
         accept: payload.stream === true ? "text/event-stream" : "application/json",
@@ -115,7 +122,12 @@ export async function fetchPortalChat(cookie: string, payload: Record<string, un
       body: JSON.stringify(payload),
       signal: timeoutSignal(180_000)
     })
+    if (!response.ok) {
+      console.error(`[portal] chat rejected status=${response.status} stream=${String(payload.stream)}`)
+    }
+    return response
   } catch {
+    console.error("[portal] chat request failed: portal unreachable")
     throw new AppError("The Neuralwatt portal is unreachable", 502, "portal_unreachable")
   }
 }
