@@ -17,9 +17,9 @@ ENV NODE_ENV=production
 ENV NITRO_HOST=0.0.0.0
 ENV NITRO_PORT=3000
 COPY --from=build /app/.output ./.output
-# Account data lives in .data (NEURALWATT_DATA_FILE defaults to <cwd>/.data/...);
-# pre-create it so a host bind mount keeps node-writable ownership.
-RUN mkdir -p /app/.data && chown -R node:node /app
-USER node
+# Account data lives in .data (NEURALWATT_DATA_FILE defaults to <cwd>/.data/...).
+# Runs as root on purpose: Docker creates missing bind-mount source dirs
+# root-owned, so a non-root user could not write ./data on a first copy-paste run.
+RUN mkdir -p /app/.data
 EXPOSE 3000
 CMD ["node", ".output/server/index.mjs"]
