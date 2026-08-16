@@ -126,8 +126,8 @@ export async function fetchPortalChat(cookie: string, payload: Record<string, un
       console.error(`[portal] chat rejected status=${response.status} stream=${String(payload.stream)}`)
     }
     return response
-  } catch {
-    console.error("[portal] chat request failed: portal unreachable")
+  } catch (error) {
+    console.error(`[portal] chat request failed: portal unreachable (${error instanceof Error ? error.message : "unknown"})`)
     throw new AppError("The Neuralwatt portal is unreachable", 502, "portal_unreachable")
   }
 }

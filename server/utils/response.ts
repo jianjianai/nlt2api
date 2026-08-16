@@ -266,6 +266,7 @@ export function createToolSseRelay(
         let usage: JsonObject | undefined
         let roleSent = false
         let upstreamFinishReason: unknown = "stop"
+        let reasoningChars = 0
 
         const processToolChunk = (value: JsonObject): void => {
           identity ??= completionChunkIdentity(value, model)
@@ -286,7 +287,10 @@ export function createToolSseRelay(
             roleSent = true
           }
           const reasoningContent = reasoningContentFrom(rawDelta)
-          if (reasoningContent !== undefined) delta.reasoning_content = reasoningContent
+          if (reasoningContent !== undefined) {
+            if (typeof reasoningContent === "string") reasoningChars += reasoningContent.length
+            delta.reasoning_content = reasoningContent
+          }
           if (rawDelta.refusal !== undefined) delta.refusal = rawDelta.refusal
           if (Object.keys(delta).length > 0) {
             controller.enqueue(formatSse({
@@ -355,12 +359,13 @@ export function createToolSseRelay(
               // Reasoning from this attempt was already streamed; give it one
               // corrective turn so the client still receives a usable result.
               retries += 1
-              console.warn(`[proxy] tool action invalid, retry ${retries}/${TOOL_ACTION_MAX_RETRIES}: ${error instanceof Error ? error.message : "unknown"}`)
+              console.warn(`[proxy] tool action invalid, retry ${retries}/${TOOL_ACTION_MAX_RETRIES}: ${error instanceof Error ? error.message : "unknown"} finish=${String(upstreamFinishReason)} reasoning_chars=${reasoningChars} content_chars=${content.length} content_head=${JSON.stringify(content.slice(0, 160))}`)
               content = ""
               identity = undefined
               usage = undefined
               roleSent = false
               upstreamFinishReason = "stop"
+              reasoningChars = 0
               current = await refetch(
                 'Your previous response did not provide the required JSON action, so nothing was delivered. ' +
                 'Now emit exactly one JSON object and no prose: {"type":"tool_calls","tool_calls":[{"id":"call_0","name":"<tool>","arguments":{}}]} to call a tool, ' +
@@ -379,7 +384,7 @@ export function createToolSseRelay(
           } else {
             delta.content = parsedAction.content
           }
-          console.info(`[proxy] tool action delivered kind=${parsedAction.kind} attempts=${retries + 1}`)
+          console.info(`[proxy] tool action delivered kind=${parsedAction.kind} attempts=${retries + 1} finish=${String(upstreamFinishReason)} reasoning_chars=${reasoningChars} content_chars=${content.length} tools=${plan.tools.length} choice=${plan.choice}`)
           controller.enqueue(formatSse({
             ...identity,
             choices: [{ index: 0, delta, finish_reason: finishReason ?? "stop" }]
@@ -390,7 +395,7 @@ export function createToolSseRelay(
           }
           controller.enqueue(new TextEncoder().encode("data: [DONE]\n\n"))
         } catch (error) {
-          console.error(`[proxy] tool stream failed: ${error instanceof Error ? error.message : "unknown"}`)
+          console.error(`[proxy] tool stream failed: ${error instanceof Error ? error.message : "unknown"} finish=${String(upstreamFinishReason)} reasoning_chars=${reasoningChars} content_chars=${content.length} content_head=${JSON.stringify(content.slice(0, 160))}`)
           controller.enqueue(formatSseError(error))
         } finally {
           controller.close()
