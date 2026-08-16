@@ -1,4 +1,5 @@
 import { AppError } from "./errors"
+import { buildToolProtocol, encodeAssistantToolCalls, parseToolPlan, type ToolPlan } from "./tools"
 
 type JsonObject = Record<string, unknown>
 
@@ -7,6 +8,7 @@ export interface ValidatedChatRequest {
   stream: boolean
   includeUsage: boolean
   portalPayload: JsonObject
+  toolPlan?: ToolPlan
 }
 
 const supportedFields = new Set([
@@ -19,18 +21,18 @@ const supportedFields = new Set([
   "max_completion_tokens",
   "response_format",
   "modalities",
-  "stream_options"
+  "stream_options",
+  "tools",
+  "tool_choice",
+  "parallel_tool_calls"
 ])
 
 const unsupportedFields = new Set([
   "n",
   "stop",
   "seed",
-  "tools",
-  "tool_choice",
   "functions",
   "function_call",
-  "parallel_tool_calls",
   "logprobs",
   "top_logprobs",
   "audio",
@@ -125,13 +127,15 @@ function normalizeMessages(value: unknown): JsonObject[] {
     }
 
     const message: JsonObject = { role: item.role }
-    if (hasOwn(item, "content")) {
+    if (item.role === "assistant" && hasOwn(item, "tool_calls")) {
+      message.content = encodeAssistantToolCalls(item.tool_calls, `messages[${index}].tool_calls`)
+    } else if (hasOwn(item, "content")) {
       message.content = normalizeContent(item.content, `messages[${index}].content`)
-    } else if (item.role !== "assistant" || !hasOwn(item, "tool_calls")) {
+    } else {
       throw new AppError(`messages[${index}].content is required`, 400, "invalid_message", `messages[${index}].content`, "invalid_request_error")
     }
 
-    for (const key of ["name", "tool_call_id", "tool_calls", "function_call"]) {
+    for (const key of ["name", "tool_call_id", "function_call"]) {
       if (hasOwn(item, key)) {
         message[key] = item[key]
       }
@@ -195,10 +199,21 @@ export function validateChatRequest(input: unknown): ValidatedChatRequest {
     portalPayload.max_tokens = maxTokens ?? maxCompletionTokens
   }
 
+  let responseFormat: "text" | "json_object" = "text"
   if (hasOwn(input, "response_format")) {
     if (!isRecord(input.response_format) || (input.response_format.type !== "text" && input.response_format.type !== "json_object")) {
       throw new AppError("Only response_format text and json_object are supported", 400, "unsupported_response_format", "response_format", "invalid_request_error")
     }
+    responseFormat = input.response_format.type
+  }
+
+  const toolPlan = parseToolPlan(input, responseFormat)
+  if (toolPlan) {
+    let insertionIndex = 0
+    while (insertionIndex < messages.length && messages[insertionIndex].role === "system") insertionIndex += 1
+    messages.splice(insertionIndex, 0, { role: "system", content: buildToolProtocol(toolPlan) })
+    portalPayload.response_format = { type: "json_object" }
+  } else if (hasOwn(input, "response_format")) {
     portalPayload.response_format = input.response_format
   }
 
@@ -225,5 +240,5 @@ export function validateChatRequest(input: unknown): ValidatedChatRequest {
     }
   }
 
-  return { model: input.model, stream, includeUsage, portalPayload }
+  return { model: input.model, stream, includeUsage, portalPayload, ...(toolPlan ? { toolPlan } : {}) }
 }

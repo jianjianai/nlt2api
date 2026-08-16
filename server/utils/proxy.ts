@@ -1,7 +1,7 @@
 import { AccountAuthError, AppError } from "./errors"
 import { validateChatRequest, type ValidatedChatRequest } from "./openai"
 import { checkPortalSession, ensurePortalLogin, fetchPortalChat } from "./portal"
-import { createSseRelay, normalizeCompletion, prepareSse, type UpstreamStreamError } from "./response"
+import { createSseRelay, createToolSseRelay, normalizeCompletion, normalizeToolCompletion, prepareSse, type UpstreamStreamError } from "./response"
 import {
   getAccount,
   getEnabledAccounts,
@@ -98,7 +98,12 @@ async function proxyForAccount(account: StoredAccount, request: ValidatedChatReq
   if (!request.stream) {
     try {
       const value: unknown = await response.json()
-      return { kind: "json", body: normalizeCompletion(value, request.model) }
+      return {
+        kind: "json",
+        body: request.toolPlan
+          ? normalizeToolCompletion(value, request.model, request.toolPlan)
+          : normalizeCompletion(value, request.model)
+      }
     } catch (error) {
       if (error instanceof AppError) throw error
       throw new AppError("The upstream returned invalid JSON", 502, "invalid_upstream_json")
@@ -122,7 +127,12 @@ async function proxyForAccount(account: StoredAccount, request: ValidatedChatReq
     throw new AppError(streamError.message, 502, "upstream_stream_error")
   }
 
-  return { kind: "stream", body: createSseRelay(prepared, request.model, request.includeUsage) }
+  return {
+    kind: "stream",
+    body: request.toolPlan
+      ? createToolSseRelay(prepared, request.model, request.includeUsage, request.toolPlan)
+      : createSseRelay(prepared, request.model, request.includeUsage)
+  }
 }
 
 export async function handleChatRequest(input: unknown): Promise<ProxyResult> {

@@ -2,7 +2,35 @@ import assert from "node:assert/strict"
 import test from "node:test"
 import { AppError } from "../server/utils/errors"
 import { validateChatRequest } from "../server/utils/openai"
-import { createSseRelay, normalizeCompletion, prepareSse } from "../server/utils/response"
+import { createSseRelay, createToolSseRelay, normalizeCompletion, normalizeToolCompletion, prepareSse } from "../server/utils/response"
+
+const weatherTool = {
+  type: "function",
+  function: {
+    name: "get_weather",
+    description: "Get the current weather for a city",
+    parameters: {
+      type: "object",
+      properties: { city: { type: "string" }, unit: { type: "string", enum: ["celsius", "fahrenheit"] } },
+      required: ["city"],
+      additionalProperties: false
+    },
+    strict: true
+  }
+}
+
+const calculatorTool = {
+  type: "function",
+  function: {
+    name: "add_numbers",
+    parameters: {
+      type: "object",
+      properties: { a: { type: "number" }, b: { type: "number" } },
+      required: ["a", "b"],
+      additionalProperties: false
+    }
+  }
+}
 
 test("maps max_completion_tokens to the portal max_tokens field", () => {
   const result = validateChatRequest({
@@ -27,15 +55,137 @@ test("maps historical assistant reasoning_content to the portal reasoning field"
   assert.equal(message.reasoning_content, undefined)
 })
 
-test("rejects unsupported tool calls with an OpenAI parameter error", () => {
+test("compiles function tools into the JSON action protocol without forwarding tools upstream", () => {
+  const result = validateChatRequest({
+    model: "kimi-k3",
+    messages: [{ role: "user", content: "What is the weather in Paris?" }],
+    tools: [weatherTool],
+    tool_choice: "required",
+    parallel_tool_calls: false
+  })
+
+  assert.equal(result.toolPlan?.choice, "required")
+  assert.equal(result.toolPlan?.parallel, false)
+  assert.equal(result.portalPayload.tools, undefined)
+  assert.deepEqual(result.portalPayload.response_format, { type: "json_object" })
+  const messages = result.portalPayload.messages as Array<Record<string, unknown>>
+  assert.equal(messages[0].role, "system")
+  assert.match(messages[0].content as string, /TOOL PROTOCOL/)
+  assert.match(messages[0].content as string, /get_weather/)
+})
+
+test("tool_choice none leaves the normal response path active", () => {
+  const result = validateChatRequest({
+    model: "kimi-k3",
+    messages: [{ role: "user", content: "hello" }],
+    tools: [weatherTool],
+    tool_choice: "none"
+  })
+
+  assert.equal(result.toolPlan, undefined)
+  assert.equal(result.portalPayload.response_format, undefined)
+  assert.equal((result.portalPayload.messages as unknown[]).length, 1)
+})
+
+test("supports current forced and allowed_tools choice objects", () => {
+  const forced = validateChatRequest({
+    model: "kimi-k3",
+    messages: [{ role: "user", content: "hello" }],
+    tools: [weatherTool, calculatorTool],
+    tool_choice: { type: "function", name: "get_weather" }
+  })
+  assert.equal(forced.toolPlan?.choice, "required")
+  assert.equal(forced.toolPlan?.parallel, false)
+  assert.deepEqual(forced.toolPlan?.tools.map((tool) => tool.name), ["get_weather"])
+
+  const allowed = validateChatRequest({
+    model: "kimi-k3",
+    messages: [{ role: "user", content: "hello" }],
+    tools: [weatherTool, calculatorTool],
+    tool_choice: {
+      type: "allowed_tools",
+      mode: "auto",
+      tools: [{ type: "function", name: "add_numbers" }]
+    }
+  })
+  assert.equal(allowed.toolPlan?.choice, "auto")
+  assert.deepEqual(allowed.toolPlan?.tools.map((tool) => tool.name), ["add_numbers"])
+})
+
+test("encodes historical assistant tool calls for the Kimi continuation turn", () => {
+  const result = validateChatRequest({
+    model: "kimi-k3",
+    messages: [
+      { role: "user", content: "weather?" },
+      {
+        role: "assistant",
+        content: null,
+        tool_calls: [{ id: "call_test", type: "function", function: { name: "get_weather", arguments: "{\"city\":\"Paris\"}" } }]
+      },
+      { role: "tool", tool_call_id: "call_test", content: "{\"temperature\":21}" }
+    ],
+    tools: [weatherTool]
+  })
+
+  const messages = result.portalPayload.messages as Array<Record<string, unknown>>
+  const assistant = messages.find((message) => message.role === "assistant")
+  assert.deepEqual(JSON.parse(assistant?.content as string), {
+    type: "tool_calls",
+    tool_calls: [{ id: "call_test", name: "get_weather", arguments: { city: "Paris" } }]
+  })
+  const tool = messages.find((message) => message.role === "tool")
+  assert.equal(tool?.tool_call_id, "call_test")
+})
+
+test("rejects invalid tool schemas and unknown forced choices", () => {
   assert.throws(
     () => validateChatRequest({
       model: "kimi-k3",
       messages: [{ role: "user", content: "hello" }],
-      tools: [{ type: "function", function: { name: "lookup" } }]
+      tools: [{ type: "function", function: { name: "lookup", parameters: { type: "not-a-json-schema-type" } } }]
     }),
-    (error: unknown) => error instanceof AppError && error.statusCode === 400 && error.param === "tools"
+    (error: unknown) => error instanceof AppError && error.statusCode === 400 && error.param === "tools[0].function.parameters"
   )
+  assert.throws(
+    () => validateChatRequest({
+      model: "kimi-k3",
+      messages: [{ role: "user", content: "hello" }],
+      tools: [weatherTool],
+      tool_choice: { type: "function", function: { name: "missing" } }
+    }),
+    (error: unknown) => error instanceof AppError && error.statusCode === 400 && error.param === "tool_choice"
+  )
+})
+
+test("accepts JSON Schema draft 2020-12 tool parameters", () => {
+  const draft2020Tool = {
+    type: "function",
+    function: {
+      name: "lookup_user",
+      parameters: {
+        $schema: "https://json-schema.org/draft/2020-12/schema",
+        type: "object",
+        properties: {
+          user_id: { type: "string" }
+        },
+        required: ["user_id"],
+        additionalProperties: false
+      }
+    }
+  }
+  const request = validateChatRequest({
+    model: "kimi-k3",
+    messages: [{ role: "user", content: "Look up user user-1" }],
+    tools: [draft2020Tool],
+    tool_choice: "required"
+  })
+
+  assert.ok(request.toolPlan)
+  const result = normalizeToolCompletion({
+    choices: [{ message: { content: '{"type":"tool_calls","tool_calls":[{"name":"lookup_user","arguments":{"user_id":"user-1"}}]}' } }]
+  }, "kimi-k3", request.toolPlan)
+  const message = ((result.choices as Array<Record<string, unknown>>)[0].message as Record<string, unknown>)
+  assert.equal((message.tool_calls as Array<Record<string, unknown>>)[0].function && ((message.tool_calls as Array<Record<string, unknown>>)[0].function as Record<string, unknown>).name, "lookup_user")
 })
 
 test("normalizes a non-streaming provider response", () => {
@@ -52,6 +202,105 @@ test("normalizes a non-streaming provider response", () => {
   assert.equal(((result.choices as Array<Record<string, unknown>>)[0].message as Record<string, unknown>).reasoning_content, "canonical reasoning")
   assert.equal(((result.choices as Array<Record<string, unknown>>)[0].message as Record<string, unknown>).reasoning, undefined)
   assert.equal(result.energy, undefined)
+})
+
+test("converts a validated non-streaming JSON action into OpenAI tool_calls", () => {
+  const request = validateChatRequest({
+    model: "kimi-k3",
+    messages: [{ role: "user", content: "Weather in Paris" }],
+    tools: [weatherTool],
+    tool_choice: "required"
+  })
+  assert.ok(request.toolPlan)
+  const result = normalizeToolCompletion({
+    id: "provider-tool-id",
+    model: "kimi-k3",
+    choices: [{
+      index: 0,
+      message: {
+        role: "assistant",
+        content: '{"type":"tool_calls","tool_calls":[{"id":"call_0","name":"get_weather","arguments":{"city":"Paris","unit":"celsius"}}]}',
+        reasoning: "I need current data"
+      },
+      finish_reason: "stop"
+    }]
+  }, "kimi-k3", request.toolPlan)
+
+  const choice = (result.choices as Array<Record<string, unknown>>)[0]
+  const message = choice.message as Record<string, unknown>
+  const calls = message.tool_calls as Array<Record<string, unknown>>
+  assert.equal(choice.finish_reason, "tool_calls")
+  assert.equal(message.content, null)
+  assert.equal(message.reasoning_content, "I need current data")
+  assert.match(calls[0].id as string, /^call_[a-f0-9]{32}$/)
+  assert.deepEqual(calls[0].function, { name: "get_weather", arguments: '{"city":"Paris","unit":"celsius"}' })
+})
+
+test("rejects model-generated tool arguments that fail the declared schema", () => {
+  const request = validateChatRequest({
+    model: "kimi-k3",
+    messages: [{ role: "user", content: "Weather" }],
+    tools: [weatherTool],
+    tool_choice: "required"
+  })
+  assert.ok(request.toolPlan)
+  assert.throws(
+    () => normalizeToolCompletion({
+      choices: [{ message: { content: '{"type":"tool_calls","tool_calls":[{"name":"get_weather","arguments":{"city":7}}]}' } }]
+    }, "kimi-k3", request.toolPlan!),
+    (error: unknown) => error instanceof AppError && error.statusCode === 502 && error.code === "invalid_tool_action"
+  )
+})
+
+test("converts parallel calls and rejects them when parallel_tool_calls is false", () => {
+  const provider = {
+    choices: [{ message: { content: JSON.stringify({
+      type: "tool_calls",
+      tool_calls: [
+        { name: "get_weather", arguments: { city: "Paris" } },
+        { name: "add_numbers", arguments: { a: 2, b: 3 } }
+      ]
+    }) } }]
+  }
+  const parallel = validateChatRequest({
+    model: "kimi-k3",
+    messages: [{ role: "user", content: "two calls" }],
+    tools: [weatherTool, calculatorTool],
+    tool_choice: "required",
+    parallel_tool_calls: true
+  })
+  assert.ok(parallel.toolPlan)
+  const result = normalizeToolCompletion(provider, "kimi-k3", parallel.toolPlan)
+  const message = ((result.choices as Array<Record<string, unknown>>)[0].message as Record<string, unknown>)
+  assert.equal((message.tool_calls as unknown[]).length, 2)
+
+  const sequential = validateChatRequest({
+    model: "kimi-k3",
+    messages: [{ role: "user", content: "two calls" }],
+    tools: [weatherTool, calculatorTool],
+    tool_choice: "required",
+    parallel_tool_calls: false
+  })
+  assert.ok(sequential.toolPlan)
+  assert.throws(
+    () => normalizeToolCompletion(provider, "kimi-k3", sequential.toolPlan!),
+    (error: unknown) => error instanceof AppError && error.code === "invalid_tool_action"
+  )
+})
+
+test("unwraps a final action when auto tool choice does not need a tool", () => {
+  const request = validateChatRequest({
+    model: "kimi-k3",
+    messages: [{ role: "user", content: "Say hello" }],
+    tools: [weatherTool]
+  })
+  assert.ok(request.toolPlan)
+  const result = normalizeToolCompletion({
+    choices: [{ message: { role: "assistant", content: '{"type":"final","content":"hello"}' }, finish_reason: "stop" }]
+  }, "kimi-k3", request.toolPlan)
+  const message = ((result.choices as Array<Record<string, unknown>>)[0].message as Record<string, unknown>)
+  assert.equal(message.content, "hello")
+  assert.equal(message.tool_calls, undefined)
 })
 
 test("normalizes SSE, preserves reasoning, and removes provider comments and optional usage", async () => {
@@ -73,4 +322,43 @@ test("normalizes SSE, preserves reasoning, and removes provider comments and opt
   assert.doesNotMatch(text, /pricing/)
   assert.doesNotMatch(text, /prompt_tokens/)
   assert.match(text, /data: \[DONE\]/)
+})
+
+test("streams reasoning but buffers and converts the JSON action into tool call deltas", async () => {
+  const request = validateChatRequest({
+    model: "kimi-k3",
+    messages: [{ role: "user", content: "Weather in Paris" }],
+    stream: true,
+    stream_options: { include_usage: true },
+    tools: [weatherTool],
+    tool_choice: "required",
+    parallel_tool_calls: false
+  })
+  assert.ok(request.toolPlan)
+  const upstream = new Response([
+    'data: {"id":"tool-stream","model":"kimi-k3","choices":[{"index":0,"delta":{"role":"assistant","reasoning":"checking"},"finish_reason":null}]}\n\n',
+    'data: {"id":"tool-stream","model":"kimi-k3","choices":[{"index":0,"delta":{"content":"{\\\"type\\\":\\\"tool_calls\\\",\\\"tool_calls\\\":[{\\\"name\\\":\\\"get_weather\\\","},"finish_reason":null}]}\n\n',
+    'data: {"id":"tool-stream","model":"kimi-k3","choices":[{"index":0,"delta":{"content":"\\\"arguments\\\":{\\\"city\\\":\\\"Paris\\\"}}]}"},"finish_reason":"stop"}]}\n\n',
+    'data: {"id":"tool-stream","model":"kimi-k3","choices":[],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}\n\n',
+    "data: [DONE]\n\n"
+  ].join(""))
+  const prepared = await prepareSse(upstream.body)
+  const relay = createToolSseRelay(prepared, "kimi-k3", true, request.toolPlan)
+  const output = await new Response(relay).text()
+
+  const events = output
+    .split(/\r?\n/)
+    .filter((line) => line.startsWith("data: ") && line !== "data: [DONE]")
+    .map((line) => JSON.parse(line.slice(6)) as Record<string, unknown>)
+  assert.equal(events.length, 3)
+  const reasoningDelta = ((events[0].choices as Array<Record<string, unknown>>)[0].delta as Record<string, unknown>)
+  assert.equal(reasoningDelta.reasoning_content, "checking")
+  const toolChoice = (events[1].choices as Array<Record<string, unknown>>)[0]
+  const toolDelta = toolChoice.delta as Record<string, unknown>
+  assert.equal(toolChoice.finish_reason, "tool_calls")
+  assert.equal(((toolDelta.tool_calls as Array<Record<string, unknown>>)[0].function as Record<string, unknown>).arguments, '{"city":"Paris"}')
+  assert.deepEqual(events[2].choices, [])
+  assert.deepEqual(events[2].usage, { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 })
+  assert.doesNotMatch(output, /\\\"type\\\":\\\"tool_calls\\\"/)
+  assert.match(output, /data: \[DONE\]/)
 })

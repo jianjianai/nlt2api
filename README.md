@@ -71,8 +71,24 @@ curl.exe http://127.0.0.1:3000/v1/chat/completions `
 - `response_format: text` 和 `json_object`；
 - 标准 JSON/SSE 响应和 OpenAI 风格错误。
 - 上游 `reasoning` / `reasoning_content` 会作为兼容扩展统一输出为 `reasoning_content`；连续对话中客户端传入的 assistant `reasoning_content` 会映射回门户 `reasoning`；正文仍在标准 `content` 字段中。
+- 现代 function tools：`tools`、`tool_choice` 和 `parallel_tool_calls`，响应还原为标准 `message.tool_calls` / `delta.tool_calls`；参数 Schema 支持未声明版本、draft-06/07、draft-2019-09 和 draft-2020-12。
 
-已确认不具备标准语义的字段会返回 400，包括工具调用、developer role、音频、文件、web search、prediction、prompt cache、logprobs、stop、seed、`n > 1` 和 JSON Schema 严格约束。
+已确认不具备标准语义的字段会返回 400，包括旧版 `functions` / `function_call`、custom tools、developer role、音频、文件、web search、prediction、prompt cache、logprobs、stop、seed、`n > 1` 和 OpenAI Structured Outputs 的 `json_schema` 模式。
+
+### 工具调用实现
+
+门户不会原生解析 Kimi K3 的工具定义。本适配器采用经过真实接口验证的兼容方案：将 function tools 编译为受约束的 JSON 动作协议，强制门户生成 JSON Object，再使用 Ajv 按调用方提供的参数 Schema 校验，最后转换为 OpenAI 标准工具响应。工具由调用方执行，代理本身不会执行函数。
+
+支持的选择方式：
+
+- `tool_choice: "auto" | "none" | "required"`；
+- 指定函数的 `{ "type": "function", "name": "..." }`，同时兼容传统的嵌套 `function.name` 形状；
+- `allowed_tools` 的 `auto` / `required` 子集；
+- `parallel_tool_calls: false` 会严格限制为一次最多一个调用。
+
+工具循环仍遵循 [OpenAI Function calling 指南](https://developers.openai.com/api/docs/guides/function-calling)中的 Chat Completions 流程：把首轮完整的 assistant message 追加到历史，再追加具有相同 `tool_call_id` 的 `role: "tool"` 消息，并在下一次请求中继续携带 `tools`。代理会把历史 `assistant.tool_calls` 重新编码给 Kimi，以便模型读取工具结果并生成最终答案。
+
+流式请求会实时转发 `reasoning_content`，但不会把内部动作 JSON 暴露给客户端；动作完整且校验通过后才发出 `delta.tool_calls` 和 `finish_reason: "tool_calls"`。若模型生成无效 JSON、未知工具或不符合 Schema 的参数，非流式请求返回 HTTP 502 `invalid_tool_action`；流式响应已经开始后则通过 SSE error 事件结束。该方案是模型协议仿真，不等同于上游推理框架原生的 `kimi_k3` tool parser。
 
 账号按轮询使用。只有在上游尚未开始推理且明确是会话认证失败时，代理才会刷新登录或切换下一个账号；流式数据开始、超时或未知请求状态不会自动重发。
 
@@ -83,4 +99,4 @@ pnpm test
 pnpm run build
 ```
 
-`tests/` 覆盖请求字段校验、token 映射、JSON 归一化和 SSE 归一化。真实账号登录应通过面板手动触发，凭据不会放入测试文件。
+`tests/` 覆盖请求字段校验、token 映射、工具协议、参数 Schema、JSON 归一化和 SSE 归一化。真实账号登录应通过面板手动触发，凭据不会放入测试文件。

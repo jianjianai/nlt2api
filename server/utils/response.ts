@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto"
 import { AppError } from "./errors"
+import { parseToolAction, type ToolPlan } from "./tools"
 
 type JsonObject = Record<string, unknown>
 
@@ -169,7 +170,9 @@ function formatSse(value: JsonObject): Uint8Array {
 
 function formatSseError(error: unknown): Uint8Array {
   const message = error instanceof Error ? error.message : "The upstream stream failed"
-  return new TextEncoder().encode(`data: ${JSON.stringify({ error: { message, type: "server_error", code: "upstream_stream_error" } })}\n\ndata: [DONE]\n\n`)
+  const code = error instanceof AppError ? error.code : "upstream_stream_error"
+  const type = error instanceof AppError ? error.type : "server_error"
+  return new TextEncoder().encode(`data: ${JSON.stringify({ error: { message, type, code } })}\n\ndata: [DONE]\n\n`)
 }
 
 function processFrame(frame: string, model: string, includeUsage: boolean): { output?: Uint8Array; done: boolean } {
@@ -230,6 +233,126 @@ export function createSseRelay(prepared: PreparedSse, model: string, includeUsag
   })
 }
 
+function completionChunkIdentity(value: JsonObject, model: string): JsonObject {
+  return {
+    id: typeof value.id === "string" ? value.id : `chatcmpl-${randomUUID()}`,
+    object: "chat.completion.chunk",
+    created: typeof value.created === "number" ? value.created : Math.floor(Date.now() / 1000),
+    model: typeof value.model === "string" ? value.model : model
+  }
+}
+
+export function createToolSseRelay(prepared: PreparedSse, model: string, includeUsage: boolean, plan: ToolPlan): ReadableStream<Uint8Array> {
+  return new ReadableStream<Uint8Array>({
+    start(controller) {
+      void (async () => {
+        const decoder = new TextDecoder()
+        let pending = prepared.pending
+        let content = ""
+        let identity: JsonObject | undefined
+        let usage: JsonObject | undefined
+        let roleSent = false
+        let upstreamFinishReason: unknown = "stop"
+
+        const processToolChunk = (value: JsonObject): void => {
+          identity ??= completionChunkIdentity(value, model)
+          if (includeUsage && value.usage !== undefined) usage = normalizeUsage(value.usage) ?? (isRecord(value.usage) ? value.usage : undefined)
+
+          const rawChoice = Array.isArray(value.choices) ? value.choices[0] : undefined
+          if (!isRecord(rawChoice)) return
+          if (rawChoice.finish_reason !== undefined && rawChoice.finish_reason !== null) upstreamFinishReason = rawChoice.finish_reason
+          const rawDelta = isRecord(rawChoice.delta) ? rawChoice.delta : {}
+          if (typeof rawDelta.content === "string") content += rawDelta.content
+          else if (rawDelta.content !== undefined && rawDelta.content !== null) {
+            throw new UpstreamStreamError("The upstream returned a non-text tool action delta")
+          }
+
+          const delta: JsonObject = {}
+          if (typeof rawDelta.role === "string") {
+            delta.role = rawDelta.role
+            roleSent = true
+          }
+          const reasoningContent = reasoningContentFrom(rawDelta)
+          if (reasoningContent !== undefined) delta.reasoning_content = reasoningContent
+          if (rawDelta.refusal !== undefined) delta.refusal = rawDelta.refusal
+          if (Object.keys(delta).length > 0) {
+            controller.enqueue(formatSse({
+              ...(identity as JsonObject),
+              choices: [{ index: typeof rawChoice.index === "number" ? rawChoice.index : 0, delta, finish_reason: null }]
+            }))
+          }
+        }
+
+        const processToolFrame = (frame: string): boolean => {
+          const data = dataFromFrame(frame)
+          if (!data) return false
+          const parsed = parseData(data)
+          if (parsed === "DONE") return true
+          processToolChunk(parsed)
+          return false
+        }
+
+        try {
+          if (prepared.firstChunk) processToolChunk(prepared.firstChunk)
+          let upstreamDone = prepared.firstDone
+          while (!upstreamDone) {
+            const frame = takeFrame(pending)
+            if (frame) {
+              pending = frame.rest
+              upstreamDone = processToolFrame(frame.frame)
+              continue
+            }
+
+            const next = await prepared.reader.read()
+            if (next.done) {
+              pending += decoder.decode()
+              if (pending) {
+                pending += "\n\n"
+                while (true) {
+                  const finalFrame = takeFrame(pending)
+                  if (!finalFrame) break
+                  pending = finalFrame.rest
+                  if (processToolFrame(finalFrame.frame)) {
+                    upstreamDone = true
+                    break
+                  }
+                }
+              }
+              break
+            }
+            pending += decoder.decode(next.value, { stream: true })
+          }
+
+          const action = parseToolAction(content, plan)
+          identity ??= completionChunkIdentity({}, model)
+          const delta: JsonObject = roleSent ? {} : { role: "assistant" }
+          let finishReason: unknown = upstreamFinishReason
+          if (action.kind === "tool_calls") {
+            delta.tool_calls = action.toolCalls.map((call, index) => ({ index, ...call }))
+            finishReason = "tool_calls"
+          } else {
+            delta.content = action.content
+          }
+          controller.enqueue(formatSse({
+            ...identity,
+            choices: [{ index: 0, delta, finish_reason: finishReason ?? "stop" }]
+          }))
+
+          if (includeUsage && usage) {
+            controller.enqueue(formatSse({ ...identity, choices: [], usage }))
+          }
+          controller.enqueue(new TextEncoder().encode("data: [DONE]\n\n"))
+        } catch (error) {
+          controller.enqueue(formatSseError(error))
+        } finally {
+          prepared.reader.releaseLock()
+          controller.close()
+        }
+      })()
+    }
+  })
+}
+
 export function normalizeCompletion(value: unknown, model: string): JsonObject {
   const record = isRecord(value) ? value : {}
   if (record.error !== undefined) {
@@ -263,5 +386,26 @@ export function normalizeCompletion(value: unknown, model: string): JsonObject {
   }
   const usage = normalizeUsage(record.usage)
   if (usage) normalized.usage = usage
+  return normalized
+}
+
+export function normalizeToolCompletion(value: unknown, model: string, plan: ToolPlan): JsonObject {
+  const normalized = normalizeCompletion(value, model)
+  const choices = Array.isArray(normalized.choices) ? normalized.choices : []
+  const choice = isRecord(choices[0]) ? choices[0] : undefined
+  const message = choice && isRecord(choice.message) ? choice.message : undefined
+  if (!choice || !message) {
+    throw new AppError("The upstream returned no completion for the tool request", 502, "invalid_tool_action")
+  }
+
+  const action = parseToolAction(message.content, plan)
+  if (action.kind === "tool_calls") {
+    message.content = null
+    message.tool_calls = action.toolCalls
+    delete message.function_call
+    choice.finish_reason = "tool_calls"
+  } else {
+    message.content = action.content
+  }
   return normalized
 }
