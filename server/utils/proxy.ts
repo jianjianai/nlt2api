@@ -5,9 +5,11 @@ import {
   createSseRelay,
   createToolSseRelay,
   normalizeCompletion,
-  normalizeToolCompletion,
+  normalizeToolCompletionWithRetry,
   prepareSse,
+  type OutputLengthContinuation,
   type PreparedSse,
+  type ToolActionRetry,
   type UpstreamStreamError
 } from "./response"
 import {
@@ -130,54 +132,65 @@ async function preparePortalSse(account: StoredAccount, request: ValidatedChatRe
 
 async function proxyForAccount(account: StoredAccount, request: ValidatedChatRequest): Promise<ProxyResult> {
   console.info(`[proxy] chat request account=${account.label} model=${request.model} stream=${request.stream} tools=${request.toolPlan ? "yes" : "no"} max_tokens=${request.portalPayload.max_tokens ?? "default"}`)
+  const continuationPayload = (continuation: OutputLengthContinuation | ToolActionRetry): Record<string, unknown> => {
+    const messages = [...(request.portalPayload.messages as unknown[])]
+    // The provider can continue from emitted reasoning, never hidden state.
+    if (continuation.content || continuation.reasoning) {
+      messages.push({
+        role: "assistant",
+        ...(continuation.reasoning ? { reasoning: continuation.reasoning } : {}),
+        content: continuation.content || null
+      })
+    }
+    messages.push({ role: "user", content: continuation.nudge })
+    return { ...request.portalPayload, messages }
+  }
+
   if (!request.stream) {
-    let response: Response
-    try {
-      response = await fetchWithAuthRecovery(account, request)
-    } catch (error) {
-      if (error instanceof AccountAuthError) {
-        await recordAccountStatus(account.id, error.code === "manual_cookie_required" ? "manual_cookie_required" : "login_failed", error.message)
+    const fetchJson = async (portalPayload: Record<string, unknown>): Promise<unknown> => {
+      let response: Response
+      try {
+        response = await fetchWithAuthRecovery(account, { ...request, portalPayload })
+      } catch (error) {
+        if (error instanceof AccountAuthError) {
+          await recordAccountStatus(account.id, error.code === "manual_cookie_required" ? "manual_cookie_required" : "login_failed", error.message)
+        }
+        throw error
       }
-      throw error
+
+      if (!response.ok) {
+        const status = response.status === 429 ? 429 : response.status >= 500 ? 502 : response.status
+        await discardResponse(response)
+        throw new AppError(`Neuralwatt rejected the request with HTTP ${response.status}`, status, "upstream_http_error", undefined, status === 429 ? "rate_limit_error" : "server_error")
+      }
+
+      try {
+        return await response.json()
+      } catch (error) {
+        if (error instanceof AppError) throw error
+        throw new AppError("The upstream returned invalid JSON", 502, "invalid_upstream_json")
+      }
     }
 
-    if (!response.ok) {
-      const status = response.status === 429 ? 429 : response.status >= 500 ? 502 : response.status
-      await discardResponse(response)
-      throw new AppError(`Neuralwatt rejected the request with HTTP ${response.status}`, status, "upstream_http_error", undefined, status === 429 ? "rate_limit_error" : "server_error")
+    const value = await fetchJson(request.portalPayload)
+    if (!request.toolPlan) {
+      return { kind: "json", body: normalizeCompletion(value, request.model) }
     }
-
-    try {
-      const value: unknown = await response.json()
-      return {
-        kind: "json",
-        body: request.toolPlan
-          ? normalizeToolCompletion(value, request.model, request.toolPlan)
-          : normalizeCompletion(value, request.model)
-      }
-    } catch (error) {
-      if (error instanceof AppError) throw error
-      throw new AppError("The upstream returned invalid JSON", 502, "invalid_upstream_json")
+    const refetch = async (retry: ToolActionRetry): Promise<unknown> => {
+      console.warn(`[proxy] tool action retry cause=${retry.cause} account=${account.label} model=${request.model} preserved reasoning_chars=${retry.reasoning.length} content_chars=${retry.content.length}`)
+      return fetchJson(continuationPayload(retry))
+    }
+    return {
+      kind: "json",
+      body: await normalizeToolCompletionWithRetry(value, request.model, request.toolPlan, refetch)
     }
   }
 
   const prepared = await preparePortalSse(account, request)
   if (request.toolPlan) {
-    const refetch = async (failed: { reasoning: string; content: string; nudge: string }): Promise<PreparedSse> => {
-      console.warn(`[proxy] tool action retry account=${account.label} model=${request.model} preserved reasoning_chars=${failed.reasoning.length} content_chars=${failed.content.length}`)
-      const messages = [...(request.portalPayload.messages as unknown[])]
-      // Preserve the model's failed attempt as an assistant turn so the retry
-      // sees its own thinking and output and can correct them precisely.
-      if (failed.content || failed.reasoning) {
-        messages.push({
-          role: "assistant",
-          ...(failed.reasoning ? { reasoning: failed.reasoning } : {}),
-          content: failed.content || null
-        })
-      }
-      messages.push({ role: "user", content: failed.nudge })
-      const portalPayload: Record<string, unknown> = { ...request.portalPayload, messages }
-      return preparePortalSse(account, { ...request, portalPayload })
+    const refetch = async (retry: ToolActionRetry): Promise<PreparedSse> => {
+      console.warn(`[proxy] tool action retry cause=${retry.cause} account=${account.label} model=${request.model} preserved reasoning_chars=${retry.reasoning.length} content_chars=${retry.content.length}`)
+      return preparePortalSse(account, { ...request, portalPayload: continuationPayload(retry) })
     }
     return {
       kind: "stream",
@@ -185,9 +198,20 @@ async function proxyForAccount(account: StoredAccount, request: ValidatedChatReq
     }
   }
 
+  const responseFormat = request.portalPayload.response_format
+  const isJsonObjectResponse = typeof responseFormat === "object"
+    && responseFormat !== null
+    && !Array.isArray(responseFormat)
+    && (responseFormat as Record<string, unknown>).type === "json_object"
+  const outputRefetch = isJsonObjectResponse
+    ? undefined
+    : async (continuation: OutputLengthContinuation): Promise<PreparedSse> => {
+        console.warn(`[proxy] output continuation account=${account.label} model=${request.model} preserved reasoning_chars=${continuation.reasoning.length} content_chars=${continuation.content.length}`)
+        return preparePortalSse(account, { ...request, portalPayload: continuationPayload(continuation) })
+      }
   return {
     kind: "stream",
-    body: createSseRelay(prepared, request.model, request.includeUsage)
+    body: createSseRelay(prepared, request.model, request.includeUsage, outputRefetch)
   }
 }
 

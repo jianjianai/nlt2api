@@ -92,6 +92,8 @@ curl.exe http://127.0.0.1:3000/v1/chat/completions `
 
 流式请求会实时转发 `reasoning_content`，但不会把内部动作 JSON 暴露给客户端；动作完整且校验通过后才发出 `delta.tool_calls` 和 `finish_reason: "tool_calls"`。若模型生成无效 JSON、未知工具或不符合 Schema 的参数，非流式请求返回 HTTP 502 `invalid_tool_action`；流式响应已经开始后则通过 SSE error 事件结束。该方案是模型协议仿真，不等同于上游推理框架原生的 `kimi_k3` tool parser。
 
+当上游明确以 `finish_reason: "length"` 截断时，代理会为 `response_format: text` 流式响应和尚未形成合法工具动作的工具请求，最多发起两次内部续轮。续轮仅回传已公开的 `reasoning_content` 和 `content`，不可能恢复模型的隐藏推理状态；每次上游请求仍复用该请求的有效 `max_tokens` 上限，客户端会收到一个连续的 SSE 响应及累计 usage。`response_format: json_object` 保持单次响应语义，不自动拼接截断 JSON；连续三次截断时，文本流最终保留 `finish_reason: "length"`，工具请求返回 `tool_action_length_exceeded`。
+
 账号按轮询使用。只有在上游尚未开始推理且明确是会话认证失败时，代理才会刷新登录或切换下一个账号；流式数据开始、超时或未知请求状态不会自动重发。
 
 ## 验证

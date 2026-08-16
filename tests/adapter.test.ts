@@ -2,7 +2,7 @@ import assert from "node:assert/strict"
 import test from "node:test"
 import { AppError } from "../server/utils/errors"
 import { validateChatRequest, TOOL_PROTOCOL_MIN_MAX_TOKENS } from "../server/utils/openai"
-import { createSseRelay, createToolSseRelay, normalizeCompletion, normalizeToolCompletion, prepareSse, type PreparedSse } from "../server/utils/response"
+import { createSseRelay, createToolSseRelay, normalizeCompletion, normalizeToolCompletion, normalizeToolCompletionWithRetry, prepareSse, type PreparedSse } from "../server/utils/response"
 
 const weatherTool = {
   type: "function",
@@ -630,6 +630,82 @@ test("normalizes SSE, preserves reasoning, and removes provider comments and opt
   assert.match(text, /data: \[DONE\]/)
 })
 
+test("continues a normal length-truncated stream without exposing the intermediate terminal frame", async () => {
+  const frame = (value: unknown) => `data: ${JSON.stringify(value)}\n\n`
+  const initial = new Response([
+    frame({ id: "truncated", model: "kimi-k3", choices: [{ index: 0, delta: { role: "assistant", reasoning: "work through the layout" }, finish_reason: null }] }),
+    frame({ id: "truncated", model: "kimi-k3", choices: [{ index: 0, delta: {}, finish_reason: "length" }] }),
+    frame({ id: "truncated", model: "kimi-k3", choices: [], usage: { prompt_tokens: 101, completion_tokens: 8192, total_tokens: 8293 } }),
+    "data: [DONE]\n\n"
+  ].join(""))
+  let refetchCalls = 0
+  const relay = createSseRelay(await prepareSse(initial.body), "kimi-k3", true, async (continuation) => {
+    refetchCalls += 1
+    assert.match(continuation.reasoning, /work through the layout/)
+    assert.equal(continuation.content, "")
+    assert.match(continuation.nudge, /output token limit/)
+    const resumed = new Response([
+      frame({ id: "resumed", model: "kimi-k3", choices: [{ index: 0, delta: { reasoning: " conclude now", content: "The layout is complete." }, finish_reason: null }] }),
+      frame({ id: "resumed", model: "kimi-k3", choices: [{ index: 0, delta: {}, finish_reason: "stop" }] }),
+      frame({ id: "resumed", model: "kimi-k3", choices: [], usage: { prompt_tokens: 9, completion_tokens: 12, total_tokens: 21 } }),
+      "data: [DONE]\n\n"
+    ].join(""))
+    return prepareSse(resumed.body)
+  })
+  const output = await new Response(relay).text()
+  const events = output
+    .split(/\r?\n/)
+    .filter((line) => line.startsWith("data: ") && line !== "data: [DONE]")
+    .map((line) => JSON.parse(line.slice(6)) as Record<string, unknown>)
+  const terminal = events.find((event) => {
+    const choice = Array.isArray(event.choices) ? event.choices[0] as Record<string, unknown> | undefined : undefined
+    return choice?.finish_reason === "stop"
+  })
+  const usage = events.find((event) => Array.isArray(event.choices) && event.choices.length === 0)
+
+  assert.equal(refetchCalls, 1)
+  assert.match(output, /The layout is complete/)
+  assert.doesNotMatch(output, /"finish_reason":"length"/)
+  assert.ok(events.every((event) => event.id === "truncated"))
+  assert.ok(terminal)
+  assert.deepEqual(usage?.usage, { prompt_tokens: 110, completion_tokens: 8204, total_tokens: 8314 })
+})
+
+test("stops normal stream continuation after the bounded retry limit", async () => {
+  const frame = (value: unknown) => `data: ${JSON.stringify(value)}\n\n`
+  const truncated = async (): Promise<PreparedSse> => {
+    const upstream = new Response([
+      frame({ id: "truncated", model: "kimi-k3", choices: [{ index: 0, delta: { reasoning: "still reasoning" }, finish_reason: null }] }),
+      frame({ id: "truncated", model: "kimi-k3", choices: [{ index: 0, delta: {}, finish_reason: "length" }] }),
+      "data: [DONE]\n\n"
+    ].join(""))
+    return prepareSse(upstream.body)
+  }
+  let refetchCalls = 0
+  const relay = createSseRelay(await truncated(), "kimi-k3", false, async () => {
+    refetchCalls += 1
+    return truncated()
+  })
+  const output = await new Response(relay).text()
+
+  assert.equal(refetchCalls, 2)
+  assert.match(output, /"finish_reason":"length"/)
+  assert.match(output, /data: \[DONE\]/)
+})
+
+test("leaves a JSON object stream at its upstream length boundary", async () => {
+  const upstream = new Response([
+    'data: {"id":"json-length","model":"kimi-k3","choices":[{"index":0,"delta":{"content":"{\\"partial\\":"},"finish_reason":null}]}\n\n',
+    'data: {"id":"json-length","model":"kimi-k3","choices":[{"index":0,"delta":{},"finish_reason":"length"}]}\n\n',
+    "data: [DONE]\n\n"
+  ].join(""))
+  const relay = createSseRelay(await prepareSse(upstream.body), "kimi-k3", false)
+  const output = await new Response(relay).text()
+
+  assert.match(output, /"finish_reason":"length"/)
+  assert.match(output, /\\"partial\\":/)
+})
+
 test("streams reasoning but buffers and converts the JSON action into tool call deltas", async () => {
   const request = validateChatRequest({
     model: "kimi-k3",
@@ -841,6 +917,153 @@ test("feeds structured schema details back when retrying invalid tool arguments"
 
   assert.match(output, /tool_calls/)
   assert.doesNotMatch(output, /"error":/)
+})
+
+test("continues a length-truncated tool reasoning turn without changing the client stream identity", async () => {
+  const request = validateChatRequest({
+    model: "kimi-k3",
+    messages: [{ role: "user", content: "Calculate the image layout" }],
+    stream: true,
+    stream_options: { include_usage: true },
+    tools: [weatherTool],
+    tool_choice: "required"
+  })
+  assert.ok(request.toolPlan)
+
+  const frame = (value: unknown) => `data: ${JSON.stringify(value)}\n\n`
+  let refetchCalls = 0
+  const refetch = async (retry: { cause: string; reasoning: string; content: string; nudge: string }): Promise<PreparedSse> => {
+    refetchCalls += 1
+    assert.equal(retry.cause, "length")
+    assert.match(retry.reasoning, /calculate the layout/)
+    assert.equal(retry.content, "")
+    assert.match(retry.nudge, /output token limit/)
+    const continued = new Response([
+      frame({ id: "truncated", model: "kimi-k3", choices: [{ index: 0, delta: { reasoning: " then emit the action." }, finish_reason: null }] }),
+      frame({ id: "truncated", model: "kimi-k3", choices: [{ index: 0, delta: { content: '{"type":"tool_calls","tool_calls":[{"name":"get_weather","arguments":{"city":"Paris"}}]}' }, finish_reason: "stop" }] }),
+      frame({ id: "truncated", model: "kimi-k3", choices: [], usage: { prompt_tokens: 8, completion_tokens: 12, total_tokens: 20 } }),
+      "data: [DONE]\n\n"
+    ].join(""))
+    return prepareSse(continued.body)
+  }
+  const truncated = new Response([
+    frame({ id: "truncated", model: "kimi-k3", choices: [{ index: 0, delta: { role: "assistant", reasoning: "calculate the layout" }, finish_reason: null }] }),
+    frame({ id: "truncated", model: "kimi-k3", choices: [{ index: 0, delta: {}, finish_reason: "length" }] }),
+    frame({ id: "truncated", model: "kimi-k3", choices: [], usage: { prompt_tokens: 101, completion_tokens: 8192, total_tokens: 8293 } }),
+    "data: [DONE]\n\n"
+  ].join(""))
+  const relay = createToolSseRelay(await prepareSse(truncated.body), "kimi-k3", true, request.toolPlan!, refetch)
+  const output = await new Response(relay).text()
+  const events = output
+    .split(/\r?\n/)
+    .filter((line) => line.startsWith("data: ") && line !== "data: [DONE]")
+    .map((line) => JSON.parse(line.slice(6)) as Record<string, unknown>)
+  const usage = events.find((event) => Array.isArray(event.choices) && event.choices.length === 0)
+
+  assert.equal(refetchCalls, 1)
+  assert.match(output, /then emit the action/)
+  assert.match(output, /tool_calls/)
+  assert.doesNotMatch(output, /NWERR-START/)
+  assert.ok(events.every((event) => event.id === "truncated"))
+  assert.deepEqual(usage?.usage, { prompt_tokens: 109, completion_tokens: 8204, total_tokens: 8313 })
+})
+
+test("bounds repeated length-truncated tool turns", async () => {
+  const request = validateChatRequest({
+    model: "kimi-k3",
+    messages: [{ role: "user", content: "Calculate the image layout" }],
+    stream: true,
+    tools: [weatherTool],
+    tool_choice: "required"
+  })
+  assert.ok(request.toolPlan)
+
+  const frame = (value: unknown) => `data: ${JSON.stringify(value)}\n\n`
+  const truncated = async (reasoning: string): Promise<PreparedSse> => {
+    const upstream = new Response([
+      frame({ id: "truncated", model: "kimi-k3", choices: [{ index: 0, delta: { reasoning }, finish_reason: null }] }),
+      frame({ id: "truncated", model: "kimi-k3", choices: [{ index: 0, delta: {}, finish_reason: "length" }] }),
+      "data: [DONE]\n\n"
+    ].join(""))
+    return prepareSse(upstream.body)
+  }
+  let refetchCalls = 0
+  const relay = createToolSseRelay(await truncated("first fragment"), "kimi-k3", false, request.toolPlan!, async (retry) => {
+    refetchCalls += 1
+    assert.equal(retry.cause, "length")
+    if (refetchCalls === 1) {
+      assert.match(retry.reasoning, /first fragment/)
+      return truncated("second fragment")
+    }
+    assert.match(retry.reasoning, /first fragment/)
+    assert.match(retry.reasoning, /second fragment/)
+    return truncated("third fragment")
+  })
+  const output = await new Response(relay).text()
+
+  assert.equal(refetchCalls, 2)
+  assert.match(output, /tool_action_length_exceeded/)
+  assert.match(output, /data: \[DONE\]/)
+})
+
+test("continues a length-truncated non-streaming tool completion", async () => {
+  const request = validateChatRequest({
+    model: "kimi-k3",
+    messages: [{ role: "user", content: "Weather in Paris" }],
+    tools: [weatherTool],
+    tool_choice: "required"
+  })
+  assert.ok(request.toolPlan)
+
+  let refetchCalls = 0
+  const completion = await normalizeToolCompletionWithRetry({
+    choices: [{ message: { reasoning: "inspect weather source", content: "" }, finish_reason: "length" }],
+    usage: { prompt_tokens: 101, completion_tokens: 8192, total_tokens: 8293 }
+  }, "kimi-k3", request.toolPlan!, async (retry) => {
+    refetchCalls += 1
+    assert.equal(retry.cause, "length")
+    assert.match(retry.reasoning, /inspect weather source/)
+    return {
+      choices: [{ message: { content: '{"type":"tool_calls","tool_calls":[{"name":"get_weather","arguments":{"city":"Paris"}}]}' }, finish_reason: "stop" }],
+      usage: { prompt_tokens: 8, completion_tokens: 12, total_tokens: 20 }
+    }
+  })
+  const choice = (completion.choices as Array<Record<string, unknown>>)[0]
+
+  assert.equal(refetchCalls, 1)
+  assert.equal(choice.finish_reason, "tool_calls")
+  assert.deepEqual(completion.usage, { prompt_tokens: 109, completion_tokens: 8204, total_tokens: 8313 })
+})
+
+test("accumulates public context across non-streaming length continuations", async () => {
+  const request = validateChatRequest({
+    model: "kimi-k3",
+    messages: [{ role: "user", content: "Weather in Paris" }],
+    tools: [weatherTool],
+    tool_choice: "required"
+  })
+  assert.ok(request.toolPlan)
+
+  let refetchCalls = 0
+  const completion = await normalizeToolCompletionWithRetry({
+    choices: [{ message: { reasoning: "first fragment", content: "" }, finish_reason: "length" }]
+  }, "kimi-k3", request.toolPlan!, async (retry) => {
+    refetchCalls += 1
+    assert.equal(retry.cause, "length")
+    if (refetchCalls === 1) {
+      assert.match(retry.reasoning, /first fragment/)
+      return { choices: [{ message: { reasoning: "second fragment", content: "" }, finish_reason: "length" }] }
+    }
+    assert.match(retry.reasoning, /first fragment/)
+    assert.match(retry.reasoning, /second fragment/)
+    return {
+      choices: [{ message: { content: '{"type":"tool_calls","tool_calls":[{"name":"get_weather","arguments":{"city":"Paris"}}]}' }, finish_reason: "stop" }]
+    }
+  })
+  const choice = (completion.choices as Array<Record<string, unknown>>)[0]
+
+  assert.equal(refetchCalls, 2)
+  assert.equal(choice.finish_reason, "tool_calls")
 })
 
 test("feeds the JSON parse reason back when retrying broken JSON", async () => {
