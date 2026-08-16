@@ -7,3 +7,4 @@ dist
 .env
 .env.local
 .data/neuralwatt-accounts.yaml
+.breezell
