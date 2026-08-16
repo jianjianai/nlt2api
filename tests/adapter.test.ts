@@ -352,14 +352,14 @@ test("supports current forced and allowed_tools choice objects", () => {
   assert.deepEqual(allowed.toolPlan?.tools.map((tool) => tool.name), ["add_numbers"])
 })
 
-test("encodes historical assistant tool calls for the Kimi continuation turn", () => {
+test("encodes historical assistant tool calls and progress for the Kimi continuation turn", () => {
   const result = validateChatRequest({
     model: "kimi-k3",
     messages: [
       { role: "user", content: "weather?" },
       {
         role: "assistant",
-        content: null,
+        content: "Checking the current weather in Paris.",
         tool_calls: [{ id: "call_test", type: "function", function: { name: "get_weather", arguments: "{\"city\":\"Paris\"}" } }]
       },
       { role: "tool", tool_call_id: "call_test", content: "{\"temperature\":21}" }
@@ -371,6 +371,7 @@ test("encodes historical assistant tool calls for the Kimi continuation turn", (
   const assistant = messages.find((message) => message.role === "assistant")
   assert.deepEqual(JSON.parse(assistant?.content as string), {
     type: "tool_calls",
+    content: "Checking the current weather in Paris.",
     tool_calls: [{ id: "call_test", name: "get_weather", arguments: { city: "Paris" } }]
   })
   const tool = messages.find((message) => message.role === "tool")
@@ -459,7 +460,7 @@ test("converts a validated non-streaming JSON action into OpenAI tool_calls", ()
       index: 0,
       message: {
         role: "assistant",
-        content: '{"type":"tool_calls","tool_calls":[{"id":"call_0","name":"get_weather","arguments":{"city":"Paris","unit":"celsius"}}]}',
+        content: '{"type":"tool_calls","content":"Checking the current weather in Paris.","tool_calls":[{"name":"get_weather","arguments":{"city":"Paris","unit":"celsius"}}]}',
         reasoning: "I need current data"
       },
       finish_reason: "stop"
@@ -470,10 +471,28 @@ test("converts a validated non-streaming JSON action into OpenAI tool_calls", ()
   const message = choice.message as Record<string, unknown>
   const calls = message.tool_calls as Array<Record<string, unknown>>
   assert.equal(choice.finish_reason, "tool_calls")
-  assert.equal(message.content, null)
+  assert.equal(message.content, "Checking the current weather in Paris.")
   assert.equal(message.reasoning_content, "I need current data")
   assert.match(calls[0].id as string, /^call_[a-f0-9]{32}$/)
   assert.deepEqual(calls[0].function, { name: "get_weather", arguments: '{"city":"Paris","unit":"celsius"}' })
+})
+
+test("rejects non-string or oversized progress in a model tool action", () => {
+  const request = validateChatRequest({
+    model: "kimi-k3",
+    messages: [{ role: "user", content: "Weather" }],
+    tools: [weatherTool],
+    tool_choice: "required"
+  })
+  assert.ok(request.toolPlan)
+  for (const content of [7, "x".repeat(241)]) {
+    assert.throws(
+      () => normalizeToolCompletion({
+        choices: [{ message: { content: JSON.stringify({ type: "tool_calls", content, tool_calls: [{ name: "get_weather", arguments: { city: "Paris" } }] }) } }]
+      }, "kimi-k3", request.toolPlan!),
+      (error: unknown) => error instanceof AppError && error.code === "invalid_tool_action"
+    )
+  }
 })
 
 test("rejects model-generated tool arguments that fail the declared schema", () => {
@@ -592,7 +611,7 @@ test("streams reasoning but buffers and converts the JSON action into tool call 
   assert.ok(request.toolPlan)
   const upstream = new Response([
     'data: {"id":"tool-stream","model":"kimi-k3","choices":[{"index":0,"delta":{"role":"assistant","reasoning":"checking"},"finish_reason":null}]}\n\n',
-    'data: {"id":"tool-stream","model":"kimi-k3","choices":[{"index":0,"delta":{"content":"{\\\"type\\\":\\\"tool_calls\\\",\\\"tool_calls\\\":[{\\\"name\\\":\\\"get_weather\\\","},"finish_reason":null}]}\n\n',
+    'data: {"id":"tool-stream","model":"kimi-k3","choices":[{"index":0,"delta":{"content":"{\\\"type\\\":\\\"tool_calls\\\",\\\"content\\\":\\\"Checking current weather.\\\",\\\"tool_calls\\\":[{\\\"name\\\":\\\"get_weather\\\","},"finish_reason":null}]}\n\n',
     'data: {"id":"tool-stream","model":"kimi-k3","choices":[{"index":0,"delta":{"content":"\\\"arguments\\\":{\\\"city\\\":\\\"Paris\\\"}}]}"},"finish_reason":"stop"}]}\n\n',
     'data: {"id":"tool-stream","model":"kimi-k3","choices":[],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}\n\n',
     "data: [DONE]\n\n"
@@ -605,15 +624,18 @@ test("streams reasoning but buffers and converts the JSON action into tool call 
     .split(/\r?\n/)
     .filter((line) => line.startsWith("data: ") && line !== "data: [DONE]")
     .map((line) => JSON.parse(line.slice(6)) as Record<string, unknown>)
-  assert.equal(events.length, 3)
+  assert.equal(events.length, 4)
   const reasoningDelta = ((events[0].choices as Array<Record<string, unknown>>)[0].delta as Record<string, unknown>)
   assert.equal(reasoningDelta.reasoning_content, "checking")
-  const toolChoice = (events[1].choices as Array<Record<string, unknown>>)[0]
+  const progressChoice = (events[1].choices as Array<Record<string, unknown>>)[0]
+  const progressDelta = progressChoice.delta as Record<string, unknown>
+  assert.equal(progressDelta.content, "Checking current weather.")
+  const toolChoice = (events[2].choices as Array<Record<string, unknown>>)[0]
   const toolDelta = toolChoice.delta as Record<string, unknown>
   assert.equal(toolChoice.finish_reason, "tool_calls")
   assert.equal(((toolDelta.tool_calls as Array<Record<string, unknown>>)[0].function as Record<string, unknown>).arguments, '{"city":"Paris"}')
-  assert.deepEqual(events[2].choices, [])
-  assert.deepEqual(events[2].usage, { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 })
+  assert.deepEqual(events[3].choices, [])
+  assert.deepEqual(events[3].usage, { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 })
   assert.doesNotMatch(output, /\\\"type\\\":\\\"tool_calls\\\"/)
   assert.match(output, /data: \[DONE\]/)
 })

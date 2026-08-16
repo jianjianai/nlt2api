@@ -287,7 +287,7 @@ function retryActionContract(plan: ToolPlan): string {
     : mayReturnFinal
       ? ', or FINAL: {"type":"final","content":"..."}'
       : ""
-  return `Reply with exactly one CALL JSON object {"type":"tool_calls","tool_calls":[{"name":"tool_name","arguments":{}}]}${final}. The proxy assigns ids; do not emit id.`
+  return `Reply with exactly one CALL JSON object {"type":"tool_calls","content":"optional short progress update","tool_calls":[{"name":"tool_name","arguments":{}}]}. content is optional, user-visible, and at most 240 characters.${final} The proxy assigns ids; do not emit id.`
 }
 
 // A compact model-facing correction derived from the parser's structured
@@ -310,6 +310,10 @@ function buildRetryNudge(content: string, error: unknown, plan: ToolPlan): strin
       return `Your previous reply must be a JSON object. ${contract}`
     case "empty_tool_calls":
       return `tool_calls must contain at least one call. ${contract}`
+    case "tool_call_content_not_string":
+      return `tool_calls.content must be a string or null. ${contract}`
+    case "tool_call_content_too_long":
+      return `tool_calls.content must be at most 240 characters. ${contract}`
     case "parallel_calls_not_allowed":
       return `Only one tool call is allowed in this turn. ${contract}`
     case "invalid_tool_call":
@@ -333,6 +337,7 @@ function buildRetryNudge(content: string, error: unknown, plan: ToolPlan): strin
     case "invalid_action_type":
       return `Action type must be tool_calls or final. ${contract}`
   }
+  return `Your previous reply did not provide a usable action. ${contract}`
 }
 
 function buildErrorDiagnosis(content: string, error: unknown): string {
@@ -344,6 +349,8 @@ function buildErrorDiagnosis(content: string, error: unknown): string {
     case "invalid_json": return text && !/^[{[]/.test(text) ? "your previous reply was unmarked prose" : `your previous reply was invalid JSON${failure.detail ? ` (${failure.detail})` : ""}`
     case "not_json_object": return "your previous reply was not a JSON object"
     case "empty_tool_calls": return "tool_calls was empty"
+    case "tool_call_content_not_string": return "tool_calls.content was not a string"
+    case "tool_call_content_too_long": return "tool_calls.content exceeded 240 characters"
     case "parallel_calls_not_allowed": return "multiple calls were returned although only one is allowed"
     case "invalid_tool_call": return `tool_calls[${failure.index}] was not an object`
     case "missing_function_name": return `tool_calls[${failure.index}] did not name a function`
@@ -356,6 +363,7 @@ function buildErrorDiagnosis(content: string, error: unknown): string {
     case "final_content_not_string": return "final content was not a string"
     case "invalid_action_type": return "the action type was invalid"
   }
+  return "your previous reply did not provide a usable action"
 }
 
 export function createToolSseRelay(
@@ -539,9 +547,20 @@ export function createToolSseRelay(
           }
 
           identity ??= completionChunkIdentity({}, model)
+          const parsedAction = action as ParsedToolAction
+          if (parsedAction.kind === "tool_calls" && parsedAction.content !== null) {
+            const progressDelta: JsonObject = roleSent
+              ? { content: parsedAction.content }
+              : { role: "assistant", content: parsedAction.content }
+            roleSent = true
+            controller.enqueue(formatSse({
+              ...identity,
+              choices: [{ index: 0, delta: progressDelta, finish_reason: null }]
+            }))
+          }
+
           const delta: JsonObject = roleSent ? {} : { role: "assistant" }
           let finishReason: unknown = upstreamFinishReason
-          const parsedAction = action as ParsedToolAction
           if (parsedAction.kind === "tool_calls") {
             delta.tool_calls = parsedAction.toolCalls.map((call, index) => ({ index, ...call }))
             finishReason = "tool_calls"
@@ -622,7 +641,7 @@ export function normalizeToolCompletion(value: unknown, model: string, plan: Too
 
   const action = parseToolAction(message.content, plan)
   if (action.kind === "tool_calls") {
-    message.content = null
+    message.content = action.content
     message.tool_calls = action.toolCalls
     delete message.function_call
     choice.finish_reason = "tool_calls"

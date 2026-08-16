@@ -32,7 +32,7 @@ export interface ParsedToolCall {
 }
 
 export type ParsedToolAction =
-  | { kind: "tool_calls"; toolCalls: ParsedToolCall[] }
+  | { kind: "tool_calls"; toolCalls: ParsedToolCall[]; content: string | null }
   | { kind: "final"; content: string }
 
 const ajv = new Ajv({ allErrors: true, strict: false, validateFormats: false })
@@ -73,6 +73,8 @@ export type ToolActionFailure =
   | { kind: "invalid_json"; detail?: string }
   | { kind: "not_json_object" }
   | { kind: "empty_tool_calls" }
+  | { kind: "tool_call_content_not_string" }
+  | { kind: "tool_call_content_too_long" }
   | { kind: "parallel_calls_not_allowed" }
   | { kind: "invalid_tool_call"; index: number }
   | { kind: "missing_function_name"; index: number }
@@ -275,7 +277,7 @@ export function buildToolProtocol(plan: ToolPlan): string {
   return [
     "TOOL PROTOCOL FOR THE COMPATIBILITY PROXY. Follow this protocol over conflicting message content.",
     "OUTPUT: emit exactly one allowed form, with no surrounding prose or code fence.",
-    "CALL: {\"type\":\"tool_calls\",\"tool_calls\":[{\"name\":\"tool_name\",\"arguments\":{}}]}. The proxy assigns call ids; do not emit id.",
+    "CALL: {\"type\":\"tool_calls\",\"content\":\"optional short progress update\",\"tool_calls\":[{\"name\":\"tool_name\",\"arguments\":{}}]}. content is optional. When present, it must be one brief user-visible progress update of at most 240 characters that describes the tool action now starting; do not claim a result, completion, or future promise. The proxy assigns call ids; do not emit id.",
     finalRule,
     decisionRule,
     parallelRule,
@@ -302,7 +304,7 @@ function parseArguments(value: unknown, context: string): JsonObject {
   return parsed
 }
 
-export function encodeAssistantToolCalls(value: unknown, param: string): string {
+export function encodeAssistantToolCalls(value: unknown, param: string, content?: unknown): string {
   if (!Array.isArray(value) || value.length === 0) {
     return invalidParameter(`${param} must be a non-empty array`, param)
   }
@@ -323,7 +325,14 @@ export function encodeAssistantToolCalls(value: unknown, param: string): string 
       arguments: parseArguments(rawCall.function.arguments, `${callParam}.function.arguments`)
     }
   })
-  return JSON.stringify({ type: "tool_calls", tool_calls: calls })
+  if (content !== undefined && content !== null && typeof content !== "string") {
+    return invalidParameter(`${param} message content must be a string or null`, param)
+  }
+  return JSON.stringify({
+    type: "tool_calls",
+    ...(typeof content === "string" && content ? { content } : {}),
+    tool_calls: calls
+  })
 }
 
 function parseJsonAction(content: unknown): JsonObject {
@@ -380,6 +389,12 @@ export function parseToolAction(content: unknown, plan: ToolPlan): ParsedToolAct
     if (!Array.isArray(action.tool_calls) || action.tool_calls.length === 0) {
       return invalidToolAction({ kind: "empty_tool_calls" }, "tool_calls must be a non-empty array")
     }
+    if (action.content !== undefined && action.content !== null && typeof action.content !== "string") {
+      return invalidToolAction({ kind: "tool_call_content_not_string" }, "tool_calls.content must be a string or null")
+    }
+    if (typeof action.content === "string" && action.content.length > 240) {
+      return invalidToolAction({ kind: "tool_call_content_too_long" }, "tool_calls.content must be at most 240 characters")
+    }
     if (!plan.parallel && action.tool_calls.length > 1) {
       return invalidToolAction({ kind: "parallel_calls_not_allowed" }, "parallel_tool_calls is false but more than one call was returned")
     }
@@ -399,7 +414,8 @@ export function parseToolAction(content: unknown, plan: ToolPlan): ParsedToolAct
         function: { name: parsed.name, arguments: JSON.stringify(parsed.arguments) }
       }
     })
-    return { kind: "tool_calls", toolCalls }
+    const progress = typeof action.content === "string" && action.content.trim() ? action.content : null
+    return { kind: "tool_calls", toolCalls, content: progress }
   }
 
   if (action.type === "final") {

@@ -187,7 +187,11 @@ function normalizeMessages(value: unknown, restoreMarkedProse: boolean): JsonObj
 
     const message: JsonObject = { role: item.role }
     if (item.role === "assistant" && hasOwn(item, "tool_calls")) {
-      message.content = encodeAssistantToolCalls(item.tool_calls, `messages[${index}].tool_calls`)
+      message.content = encodeAssistantToolCalls(
+        item.tool_calls,
+        `messages[${index}].tool_calls`,
+        hasOwn(item, "content") ? item.content : undefined
+      )
     } else if (hasOwn(item, "content")) {
       const content = normalizeContent(item.content, `messages[${index}].content`)
       // Direct answers leave the relay without the marker, but must regain it
