@@ -73,7 +73,7 @@ curl.exe http://127.0.0.1:3000/v1/chat/completions `
 - 上游 `reasoning` / `reasoning_content` 会作为兼容扩展统一输出为 `reasoning_content`；连续对话中客户端传入的 assistant `reasoning_content` 会映射回门户 `reasoning`；正文仍在标准 `content` 字段中。
 - 现代 function tools：`tools`、`tool_choice` 和 `parallel_tool_calls`，响应还原为标准 `message.tool_calls` / `delta.tool_calls`；参数 Schema 支持未声明版本、draft-06/07、draft-2019-09 和 draft-2020-12。
 
-已确认不具备标准语义的字段会返回 400，包括旧版 `functions` / `function_call`、custom tools、developer role、音频、文件、web search、prediction、prompt cache、logprobs、stop、seed、`n > 1` 和 OpenAI Structured Outputs 的 `json_schema` 模式。
+已确认不具备标准语义、静默丢弃会造成误导的字段会返回 400，包括旧版 `functions` / `function_call`、custom tools、developer role、音频、文件、web search、prediction、logprobs、stop、seed、`n > 1` 和 OpenAI Structured Outputs 的 `json_schema` 模式。纯提示性字段（`reasoning_effort`、`prompt_cache_key`、`prompt_cache_options`、`prompt_cache_retention`、`store`、`metadata`、`service_tier`、`verbosity`、`safety_identifier`、`user`）会被接受并忽略，门户对这些字段没有对应语义，拒绝它们会无谓地阻断 opencode 等真实客户端。
 
 ### 工具调用实现
 

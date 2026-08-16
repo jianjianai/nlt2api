@@ -29,10 +29,19 @@ const supportedFields = new Set([
   "tools",
   "tool_choice",
   "parallel_tool_calls",
-  // Accepted but dropped: the portal accepts reasoning_effort without any
-  // reasoning-control semantics (verified in OPENAI_CHAT_COMPATIBILITY.md),
-  // and rejecting it breaks clients like opencode that send it.
-  "reasoning_effort"
+  // Accepted but dropped: the portal tolerates these fields without any
+  // semantic effect (verified in OPENAI_CHAT_COMPATIBILITY.md), and rejecting
+  // them breaks clients like opencode that send them.
+  "reasoning_effort",
+  "prompt_cache_key",
+  "prompt_cache_options",
+  "prompt_cache_retention",
+  "store",
+  "metadata",
+  "service_tier",
+  "verbosity",
+  "safety_identifier",
+  "user"
 ])
 
 const unsupportedFields = new Set([
@@ -46,18 +55,9 @@ const unsupportedFields = new Set([
   "audio",
   "web_search_options",
   "prediction",
-  "prompt_cache_key",
-  "prompt_cache_options",
-  "prompt_cache_retention",
-  "store",
-  "metadata",
-  "safety_identifier",
-  "service_tier",
-  "verbosity",
   "presence_penalty",
   "frequency_penalty",
-  "logit_bias",
-  "user"
+  "logit_bias"
 ])
 
 function isRecord(value: unknown): value is JsonObject {
@@ -166,6 +166,7 @@ export function validateChatRequest(input: unknown): ValidatedChatRequest {
 
   for (const key of Object.keys(input)) {
     if (unsupportedFields.has(key)) {
+      console.warn(`[proxy] rejecting unsupported field key=${key}`)
       throw new AppError(`${key} is not supported by /api/chat`, 400, "unsupported_parameter", key, "invalid_request_error")
     }
     if (!supportedFields.has(key)) {

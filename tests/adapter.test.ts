@@ -73,6 +73,34 @@ test("accepts reasoning_effort and drops it instead of forwarding it", () => {
   assert.equal(result.portalPayload.reasoning_effort, undefined)
 })
 
+test("accepts and drops cache/metadata hint fields without forwarding them", () => {
+  const result = validateChatRequest({
+    model: "kimi-k3",
+    messages: [{ role: "user", content: "hello" }],
+    prompt_cache_key: "sess-1",
+    prompt_cache_retention: "24h",
+    store: true,
+    metadata: { tag: "x" },
+    service_tier: "auto",
+    verbosity: "low",
+    user: "u-1"
+  })
+  for (const key of ["prompt_cache_key", "prompt_cache_retention", "store", "metadata", "service_tier", "verbosity", "user"]) {
+    assert.equal(result.portalPayload[key], undefined)
+  }
+})
+
+test("still rejects sampling/contract fields with a 400", () => {
+  assert.throws(
+    () => validateChatRequest({
+      model: "kimi-k3",
+      messages: [{ role: "user", content: "hello" }],
+      stop: ["\n"]
+    }),
+    (error: unknown) => error instanceof AppError && error.statusCode === 400 && error.param === "stop"
+  )
+})
+
 test("maps historical assistant reasoning_content to the portal reasoning field", () => {
   const result = validateChatRequest({
     model: "kimi-k3",
