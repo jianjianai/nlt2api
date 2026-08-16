@@ -163,12 +163,20 @@ async function proxyForAccount(account: StoredAccount, request: ValidatedChatReq
 
   const prepared = await preparePortalSse(account, request)
   if (request.toolPlan) {
-    const refetch = async (nudge: string): Promise<PreparedSse> => {
-      console.warn(`[proxy] tool action retry account=${account.label} model=${request.model}`)
-      const portalPayload: Record<string, unknown> = {
-        ...request.portalPayload,
-        messages: [...(request.portalPayload.messages as unknown[]), { role: "user", content: nudge }]
+    const refetch = async (failed: { reasoning: string; content: string; nudge: string }): Promise<PreparedSse> => {
+      console.warn(`[proxy] tool action retry account=${account.label} model=${request.model} preserved reasoning_chars=${failed.reasoning.length} content_chars=${failed.content.length}`)
+      const messages = [...(request.portalPayload.messages as unknown[])]
+      // Preserve the model's failed attempt as an assistant turn so the retry
+      // sees its own thinking and output and can correct them precisely.
+      if (failed.content || failed.reasoning) {
+        messages.push({
+          role: "assistant",
+          ...(failed.reasoning ? { reasoning: failed.reasoning } : {}),
+          content: failed.content || null
+        })
       }
+      messages.push({ role: "user", content: failed.nudge })
+      const portalPayload: Record<string, unknown> = { ...request.portalPayload, messages }
       return preparePortalSse(account, { ...request, portalPayload })
     }
     return {

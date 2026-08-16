@@ -244,7 +244,7 @@ function completionChunkIdentity(value: JsonObject, model: string): JsonObject {
 }
 
 export interface ToolSseRefetch {
-  (nudge: string): Promise<PreparedSse>
+  (failed: { reasoning: string; content: string; nudge: string }): Promise<PreparedSse>
 }
 
 const TOOL_ACTION_MAX_RETRIES = 1
@@ -308,7 +308,7 @@ export function createToolSseRelay(
         let usage: JsonObject | undefined
         let roleSent = false
         let upstreamFinishReason: unknown = "stop"
-        let reasoningChars = 0
+        let reasoningText = ""
 
         const processToolChunk = (value: JsonObject): void => {
           identity ??= completionChunkIdentity(value, model)
@@ -330,7 +330,7 @@ export function createToolSseRelay(
           }
           const reasoningContent = reasoningContentFrom(rawDelta)
           if (reasoningContent !== undefined) {
-            if (typeof reasoningContent === "string") reasoningChars += reasoningContent.length
+            if (typeof reasoningContent === "string") reasoningText += reasoningContent
             delta.reasoning_content = reasoningContent
           }
           if (rawDelta.refusal !== undefined) delta.refusal = rawDelta.refusal
@@ -417,15 +417,19 @@ export function createToolSseRelay(
               // Reasoning from this attempt was already streamed; give it one
               // corrective turn so the client still receives a usable result.
               retries += 1
-              console.warn(`[proxy] tool action invalid, retry ${retries}/${TOOL_ACTION_MAX_RETRIES}: ${error instanceof Error ? error.message : "unknown"} finish=${String(upstreamFinishReason)} reasoning_chars=${reasoningChars} content_chars=${content.length} content_head=${JSON.stringify(content.slice(0, 160))}`)
+              console.warn(`[proxy] tool action invalid, retry ${retries}/${TOOL_ACTION_MAX_RETRIES}: ${error instanceof Error ? error.message : "unknown"} finish=${String(upstreamFinishReason)} reasoning_chars=${reasoningText.length} content_chars=${content.length} content_head=${JSON.stringify(content.slice(0, 160))}`)
+              // Preserve the failed attempt (thinking + output) so the retry
+              // sees its own previous turn and can correct it precisely.
               const nudge = buildRetryNudge(content, error, plan.choice)
+              const failedReasoning = reasoningText.slice(-2000)
+              const failedContent = content.slice(-1500)
               content = ""
               identity = undefined
               usage = undefined
               roleSent = false
               upstreamFinishReason = "stop"
-              reasoningChars = 0
-              current = await refetch(nudge)
+              reasoningText = ""
+              current = await refetch({ reasoning: failedReasoning, content: failedContent, nudge })
             }
           }
 
@@ -439,7 +443,7 @@ export function createToolSseRelay(
           } else {
             delta.content = parsedAction.content
           }
-          console.info(`[proxy] tool action delivered kind=${parsedAction.kind} attempts=${retries + 1} finish=${String(upstreamFinishReason)} reasoning_chars=${reasoningChars} content_chars=${content.length} tools=${plan.tools.length} choice=${plan.choice}`)
+          console.info(`[proxy] tool action delivered kind=${parsedAction.kind} attempts=${retries + 1} finish=${String(upstreamFinishReason)} reasoning_chars=${reasoningText.length} content_chars=${content.length} tools=${plan.tools.length} choice=${plan.choice}`)
           controller.enqueue(formatSse({
             ...identity,
             choices: [{ index: 0, delta, finish_reason: finishReason ?? "stop" }]
@@ -450,7 +454,7 @@ export function createToolSseRelay(
           }
           controller.enqueue(new TextEncoder().encode("data: [DONE]\n\n"))
         } catch (error) {
-          console.error(`[proxy] tool stream failed: ${error instanceof Error ? error.message : "unknown"} finish=${String(upstreamFinishReason)} reasoning_chars=${reasoningChars} content_chars=${content.length} content_head=${JSON.stringify(content.slice(0, 160))}`)
+          console.error(`[proxy] tool stream failed: ${error instanceof Error ? error.message : "unknown"} finish=${String(upstreamFinishReason)} reasoning_chars=${reasoningText.length} content_chars=${content.length} content_head=${JSON.stringify(content.slice(0, 160))}`)
           controller.enqueue(formatSseError(error))
         } finally {
           controller.close()

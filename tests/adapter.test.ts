@@ -432,9 +432,10 @@ test("retries with a corrective nudge when the model streams reasoning but no JS
   assert.ok(request.toolPlan)
 
   let refetchCalls = 0
-  const refetch = async (nudge: string): Promise<PreparedSse> => {
+  const refetch = async (failed: { reasoning: string; content: string; nudge: string }): Promise<PreparedSse> => {
     refetchCalls += 1
-    assert.match(nudge, /JSON object/)
+    assert.match(failed.nudge, /JSON object/)
+    assert.match(failed.reasoning, /thinking hard/)
     const upstream = new Response([
       'data: {"id":"retry","model":"kimi-k3","choices":[{"index":0,"delta":{"role":"assistant","content":"{\\\"type\\\":\\\"tool_calls\\\",\\\"tool_calls\\\":[{\\\"name\\\":\\\"get_weather\\\",\\\"arguments\\\":{\\\"city\\\":\\\"Paris\\\"}}]}"},"finish_reason":"stop"}]}\n\n',
       "data: [DONE]\n\n"
@@ -469,7 +470,7 @@ test("delivers prose as final when auto choice has no retry left", async () => {
   assert.equal(request.toolPlan!.choice, "auto")
 
   let refetchCalls = 0
-  const refetch = async (): Promise<PreparedSse> => {
+  const refetch = async (failed: { reasoning: string; content: string; nudge: string }): Promise<PreparedSse> => {
     refetchCalls += 1
     const upstream = new Response([
       'data: {"id":"prose2","model":"kimi-k3","choices":[{"index":0,"delta":{"role":"assistant","content":"The previous read came back truncated, so I cannot analyze it fully."},"finish_reason":"stop"}]}\n\n',
@@ -502,9 +503,9 @@ test("retries prose first when a retry is available (auto choice keeps tool pref
   assert.ok(request.toolPlan)
 
   let refetchCalls = 0
-  const refetch = async (nudge: string): Promise<PreparedSse> => {
+  const refetch = async (failed: { reasoning: string; content: string; nudge: string }): Promise<PreparedSse> => {
     refetchCalls += 1
-    assert.match(nudge, /prose/)
+    assert.match(failed.nudge, /prose/)
     const upstream = new Response([
       'data: {"id":"retry","model":"kimi-k3","choices":[{"index":0,"delta":{"role":"assistant","content":"{\\\"type\\\":\\\"tool_calls\\\",\\\"tool_calls\\\":[{\\\"name\\\":\\\"get_weather\\\",\\\"arguments\\\":{\\\"city\\\":\\\"Paris\\\"}}]}"},"finish_reason":"stop"}]}\n\n',
       "data: [DONE]\n\n"
@@ -536,9 +537,10 @@ test("feeds the JSON parse reason back when retrying broken JSON", async () => {
   assert.ok(request.toolPlan)
 
   let refetchCalls = 0
-  const refetch = async (nudge: string): Promise<PreparedSse> => {
+  const refetch = async (failed: { reasoning: string; content: string; nudge: string }): Promise<PreparedSse> => {
     refetchCalls += 1
-    assert.match(nudge, /parser reported/)
+    assert.match(failed.nudge, /parser reported/)
+    assert.match(failed.content, /"city"/)
     const upstream = new Response([
       'data: {"id":"retry","model":"kimi-k3","choices":[{"index":0,"delta":{"role":"assistant","content":"{\\\"type\\\":\\\"tool_calls\\\",\\\"tool_calls\\\":[{\\\"name\\\":\\\"get_weather\\\",\\\"arguments\\\":{\\\"city\\\":\\\"Paris\\\"}}]}"},"finish_reason":"stop"}]}\n\n',
       "data: [DONE]\n\n"
