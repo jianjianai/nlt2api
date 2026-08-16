@@ -147,6 +147,25 @@ function shouldRestoreMarkedProse(plan: ToolPlan | undefined): boolean {
   return plan?.choice === "auto" && plan.finalResponseFormat === "text"
 }
 
+function hasToolResults(value: unknown): boolean {
+  if (!Array.isArray(value) || value.length === 0) return false
+  let index = value.length - 1
+  let foundToolResult = false
+
+  while (index >= 0) {
+    const item = value[index]
+    if (!isRecord(item)) return false
+    if (item.role === "tool") {
+      foundToolResult = true
+      index -= 1
+      continue
+    }
+    return foundToolResult && item.role === "assistant" && hasOwn(item, "tool_calls")
+  }
+
+  return false
+}
+
 function normalizeMessages(value: unknown, restoreMarkedProse: boolean): JsonObject[] {
   if (!Array.isArray(value) || value.length === 0) {
     throw new AppError("messages must be a non-empty array", 400, "invalid_messages", "messages", "invalid_request_error")
@@ -250,7 +269,7 @@ export function validateChatRequest(input: unknown): ValidatedChatRequest {
     responseFormat = input.response_format.type
   }
 
-  const toolPlan = parseToolPlan(input, responseFormat)
+  const toolPlan = parseToolPlan(input, responseFormat, hasToolResults(input.messages))
   const messages = normalizeMessages(input.messages, shouldRestoreMarkedProse(toolPlan))
   const portalPayload: JsonObject = {
     model: input.model,

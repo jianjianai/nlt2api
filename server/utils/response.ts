@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto"
 import { AppError } from "./errors"
-import { TOOL_PROSE_FINAL_PREFIX, parseToolAction, type ParsedToolAction, type ToolPlan } from "./tools"
+import { TOOL_PROSE_FINAL_PREFIX, ToolActionError, parseToolAction, type ParsedToolAction, type ToolPlan } from "./tools"
 
 type JsonObject = Record<string, unknown>
 
@@ -267,11 +267,9 @@ function markedProseFinal(content: unknown, plan: ToolPlan): string | null {
 // "Attempted JSON" (starts with { or [) is a broken action, not a final answer.
 function proseCandidate(content: string, error: unknown): string | null {
   const text = content.trim()
-  if (!text) return null
+  if (!text || !(error instanceof ToolActionError) || error.failure.kind !== "invalid_json") return null
   const first = text[0]
-  if (first === "{" || first === "[") return null
-  const message = error instanceof AppError ? error.message : ""
-  return message.includes("was not valid JSON") ? text : null
+  return first === "{" || first === "[" ? null : text
 }
 
 // Encodes the failed attempt (error output + reason) as a self-contained
@@ -282,62 +280,82 @@ function encodeErrorBlock(content: string, reason: string): string {
   return `[NWERR-START]${JSON.stringify({ v: 1, out: content, reason })}[NWERR-END]`
 }
 
-// A corrective nudge tuned to the failure type so the retry has the best
-// chance of producing a usable JSON action.
-function buildRetryNudge(content: string, error: unknown, plan: ToolPlan): string {
-  const text = content.trim()
-  const message = error instanceof AppError ? error.message : ""
-  const finalHint = allowsMarkedProse(plan)
-    ? `, or begin a committed direct final answer with "${TOOL_PROSE_FINAL_PREFIX}" when no tool is needed`
-    : plan.choice === "auto"
-      ? ', or {"type":"final","content":"..."} to answer directly'
+function retryActionContract(plan: ToolPlan): string {
+  const mayReturnFinal = plan.choice === "auto" || plan.hasToolResults
+  const final = allowsMarkedProse(plan)
+    ? ` or FINAL: ${TOOL_PROSE_FINAL_PREFIX}<completed answer>`
+    : mayReturnFinal
+      ? ', or FINAL: {"type":"final","content":"..."}'
       : ""
-
-  if (message.includes("content was empty")) {
-    return 'Your previous reply was empty. Now emit exactly one JSON object and no prose: {"type":"tool_calls","tool_calls":[{"id":"call_0","name":"<tool>","arguments":{}}]} to call a tool' + finalHint + ". Do not return an empty turn."
-  }
-  if (text === TOOL_PROSE_FINAL_PREFIX) {
-    return `Your previous reply contained only the direct-answer marker "${TOOL_PROSE_FINAL_PREFIX}". Emit a non-empty final answer beginning with that marker, or emit exactly one JSON object to call a tool.`
-  }
-  if (message.includes("was not valid JSON") && text && !/^[{[]/.test(text)) {
-    return `Your previous reply was unmarked prose, so it cannot be treated as a final answer. If it is a completed answer and no tool is needed, re-emit it with "${TOOL_PROSE_FINAL_PREFIX}" as its first character. Otherwise emit exactly one JSON object and no prose: {"type":"tool_calls","tool_calls":[{"id":"call_0","name":"<tool>","arguments":{}}]} to call a tool.`
-  }
-  if (message.includes("was not valid JSON")) {
-    // Broken/truncated JSON: surface the parser's reason so the model can fix
-    // the exact escaping or truncation problem instead of guessing.
-    const reason = message.split("was not valid JSON")[1]?.trim() || ""
-    const detail = reason ? ` The parser reported:${reason}` : ""
-    return `Your previous reply was not valid JSON and could not be parsed.${detail} Re-emit exactly one valid JSON object with string values properly escaped and no trailing text: {"type":"tool_calls","tool_calls":[{"id":"call_0","name":"<tool>","arguments":{}}]} to call a tool` + finalHint + "."
-  }
-  if (message.includes("unknown function")) {
-    return 'You called a tool that is not in the list. Emit exactly one JSON object using ONLY the listed tool names: {"type":"tool_calls","tool_calls":[{"id":"call_0","name":"<tool>","arguments":{}}]}' + finalHint + "."
-  }
-  if (message.includes("failed schema validation") || message.includes("arguments")) {
-    return 'Your tool arguments were invalid. Emit exactly one JSON object whose arguments satisfy that tool\'s parameters schema' + finalHint + "."
-  }
-  return 'Your previous response did not provide a usable JSON action. Now emit exactly one JSON object and no prose: {"type":"tool_calls","tool_calls":[{"id":"call_0","name":"<tool>","arguments":{}}]} to call a tool' + finalHint + "."
+  return `Reply with exactly one CALL JSON object {"type":"tool_calls","tool_calls":[{"name":"tool_name","arguments":{}}]}${final}. The proxy assigns ids; do not emit id.`
 }
 
-// A short, model-facing diagnosis of why the previous action failed. Unlike
-// the human-facing AppError message (proxy jargon), this is phrased for the
-// model so it can correct the specific failure when the context is echoed
-// back in a later turn.
-function buildErrorDiagnosis(content: string, error: unknown, choice: "auto" | "required"): string {
-  const message = error instanceof AppError ? error.message : ""
+// A compact model-facing correction derived from the parser's structured
+// failure rather than matching human-readable error text.
+function buildRetryNudge(content: string, error: unknown, plan: ToolPlan): string {
   const text = content.trim()
-  if (message.includes("content was empty")) return "your previous reply was empty"
-  if (message.includes("was not valid JSON") && text && !/^[{[]/.test(text)) {
-    return "your previous reply was prose, not the required JSON action"
+  const failure = error instanceof ToolActionError ? error.failure : undefined
+  const contract = retryActionContract(plan)
+  if (!failure) return `Your previous reply did not provide a usable action. ${contract}`
+
+  switch (failure.kind) {
+    case "empty_content":
+      return `Your previous reply was empty. ${contract}`
+    case "invalid_json":
+      if (text && !/^[{[]/.test(text)) {
+        return `Your previous reply was unmarked prose. If it is a completed answer, re-emit it with "${TOOL_PROSE_FINAL_PREFIX}" as the first character; otherwise ${contract}`
+      }
+      return `Your previous reply was invalid JSON${failure.detail ? ` (${failure.detail})` : ""}. ${contract}`
+    case "not_json_object":
+      return `Your previous reply must be a JSON object. ${contract}`
+    case "empty_tool_calls":
+      return `tool_calls must contain at least one call. ${contract}`
+    case "parallel_calls_not_allowed":
+      return `Only one tool call is allowed in this turn. ${contract}`
+    case "invalid_tool_call":
+      return `tool_calls[${failure.index}] must be an object with name and arguments. ${contract}`
+    case "missing_function_name":
+      return `tool_calls[${failure.index}] is missing a function name. ${contract}`
+    case "arguments_invalid_json":
+      return `Arguments for ${failure.name} must be valid JSON. ${contract}`
+    case "arguments_not_object":
+      return `Arguments for ${failure.name} must be a JSON object. ${contract}`
+    case "unknown_function":
+      return `Unknown function ${failure.name}. Use only a name from TOOL DEFINITIONS. ${contract}`
+    case "schema_validation":
+      return `Arguments for ${failure.name} failed schema validation: ${failure.details}. ${contract}`
+    case "final_before_tool_results":
+      return `A tool call is required before any tool result arrives. ${contract}`
+    case "final_content_not_json_object":
+      return `FINAL content must be one JSON object. ${contract}`
+    case "final_content_not_string":
+      return `FINAL content must be a string. ${contract}`
+    case "invalid_action_type":
+      return `Action type must be tool_calls or final. ${contract}`
   }
-  if (message.includes("was not valid JSON")) {
-    const detail = message.split("was not valid JSON")[1]?.trim().replace(/^: /, "") || ""
-    return `your previous reply was not valid JSON${detail ? ` (${detail})` : ""}`
+}
+
+function buildErrorDiagnosis(content: string, error: unknown): string {
+  const text = content.trim()
+  const failure = error instanceof ToolActionError ? error.failure : undefined
+  if (!failure) return "your previous reply did not provide a usable action"
+  switch (failure.kind) {
+    case "empty_content": return "your previous reply was empty"
+    case "invalid_json": return text && !/^[{[]/.test(text) ? "your previous reply was unmarked prose" : `your previous reply was invalid JSON${failure.detail ? ` (${failure.detail})` : ""}`
+    case "not_json_object": return "your previous reply was not a JSON object"
+    case "empty_tool_calls": return "tool_calls was empty"
+    case "parallel_calls_not_allowed": return "multiple calls were returned although only one is allowed"
+    case "invalid_tool_call": return `tool_calls[${failure.index}] was not an object`
+    case "missing_function_name": return `tool_calls[${failure.index}] did not name a function`
+    case "arguments_invalid_json": return `arguments for ${failure.name} were not valid JSON`
+    case "arguments_not_object": return `arguments for ${failure.name} were not a JSON object`
+    case "unknown_function": return `unknown function ${failure.name}`
+    case "schema_validation": return `arguments for ${failure.name} failed schema validation: ${failure.details}`
+    case "final_before_tool_results": return "a final response was returned before required tool results arrived"
+    case "final_content_not_json_object": return "final content was not a JSON object"
+    case "final_content_not_string": return "final content was not a string"
+    case "invalid_action_type": return "the action type was invalid"
   }
-  if (message.includes("unknown function")) return "you called a tool that is not in the list"
-  if (message.includes("failed schema validation")) return "your tool arguments did not satisfy the tool's parameters schema"
-  if (message.includes("arguments")) return "your tool arguments were invalid"
-  if (message.includes("tool_choice requires a tool call")) return "a final response was returned when a tool call was required"
-  return "your previous reply did not provide a usable JSON action"
 }
 
 export function createToolSseRelay(
@@ -505,7 +523,7 @@ export function createToolSseRelay(
               if (failedContent || failedReasoning) {
                 controller.enqueue(formatSse({
                   ...(identity ?? completionChunkIdentity({}, model)),
-                  choices: [{ index: 0, delta: { reasoning_content: encodeErrorBlock(failedContent, buildErrorDiagnosis(content, error, plan.choice)) }, finish_reason: null }]
+                  choices: [{ index: 0, delta: { reasoning_content: encodeErrorBlock(failedContent, buildErrorDiagnosis(content, error)) }, finish_reason: null }]
                 }))
               }
               content = ""
