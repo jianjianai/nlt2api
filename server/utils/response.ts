@@ -247,7 +247,7 @@ export interface ToolSseRefetch {
   (failed: { reasoning: string; content: string; nudge: string }): Promise<PreparedSse>
 }
 
-const TOOL_ACTION_MAX_RETRIES = 1
+const TOOL_ACTION_MAX_RETRIES = 2
 
 // If the model answered in prose instead of an attempted JSON action, returns
 // the trimmed prose so the caller can deliver it as a final message; otherwise

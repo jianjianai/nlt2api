@@ -133,6 +133,30 @@ test("reconstructs a failed attempt from an echoed cross-turn error block", () =
   assert.match(messages[1].content as string, /tool_calls/)
 })
 
+test("reconstructs multiple failed attempts when the reasoning echoes several error blocks", () => {
+  const block1 = `[NWERR-START]${JSON.stringify({ v: 1, out: "first broken", reason: "your previous reply was not valid JSON" })}[NWERR-END]`
+  const block2 = `[NWERR-START]${JSON.stringify({ v: 1, out: "second broken", reason: "your previous reply was empty" })}[NWERR-END]`
+  const result = validateChatRequest({
+    model: "kimi-k3",
+    messages: [
+      { role: "assistant", reasoning_content: `t1${block1}t2${block2}t3`, tool_calls: [{ id: "c1", type: "function", function: { name: "get_weather", arguments: { city: "Paris" } } }] }
+    ]
+  })
+  const messages = result.portalPayload.messages as Array<Record<string, unknown>>
+  assert.equal(messages.length, 3)
+  assert.equal(messages[0].role, "assistant")
+  assert.match(messages[0].reasoning as string, /t1/)
+  assert.match(messages[0].reasoning as string, /This attempt was invalid: your previous reply was not valid JSON/)
+  assert.equal(messages[0].content, "first broken")
+  assert.equal(messages[1].role, "assistant")
+  assert.match(messages[1].reasoning as string, /t2/)
+  assert.match(messages[1].reasoning as string, /This attempt was invalid: your previous reply was empty/)
+  assert.equal(messages[1].content, "second broken")
+  assert.equal(messages[2].role, "assistant")
+  assert.equal(messages[2].reasoning, "t3")
+  assert.match(messages[2].content as string, /tool_calls/)
+})
+
 test("ignores malformed cross-turn error blocks in reasoning", () => {
   const result = validateChatRequest({
     model: "kimi-k3",
@@ -551,7 +575,7 @@ test("delivers prose as final when auto choice has no retry left", async () => {
   const relay = createToolSseRelay(prepared, "kimi-k3", false, request.toolPlan!, refetch)
   const output = await new Response(relay).text()
 
-  assert.equal(refetchCalls, 1)
+  assert.equal(refetchCalls, 2)
   assert.match(output, /came back truncated/)
   assert.doesNotMatch(output, /"error":/)
   assert.match(output, /data: \[DONE\]/)
