@@ -4,10 +4,15 @@
   "scripts": {
     "build": "nitro build",
     "dev": "nitro dev",
-    "preview": "node .output/server/index.mjs"
+    "preview": "node .output/server/index.mjs",
+    "test": "tsx --test \"tests/**/*.test.ts\""
   },
   "devDependencies": {
     "h3": "^1.15.4",
-    "nitropack": "^2.12.4"
+    "nitropack": "^2.12.4",
+    "tsx": "^4.23.12"
+  },
+  "dependencies": {
+    "yaml": "^2.9.0"
   }
 }

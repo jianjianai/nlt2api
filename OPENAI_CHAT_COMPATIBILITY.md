@@ -412,3 +412,13 @@ image_url content parts（仅基础验证）
 - 工具调用、developer role、logprobs、n>1、音频、文件、web search、moderation、prompt cache、prediction：当前实测不应宣称支持。
 
 最稳妥的生产策略是建立一个“支持子集 + 显式拒绝列表”的适配层，而不是把所有外部字段原样透传。
+
+## 自建适配器实现状态
+
+本仓库现已实现一个本地 Nitro 适配器：
+
+- `POST /v1/chat/completions` 将已验证的 OpenAI 字段映射为门户 `POST /api/chat`；
+- 流式响应会移除门户的 pricing、energy、routing 注释和 reasoning 扩展，只保留标准 SSE 字段；
+- `max_completion_tokens` 在本地转换为 `max_tokens`，已知无效语义字段返回标准 400；
+- 账号密码和会话 Cookie 保存于被 Git 忽略的 `.data/neuralwatt-accounts.yaml`，会话失效时先用 `/api/usage` 检查并自动重新登录；
+- 代理只在认证失败且上游尚未开始推理时切换账号，避免对未知执行状态的请求重复发送。

@@ -1,0 +1,116 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="light dark" />
+    <title>Neuralwatt AI Proxy</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <main class="page-shell">
+      <header class="page-header">
+        <div>
+          <p class="eyebrow">LOCAL OPENAI COMPATIBILITY LAYER</p>
+          <h1>Neuralwatt AI Proxy</h1>
+          <p class="subtitle">管理登录会话，并将 OpenAI Chat Completions 请求转发到 Neuralwatt Playground。</p>
+        </div>
+        <div id="health-badge" class="status-badge status-unknown">检查服务</div>
+      </header>
+
+      <section class="panel access-panel">
+        <div class="panel-heading">
+          <div>
+            <h2>本地代理 Key</h2>
+            <p>服务首次初始化时会在终端输出 Key。Key 只保存在当前浏览器会话。</p>
+          </div>
+          <button id="rotate-key" class="button button-secondary" type="button">轮换 Key</button>
+        </div>
+        <div class="inline-form">
+          <label class="field grow">
+            <span>Bearer Key</span>
+            <input id="proxy-key" type="password" autocomplete="off" placeholder="粘贴本地代理 Key" />
+          </label>
+          <button id="save-key" class="button button-primary" type="button">连接服务</button>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-heading">
+          <div>
+            <h2>账号管理</h2>
+            <p>密码和会话 Cookie 不会在列表中显示。</p>
+          </div>
+          <button id="refresh-accounts" class="button button-secondary" type="button">刷新</button>
+        </div>
+
+        <form id="account-form" class="account-form">
+          <input id="editing-id" type="hidden" />
+          <label class="field">
+            <span>显示名称</span>
+            <input id="account-label" required maxlength="80" placeholder="例如：主账号" />
+          </label>
+          <label class="field">
+            <span>邮箱</span>
+            <input id="account-email" required type="email" autocomplete="username" placeholder="name@example.com" />
+          </label>
+          <label class="field">
+            <span>密码</span>
+            <input id="account-password" type="password" autocomplete="new-password" placeholder="新增必填，编辑留空则保留" />
+          </label>
+          <label class="field field-wide">
+            <span>手动 Cookie（可选）</span>
+            <textarea id="account-cookie" rows="2" autocomplete="off" placeholder="登录遇到挑战时，在这里粘贴 Cookie 请求头"></textarea>
+          </label>
+          <div class="form-actions field-wide">
+            <button class="button button-primary" type="submit">保存账号</button>
+            <button id="clear-account-form" class="button button-ghost" type="button">清空</button>
+          </div>
+        </form>
+
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>账号</th>
+                <th>状态</th>
+                <th>登录时间</th>
+                <th>属性</th>
+                <th>操作</th>
+              </tr>
+            </thead>
+            <tbody id="accounts-body">
+              <tr><td colspan="5" class="empty-state">尚未加载账号</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="panel test-panel">
+        <div class="panel-heading">
+          <div>
+            <h2>兼容接口测试</h2>
+            <p>使用当前启用账号发送一次非流式 Chat Completions 请求。</p>
+          </div>
+        </div>
+        <form id="test-form" class="test-form">
+          <label class="field">
+            <span>模型</span>
+            <input id="test-model" value="kimi-k3" required />
+          </label>
+          <label class="field field-wide">
+            <span>消息</span>
+            <textarea id="test-message" rows="3" required>请只回复 TEST_OK</textarea>
+          </label>
+          <div class="form-actions field-wide">
+            <button class="button button-primary" type="submit">发送测试请求</button>
+          </div>
+        </form>
+        <pre id="test-output" class="output-box">等待测试</pre>
+      </section>
+
+      <p id="notice" class="notice" role="status" aria-live="polite"></p>
+    </main>
+    <script src="/app.js" defer></script>
+  </body>
+</html>

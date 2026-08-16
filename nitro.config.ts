@@ -4,5 +4,10 @@ import { defineNitroConfig } from "nitropack/config"
 export default defineNitroConfig({
   compatibilityDate: "2026-08-15",
   srcDir: "server",
-  imports: false
+  imports: false,
+  publicAssets: [
+    {
+      dir: "../public"
+    }
+  ]
 });
