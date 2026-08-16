@@ -249,6 +249,48 @@ export interface ToolSseRefetch {
 
 const TOOL_ACTION_MAX_RETRIES = 1
 
+// If the model answered in prose instead of an attempted JSON action, returns
+// the trimmed prose so the caller can deliver it as a final message; otherwise
+// returns null. "Attempted JSON" (starts with { or [) is a broken action and
+// must not be mistaken for a final answer.
+function proseCandidate(content: string, error: unknown): string | null {
+  const text = content.trim()
+  if (!text) return null
+  const first = text[0]
+  if (first === "{" || first === "[") return null
+  const message = error instanceof AppError ? error.message : ""
+  return message.includes("was not valid JSON") ? text : null
+}
+
+// A corrective nudge tuned to the failure type so the retry has the best
+// chance of producing a usable JSON action.
+function buildRetryNudge(content: string, error: unknown, choice: "auto" | "required"): string {
+  const text = content.trim()
+  const message = error instanceof AppError ? error.message : ""
+  const finalHint = choice === "auto" ? ', or {"type":"final","content":"..."} to answer directly' : ""
+
+  if (message.includes("content was empty")) {
+    return 'Your previous reply was empty. Now emit exactly one JSON object and no prose: {"type":"tool_calls","tool_calls":[{"id":"call_0","name":"<tool>","arguments":{}}]} to call a tool' + finalHint + ". Do not return an empty turn."
+  }
+  if (message.includes("was not valid JSON") && text && !/^[{[]/.test(text)) {
+    return 'Your previous reply was prose, not the required JSON action. Emit ONLY exactly one JSON object and no prose: {"type":"tool_calls","tool_calls":[{"id":"call_0","name":"<tool>","arguments":{}}]} to call a tool' + finalHint + "."
+  }
+  if (message.includes("was not valid JSON")) {
+    // Broken/truncated JSON: surface the parser's reason so the model can fix
+    // the exact escaping or truncation problem instead of guessing.
+    const reason = message.split("was not valid JSON")[1]?.trim() || ""
+    const detail = reason ? ` The parser reported:${reason}` : ""
+    return `Your previous reply was not valid JSON and could not be parsed.${detail} Re-emit exactly one valid JSON object with string values properly escaped and no trailing text: {"type":"tool_calls","tool_calls":[{"id":"call_0","name":"<tool>","arguments":{}}]} to call a tool` + finalHint + "."
+  }
+  if (message.includes("unknown function")) {
+    return 'You called a tool that is not in the list. Emit exactly one JSON object using ONLY the listed tool names: {"type":"tool_calls","tool_calls":[{"id":"call_0","name":"<tool>","arguments":{}}]}' + finalHint + "."
+  }
+  if (message.includes("failed schema validation") || message.includes("arguments")) {
+    return 'Your tool arguments were invalid. Emit exactly one JSON object whose arguments satisfy that tool\'s parameters schema' + finalHint + "."
+  }
+  return 'Your previous response did not provide a usable JSON action. Now emit exactly one JSON object and no prose: {"type":"tool_calls","tool_calls":[{"id":"call_0","name":"<tool>","arguments":{}}]} to call a tool' + finalHint + "."
+}
+
 export function createToolSseRelay(
   prepared: PreparedSse,
   model: string,
@@ -350,7 +392,23 @@ export function createToolSseRelay(
               break
             } catch (error) {
               const invalidAction = error instanceof AppError && error.code === "invalid_tool_action"
-              if (!invalidAction || !refetch || retries >= TOOL_ACTION_MAX_RETRIES) {
+              if (!invalidAction) {
+                throw error
+              }
+
+              // Auto choice with no useful retry left: the model answered in
+              // prose instead of a JSON action. Deliver the prose as the final
+              // message instead of failing the whole request.
+              if (plan.choice === "auto" && plan.finalResponseFormat === "text") {
+                const prose = proseCandidate(content, error)
+                if (prose !== null && (!refetch || retries >= TOOL_ACTION_MAX_RETRIES)) {
+                  console.warn(`[proxy] tool action fallback: delivering prose as final (auto choice) content_chars=${content.length}`)
+                  action = { kind: "final", content: prose }
+                  break
+                }
+              }
+
+              if (!refetch || retries >= TOOL_ACTION_MAX_RETRIES) {
                 throw error
               }
 
@@ -360,17 +418,14 @@ export function createToolSseRelay(
               // corrective turn so the client still receives a usable result.
               retries += 1
               console.warn(`[proxy] tool action invalid, retry ${retries}/${TOOL_ACTION_MAX_RETRIES}: ${error instanceof Error ? error.message : "unknown"} finish=${String(upstreamFinishReason)} reasoning_chars=${reasoningChars} content_chars=${content.length} content_head=${JSON.stringify(content.slice(0, 160))}`)
+              const nudge = buildRetryNudge(content, error, plan.choice)
               content = ""
               identity = undefined
               usage = undefined
               roleSent = false
               upstreamFinishReason = "stop"
               reasoningChars = 0
-              current = await refetch(
-                'Your previous response did not provide the required JSON action, so nothing was delivered. ' +
-                'Now emit exactly one JSON object and no prose: {"type":"tool_calls","tool_calls":[{"id":"call_0","name":"<tool>","arguments":{}}]} to call a tool, ' +
-                'or {"type":"final","content":"..."} to answer directly.'
-              )
+              current = await refetch(nudge)
             }
           }
 

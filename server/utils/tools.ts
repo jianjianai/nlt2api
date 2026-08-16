@@ -295,8 +295,11 @@ function parseJsonAction(content: unknown): JsonObject {
     const parsed: unknown = JSON.parse(source)
     if (!isRecord(parsed)) return invalidToolAction("the response was not a JSON object")
     return parsed
-  } catch {
-    return invalidToolAction("the response was not valid JSON")
+  } catch (error) {
+    // Carry the parser's reason (e.g. "Unexpected token ... at position N") so
+    // the retry nudge can tell the model exactly how the JSON was malformed.
+    const reason = error instanceof Error && error.message ? `: ${error.message.slice(0, 120)}` : ""
+    return invalidToolAction(`the response was not valid JSON${reason}`)
   }
 }
 

@@ -434,7 +434,7 @@ test("retries with a corrective nudge when the model streams reasoning but no JS
   let refetchCalls = 0
   const refetch = async (nudge: string): Promise<PreparedSse> => {
     refetchCalls += 1
-    assert.match(nudge, /JSON action/)
+    assert.match(nudge, /JSON object/)
     const upstream = new Response([
       'data: {"id":"retry","model":"kimi-k3","choices":[{"index":0,"delta":{"role":"assistant","content":"{\\\"type\\\":\\\"tool_calls\\\",\\\"tool_calls\\\":[{\\\"name\\\":\\\"get_weather\\\",\\\"arguments\\\":{\\\"city\\\":\\\"Paris\\\"}}]}"},"finish_reason":"stop"}]}\n\n',
       "data: [DONE]\n\n"
@@ -456,4 +456,108 @@ test("retries with a corrective nudge when the model streams reasoning but no JS
   assert.match(output, /get_weather/)
   assert.doesNotMatch(output, /invalid tool action/)
   assert.match(output, /data: \[DONE\]/)
+})
+
+test("delivers prose as final when auto choice has no retry left", async () => {
+  const request = validateChatRequest({
+    model: "kimi-k3",
+    messages: [{ role: "user", content: "Analyze the file" }],
+    stream: true,
+    tools: [weatherTool]
+  })
+  assert.ok(request.toolPlan)
+  assert.equal(request.toolPlan!.choice, "auto")
+
+  let refetchCalls = 0
+  const refetch = async (): Promise<PreparedSse> => {
+    refetchCalls += 1
+    const upstream = new Response([
+      'data: {"id":"prose2","model":"kimi-k3","choices":[{"index":0,"delta":{"role":"assistant","content":"The previous read came back truncated, so I cannot analyze it fully."},"finish_reason":"stop"}]}\n\n',
+      "data: [DONE]\n\n"
+    ].join(""))
+    return prepareSse(upstream.body)
+  }
+
+  const upstream = new Response([
+    'data: {"id":"prose1","model":"kimi-k3","choices":[{"index":0,"delta":{"role":"assistant","content":"The previous read came back truncated, so I cannot analyze it fully."},"finish_reason":"stop"}]}\n\n',
+    "data: [DONE]\n\n"
+  ].join(""))
+  const prepared = await prepareSse(upstream.body)
+  const relay = createToolSseRelay(prepared, "kimi-k3", false, request.toolPlan!, refetch)
+  const output = await new Response(relay).text()
+
+  assert.equal(refetchCalls, 1)
+  assert.match(output, /came back truncated/)
+  assert.doesNotMatch(output, /invalid tool action/)
+  assert.match(output, /data: \[DONE\]/)
+})
+
+test("retries prose first when a retry is available (auto choice keeps tool preference)", async () => {
+  const request = validateChatRequest({
+    model: "kimi-k3",
+    messages: [{ role: "user", content: "Weather in Paris" }],
+    stream: true,
+    tools: [weatherTool]
+  })
+  assert.ok(request.toolPlan)
+
+  let refetchCalls = 0
+  const refetch = async (nudge: string): Promise<PreparedSse> => {
+    refetchCalls += 1
+    assert.match(nudge, /prose/)
+    const upstream = new Response([
+      'data: {"id":"retry","model":"kimi-k3","choices":[{"index":0,"delta":{"role":"assistant","content":"{\\\"type\\\":\\\"tool_calls\\\",\\\"tool_calls\\\":[{\\\"name\\\":\\\"get_weather\\\",\\\"arguments\\\":{\\\"city\\\":\\\"Paris\\\"}}]}"},"finish_reason":"stop"}]}\n\n',
+      "data: [DONE]\n\n"
+    ].join(""))
+    return prepareSse(upstream.body)
+  }
+
+  const upstream = new Response([
+    'data: {"id":"prose","model":"kimi-k3","choices":[{"index":0,"delta":{"role":"assistant","content":"Let me just answer directly: it is 21C in Paris."},"finish_reason":"stop"}]}\n\n',
+    "data: [DONE]\n\n"
+  ].join(""))
+  const prepared = await prepareSse(upstream.body)
+  const relay = createToolSseRelay(prepared, "kimi-k3", false, request.toolPlan!, refetch)
+  const output = await new Response(relay).text()
+
+  assert.equal(refetchCalls, 1)
+  assert.match(output, /tool_calls/)
+  assert.match(output, /get_weather/)
+  assert.doesNotMatch(output, /invalid tool action/)
+})
+
+test("feeds the JSON parse reason back when retrying broken JSON", async () => {
+  const request = validateChatRequest({
+    model: "kimi-k3",
+    messages: [{ role: "user", content: "Weather in Paris" }],
+    stream: true,
+    tools: [weatherTool]
+  })
+  assert.ok(request.toolPlan)
+
+  let refetchCalls = 0
+  const refetch = async (nudge: string): Promise<PreparedSse> => {
+    refetchCalls += 1
+    assert.match(nudge, /parser reported/)
+    const upstream = new Response([
+      'data: {"id":"retry","model":"kimi-k3","choices":[{"index":0,"delta":{"role":"assistant","content":"{\\\"type\\\":\\\"tool_calls\\\",\\\"tool_calls\\\":[{\\\"name\\\":\\\"get_weather\\\",\\\"arguments\\\":{\\\"city\\\":\\\"Paris\\\"}}]}"},"finish_reason":"stop"}]}\n\n',
+      "data: [DONE]\n\n"
+    ].join(""))
+    return prepareSse(upstream.body)
+  }
+
+  // Truncated JSON action: starts with {, so it must be retried (not treated
+  // as a prose final) and the retry nudge must carry the parser's reason.
+  const upstream = new Response([
+    'data: {"id":"broken","model":"kimi-k3","choices":[{"index":0,"delta":{"role":"assistant","content":"{\\\"type\\\":\\\"tool_calls\\\",\\\"tool_calls\\\":[{\\\"name\\\":\\\"get_weather\\\",\\\"arguments\\\":{\\\"city\\\":\\\"Paris\\\""},"finish_reason":"stop"}]}\n\n',
+    "data: [DONE]\n\n"
+  ].join(""))
+  const prepared = await prepareSse(upstream.body)
+  const relay = createToolSseRelay(prepared, "kimi-k3", false, request.toolPlan!, refetch)
+  const output = await new Response(relay).text()
+
+  assert.equal(refetchCalls, 1)
+  assert.match(output, /tool_calls/)
+  assert.match(output, /get_weather/)
+  assert.doesNotMatch(output, /invalid tool action/)
 })
