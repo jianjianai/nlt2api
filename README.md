@@ -1,6 +1,6 @@
-# Neuralwatt AI Proxy
+# Nlt 2 api
 
-这是一个本地/局域网 Nitro 服务，将 OpenAI `v1/chat/completions` 请求转换为 Neuralwatt 门户的 `/api/chat` 请求，并提供账号和会话管理面板。
+这是一个本地/局域网 Nitro 服务，将 OpenAI `v1/chat/completions` 请求转换为 Nlt 门户的 `/api/chat` 请求，并提供账号和会话管理面板。
 
 ## 启动
 
