@@ -136,6 +136,14 @@ function normalizeMessages(value: unknown): JsonObject[] {
         message[key] = item[key]
       }
     }
+
+    if (item.role === "assistant" && (hasOwn(item, "reasoning_content") || hasOwn(item, "reasoning"))) {
+      const reasoningContent = hasOwn(item, "reasoning_content") ? item.reasoning_content : item.reasoning
+      if (typeof reasoningContent !== "string" && reasoningContent !== null) {
+        throw new AppError(`messages[${index}].reasoning_content must be a string or null`, 400, "invalid_message", `messages[${index}].reasoning_content`, "invalid_request_error")
+      }
+      message.reasoning = reasoningContent
+    }
     return message
   })
 }

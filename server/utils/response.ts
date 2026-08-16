@@ -124,12 +124,18 @@ function normalizeUsage(value: unknown): JsonObject | undefined {
   return usage
 }
 
+function reasoningContentFrom(value: JsonObject): unknown {
+  return value.reasoning_content !== undefined ? value.reasoning_content : value.reasoning
+}
+
 function normalizeDelta(value: unknown): JsonObject {
   if (!isRecord(value)) return {}
   const delta: JsonObject = {}
   for (const key of ["role", "content", "refusal", "tool_calls", "function_call"]) {
     if (value[key] !== undefined) delta[key] = value[key]
   }
+  const reasoningContent = reasoningContentFrom(value)
+  if (reasoningContent !== undefined) delta.reasoning_content = reasoningContent
   return delta
 }
 
@@ -239,6 +245,8 @@ export function normalizeCompletion(value: unknown, model: string): JsonObject {
     for (const key of ["refusal", "tool_calls", "function_call"]) {
       if (rawMessage[key] !== undefined) message[key] = rawMessage[key]
     }
+    const reasoningContent = reasoningContentFrom(rawMessage)
+    if (reasoningContent !== undefined) message.reasoning_content = reasoningContent
     return {
       index: typeof item.index === "number" ? item.index : 0,
       message,

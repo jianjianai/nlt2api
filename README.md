@@ -70,6 +70,7 @@ curl.exe http://127.0.0.1:3000/v1/chat/completions `
 - 文本图片输入；
 - `response_format: text` 和 `json_object`；
 - 标准 JSON/SSE 响应和 OpenAI 风格错误。
+- 上游 `reasoning` / `reasoning_content` 会作为兼容扩展统一输出为 `reasoning_content`；连续对话中客户端传入的 assistant `reasoning_content` 会映射回门户 `reasoning`；正文仍在标准 `content` 字段中。
 
 已确认不具备标准语义的字段会返回 400，包括工具调用、developer role、音频、文件、web search、prediction、prompt cache、logprobs、stop、seed、`n > 1` 和 JSON Schema 严格约束。
 
