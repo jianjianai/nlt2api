@@ -19,7 +19,6 @@ export interface ToolPlan {
   choice: "auto" | "required"
   parallel: boolean
   finalResponseFormat: "text" | "json_object"
-  hasToolResults: boolean
 }
 
 export interface ParsedToolCall {
@@ -82,7 +81,7 @@ export type ToolActionFailure =
   | { kind: "arguments_not_object"; name: string }
   | { kind: "unknown_function"; name: string }
   | { kind: "schema_validation"; name: string; details: string }
-  | { kind: "final_before_tool_results" }
+  | { kind: "final_when_tool_required" }
   | { kind: "final_content_not_json_object" }
   | { kind: "final_content_not_string" }
   | { kind: "invalid_action_type" }
@@ -204,7 +203,7 @@ function allowedToolNames(value: JsonObject): { mode: "auto" | "required"; names
   return { mode: config.mode, names: [...new Set(names)] }
 }
 
-export function parseToolPlan(input: JsonObject, finalResponseFormat: "text" | "json_object", hasToolResults = false): ToolPlan | undefined {
+export function parseToolPlan(input: JsonObject, finalResponseFormat: "text" | "json_object"): ToolPlan | undefined {
   if (hasOwn(input, "parallel_tool_calls") && typeof input.parallel_tool_calls !== "boolean") {
     return invalidParameter("parallel_tool_calls must be a boolean", "parallel_tool_calls")
   }
@@ -218,11 +217,11 @@ export function parseToolPlan(input: JsonObject, finalResponseFormat: "text" | "
   const tools = normalizeFunctionTools(input.tools)
   const choice = input.tool_choice
   if (choice === undefined || choice === "auto") {
-    return { tools, choice: "auto", parallel, finalResponseFormat, hasToolResults }
+    return { tools, choice: "auto", parallel, finalResponseFormat }
   }
   if (choice === "none") return undefined
   if (choice === "required") {
-    return { tools, choice: "required", parallel, finalResponseFormat, hasToolResults }
+    return { tools, choice: "required", parallel, finalResponseFormat }
   }
   if (!isRecord(choice) || typeof choice.type !== "string") {
     return invalidParameter("tool_choice must be none, auto, required, or a supported tool choice object", "tool_choice")
@@ -232,7 +231,7 @@ export function parseToolPlan(input: JsonObject, finalResponseFormat: "text" | "
     const name = namedChoice(choice, "tool_choice")
     const selected = tools.find((tool) => tool.name === name)
     if (!selected) return invalidParameter(`tool_choice references unknown function ${name}`, "tool_choice")
-    return { tools: [selected], choice: "required", parallel: false, finalResponseFormat, hasToolResults }
+    return { tools: [selected], choice: "required", parallel: false, finalResponseFormat }
   }
 
   if (choice.type === "allowed_tools") {
@@ -242,7 +241,7 @@ export function parseToolPlan(input: JsonObject, finalResponseFormat: "text" | "
       if (!tool) return invalidParameter(`tool_choice references unknown function ${name}`, "tool_choice")
       return tool
     })
-    return { tools: selected, choice: allowed.mode, parallel, finalResponseFormat, hasToolResults }
+    return { tools: selected, choice: allowed.mode, parallel, finalResponseFormat }
   }
 
   return invalidParameter(`tool_choice.type=${choice.type} is unsupported`, "tool_choice")
@@ -262,14 +261,16 @@ function publicToolDefinitions(plan: ToolPlan): JsonObject[] {
 
 export function buildToolProtocol(plan: ToolPlan): string {
   const allowsMarkedProse = plan.choice === "auto" && plan.finalResponseFormat === "text"
-  const finalRule = allowsMarkedProse
-    ? `FINAL: when no further tool is needed, emit ${TOOL_PROSE_FINAL_PREFIX}<completed answer>. ${TOOL_PROSE_FINAL_PREFIX} must be the first character; do not use JSON, Markdown fences, plans, promises, or status updates.`
-    : plan.finalResponseFormat === "json_object"
-      ? "FINAL: emit exactly {\"type\":\"final\",\"content\":{...}} with content as one JSON object."
-      : "FINAL: emit exactly {\"type\":\"final\",\"content\":\"...\"}."
+  const finalRule = plan.choice === "required"
+    ? "FINAL: not allowed in this request. tool_choice=required means every response must contain one or more tool calls."
+    : allowsMarkedProse
+      ? `FINAL: when no further tool is needed, emit ${TOOL_PROSE_FINAL_PREFIX}<completed answer>. ${TOOL_PROSE_FINAL_PREFIX} must be the first character; do not use JSON, Markdown fences, plans, promises, or status updates.`
+      : plan.finalResponseFormat === "json_object"
+        ? "FINAL: emit exactly {\"type\":\"final\",\"content\":{...}} with content as one JSON object."
+        : "FINAL: emit exactly {\"type\":\"final\",\"content\":\"...\"}."
   const decisionRule = plan.choice === "required"
-    ? "DECISION: before any role=tool result appears, call one or more tools. Once a role=tool result appears, return FINAL unless another call is necessary."
-    : "DECISION: call a tool only when it is necessary for the original user request. After a usable tool result, return FINAL unless another call is necessary."
+    ? "DECISION: call one or more tools in this response, even when role=tool results already appear in the conversation."
+    : "DECISION: call a tool only when it is necessary for the original user request. After usable tool results, return FINAL unless another call is necessary."
   const parallelRule = plan.parallel
     ? "CALL LIMIT: independent calls may be returned together."
     : "CALL LIMIT: return exactly one call in tool_calls."
@@ -419,8 +420,8 @@ export function parseToolAction(content: unknown, plan: ToolPlan): ParsedToolAct
   }
 
   if (action.type === "final") {
-    if (plan.choice === "required" && !plan.hasToolResults) {
-      return invalidToolAction({ kind: "final_before_tool_results" }, "tool_choice requires a tool call before tool results arrive")
+    if (plan.choice === "required") {
+      return invalidToolAction({ kind: "final_when_tool_required" }, "tool_choice=required requires one or more tool calls in every response")
     }
     if (plan.finalResponseFormat === "json_object") {
       if (!isRecord(action.content)) return invalidToolAction({ kind: "final_content_not_json_object" }, "final.content must be a JSON object")

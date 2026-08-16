@@ -281,10 +281,9 @@ function encodeErrorBlock(content: string, reason: string): string {
 }
 
 function retryActionContract(plan: ToolPlan): string {
-  const mayReturnFinal = plan.choice === "auto" || plan.hasToolResults
   const final = allowsMarkedProse(plan)
     ? ` or FINAL: ${TOOL_PROSE_FINAL_PREFIX}<completed answer>`
-    : mayReturnFinal
+    : plan.choice === "auto"
       ? ', or FINAL: {"type":"final","content":"..."}'
       : ""
   return `Reply with exactly one CALL JSON object {"type":"tool_calls","content":"optional short progress update","tool_calls":[{"name":"tool_name","arguments":{}}]}. content is optional, user-visible, and at most 240 characters.${final} The proxy assigns ids; do not emit id.`
@@ -303,7 +302,10 @@ function buildRetryNudge(content: string, error: unknown, plan: ToolPlan): strin
       return `Your previous reply was empty. ${contract}`
     case "invalid_json":
       if (text && !/^[{[]/.test(text)) {
-        return `Your previous reply was unmarked prose. If it is a completed answer, re-emit it with "${TOOL_PROSE_FINAL_PREFIX}" as the first character; otherwise ${contract}`
+        if (allowsMarkedProse(plan)) {
+          return `Your previous reply was unmarked prose. If it is a completed answer, re-emit it with "${TOOL_PROSE_FINAL_PREFIX}" as the first character; otherwise ${contract}`
+        }
+        return `Your previous reply was unmarked prose. ${contract}`
       }
       return `Your previous reply was invalid JSON${failure.detail ? ` (${failure.detail})` : ""}. ${contract}`
     case "not_json_object":
@@ -328,8 +330,8 @@ function buildRetryNudge(content: string, error: unknown, plan: ToolPlan): strin
       return `Unknown function ${failure.name}. Use only a name from TOOL DEFINITIONS. ${contract}`
     case "schema_validation":
       return `Arguments for ${failure.name} failed schema validation: ${failure.details}. ${contract}`
-    case "final_before_tool_results":
-      return `A tool call is required before any tool result arrives. ${contract}`
+    case "final_when_tool_required":
+      return `tool_choice=required requires one or more tool calls in this response. ${contract}`
     case "final_content_not_json_object":
       return `FINAL content must be one JSON object. ${contract}`
     case "final_content_not_string":
@@ -358,7 +360,7 @@ function buildErrorDiagnosis(content: string, error: unknown): string {
     case "arguments_not_object": return `arguments for ${failure.name} were not a JSON object`
     case "unknown_function": return `unknown function ${failure.name}`
     case "schema_validation": return `arguments for ${failure.name} failed schema validation: ${failure.details}`
-    case "final_before_tool_results": return "a final response was returned before required tool results arrived"
+    case "final_when_tool_required": return "a final response was returned while tool_choice was required"
     case "final_content_not_json_object": return "final content was not a JSON object"
     case "final_content_not_string": return "final content was not a string"
     case "invalid_action_type": return "the action type was invalid"

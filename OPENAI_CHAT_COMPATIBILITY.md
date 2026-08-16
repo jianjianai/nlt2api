@@ -201,19 +201,20 @@
 2. 对门户强制使用 `response_format: {"type":"json_object"}`，不把外部 `tools` 字段传给门户。
 3. 在代理本地解析动作，限制可调用的函数名，并用 Ajv 按每个函数的 `parameters` JSON Schema 校验 arguments；根据 `$schema` 选择 draft-06/07、draft-2019-09 或 draft-2020-12 校验器。
 4. 为合法调用生成代理侧 call ID，并转换为标准 `choices[].message.tool_calls` / 流式 `delta.tool_calls`，同时把 finish_reason 改为 `tool_calls`。
-5. 下一轮把客户端传回的 assistant tool_calls 重新编码成动作历史，保留 `role: "tool"`、`tool_call_id` 和工具结果，使模型能够完成标准两轮循环。
+5. 下一轮把客户端传回的完整 assistant tool_calls 重新编码成动作历史，并要求其后紧接每个调用各一条具有匹配 `tool_call_id` 的 `role: "tool"` 结果；遗漏、重复、未知或被其他角色消息打断的结果返回 400 `invalid_message`。
+6. `tool_choice` 按请求独立生效：`required` 在每一次请求中都禁止最终回答并要求至少一个调用；客户端回传工具结果后若要生成最终正文，必须省略该字段或改为 `auto`。
 
 2026-08-16 在本地适配器连接真实 `/api/chat` 登录态后得到以下结果：
 
 | 用例 | 结果 |
 | --- | --- |
 | 非流式 `tool_choice: required` | 返回标准 `message.tool_calls`，函数名和 JSON arguments 正确 |
-| 两轮调用循环 | 首轮调用、回传 tool result、次轮最终正文全部成功 |
+| 两轮调用循环 | 首轮 `required` 返回调用；客户端回传完整 tool results 并以 `auto` 发起次轮后返回最终正文 |
 | 流式工具调用 | 思考增量实时返回，内部动作 JSON 被隐藏，末尾返回标准 `delta.tool_calls`、usage 和 `[DONE]` |
 | `tool_choice: none` | 走普通文本路径，不生成工具调用 |
 | 并行调用 | 单轮正确返回两个标准 tool calls；`parallel_tool_calls: false` 由代理严格限制 |
 | 指定函数 | 当前 `{ "type": "function", "name": "..." }` 形状正确强制目标函数 |
-| 本地自动化测试 | 15/15 通过，覆盖 Schema 拒绝、选择语义、并行限制、历史转换和流式转换 |
+| 本地自动化测试 | 覆盖 Schema 拒绝、逐请求选择语义、完整/损坏工具事务、并行限制、历史转换和流式转换 |
 
 该实现仍是模型协议仿真，而不是推理框架原生 tool parser。模型若输出无效动作，代理会失败关闭并返回 `invalid_tool_action`；代理也只负责生成调用，不负责执行用户函数。若未来门户启用 vLLM 的 Kimi K3 工具解析器，优先切换到原生通道并保留当前方案作为兼容回退。
 
@@ -444,6 +445,6 @@ image_url content parts（仅基础验证）
 - `POST /v1/chat/completions` 将已验证的 OpenAI 字段映射为门户 `POST /api/chat`；
 - 流式响应会移除门户的 pricing、energy、routing 注释，并将门户 `reasoning` / `reasoning_content` 统一映射为兼容扩展 `delta.reasoning_content`；非流式响应对应映射到 `choices[].message.reasoning_content`。连续对话中，客户端 assistant 消息携带的 `reasoning_content` 会反向映射为门户 `reasoning`。这不是 OpenAI Chat Completions 的正式字段，但可兼容常见的推理模型客户端约定。
 - `max_completion_tokens` 在本地转换为 `max_tokens`，已知无效语义字段返回标准 400；
-- 现代 function tools 会转换为受约束的 JSON 动作协议，本地执行函数名/参数 Schema/并行数量校验，并还原为 OpenAI 标准非流式和流式 `tool_calls`；支持完整的 assistant/tool 两轮历史；
+- 现代 function tools 会转换为受约束的 JSON 动作协议，本地执行函数名/参数 Schema/并行数量校验，并还原为 OpenAI 标准非流式和流式 `tool_calls`；严格校验 assistant tool calls 与对应 tool results 的完整事务，并按每次请求执行 `tool_choice` 语义；
 - 账号密码和会话 Cookie 保存于被 Git 忽略的 `.data/neuralwatt-accounts.yaml`，会话失效时先用 `/api/usage` 检查并自动重新登录；
 - 代理只在认证失败且上游尚未开始推理时切换账号，避免对未知执行状态的请求重复发送。

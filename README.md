@@ -86,7 +86,9 @@ curl.exe http://127.0.0.1:3000/v1/chat/completions `
 - `allowed_tools` 的 `auto` / `required` 子集；
 - `parallel_tool_calls: false` 会严格限制为一次最多一个调用。
 
-工具循环仍遵循 [OpenAI Function calling 指南](https://developers.openai.com/api/docs/guides/function-calling)中的 Chat Completions 流程：把首轮完整的 assistant message 追加到历史，再追加具有相同 `tool_call_id` 的 `role: "tool"` 消息，并在下一次请求中继续携带 `tools`。代理会把历史 `assistant.tool_calls` 重新编码给 Kimi，以便模型读取工具结果并生成最终答案。
+工具循环遵循 [OpenAI Function calling 指南](https://developers.openai.com/api/docs/guides/function-calling)中的 Chat Completions 流程：把首轮完整的 assistant message 追加到历史，紧接着为其中每个调用追加一条具有相同 `tool_call_id` 的 `role: "tool"` 消息，再发起新的 `/v1/chat/completions` 请求。代理会拒绝遗漏、重复、未知或被其他角色消息打断的工具结果，并把合法的 `assistant.tool_calls` 历史重新编码给 Kimi。
+
+`tool_choice` 是逐请求约束。`required` 要求当前响应必须产生至少一个工具调用，即使历史中已经有工具结果；若要让模型基于结果生成最终答案，下一次请求必须省略 `tool_choice` 或改为 `auto`。工具调用消息可以同时携带简短的用户可见 `content`，但客户端应以 `finish_reason: "tool_calls"` 和完整的 `tool_calls` 数组驱动执行循环，而不能把进度正文当作状态信号。
 
 流式请求会实时转发 `reasoning_content`，但不会把内部动作 JSON 暴露给客户端；动作完整且校验通过后才发出 `delta.tool_calls` 和 `finish_reason: "tool_calls"`。若模型生成无效 JSON、未知工具或不符合 Schema 的参数，非流式请求返回 HTTP 502 `invalid_tool_action`；流式响应已经开始后则通过 SSE error 事件结束。该方案是模型协议仿真，不等同于上游推理框架原生的 `kimi_k3` tool parser。
 

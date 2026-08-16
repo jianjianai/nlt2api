@@ -147,29 +147,85 @@ function shouldRestoreMarkedProse(plan: ToolPlan | undefined): boolean {
   return plan?.choice === "auto" && plan.finalResponseFormat === "text"
 }
 
-function hasToolResults(value: unknown): boolean {
-  if (!Array.isArray(value) || value.length === 0) return false
-  let index = value.length - 1
-  let foundToolResult = false
+function invalidMessage(message: string, param: string): never {
+  throw new AppError(message, 400, "invalid_message", param, "invalid_request_error")
+}
 
-  while (index >= 0) {
-    const item = value[index]
-    if (!isRecord(item)) return false
-    if (item.role === "tool") {
-      foundToolResult = true
-      index -= 1
+function validateToolMessageSequence(messages: unknown[]): void {
+  let pending: Set<string> | undefined
+  let resolved = new Set<string>()
+  let pendingParam = "messages"
+
+  for (let index = 0; index < messages.length; index += 1) {
+    const item = messages[index]
+    if (!isRecord(item) || typeof item.role !== "string") continue
+
+    if (pending && pending.size > 0) {
+      if (item.role !== "tool") {
+        return invalidMessage(
+          `messages[${index}].role must be tool while responses are pending for: ${[...pending].join(", ")}`,
+          `messages[${index}].role`
+        )
+      }
+
+      const param = `messages[${index}].tool_call_id`
+      if (typeof item.tool_call_id !== "string" || !item.tool_call_id) {
+        return invalidMessage(`${param} is required for a tool message`, param)
+      }
+      if (!pending.has(item.tool_call_id)) {
+        const detail = resolved.has(item.tool_call_id)
+          ? `duplicates an earlier response for ${item.tool_call_id}`
+          : `does not match any pending tool call: ${item.tool_call_id}`
+        return invalidMessage(`${param} ${detail}`, param)
+      }
+
+      pending.delete(item.tool_call_id)
+      resolved.add(item.tool_call_id)
+      if (pending.size === 0) pending = undefined
       continue
     }
-    return foundToolResult && item.role === "assistant" && hasOwn(item, "tool_calls")
+
+    if (item.role === "tool") {
+      return invalidMessage(
+        `messages[${index}] with role=tool must respond to a preceding assistant message with tool_calls`,
+        `messages[${index}].tool_call_id`
+      )
+    }
+    if (item.role !== "assistant" || !hasOwn(item, "tool_calls")) continue
+
+    pendingParam = `messages[${index}].tool_calls`
+    if (!Array.isArray(item.tool_calls) || item.tool_calls.length === 0) {
+      return invalidMessage(`${pendingParam} must be a non-empty array`, pendingParam)
+    }
+
+    pending = new Set<string>()
+    resolved = new Set<string>()
+    for (let callIndex = 0; callIndex < item.tool_calls.length; callIndex += 1) {
+      const call = item.tool_calls[callIndex]
+      const param = `${pendingParam}[${callIndex}].id`
+      if (!isRecord(call) || typeof call.id !== "string" || !call.id) {
+        return invalidMessage(`${param} is required`, param)
+      }
+      if (pending.has(call.id)) {
+        return invalidMessage(`${param} duplicates tool call id ${call.id}`, param)
+      }
+      pending.add(call.id)
+    }
   }
 
-  return false
+  if (pending && pending.size > 0) {
+    return invalidMessage(
+      `${pendingParam} must be followed by tool messages for every tool call id; missing: ${[...pending].join(", ")}`,
+      pendingParam
+    )
+  }
 }
 
 function normalizeMessages(value: unknown, restoreMarkedProse: boolean): JsonObject[] {
   if (!Array.isArray(value) || value.length === 0) {
     throw new AppError("messages must be a non-empty array", 400, "invalid_messages", "messages", "invalid_request_error")
   }
+  validateToolMessageSequence(value)
 
   return value.flatMap((item, index) => {
     if (!isRecord(item) || typeof item.role !== "string") {
@@ -273,7 +329,7 @@ export function validateChatRequest(input: unknown): ValidatedChatRequest {
     responseFormat = input.response_format.type
   }
 
-  const toolPlan = parseToolPlan(input, responseFormat, hasToolResults(input.messages))
+  const toolPlan = parseToolPlan(input, responseFormat)
   const messages = normalizeMessages(input.messages, shouldRestoreMarkedProse(toolPlan))
   const portalPayload: JsonObject = {
     model: input.model,
