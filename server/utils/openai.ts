@@ -28,7 +28,11 @@ const supportedFields = new Set([
   "stream_options",
   "tools",
   "tool_choice",
-  "parallel_tool_calls"
+  "parallel_tool_calls",
+  // Accepted but dropped: the portal accepts reasoning_effort without any
+  // reasoning-control semantics (verified in OPENAI_CHAT_COMPATIBILITY.md),
+  // and rejecting it breaks clients like opencode that send it.
+  "reasoning_effort"
 ])
 
 const unsupportedFields = new Set([
@@ -49,7 +53,6 @@ const unsupportedFields = new Set([
   "metadata",
   "safety_identifier",
   "service_tier",
-  "reasoning_effort",
   "verbosity",
   "presence_penalty",
   "frequency_penalty",

@@ -64,6 +64,15 @@ test("keeps a tiny max_tokens when no tool protocol is active", () => {
   assert.equal(result.portalPayload.max_tokens, 32)
 })
 
+test("accepts reasoning_effort and drops it instead of forwarding it", () => {
+  const result = validateChatRequest({
+    model: "kimi-k3",
+    messages: [{ role: "user", content: "hello" }],
+    reasoning_effort: "high"
+  })
+  assert.equal(result.portalPayload.reasoning_effort, undefined)
+})
+
 test("maps historical assistant reasoning_content to the portal reasoning field", () => {
   const result = validateChatRequest({
     model: "kimi-k3",
