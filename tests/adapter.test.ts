@@ -195,6 +195,43 @@ test("allows the marked direct-answer branch for auto text tool requests", () =>
   const messages = result.portalPayload.messages as Array<Record<string, unknown>>
   assert.match(messages[0].content as string, /\u25c6/)
   assert.match(messages[0].content as string, /committed final answer/)
+  assert.match(messages[0].content as string, /do not wrap it in JSON/)
+})
+
+test("restores the direct-answer marker on compatible assistant history", () => {
+  const result = validateChatRequest({
+    model: "kimi-k3",
+    messages: [
+      { role: "assistant", content: "Completed answer." },
+      { role: "user", content: "Continue." }
+    ],
+    tools: [weatherTool]
+  })
+
+  const messages = result.portalPayload.messages as Array<Record<string, unknown>>
+  assert.equal(messages[1].content, "\u25c6Completed answer.")
+  assert.equal(messages[2].content, "Continue.")
+})
+
+test("does not restore the marker on tool-call history or requests without an auto text tool plan", () => {
+  const withToolCall = validateChatRequest({
+    model: "kimi-k3",
+    messages: [{
+      role: "assistant",
+      content: null,
+      tool_calls: [{ id: "call_test", type: "function", function: { name: "get_weather", arguments: { city: "Paris" } } }]
+    }],
+    tools: [weatherTool]
+  })
+  const toolMessage = (withToolCall.portalPayload.messages as Array<Record<string, unknown>>)[1]
+  assert.doesNotMatch(toolMessage.content as string, /^\u25c6/)
+
+  const withoutTools = validateChatRequest({
+    model: "kimi-k3",
+    messages: [{ role: "assistant", content: "Completed answer." }]
+  })
+  const plainMessage = (withoutTools.portalPayload.messages as Array<Record<string, unknown>>)[0]
+  assert.equal(plainMessage.content, "Completed answer.")
 })
 
 test("tool_choice none leaves the normal response path active", () => {

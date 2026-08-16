@@ -1,5 +1,5 @@
 import { AppError } from "./errors"
-import { buildToolProtocol, encodeAssistantToolCalls, parseToolPlan, type ToolPlan } from "./tools"
+import { TOOL_PROSE_FINAL_PREFIX, buildToolProtocol, encodeAssistantToolCalls, parseToolPlan, type ToolPlan } from "./tools"
 
 type JsonObject = Record<string, unknown>
 
@@ -143,7 +143,11 @@ function decodeErrorBlocks(reasoning: string): { attempts: { prev: string; out: 
   return { attempts, re: reasoning.slice(cursor) }
 }
 
-function normalizeMessages(value: unknown): JsonObject[] {
+function shouldRestoreMarkedProse(plan: ToolPlan | undefined): boolean {
+  return plan?.choice === "auto" && plan.finalResponseFormat === "text"
+}
+
+function normalizeMessages(value: unknown, restoreMarkedProse: boolean): JsonObject[] {
   if (!Array.isArray(value) || value.length === 0) {
     throw new AppError("messages must be a non-empty array", 400, "invalid_messages", "messages", "invalid_request_error")
   }
@@ -166,7 +170,12 @@ function normalizeMessages(value: unknown): JsonObject[] {
     if (item.role === "assistant" && hasOwn(item, "tool_calls")) {
       message.content = encodeAssistantToolCalls(item.tool_calls, `messages[${index}].tool_calls`)
     } else if (hasOwn(item, "content")) {
-      message.content = normalizeContent(item.content, `messages[${index}].content`)
+      const content = normalizeContent(item.content, `messages[${index}].content`)
+      // Direct answers leave the relay without the marker, but must regain it
+      // before returning to the model so the tool-protocol history is stable.
+      message.content = restoreMarkedProse && item.role === "assistant" && !hasOwn(item, "function_call") && typeof content === "string" && content && !content.startsWith(TOOL_PROSE_FINAL_PREFIX)
+        ? `${TOOL_PROSE_FINAL_PREFIX}${content}`
+        : content
     } else {
       throw new AppError(`messages[${index}].content is required`, 400, "invalid_message", `messages[${index}].content`, "invalid_request_error")
     }
@@ -233,7 +242,16 @@ export function validateChatRequest(input: unknown): ValidatedChatRequest {
     throw new AppError("stream must be a boolean", 400, "invalid_parameter", "stream", "invalid_request_error")
   }
 
-  const messages = normalizeMessages(input.messages)
+  let responseFormat: "text" | "json_object" = "text"
+  if (hasOwn(input, "response_format")) {
+    if (!isRecord(input.response_format) || (input.response_format.type !== "text" && input.response_format.type !== "json_object")) {
+      throw new AppError("Only response_format text and json_object are supported", 400, "unsupported_response_format", "response_format", "invalid_request_error")
+    }
+    responseFormat = input.response_format.type
+  }
+
+  const toolPlan = parseToolPlan(input, responseFormat)
+  const messages = normalizeMessages(input.messages, shouldRestoreMarkedProse(toolPlan))
   const portalPayload: JsonObject = {
     model: input.model,
     messages,
@@ -257,15 +275,6 @@ export function validateChatRequest(input: unknown): ValidatedChatRequest {
     portalPayload.max_tokens = maxTokens ?? maxCompletionTokens
   }
 
-  let responseFormat: "text" | "json_object" = "text"
-  if (hasOwn(input, "response_format")) {
-    if (!isRecord(input.response_format) || (input.response_format.type !== "text" && input.response_format.type !== "json_object")) {
-      throw new AppError("Only response_format text and json_object are supported", 400, "unsupported_response_format", "response_format", "invalid_request_error")
-    }
-    responseFormat = input.response_format.type
-  }
-
-  const toolPlan = parseToolPlan(input, responseFormat)
   if (toolPlan) {
     let insertionIndex = 0
     while (insertionIndex < messages.length && messages[insertionIndex].role === "system") insertionIndex += 1
