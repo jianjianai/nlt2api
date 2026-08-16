@@ -112,8 +112,9 @@ test("maps historical assistant reasoning_content to the portal reasoning field"
   assert.equal(message.reasoning_content, undefined)
 })
 
-test("reconstructs a failed attempt from an echoed cross-turn error block", () => {
-  const block = `[NWERR-START]${JSON.stringify({ v: 1, out: '{"type":"tool_calls","tool_calls":[{"name":"get_weather"', reason: "Kimi returned an invalid tool action: the response was not valid JSON: Unexpected end of JSON input" })}[NWERR-END]`
+test("reconstructs a failed attempt and its correction from an echoed error block", () => {
+  const reason = "Kimi returned an invalid tool action: the response was not valid JSON: Unexpected end of JSON input"
+  const block = `[NWERR-START]${JSON.stringify({ v: 1, out: '{"type":"tool_calls","tool_calls":[{"name":"get_weather"', reason })}[NWERR-END]`
   const result = validateChatRequest({
     model: "kimi-k3",
     messages: [
@@ -121,19 +122,20 @@ test("reconstructs a failed attempt from an echoed cross-turn error block", () =
     ]
   })
   const messages = result.portalPayload.messages as Array<Record<string, unknown>>
-  assert.equal(messages.length, 2)
-  // Failed attempt is re-materialized first, with the error output and reason.
+  assert.equal(messages.length, 3)
+  // The failed output remains an assistant attempt.
   assert.equal(messages[0].role, "assistant")
-  assert.match(messages[0].reasoning as string, /first thinking/)
-  assert.match(messages[0].reasoning as string, /This attempt was invalid/)
+  assert.equal(messages[0].reasoning, "first thinking")
   assert.equal(messages[0].content, '{"type":"tool_calls","tool_calls":[{"name":"get_weather"')
-  // Corrected attempt follows, with the block stripped from its reasoning.
-  assert.equal(messages[1].role, "assistant")
-  assert.equal(messages[1].reasoning, " corrected thinking")
-  assert.match(messages[1].content as string, /tool_calls/)
+  // The diagnosis is the user correction that caused the retry.
+  assert.deepEqual(messages[1], { role: "user", content: reason })
+  // The corrected attempt follows, with the block stripped from its reasoning.
+  assert.equal(messages[2].role, "assistant")
+  assert.equal(messages[2].reasoning, " corrected thinking")
+  assert.match(messages[2].content as string, /tool_calls/)
 })
 
-test("reconstructs multiple failed attempts when the reasoning echoes several error blocks", () => {
+test("reconstructs multiple failed attempts with their corrections in order", () => {
   const block1 = `[NWERR-START]${JSON.stringify({ v: 1, out: "first broken", reason: "your previous reply was not valid JSON" })}[NWERR-END]`
   const block2 = `[NWERR-START]${JSON.stringify({ v: 1, out: "second broken", reason: "your previous reply was empty" })}[NWERR-END]`
   const result = validateChatRequest({
@@ -143,18 +145,14 @@ test("reconstructs multiple failed attempts when the reasoning echoes several er
     ]
   })
   const messages = result.portalPayload.messages as Array<Record<string, unknown>>
-  assert.equal(messages.length, 3)
-  assert.equal(messages[0].role, "assistant")
-  assert.match(messages[0].reasoning as string, /t1/)
-  assert.match(messages[0].reasoning as string, /This attempt was invalid: your previous reply was not valid JSON/)
-  assert.equal(messages[0].content, "first broken")
-  assert.equal(messages[1].role, "assistant")
-  assert.match(messages[1].reasoning as string, /t2/)
-  assert.match(messages[1].reasoning as string, /This attempt was invalid: your previous reply was empty/)
-  assert.equal(messages[1].content, "second broken")
-  assert.equal(messages[2].role, "assistant")
-  assert.equal(messages[2].reasoning, "t3")
-  assert.match(messages[2].content as string, /tool_calls/)
+  assert.equal(messages.length, 5)
+  assert.deepEqual(messages[0], { role: "assistant", reasoning: "t1", content: "first broken" })
+  assert.deepEqual(messages[1], { role: "user", content: "your previous reply was not valid JSON" })
+  assert.deepEqual(messages[2], { role: "assistant", reasoning: "t2", content: "second broken" })
+  assert.deepEqual(messages[3], { role: "user", content: "your previous reply was empty" })
+  assert.equal(messages[4].role, "assistant")
+  assert.equal(messages[4].reasoning, "t3")
+  assert.match(messages[4].content as string, /tool_calls/)
 })
 
 test("ignores malformed cross-turn error blocks in reasoning", () => {

@@ -185,16 +185,20 @@ function normalizeMessages(value: unknown): JsonObject[] {
       if (typeof reasoningContent === "string") {
         const decoded = decodeErrorBlocks(reasoningContent)
         if (decoded) {
-          // The reasoning echoes failed attempts from earlier turns (encoded
-          // into the stream by the tool relay, one block per retry).
-          // Re-materialize each as its own assistant turn so the model sees
-          // its previous errors, then emit the corrected attempt with all
-          // blocks stripped out.
-          const failedTurns = decoded.attempts.map((attempt) => ({
-            role: "assistant",
-            reasoning: attempt.prev + (attempt.reason ? `\n[This attempt was invalid: ${attempt.reason}]` : ""),
-            content: attempt.out || null
-          }))
+          // Re-materialize each failed attempt as an assistant turn followed
+          // by the user correction that prompted the retry. The corrected
+          // attempt follows with all error blocks stripped from its reasoning.
+          const failedTurns = decoded.attempts.flatMap((attempt) => [
+            {
+              role: "assistant",
+              reasoning: attempt.prev || null,
+              content: attempt.out || null
+            },
+            {
+              role: "user",
+              content: attempt.reason
+            }
+          ])
           message.reasoning = decoded.re || null
           return [...failedTurns, message]
         }
