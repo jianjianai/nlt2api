@@ -114,12 +114,34 @@ function normalizeContent(content: unknown, param: string): unknown {
   })
 }
 
+// Parses a cross-turn error block embedded in assistant reasoning (emitted by
+// the tool relay when a retry happens). Returns the failed attempt's previous
+// reasoning, its error output, the error reason, and the corrected reasoning
+// after the block; null when no valid block is present.
+function decodeErrorBlock(reasoning: string): { prev: string; out: string; reason: string; re: string } | null {
+  const match = reasoning.match(/\[NWERR-START\]([\s\S]*?)\[NWERR-END\]/)
+  if (!match || match.index === undefined) return null
+  try {
+    const payload = JSON.parse(match[1]) as { out?: unknown; reason?: unknown }
+    if (typeof payload.out !== "string" || typeof payload.reason !== "string") return null
+    return {
+      prev: reasoning.slice(0, match.index),
+      out: payload.out,
+      reason: payload.reason,
+      re: reasoning.slice(match.index + match[0].length)
+    }
+  } catch {
+    // Malformed or truncated block: treat as absent.
+    return null
+  }
+}
+
 function normalizeMessages(value: unknown): JsonObject[] {
   if (!Array.isArray(value) || value.length === 0) {
     throw new AppError("messages must be a non-empty array", 400, "invalid_messages", "messages", "invalid_request_error")
   }
 
-  return value.map((item, index) => {
+  return value.flatMap((item, index) => {
     if (!isRecord(item) || typeof item.role !== "string") {
       throw new AppError(`messages[${index}] must contain a role`, 400, "invalid_message", `messages[${index}]`, "invalid_request_error")
     }
@@ -153,9 +175,25 @@ function normalizeMessages(value: unknown): JsonObject[] {
       if (typeof reasoningContent !== "string" && reasoningContent !== null) {
         throw new AppError(`messages[${index}].reasoning_content must be a string or null`, 400, "invalid_message", `messages[${index}].reasoning_content`, "invalid_request_error")
       }
+      if (typeof reasoningContent === "string") {
+        const decoded = decodeErrorBlock(reasoningContent)
+        if (decoded) {
+          // The reasoning echoes a failed attempt from an earlier turn (encoded
+          // into the stream by the tool relay). Re-materialize it as its own
+          // assistant turn so the model sees its previous error, then emit the
+          // corrected attempt with the block stripped out.
+          const failed: JsonObject = {
+            role: "assistant",
+            reasoning: decoded.prev + (decoded.reason ? `\n[This attempt was invalid: ${decoded.reason}]` : ""),
+            content: decoded.out || null
+          }
+          message.reasoning = decoded.re || null
+          return [failed, message]
+        }
+      }
       message.reasoning = reasoningContent
     }
-    return message
+    return [message]
   })
 }
 

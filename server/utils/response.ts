@@ -253,6 +253,14 @@ const TOOL_ACTION_MAX_RETRIES = 1
 // the trimmed prose so the caller can deliver it as a final message; otherwise
 // returns null. "Attempted JSON" (starts with { or [) is a broken action and
 // must not be mistaken for a final answer.
+// Encodes the failed attempt (error output + reason) as a self-contained
+// marker block appended to the reasoning stream. Echoing clients carry it
+// verbatim into the next turn, where decodeErrorBlock re-materializes the
+// failed attempt so the model can see its own previous error.
+function encodeErrorBlock(content: string, reason: string): string {
+  return `[NWERR-START]${JSON.stringify({ v: 1, out: content, reason })}[NWERR-END]`
+}
+
 function proseCandidate(content: string, error: unknown): string | null {
   const text = content.trim()
   if (!text) return null
@@ -423,6 +431,14 @@ export function createToolSseRelay(
               const nudge = buildRetryNudge(content, error, plan.choice)
               const failedReasoning = reasoningText.slice(-2000)
               const failedContent = content.slice(-1500)
+              // Encode the failed attempt into the reasoning stream so echoing
+              // clients carry it to the next turn for cross-turn error memory.
+              if (failedContent || failedReasoning) {
+                controller.enqueue(formatSse({
+                  ...(identity ?? completionChunkIdentity({}, model)),
+                  choices: [{ index: 0, delta: { reasoning_content: encodeErrorBlock(failedContent, error instanceof AppError ? error.message : "") }, finish_reason: null }]
+                }))
+              }
               content = ""
               identity = undefined
               usage = undefined

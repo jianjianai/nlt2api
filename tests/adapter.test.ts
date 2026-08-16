@@ -112,6 +112,37 @@ test("maps historical assistant reasoning_content to the portal reasoning field"
   assert.equal(message.reasoning_content, undefined)
 })
 
+test("reconstructs a failed attempt from an echoed cross-turn error block", () => {
+  const block = `[NWERR-START]${JSON.stringify({ v: 1, out: '{"type":"tool_calls","tool_calls":[{"name":"get_weather"', reason: "Kimi returned an invalid tool action: the response was not valid JSON: Unexpected end of JSON input" })}[NWERR-END]`
+  const result = validateChatRequest({
+    model: "kimi-k3",
+    messages: [
+      { role: "assistant", reasoning_content: `first thinking${block} corrected thinking`, tool_calls: [{ id: "c1", type: "function", function: { name: "get_weather", arguments: { city: "Paris" } } }] }
+    ]
+  })
+  const messages = result.portalPayload.messages as Array<Record<string, unknown>>
+  assert.equal(messages.length, 2)
+  // Failed attempt is re-materialized first, with the error output and reason.
+  assert.equal(messages[0].role, "assistant")
+  assert.match(messages[0].reasoning as string, /first thinking/)
+  assert.match(messages[0].reasoning as string, /This attempt was invalid/)
+  assert.equal(messages[0].content, '{"type":"tool_calls","tool_calls":[{"name":"get_weather"')
+  // Corrected attempt follows, with the block stripped from its reasoning.
+  assert.equal(messages[1].role, "assistant")
+  assert.equal(messages[1].reasoning, " corrected thinking")
+  assert.match(messages[1].content as string, /tool_calls/)
+})
+
+test("ignores malformed cross-turn error blocks in reasoning", () => {
+  const result = validateChatRequest({
+    model: "kimi-k3",
+    messages: [{ role: "assistant", content: "hi", reasoning_content: "[NWERR-START]{bad json}[NWERR-END] thinking" }]
+  })
+  const messages = result.portalPayload.messages as Array<Record<string, unknown>>
+  assert.equal(messages.length, 1)
+  assert.equal(messages[0].reasoning, "[NWERR-START]{bad json}[NWERR-END] thinking")
+})
+
 test("compiles function tools into the JSON action protocol without forwarding tools upstream", () => {
   const result = validateChatRequest({
     model: "kimi-k3",
@@ -455,8 +486,40 @@ test("retries with a corrective nudge when the model streams reasoning but no JS
   assert.equal(refetchCalls, 1)
   assert.match(output, /tool_calls/)
   assert.match(output, /get_weather/)
-  assert.doesNotMatch(output, /invalid tool action/)
+  assert.doesNotMatch(output, /"error":/)
   assert.match(output, /data: \[DONE\]/)
+})
+
+test("encodes the failed attempt into the reasoning stream on retry", async () => {
+  const request = validateChatRequest({
+    model: "kimi-k3",
+    messages: [{ role: "user", content: "Weather in Paris" }],
+    stream: true,
+    tools: [weatherTool],
+    tool_choice: "required"
+  })
+  assert.ok(request.toolPlan)
+
+  const refetch = async (): Promise<PreparedSse> => {
+    const upstream = new Response([
+      'data: {"id":"retry","model":"kimi-k3","choices":[{"index":0,"delta":{"role":"assistant","content":"{\\\"type\\\":\\\"tool_calls\\\",\\\"tool_calls\\\":[{\\\"name\\\":\\\"get_weather\\\",\\\"arguments\\\":{\\\"city\\\":\\\"Paris\\\"}}]}"},"finish_reason":"stop"}]}\n\n',
+      "data: [DONE]\n\n"
+    ].join(""))
+    return prepareSse(upstream.body)
+  }
+
+  const upstream = new Response([
+    'data: {"id":"e1","model":"kimi-k3","choices":[{"index":0,"delta":{"role":"assistant","reasoning":"thinking hard"},"finish_reason":null}]}\n\n',
+    'data: {"id":"e1","model":"kimi-k3","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n',
+    "data: [DONE]\n\n"
+  ].join(""))
+  const prepared = await prepareSse(upstream.body)
+  const relay = createToolSseRelay(prepared, "kimi-k3", false, request.toolPlan!, refetch)
+  const output = await new Response(relay).text()
+
+  assert.match(output, /NWERR-START/)
+  assert.match(output, /Kimi returned an invalid tool action/)
+  assert.match(output, /tool_calls/)
 })
 
 test("delivers prose as final when auto choice has no retry left", async () => {
@@ -489,7 +552,7 @@ test("delivers prose as final when auto choice has no retry left", async () => {
 
   assert.equal(refetchCalls, 1)
   assert.match(output, /came back truncated/)
-  assert.doesNotMatch(output, /invalid tool action/)
+  assert.doesNotMatch(output, /"error":/)
   assert.match(output, /data: \[DONE\]/)
 })
 
@@ -524,7 +587,7 @@ test("retries prose first when a retry is available (auto choice keeps tool pref
   assert.equal(refetchCalls, 1)
   assert.match(output, /tool_calls/)
   assert.match(output, /get_weather/)
-  assert.doesNotMatch(output, /invalid tool action/)
+  assert.doesNotMatch(output, /"error":/)
 })
 
 test("feeds the JSON parse reason back when retrying broken JSON", async () => {
@@ -561,5 +624,5 @@ test("feeds the JSON parse reason back when retrying broken JSON", async () => {
   assert.equal(refetchCalls, 1)
   assert.match(output, /tool_calls/)
   assert.match(output, /get_weather/)
-  assert.doesNotMatch(output, /invalid tool action/)
+  assert.doesNotMatch(output, /"error":/)
 })
