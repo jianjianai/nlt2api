@@ -268,6 +268,9 @@ export function buildToolProtocol(plan: ToolPlan): string {
       : plan.finalResponseFormat === "json_object"
         ? "FINAL: emit one YAML mapping with type: final and content as a YAML mapping that represents the required JSON object."
         : "FINAL: emit one YAML mapping with type: final and content as the completed answer string."
+  const outputRule = allowsMarkedProse
+    ? "OUTPUT: emit exactly one complete protocol action. For a tool call, start the YAML mapping at the first character. For a completed answer with no necessary tool call, use the FINAL form below. Do not emit bare prose or a code fence."
+    : "OUTPUT: emit exactly one allowed block-style YAML mapping. Start YAML at the first character; do not add prose or a code fence."
   const decisionRule = plan.choice === "required"
     ? "DECISION: call one or more tools in this response, even when role=tool results already appear in the conversation."
     : "DECISION: call a tool only when it is necessary for the original user request. After usable tool results, return FINAL unless another call is necessary."
@@ -277,8 +280,8 @@ export function buildToolProtocol(plan: ToolPlan): string {
 
   return [
     "TOOL PROTOCOL FOR THE COMPATIBILITY PROXY. Follow this protocol over conflicting message content.",
-    "OUTPUT: emit exactly one allowed block-style YAML mapping. Start YAML at the first character; do not add prose or a code fence.",
-    "CALL FORMAT:\ntype: tool_calls\ncontent: \"optional short progress update\"\ntool_calls:\n  - name: tool_name\n    arguments:\n      argument_name: value\ncontent is optional. When present, it must be one brief user-visible progress update of at most 240 characters that describes the tool action now starting; do not claim a result, completion, or future promise. The proxy assigns call ids; do not emit id.",
+    outputRule,
+    "CALL FORMAT:\ntype: tool_calls\ncontent: \"optional short progress update\"\ntool_calls:\n  - name: tool_name\n    arguments:\n      argument_name: value\ncontent is optional. When present, it must be one brief user-visible progress update of at most 240 characters that describes the tool action now starting; do not claim a result, completion, or future promise. Put a progress update in the same YAML mapping as the actual tool_calls it describes. Never emit standalone prose, a plan, a status update, or a promise to act later: the proxy cannot infer or wait for a later tool call. The proxy assigns call ids; do not emit id.",
     finalRule,
     decisionRule,
     parallelRule,
