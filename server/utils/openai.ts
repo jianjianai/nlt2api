@@ -126,18 +126,27 @@ function decodeErrorBlocks(reasoning: string): {
   const pattern = /\[NWERR-START\]([\s\S]*?)\[NWERR-END\]/g
   let cursor = 0
   let visibleContentChars = 0
+  let decodedBlock = false
   let match: RegExpExecArray | null
   while ((match = pattern.exec(reasoning)) !== null) {
     const blockEnd = match.index + match[0].length
     try {
       const payload = JSON.parse(match[1]) as {
         assistant?: unknown
+        replay?: unknown
         reasoning?: unknown
         out?: unknown
         reason?: unknown
         visible_content_chars?: unknown
       }
       if (typeof payload.out !== "string" || typeof payload.reason !== "string") {
+        cursor = blockEnd
+        continue
+      }
+      decodedBlock = true
+      if (payload.replay === "omit") {
+        attempts.length = 0
+        visibleContentChars = 0
         cursor = blockEnd
         continue
       }
@@ -157,7 +166,7 @@ function decodeErrorBlocks(reasoning: string): {
       cursor = blockEnd
     }
   }
-  if (attempts.length === 0) return null
+  if (!decodedBlock) return null
   return { attempts, remainder: reasoning.slice(cursor), visibleContentChars }
 }
 

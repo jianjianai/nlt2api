@@ -131,13 +131,24 @@ async function preparePortalSse(account: StoredAccount, request: ValidatedChatRe
 }
 
 type ReplayableContinuation = Pick<OutputLengthContinuation, "reasoning" | "content" | "nudge">
+  & Partial<Pick<ToolActionRetry, "context">>
+
+function waitForRetry(retry: ToolActionRetry): Promise<void> {
+  if (retry.retryAfterMs <= 0) return Promise.resolve()
+  return new Promise((resolve) => setTimeout(resolve, retry.retryAfterMs))
+}
 
 export function createContinuationPayloadBuilder(portalPayload: Record<string, unknown>): (continuation: ReplayableContinuation) => Record<string, unknown> {
-  const messages = Array.isArray(portalPayload.messages) ? [...portalPayload.messages] : []
+  const baseMessages = Array.isArray(portalPayload.messages) ? [...portalPayload.messages] : []
+  let messages = [...baseMessages]
+  let isolatedRecoveryActive = false
   return (continuation) => {
-    // Preserve every prior assistant -> user retry pair verbatim. The next
-    // upstream request then extends the preceding one, enabling prefix caching.
-    if (continuation.content || continuation.reasoning) {
+    if (continuation.context === "isolated" || (isolatedRecoveryActive && continuation.context !== undefined)) {
+      // Format recovery starts from the original request so malformed output
+      // cannot become instructions in any later correction turn.
+      messages = [...baseMessages]
+      isolatedRecoveryActive = true
+    } else if (continuation.content || continuation.reasoning) {
       messages.push({
         role: "assistant",
         ...(continuation.reasoning ? { reasoning: continuation.reasoning } : {}),
@@ -198,7 +209,8 @@ async function proxyForAccount(account: StoredAccount, request: ValidatedChatReq
       }
     }
     const refetch = async (retry: ToolActionRetry): Promise<unknown> => {
-      console.warn(`[proxy] tool action retry cause=${retry.cause} account=${account.label} model=${request.model} preserved reasoning_chars=${retry.reasoning.length} content_chars=${retry.content.length}`)
+      console.warn(`[proxy] tool action retry cause=${retry.cause} attempt=${retry.attempt} context=${retry.context} retry_after_ms=${retry.retryAfterMs} account=${account.label} model=${request.model} preserved reasoning_chars=${retry.reasoning.length} content_chars=${retry.content.length}`)
+      await waitForRetry(retry)
       return fetchJson(continuationPayload(retry))
     }
     return {
@@ -210,7 +222,8 @@ async function proxyForAccount(account: StoredAccount, request: ValidatedChatReq
   const prepared = await preparePortalSse(account, request)
   if (request.toolPlan) {
     const refetch = async (retry: ToolActionRetry): Promise<PreparedSse> => {
-      console.warn(`[proxy] tool action retry cause=${retry.cause} account=${account.label} model=${request.model} preserved reasoning_chars=${retry.reasoning.length} content_chars=${retry.content.length}`)
+      console.warn(`[proxy] tool action retry cause=${retry.cause} attempt=${retry.attempt} context=${retry.context} retry_after_ms=${retry.retryAfterMs} account=${account.label} model=${request.model} preserved reasoning_chars=${retry.reasoning.length} content_chars=${retry.content.length}`)
+      await waitForRetry(retry)
       return preparePortalSse(account, { ...request, portalPayload: continuationPayload(retry) })
     }
     return {

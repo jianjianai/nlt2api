@@ -1517,3 +1517,143 @@ test("feeds the XML parse reason back when retrying a broken action", async () =
   assert.match(output, /get_weather/)
   assert.doesNotMatch(output, /"error":/)
 })
+
+test("isolates the second consecutive malformed XML recovery for non-streaming completions", async () => {
+  const request = validateChatRequest({
+    model: "kimi-k3",
+    messages: [{ role: "user", content: "Weather in Paris" }],
+    tools: [weatherTool],
+    tool_choice: "required"
+  })
+  assert.ok(request.toolPlan)
+  const malformed = "<tool_calls><tool_call><name><![CDATA[get_weather]]></name></arguments></tool_call></tool_calls>"
+  const retries: Array<{ attempt: number; context: string; nudge: string }> = []
+
+  const completion = await normalizeToolCompletionWithRetry({
+    choices: [{ message: { content: malformed }, finish_reason: "stop" }]
+  }, "kimi-k3", request.toolPlan!, async (retry) => {
+    retries.push({ attempt: retry.attempt, context: retry.context, nudge: retry.nudge })
+    if (retry.attempt === 1) {
+      assert.equal(retry.context, "extend")
+      assert.match(retry.nudge, /XML parse failed/)
+      return { choices: [{ message: { content: malformed }, finish_reason: "stop" }] }
+    }
+    assert.equal(retry.context, "isolated")
+    assert.equal(retry.retryAfterMs, 0)
+    assert.match(retry.nudge, /Format recovery/)
+    assert.doesNotMatch(retry.nudge, /unexpected close tag/)
+    if (retry.attempt === 2) {
+      return { choices: [{ message: { content: malformed }, finish_reason: "stop" }] }
+    }
+    assert.equal(retry.attempt, 3)
+    return {
+      choices: [{
+        message: { content: xmlToolCalls([{ name: "get_weather", arguments: { city: "Paris" } }]) },
+        finish_reason: "stop"
+      }]
+    }
+  })
+
+  const choice = (completion.choices as Array<Record<string, unknown>>)[0]
+  assert.equal(choice.finish_reason, "tool_calls")
+  assert.deepEqual(retries.map(({ attempt, context }) => ({ attempt, context })), [
+    { attempt: 1, context: "extend" },
+    { attempt: 2, context: "isolated" },
+    { attempt: 3, context: "isolated" }
+  ])
+})
+
+test("isolates the second consecutive malformed XML recovery for SSE completions", async () => {
+  const request = validateChatRequest({
+    model: "kimi-k3",
+    messages: [{ role: "user", content: "Weather in Paris" }],
+    stream: true,
+    tools: [weatherTool],
+    tool_choice: "required"
+  })
+  assert.ok(request.toolPlan)
+  const frame = (value: unknown) => `data: ${JSON.stringify(value)}\n\n`
+  const malformed = "<tool_calls><tool_call><name><![CDATA[get_weather]]></name></arguments></tool_call></tool_calls>"
+  const streamFor = async (id: string, content: string): Promise<PreparedSse> => prepareSse(new Response([
+    frame({ id, model: "kimi-k3", choices: [{ index: 0, delta: { role: "assistant", content }, finish_reason: "stop" }] }),
+    "data: [DONE]\n\n"
+  ].join("")).body)
+  const contexts: string[] = []
+
+  const output = await new Response(createToolSseRelay(await streamFor("broken-1", malformed), "kimi-k3", false, request.toolPlan!, async (retry) => {
+    contexts.push(retry.context)
+    if (retry.attempt === 1) {
+      assert.match(retry.nudge, /XML parse failed/)
+      return streamFor("broken-2", malformed)
+    }
+    assert.equal(retry.attempt, 2)
+    assert.equal(retry.context, "isolated")
+    assert.match(retry.nudge, /Format recovery/)
+    return streamFor("fixed", xmlToolCalls([{ name: "get_weather", arguments: { city: "Paris" } }]))
+  })).text()
+
+  assert.deepEqual(contexts, ["extend", "isolated"])
+  assert.match(output, /tool_calls/)
+  assert.match(output, /get_weather/)
+  assert.doesNotMatch(output, /"error":/)
+})
+
+test("resets continuation payloads after an isolated tool recovery", () => {
+  const build = createContinuationPayloadBuilder({
+    model: "kimi-k3",
+    messages: [{ role: "user", content: "initial" }]
+  })
+  build({ reasoning: "first reasoning", content: "first malformed action", nudge: "first correction", context: "extend" })
+  const isolated = build({ reasoning: "second reasoning", content: "second malformed action", nudge: "strict correction", context: "isolated" })
+  const following = build({ reasoning: "third reasoning", content: "third malformed action", nudge: "follow-up correction", context: "extend" })
+
+  assert.deepEqual(isolated.messages, [
+    { role: "user", content: "initial" },
+    { role: "user", content: "strict correction" }
+  ])
+  assert.deepEqual(following.messages, [
+    { role: "user", content: "initial" },
+    { role: "user", content: "follow-up correction" }
+  ])
+})
+
+test("omits isolated retry blocks when restoring echoed history", () => {
+  const first = `[NWERR-START]${JSON.stringify({ v: 1, assistant: true, reasoning: "first reasoning", out: "first malformed action", reason: "first correction" })}[NWERR-END]`
+  const isolated = `[NWERR-START]${JSON.stringify({ v: 1, assistant: false, replay: "omit", reasoning: "", out: "second malformed action", reason: "strict correction" })}[NWERR-END]`
+  const result = validateChatRequest({
+    model: "kimi-k3",
+    messages: [{ role: "assistant", reasoning_content: `displayed${first}discarded${isolated}final reasoning`, content: "final response" }]
+  })
+  const messages = result.portalPayload.messages as Array<Record<string, unknown>>
+
+  assert.deepEqual(messages, [{ role: "assistant", reasoning: "final reasoning", content: "final response" }])
+})
+
+test("isolates empty upstream tool completions with bounded backoff metadata", async () => {
+  const request = validateChatRequest({
+    model: "kimi-k3",
+    messages: [{ role: "user", content: "Weather in Paris" }],
+    tools: [weatherTool],
+    tool_choice: "required"
+  })
+  assert.ok(request.toolPlan)
+
+  const completion = await normalizeToolCompletionWithRetry({
+    choices: [{ message: { content: "" }, finish_reason: "stop" }]
+  }, "kimi-k3", request.toolPlan!, async (retry) => {
+    assert.equal(retry.cause, "invalid_action")
+    assert.equal(retry.attempt, 1)
+    assert.equal(retry.context, "isolated")
+    assert.equal(retry.retryAfterMs, 500)
+    assert.match(retry.nudge, /upstream completed without any action content/)
+    return {
+      choices: [{
+        message: { content: xmlToolCalls([{ name: "get_weather", arguments: { city: "Paris" } }]) },
+        finish_reason: "stop"
+      }]
+    }
+  })
+
+  const choice = (completion.choices as Array<Record<string, unknown>>)[0]
+  assert.equal(choice.finish_reason, "tool_calls")
+})

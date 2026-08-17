@@ -449,9 +449,13 @@ function completionChunkIdentity(value: JsonObject, model: string): JsonObject {
 }
 
 export type ToolActionRetryCause = "invalid_action" | "length" | "timeout"
+export type ToolActionRetryContext = "extend" | "isolated"
 
 export interface ToolActionRetry {
   cause: ToolActionRetryCause
+  attempt: number
+  context: ToolActionRetryContext
+  retryAfterMs: number
   reasoning: string
   content: string
   nudge: string
@@ -485,7 +489,7 @@ function markedProseFinal(content: unknown, plan: ToolPlan): string | null {
 }
 
 function looksLikeXmlAction(content: string): boolean {
-  return /^\s*(?:```xml\s*)?<tool_calls\b/i.test(content)
+  return /^\s*(?:```xml\s*)?<(?:tool_calls|final)\b/i.test(content)
 }
 
 // Identifies bare prose so retries can explain how to attach it to a tool action.
@@ -500,18 +504,21 @@ function proseCandidate(content: string, error: unknown): string | null {
   return looksLikeXmlAction(text) ? null : text
 }
 
-// Encodes the failed attempt (error output + reason) as a self-contained
-// marker block appended to the reasoning stream. Echoing clients carry it
-// verbatim into the next turn, where decodeErrorBlock re-materializes the
-// failed attempt so the model can see its own previous error.
+// Failed attempts remain observable to clients. Isolated recoveries reset prior
+// retry replay so malformed output cannot become a later model prompt.
+type ErrorBlockAttempt = Pick<OutputLengthContinuation, "reasoning" | "content" | "nudge">
+  & Partial<Pick<ToolActionRetry, "context">>
+
 function encodeErrorBlock(
-  attempt: Pick<OutputLengthContinuation, "reasoning" | "content" | "nudge">,
+  attempt: ErrorBlockAttempt,
   visible?: { reasoningChars: number; contentChars: number }
 ): string {
-  const hasAssistantTurn = Boolean(attempt.reasoning || attempt.content)
+  const replayFailedAttempt = attempt.context !== "isolated"
+  const hasAssistantTurn = replayFailedAttempt && Boolean(attempt.reasoning || attempt.content)
   return `[NWERR-START]${JSON.stringify({
     v: visible ? 2 : 1,
     assistant: hasAssistantTurn,
+    ...(replayFailedAttempt ? {} : { replay: "omit" }),
     reasoning: attempt.reasoning,
     out: attempt.content,
     reason: attempt.nudge,
@@ -545,12 +552,22 @@ function isUpstreamTimeout(error: unknown): boolean {
   return error.name === "TimeoutError" || /aborted due to timeout|timed out|timeout/i.test(error.message)
 }
 
-function buildTimeoutRetry(reasoning: string, content: string, plan: ToolPlan): ToolActionRetry {
+function buildTimeoutRetry(
+  reasoning: string,
+  content: string,
+  plan: ToolPlan,
+  isolatedRecoveryActive: boolean
+): ToolActionRetry {
   return {
     cause: "timeout",
+    attempt: 1,
+    context: isolatedRecoveryActive ? "isolated" : "extend",
+    retryAfterMs: 0,
     reasoning: tailForRetry(reasoning, TOOL_INVALID_ACTION_REASONING_MAX_CHARS),
     content: tailForRetry(content, TOOL_INVALID_ACTION_CONTENT_MAX_CHARS),
-    nudge: `The upstream response timed out before a complete action. Continue once and return only the XML action from the system protocol. Do not repeat prior reasoning. ${plan.choice === "required" ? "A tool call is required." : "Use <final> only when no tool is needed."}`
+    nudge: isolatedRecoveryActive
+      ? strictFormatRecoveryNudge(plan)
+      : `The upstream response timed out before a complete action. Continue once and return only the XML action from the system protocol. Do not repeat prior reasoning. ${plan.choice === "required" ? "A tool call is required." : "Use <final> only when no tool is needed."}`
   }
 }
 
@@ -562,21 +579,70 @@ function buildLengthContinuationNudge(plan: ToolPlan): string {
   return `Your previous tool-protocol turn reached the output token limit before it produced a complete action. Continue from the preceding assistant reasoning and partial output. Do not restart, repeat, or explain the analysis. Use minimal additional reasoning and immediately ${retryActionContract(plan)}`
 }
 
+function isXmlFormatFailure(error: unknown, content: string): boolean {
+  if (!(error instanceof ToolActionError) || !looksLikeXmlAction(content.trim())) return false
+  return error.failure.kind === "invalid_xml"
+    || error.failure.kind === "invalid_xml_root"
+    || error.failure.kind === "invalid_xml_structure"
+}
+
+function isEmptyUpstreamAction(error: unknown, reasoning: string, content: string): boolean {
+  return error instanceof ToolActionError
+    && error.failure.kind === "empty_content"
+    && !reasoning.trim()
+    && !content.trim()
+}
+
+function emptyActionRetryDelay(attempt: number): number {
+  return Math.min(4_000, 500 * 2 ** (attempt - 1))
+}
+
+function strictFormatRecoveryNudge(plan: ToolPlan): string {
+  const action = plan.choice === "required"
+    ? "Emit exactly one complete <tool_calls> document containing at least one <tool_call>."
+    : allowsMarkedProse(plan)
+      ? `Emit exactly one complete <tool_calls> document, or ${TOOL_PROSE_FINAL_PREFIX}<completed answer> only when no tool is needed.`
+      : "Emit exactly one complete XML document rooted at <tool_calls> or <final>."
+  return `Format recovery: discard the preceding malformed output. ${action} Start directly with the action. For XML, close every element and use only allowed function names with schema-valid arguments. Do not emit progress, reasoning, error reports, NWERR text, Markdown, or any other prose.`
+}
+
+function emptyActionRecoveryNudge(plan: ToolPlan, attempt: number): string {
+  const status = attempt === 1
+    ? "The upstream completed without any action content."
+    : "The upstream again completed without any action content."
+  return `${status} Regenerate a fresh action for the original user request. ${strictFormatRecoveryNudge(plan)}`
+}
+
 function buildToolActionRetry(
   error: unknown,
   plan: ToolPlan,
   finishReason: unknown,
   reasoning: string,
-  content: string
+  content: string,
+  retryAttempt: number,
+  consecutiveFormatFailures: number,
+  isolatedRecoveryActive: boolean
 ): ToolActionRetry {
   const cause: ToolActionRetryCause = isLengthTruncation(finishReason) ? "length" : "invalid_action"
   const reasoningLimit = cause === "length" ? TOOL_LENGTH_CONTINUATION_REASONING_MAX_CHARS : TOOL_INVALID_ACTION_REASONING_MAX_CHARS
   const contentLimit = cause === "length" ? TOOL_LENGTH_CONTINUATION_CONTENT_MAX_CHARS : TOOL_INVALID_ACTION_CONTENT_MAX_CHARS
+  const emptyUpstreamAction = cause === "invalid_action" && isEmptyUpstreamAction(error, reasoning, content)
+  const strictFormatRecovery = cause === "invalid_action" && consecutiveFormatFailures >= 2
+  const isolated = isolatedRecoveryActive || emptyUpstreamAction || strictFormatRecovery
   return {
     cause,
+    attempt: retryAttempt,
+    context: isolated ? "isolated" : "extend",
+    retryAfterMs: emptyUpstreamAction ? emptyActionRetryDelay(retryAttempt) : 0,
     reasoning: tailForRetry(reasoning, reasoningLimit),
     content: tailForRetry(content, contentLimit),
-    nudge: cause === "length" ? buildLengthContinuationNudge(plan) : buildRetryNudge(content, error, plan)
+    nudge: emptyUpstreamAction
+      ? emptyActionRecoveryNudge(plan, retryAttempt)
+      : isolated
+        ? strictFormatRecoveryNudge(plan)
+        : cause === "length"
+          ? buildLengthContinuationNudge(plan)
+          : buildRetryNudge(content, error, plan)
   }
 }
 
@@ -721,6 +787,8 @@ export function createToolSseRelay(
         try {
           let lengthRetries = 0
           let correctionRetries = 0
+          let consecutiveFormatFailures = 0
+          let isolatedRecoveryActive = false
           let timeoutRetries = 0
           let toolCallDelivered = false
           let action: ParsedToolAction | undefined
@@ -745,7 +813,7 @@ export function createToolSseRelay(
               } catch (error) {
                 if (!isUpstreamTimeout(error) || !refetch || timeoutRetries >= 1 || toolCallDelivered) throw error
                 timeoutRetries += 1
-                timeoutRetry = buildTimeoutRetry(reasoningText, content, plan)
+                timeoutRetry = buildTimeoutRetry(reasoningText, content, plan, isolatedRecoveryActive)
                 break
               }
               if (next.done) {
@@ -818,10 +886,19 @@ export function createToolSseRelay(
               if (!refetch || retryCount >= retryLimit) {
                 throw terminalToolActionError(error, upstreamFinishReason)
               }
-              const retry = buildToolActionRetry(error, plan, upstreamFinishReason, reasoningText, content)
-              if (cause === "length") lengthRetries += 1
-              else correctionRetries += 1
-              console.warn(`[proxy] tool action retry cause=${retry.cause} attempt=${retryCount + 1}/${retryLimit} error=${error instanceof Error ? error.message : "unknown"} finish=${String(upstreamFinishReason)} reasoning_chars=${reasoningText.length} content_chars=${content.length} content_head=${JSON.stringify(content.slice(0, 160))}`)
+              const formatFailureStreak = cause === "invalid_action" && isXmlFormatFailure(error, content)
+                ? consecutiveFormatFailures + 1
+                : 0
+              const retry = buildToolActionRetry(error, plan, upstreamFinishReason, reasoningText, content, retryCount + 1, formatFailureStreak, isolatedRecoveryActive)
+              if (cause === "length") {
+                lengthRetries += 1
+                consecutiveFormatFailures = 0
+              } else {
+                correctionRetries += 1
+                consecutiveFormatFailures = formatFailureStreak
+              }
+              if (retry.context === "isolated") isolatedRecoveryActive = true
+              console.warn(`[proxy] tool action retry cause=${retry.cause} attempt=${retryCount + 1}/${retryLimit} context=${retry.context} retry_after_ms=${retry.retryAfterMs} format_failure_streak=${formatFailureStreak} error=${error instanceof Error ? error.message : "unknown"} finish=${String(upstreamFinishReason)} reasoning_chars=${reasoningText.length} content_chars=${content.length} content_head=${JSON.stringify(content.slice(0, 160))}`)
               controller.enqueue(formatSse({
                 ...(identity ?? completionChunkIdentity({}, model)),
                 choices: [{ index: 0, delta: { reasoning_content: encodeErrorBlock(retry) }, finish_reason: null }]
@@ -1017,6 +1094,8 @@ export async function normalizeToolCompletionWithRetry(
   let current = value
   let lengthRetries = 0
   let correctionRetries = 0
+  let consecutiveFormatFailures = 0
+  let isolatedRecoveryActive = false
   let totalUsage: JsonObject | undefined
   let replayReasoning = ""
 
@@ -1048,9 +1127,19 @@ export async function normalizeToolCompletionWithRetry(
       }
       const retryFetch = refetch
 
-      const retry = buildToolActionRetry(error, plan, attempt?.finishReason, attempt?.reasoning ?? "", attempt?.content ?? "")
-      if (cause === "length") lengthRetries += 1
-      else correctionRetries += 1
+      const attemptContent = attempt?.content ?? ""
+      const formatFailureStreak = cause === "invalid_action" && isXmlFormatFailure(error, attemptContent)
+        ? consecutiveFormatFailures + 1
+        : 0
+      const retry = buildToolActionRetry(error, plan, attempt?.finishReason, attempt?.reasoning ?? "", attemptContent, retryCount + 1, formatFailureStreak, isolatedRecoveryActive)
+      if (cause === "length") {
+        lengthRetries += 1
+        consecutiveFormatFailures = 0
+      } else {
+        correctionRetries += 1
+        consecutiveFormatFailures = formatFailureStreak
+      }
+      if (retry.context === "isolated") isolatedRecoveryActive = true
       replayReasoning += `${retry.reasoning}${encodeErrorBlock(retry)}`
       totalUsage = mergeUsage(totalUsage, isRecord(normalized.usage) ? normalized.usage : undefined)
       current = await retryFetch(retry)
