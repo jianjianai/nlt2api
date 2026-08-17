@@ -114,25 +114,43 @@ function normalizeContent(content: unknown, param: string): unknown {
   })
 }
 
-// Parses cross-turn error blocks embedded in assistant reasoning (emitted by
-// the tool relay on every failed attempt). Returns each failed attempt (its
-// reasoning segment before the block, its error output, and its error reason)
-// plus the corrected reasoning after the last block; null when no valid block
-// is present. Multiple blocks (one per retry) are all decoded in order.
-function decodeErrorBlocks(reasoning: string): { attempts: { prev: string; out: string; reason: string }[]; re: string } | null {
-  const attempts: { prev: string; out: string; reason: string }[] = []
+// Parses retry blocks embedded in assistant reasoning. Legacy v1 blocks use
+// the preceding display fragment; v2 continuation blocks carry the exact
+// bounded assistant context sent upstream and the visible-text prefix length.
+function decodeErrorBlocks(reasoning: string): {
+  attempts: { assistant: boolean; reasoning: string; content: string; reason: string }[]
+  remainder: string
+  visibleContentChars: number
+} | null {
+  const attempts: { assistant: boolean; reasoning: string; content: string; reason: string }[] = []
   const pattern = /\[NWERR-START\]([\s\S]*?)\[NWERR-END\]/g
   let cursor = 0
+  let visibleContentChars = 0
   let match: RegExpExecArray | null
   while ((match = pattern.exec(reasoning)) !== null) {
     const blockEnd = match.index + match[0].length
     try {
-      const payload = JSON.parse(match[1]) as { out?: unknown; reason?: unknown }
+      const payload = JSON.parse(match[1]) as {
+        assistant?: unknown
+        reasoning?: unknown
+        out?: unknown
+        reason?: unknown
+        visible_content_chars?: unknown
+      }
       if (typeof payload.out !== "string" || typeof payload.reason !== "string") {
         cursor = blockEnd
         continue
       }
-      attempts.push({ prev: reasoning.slice(cursor, match.index), out: payload.out, reason: payload.reason })
+      const displayedReasoning = reasoning.slice(cursor, match.index)
+      attempts.push({
+        assistant: typeof payload.assistant === "boolean" ? payload.assistant : Boolean(displayedReasoning || payload.out),
+        reasoning: typeof payload.reasoning === "string" ? payload.reasoning : displayedReasoning,
+        content: payload.out,
+        reason: payload.reason
+      })
+      if (typeof payload.visible_content_chars === "number" && Number.isSafeInteger(payload.visible_content_chars) && payload.visible_content_chars >= 0) {
+        visibleContentChars += payload.visible_content_chars
+      }
       cursor = blockEnd
     } catch {
       // Malformed or truncated block: skip it.
@@ -140,7 +158,7 @@ function decodeErrorBlocks(reasoning: string): { attempts: { prev: string; out: 
     }
   }
   if (attempts.length === 0) return null
-  return { attempts, re: reasoning.slice(cursor) }
+  return { attempts, remainder: reasoning.slice(cursor), visibleContentChars }
 }
 
 function shouldRestoreMarkedProse(plan: ToolPlan | undefined): boolean {
@@ -273,21 +291,23 @@ function normalizeMessages(value: unknown, restoreMarkedProse: boolean): JsonObj
       if (typeof reasoningContent === "string") {
         const decoded = decodeErrorBlocks(reasoningContent)
         if (decoded) {
-          // Re-materialize each failed attempt as an assistant turn followed
-          // by the user correction that prompted the retry. The corrected
-          // attempt follows with all error blocks stripped from its reasoning.
+          // Re-materialize each retry as the exact assistant -> user pair sent
+          // upstream. v2 also strips response text already represented by turns.
           const failedTurns = decoded.attempts.flatMap((attempt) => [
-            {
+            ...(attempt.assistant ? [{
               role: "assistant",
-              reasoning: attempt.prev || null,
-              content: attempt.out || null
-            },
+              reasoning: attempt.reasoning || null,
+              content: attempt.content || null
+            }] : []),
             {
               role: "user",
               content: attempt.reason
             }
           ])
-          message.reasoning = decoded.re || null
+          message.reasoning = decoded.remainder || null
+          if (decoded.visibleContentChars > 0 && typeof message.content === "string") {
+            message.content = message.content.slice(decoded.visibleContentChars)
+          }
           return [...failedTurns, message]
         }
       }

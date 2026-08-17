@@ -4,7 +4,7 @@ import { checkPortalSession, ensurePortalLogin, fetchPortalChat } from "./portal
 import {
   createSseRelay,
   createToolSseRelay,
-  normalizeCompletion,
+  normalizeCompletionWithLengthContinuation,
   normalizeToolCompletionWithRetry,
   prepareSse,
   type OutputLengthContinuation,
@@ -130,11 +130,13 @@ async function preparePortalSse(account: StoredAccount, request: ValidatedChatRe
   return prepared
 }
 
-async function proxyForAccount(account: StoredAccount, request: ValidatedChatRequest): Promise<ProxyResult> {
-  console.info(`[proxy] chat request account=${account.label} model=${request.model} stream=${request.stream} tools=${request.toolPlan ? "yes" : "no"} max_tokens=${request.portalPayload.max_tokens ?? "default"}`)
-  const continuationPayload = (continuation: OutputLengthContinuation | ToolActionRetry): Record<string, unknown> => {
-    const messages = [...(request.portalPayload.messages as unknown[])]
-    // The provider can continue from emitted reasoning, never hidden state.
+type ReplayableContinuation = Pick<OutputLengthContinuation, "reasoning" | "content" | "nudge">
+
+export function createContinuationPayloadBuilder(portalPayload: Record<string, unknown>): (continuation: ReplayableContinuation) => Record<string, unknown> {
+  const messages = Array.isArray(portalPayload.messages) ? [...portalPayload.messages] : []
+  return (continuation) => {
+    // Preserve every prior assistant -> user retry pair verbatim. The next
+    // upstream request then extends the preceding one, enabling prefix caching.
     if (continuation.content || continuation.reasoning) {
       messages.push({
         role: "assistant",
@@ -143,8 +145,18 @@ async function proxyForAccount(account: StoredAccount, request: ValidatedChatReq
       })
     }
     messages.push({ role: "user", content: continuation.nudge })
-    return { ...request.portalPayload, messages }
+    return { ...portalPayload, messages: [...messages] }
   }
+}
+
+async function proxyForAccount(account: StoredAccount, request: ValidatedChatRequest): Promise<ProxyResult> {
+  console.info(`[proxy] chat request account=${account.label} model=${request.model} stream=${request.stream} tools=${request.toolPlan ? "yes" : "no"} max_tokens=${request.portalPayload.max_tokens ?? "default"}`)
+  const continuationPayload = createContinuationPayloadBuilder(request.portalPayload)
+  const responseFormat = request.portalPayload.response_format
+  const isJsonObjectResponse = typeof responseFormat === "object"
+    && responseFormat !== null
+    && !Array.isArray(responseFormat)
+    && (responseFormat as Record<string, unknown>).type === "json_object"
 
   if (!request.stream) {
     const fetchJson = async (portalPayload: Record<string, unknown>): Promise<unknown> => {
@@ -174,7 +186,16 @@ async function proxyForAccount(account: StoredAccount, request: ValidatedChatReq
 
     const value = await fetchJson(request.portalPayload)
     if (!request.toolPlan) {
-      return { kind: "json", body: normalizeCompletion(value, request.model) }
+      const outputRefetch = isJsonObjectResponse
+        ? undefined
+        : async (continuation: OutputLengthContinuation): Promise<unknown> => {
+            console.warn(`[proxy] output continuation account=${account.label} model=${request.model} preserved reasoning_chars=${continuation.reasoning.length} content_chars=${continuation.content.length}`)
+            return fetchJson(continuationPayload(continuation))
+          }
+      return {
+        kind: "json",
+        body: await normalizeCompletionWithLengthContinuation(value, request.model, outputRefetch)
+      }
     }
     const refetch = async (retry: ToolActionRetry): Promise<unknown> => {
       console.warn(`[proxy] tool action retry cause=${retry.cause} account=${account.label} model=${request.model} preserved reasoning_chars=${retry.reasoning.length} content_chars=${retry.content.length}`)
@@ -198,11 +219,6 @@ async function proxyForAccount(account: StoredAccount, request: ValidatedChatReq
     }
   }
 
-  const responseFormat = request.portalPayload.response_format
-  const isJsonObjectResponse = typeof responseFormat === "object"
-    && responseFormat !== null
-    && !Array.isArray(responseFormat)
-    && (responseFormat as Record<string, unknown>).type === "json_object"
   const outputRefetch = isJsonObjectResponse
     ? undefined
     : async (continuation: OutputLengthContinuation): Promise<PreparedSse> => {

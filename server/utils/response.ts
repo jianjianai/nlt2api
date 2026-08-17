@@ -261,7 +261,11 @@ export interface SseLengthRefetch {
   (continuation: OutputLengthContinuation): Promise<PreparedSse>
 }
 
-const OUTPUT_LENGTH_CONTINUATION_MAX_RETRIES = 2
+export interface CompletionLengthRefetch {
+  (continuation: OutputLengthContinuation): Promise<unknown>
+}
+
+const OUTPUT_LENGTH_CONTINUATION_MAX_RETRIES = 10
 const OUTPUT_LENGTH_CONTINUATION_REASONING_MAX_CHARS = 32_000
 const OUTPUT_LENGTH_CONTINUATION_CONTENT_MAX_CHARS = 32_000
 
@@ -288,8 +292,6 @@ function createSseLengthContinuationRelay(
         let identity: JsonObject | undefined
         let roleSent = false
         let totalUsage: JsonObject | undefined
-        let cumulativeReasoning = ""
-        let cumulativeContent = ""
         let retries = 0
 
         try {
@@ -378,13 +380,24 @@ function createSseLengthContinuationRelay(
             current.reader.releaseLock()
             currentReaderReleased = true
             totalUsage = mergeUsage(totalUsage, attemptUsage)
-            cumulativeReasoning = tailForRetry(cumulativeReasoning + attemptReasoning, OUTPUT_LENGTH_CONTINUATION_REASONING_MAX_CHARS)
-            cumulativeContent = tailForRetry(cumulativeContent + attemptContent, OUTPUT_LENGTH_CONTINUATION_CONTENT_MAX_CHARS)
-
             if (isLengthTruncation(finishReason) && retries < OUTPUT_LENGTH_CONTINUATION_MAX_RETRIES) {
+              const continuation = buildOutputLengthContinuation(attemptReasoning, attemptContent)
               retries += 1
-              console.warn(`[proxy] output continuation attempt=${retries}/${OUTPUT_LENGTH_CONTINUATION_MAX_RETRIES} reasoning_chars=${cumulativeReasoning.length} content_chars=${cumulativeContent.length}`)
-              current = await refetch(buildOutputLengthContinuation(cumulativeReasoning, cumulativeContent))
+              console.warn(`[proxy] output continuation attempt=${retries}/${OUTPUT_LENGTH_CONTINUATION_MAX_RETRIES} reasoning_chars=${continuation.reasoning.length} content_chars=${continuation.content.length}`)
+              controller.enqueue(formatSse({
+                ...(identity ?? completionChunkIdentity({}, model)),
+                choices: [{
+                  index: finishIndex,
+                  delta: {
+                    reasoning_content: encodeErrorBlock(continuation, {
+                      reasoningChars: attemptReasoning.length,
+                      contentChars: attemptContent.length
+                    })
+                  },
+                  finish_reason: null
+                }]
+              }))
+              current = await refetch(continuation)
               currentReaderReleased = false
               continue
             }
@@ -451,7 +464,8 @@ export interface ToolCompletionRefetch {
   (failed: ToolActionRetry): Promise<unknown>
 }
 
-const TOOL_ACTION_MAX_RETRIES = 2
+const TOOL_LENGTH_CONTINUATION_MAX_RETRIES = 10
+const TOOL_MODEL_CORRECTION_MAX_RETRIES = 5
 const UNMARKED_PROSE_MAX_RETRIES = 1
 const TOOL_LENGTH_CONTINUATION_REASONING_MAX_CHARS = 32_000
 const TOOL_LENGTH_CONTINUATION_CONTENT_MAX_CHARS = 8_000
@@ -484,8 +498,22 @@ function proseCandidate(content: string, error: unknown): string | null {
 // marker block appended to the reasoning stream. Echoing clients carry it
 // verbatim into the next turn, where decodeErrorBlock re-materializes the
 // failed attempt so the model can see its own previous error.
-function encodeErrorBlock(content: string, reason: string): string {
-  return `[NWERR-START]${JSON.stringify({ v: 1, out: content, reason })}[NWERR-END]`
+function encodeErrorBlock(
+  attempt: Pick<OutputLengthContinuation, "reasoning" | "content" | "nudge">,
+  visible?: { reasoningChars: number; contentChars: number }
+): string {
+  const hasAssistantTurn = Boolean(attempt.reasoning || attempt.content)
+  return `[NWERR-START]${JSON.stringify({
+    v: visible ? 2 : 1,
+    assistant: hasAssistantTurn,
+    reasoning: attempt.reasoning,
+    out: attempt.content,
+    reason: attempt.nudge,
+    ...(visible ? {
+      visible_reasoning_chars: visible.reasoningChars,
+      visible_content_chars: visible.contentChars
+    } : {})
+  })}[NWERR-END]`
 }
 
 function retryActionContract(plan: ToolPlan): string {
@@ -585,33 +613,6 @@ function buildRetryNudge(content: string, error: unknown, plan: ToolPlan): strin
   return `Your previous reply did not provide a usable action. ${contract}`
 }
 
-function buildErrorDiagnosis(content: string, error: unknown, finishReason: unknown): string {
-  if (isLengthTruncation(finishReason)) return "the upstream reached the output token limit before producing a complete tool action"
-  const text = content.trim()
-  const failure = error instanceof ToolActionError ? error.failure : undefined
-  if (!failure) return "your previous reply did not provide a usable action"
-  switch (failure.kind) {
-    case "empty_content": return "your previous reply was empty"
-    case "invalid_json": return text && !/^[{[]/.test(text) ? "your previous reply was unmarked prose" : `your previous reply was invalid JSON${failure.detail ? ` (${failure.detail})` : ""}`
-    case "not_json_object": return "your previous reply was not a JSON object"
-    case "empty_tool_calls": return "tool_calls was empty"
-    case "tool_call_content_not_string": return "tool_calls.content was not a string"
-    case "tool_call_content_too_long": return "tool_calls.content exceeded 240 characters"
-    case "parallel_calls_not_allowed": return "multiple calls were returned although only one is allowed"
-    case "invalid_tool_call": return `tool_calls[${failure.index}] was not an object`
-    case "missing_function_name": return `tool_calls[${failure.index}] did not name a function`
-    case "arguments_invalid_json": return `arguments for ${failure.name} were not valid JSON`
-    case "arguments_not_object": return `arguments for ${failure.name} were not a JSON object`
-    case "unknown_function": return `unknown function ${failure.name}`
-    case "schema_validation": return `arguments for ${failure.name} failed schema validation: ${failure.details}`
-    case "final_when_tool_required": return "a final response was returned while tool_choice was required"
-    case "final_content_not_json_object": return "final content was not a JSON object"
-    case "final_content_not_string": return "final content was not a string"
-    case "invalid_action_type": return "the action type was invalid"
-  }
-  return "your previous reply did not provide a usable action"
-}
-
 export function createToolSseRelay(
   prepared: PreparedSse,
   model: string,
@@ -631,8 +632,6 @@ export function createToolSseRelay(
         let roleSent = false
         let upstreamFinishReason: unknown = "stop"
         let reasoningText = ""
-        let retryReasoning = ""
-        let retryContent = ""
         let markedProse = false
         let markedProseContent = ""
 
@@ -699,7 +698,8 @@ export function createToolSseRelay(
         }
 
         try {
-          let retries = 0
+          let lengthRetries = 0
+          let correctionRetries = 0
           let action: ParsedToolAction | undefined
           while (true) {
             let pending = current.pending
@@ -753,36 +753,30 @@ export function createToolSseRelay(
               // delivering any remaining prose instead of spending more calls.
               if (!isLengthTruncation(upstreamFinishReason) && plan.choice === "auto" && plan.finalResponseFormat === "text") {
                 const prose = proseCandidate(content, error)
-                if (prose !== null && (!refetch || retries >= UNMARKED_PROSE_MAX_RETRIES)) {
+                if (prose !== null && (!refetch || correctionRetries >= UNMARKED_PROSE_MAX_RETRIES)) {
                   console.warn(`[proxy] tool action fallback: delivering unmarked prose as final (auto choice) content_chars=${content.length}`)
                   action = { kind: "final", content: prose }
                   break
                 }
               }
 
-              if (!refetch || retries >= TOOL_ACTION_MAX_RETRIES) {
+              const cause: ToolActionRetryCause = isLengthTruncation(upstreamFinishReason) ? "length" : "invalid_action"
+              const retryLimit = cause === "length" ? TOOL_LENGTH_CONTINUATION_MAX_RETRIES : TOOL_MODEL_CORRECTION_MAX_RETRIES
+              const retryCount = cause === "length" ? lengthRetries : correctionRetries
+              if (!refetch || retryCount >= retryLimit) {
                 throw terminalToolActionError(error, upstreamFinishReason)
               }
 
-              // The provider exposes only its emitted reasoning, so a bounded
-              // continuation can resume that public context but never hidden state.
-              const retryReasoningLimit = isLengthTruncation(upstreamFinishReason)
-                ? TOOL_LENGTH_CONTINUATION_REASONING_MAX_CHARS
-                : TOOL_INVALID_ACTION_REASONING_MAX_CHARS
-              const retryContentLimit = isLengthTruncation(upstreamFinishReason)
-                ? TOOL_LENGTH_CONTINUATION_CONTENT_MAX_CHARS
-                : TOOL_INVALID_ACTION_CONTENT_MAX_CHARS
-              retryReasoning = tailForRetry(retryReasoning + reasoningText, retryReasoningLimit)
-              retryContent = tailForRetry(retryContent + content, retryContentLimit)
-              const retry = buildToolActionRetry(error, plan, upstreamFinishReason, retryReasoning, retryContent)
-              retries += 1
-              console.warn(`[proxy] tool action retry cause=${retry.cause} attempt=${retries}/${TOOL_ACTION_MAX_RETRIES} error=${error instanceof Error ? error.message : "unknown"} finish=${String(upstreamFinishReason)} reasoning_chars=${reasoningText.length} content_chars=${content.length} content_head=${JSON.stringify(content.slice(0, 160))}`)
-              if (retry.cause === "invalid_action" && (retry.content || retry.reasoning)) {
-                controller.enqueue(formatSse({
-                  ...(identity ?? completionChunkIdentity({}, model)),
-                  choices: [{ index: 0, delta: { reasoning_content: encodeErrorBlock(retry.content, buildErrorDiagnosis(content, error, upstreamFinishReason)) }, finish_reason: null }]
-                }))
-              }
+              // Retry turns are appended by the proxy as assistant -> user pairs,
+              // preserving the exact prior request prefix for upstream caching.
+              const retry = buildToolActionRetry(error, plan, upstreamFinishReason, reasoningText, content)
+              if (cause === "length") lengthRetries += 1
+              else correctionRetries += 1
+              console.warn(`[proxy] tool action retry cause=${retry.cause} attempt=${retryCount + 1}/${retryLimit} error=${error instanceof Error ? error.message : "unknown"} finish=${String(upstreamFinishReason)} reasoning_chars=${reasoningText.length} content_chars=${content.length} content_head=${JSON.stringify(content.slice(0, 160))}`)
+              controller.enqueue(formatSse({
+                ...(identity ?? completionChunkIdentity({}, model)),
+                choices: [{ index: 0, delta: { reasoning_content: encodeErrorBlock(retry) }, finish_reason: null }]
+              }))
               totalUsage = mergeUsage(totalUsage, usage)
               content = ""
               usage = undefined
@@ -815,7 +809,7 @@ export function createToolSseRelay(
           } else if (!markedProse) {
             delta.content = parsedAction.content
           }
-          console.info(`[proxy] tool action delivered kind=${parsedAction.kind} attempts=${retries + 1} finish=${String(upstreamFinishReason)} reasoning_chars=${reasoningText.length} content_chars=${content.length} tools=${plan.tools.length} choice=${plan.choice}`)
+          console.info(`[proxy] tool action delivered kind=${parsedAction.kind} length_retries=${lengthRetries} correction_retries=${correctionRetries} finish=${String(upstreamFinishReason)} reasoning_chars=${reasoningText.length} content_chars=${content.length} tools=${plan.tools.length} choice=${plan.choice}`)
           controller.enqueue(formatSse({
             ...identity,
             choices: [{ index: 0, delta, finish_reason: finishReason ?? "stop" }]
@@ -873,14 +867,62 @@ export function normalizeCompletion(value: unknown, model: string): JsonObject {
   return normalized
 }
 
-function toolCompletionParts(normalized: JsonObject): { choice: JsonObject; message: JsonObject } {
+function completionParts(normalized: JsonObject): { choice: JsonObject; message: JsonObject } | undefined {
   const choices = Array.isArray(normalized.choices) ? normalized.choices : []
   const choice = isRecord(choices[0]) ? choices[0] : undefined
   const message = choice && isRecord(choice.message) ? choice.message : undefined
-  if (!choice || !message) {
+  return choice && message ? { choice, message } : undefined
+}
+
+export async function normalizeCompletionWithLengthContinuation(
+  value: unknown,
+  model: string,
+  refetch?: CompletionLengthRefetch
+): Promise<JsonObject> {
+  let current = value
+  let retries = 0
+  let totalUsage: JsonObject | undefined
+  let replayReasoning = ""
+  let visibleContent = ""
+
+  while (true) {
+    const normalized = normalizeCompletion(current, model)
+    const parts = completionParts(normalized)
+    totalUsage = mergeUsage(totalUsage, isRecord(normalized.usage) ? normalized.usage : undefined)
+
+    const reasoning = parts && typeof parts.message.reasoning_content === "string" ? parts.message.reasoning_content : ""
+    const content = parts && typeof parts.message.content === "string" ? parts.message.content : ""
+    if (parts && isLengthTruncation(parts.choice.finish_reason) && refetch && retries < OUTPUT_LENGTH_CONTINUATION_MAX_RETRIES) {
+      const continuation = buildOutputLengthContinuation(reasoning, content)
+      replayReasoning += `${continuation.reasoning}${encodeErrorBlock(continuation, {
+        reasoningChars: reasoning.length,
+        contentChars: content.length
+      })}`
+      visibleContent += content
+      retries += 1
+      current = await refetch(continuation)
+      continue
+    }
+
+    if (parts) {
+      if (replayReasoning) {
+        parts.message.reasoning_content = replayReasoning + reasoning
+      }
+      if (visibleContent) {
+        parts.message.content = visibleContent + content
+      }
+    }
+    if (totalUsage) normalized.usage = totalUsage
+    return normalized
+  }
+}
+
+function toolCompletionParts(normalized: JsonObject): { choice: JsonObject; message: JsonObject } {
+  const parts = completionParts(normalized)
+  if (!parts) {
     throw new AppError("The upstream returned no completion for the tool request", 502, "invalid_tool_action")
   }
-  return { choice, message }
+  return parts
 }
 
 function toolCompletionAttempt(normalized: JsonObject): { reasoning: string; content: string; finishReason: unknown } {
@@ -923,10 +965,10 @@ export async function normalizeToolCompletionWithRetry(
   refetch?: ToolCompletionRefetch
 ): Promise<JsonObject> {
   let current = value
-  let retries = 0
+  let lengthRetries = 0
+  let correctionRetries = 0
   let totalUsage: JsonObject | undefined
-  let retryReasoning = ""
-  let retryContent = ""
+  let replayReasoning = ""
 
   while (true) {
     const normalized = normalizeCompletion(current, model)
@@ -935,24 +977,30 @@ export async function normalizeToolCompletionWithRetry(
       attempt = toolCompletionAttempt(normalized)
       const completion = normalizeToolCompletionFromNormalized(normalized, plan)
       totalUsage = mergeUsage(totalUsage, isRecord(normalized.usage) ? normalized.usage : undefined)
+      if (replayReasoning) {
+        const { message } = toolCompletionParts(completion)
+        const finalReasoning = typeof message.reasoning_content === "string" ? message.reasoning_content : ""
+        message.reasoning_content = replayReasoning + finalReasoning
+      }
       if (totalUsage) completion.usage = totalUsage
       return completion
     } catch (error) {
       const invalidAction = error instanceof AppError && error.code === "invalid_tool_action"
-      if (!invalidAction || !refetch || retries >= TOOL_ACTION_MAX_RETRIES) {
+      if (!invalidAction) {
+        throw error
+      }
+
+      const cause: ToolActionRetryCause = isLengthTruncation(attempt?.finishReason) ? "length" : "invalid_action"
+      const retryLimit = cause === "length" ? TOOL_LENGTH_CONTINUATION_MAX_RETRIES : TOOL_MODEL_CORRECTION_MAX_RETRIES
+      const retryCount = cause === "length" ? lengthRetries : correctionRetries
+      if (!refetch || retryCount >= retryLimit) {
         throw terminalToolActionError(error, attempt?.finishReason)
       }
 
-      const retryReasoningLimit = isLengthTruncation(attempt?.finishReason)
-        ? TOOL_LENGTH_CONTINUATION_REASONING_MAX_CHARS
-        : TOOL_INVALID_ACTION_REASONING_MAX_CHARS
-      const retryContentLimit = isLengthTruncation(attempt?.finishReason)
-        ? TOOL_LENGTH_CONTINUATION_CONTENT_MAX_CHARS
-        : TOOL_INVALID_ACTION_CONTENT_MAX_CHARS
-      retryReasoning = tailForRetry(retryReasoning + (attempt?.reasoning ?? ""), retryReasoningLimit)
-      retryContent = tailForRetry(retryContent + (attempt?.content ?? ""), retryContentLimit)
-      const retry = buildToolActionRetry(error, plan, attempt?.finishReason, retryReasoning, retryContent)
-      retries += 1
+      const retry = buildToolActionRetry(error, plan, attempt?.finishReason, attempt?.reasoning ?? "", attempt?.content ?? "")
+      if (cause === "length") lengthRetries += 1
+      else correctionRetries += 1
+      replayReasoning += `${retry.reasoning}${encodeErrorBlock(retry)}`
       totalUsage = mergeUsage(totalUsage, isRecord(normalized.usage) ? normalized.usage : undefined)
       current = await refetch(retry)
     }

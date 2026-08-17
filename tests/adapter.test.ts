@@ -2,7 +2,8 @@ import assert from "node:assert/strict"
 import test from "node:test"
 import { AppError } from "../server/utils/errors"
 import { validateChatRequest, TOOL_PROTOCOL_MIN_MAX_TOKENS } from "../server/utils/openai"
-import { createSseRelay, createToolSseRelay, normalizeCompletion, normalizeToolCompletion, normalizeToolCompletionWithRetry, prepareSse, type PreparedSse } from "../server/utils/response"
+import { createContinuationPayloadBuilder } from "../server/utils/proxy"
+import { createSseRelay, createToolSseRelay, normalizeCompletion, normalizeCompletionWithLengthContinuation, normalizeToolCompletion, normalizeToolCompletionWithRetry, prepareSse, type PreparedSse } from "../server/utils/response"
 
 const weatherTool = {
   type: "function",
@@ -134,6 +135,37 @@ test("reconstructs a failed attempt and its correction from an echoed error bloc
   assert.equal(messages[2].role, "assistant")
   assert.equal(messages[2].reasoning, " corrected thinking")
   assert.match(messages[2].content as string, /tool_calls/)
+})
+
+test("reconstructs v2 continuation retries as their exact upstream request turns", () => {
+  const continuation = "continue without restarting"
+  const block = `[NWERR-START]${JSON.stringify({ v: 2, assistant: true, reasoning: "bounded reasoning", out: "partial answer", reason: continuation, visible_content_chars: 14 })}[NWERR-END]`
+  const result = validateChatRequest({
+    model: "kimi-k3",
+    messages: [{ role: "assistant", reasoning_content: `visible reasoning${block}final reasoning`, content: "partial answerfinal answer" }]
+  })
+
+  const messages = result.portalPayload.messages as Array<Record<string, unknown>>
+  assert.deepEqual(messages, [
+    { role: "assistant", reasoning: "bounded reasoning", content: "partial answer" },
+    { role: "user", content: continuation },
+    { role: "assistant", reasoning: "final reasoning", content: "final answer" }
+  ])
+})
+
+test("does not invent an assistant turn for an empty replayed retry", () => {
+  const continuation = "retry with a valid action"
+  const block = `[NWERR-START]${JSON.stringify({ v: 1, assistant: false, reasoning: "", out: "", reason: continuation })}[NWERR-END]`
+  const result = validateChatRequest({
+    model: "kimi-k3",
+    messages: [{ role: "assistant", reasoning_content: `${block}corrected reasoning`, content: "final answer" }]
+  })
+
+  const messages = result.portalPayload.messages as Array<Record<string, unknown>>
+  assert.deepEqual(messages, [
+    { role: "user", content: continuation },
+    { role: "assistant", reasoning: "corrected reasoning", content: "final answer" }
+  ])
 })
 
 test("reconstructs multiple failed attempts with their corrections in order", () => {
@@ -671,6 +703,24 @@ test("continues a normal length-truncated stream without exposing the intermedia
   assert.deepEqual(usage?.usage, { prompt_tokens: 110, completion_tokens: 8204, total_tokens: 8314 })
 })
 
+test("keeps every continuation payload as an exact extension of the prior request", () => {
+  const build = createContinuationPayloadBuilder({
+    model: "kimi-k3",
+    messages: [{ role: "user", content: "initial" }]
+  })
+  const first = build({ reasoning: "first reasoning", content: "first content", nudge: "first nudge" })
+  const second = build({ reasoning: "second reasoning", content: "second content", nudge: "second nudge" })
+
+  assert.deepEqual(second.messages, [
+    { role: "user", content: "initial" },
+    { role: "assistant", reasoning: "first reasoning", content: "first content" },
+    { role: "user", content: "first nudge" },
+    { role: "assistant", reasoning: "second reasoning", content: "second content" },
+    { role: "user", content: "second nudge" }
+  ])
+  assert.deepEqual((second.messages as unknown[]).slice(0, (first.messages as unknown[]).length), first.messages)
+})
+
 test("stops normal stream continuation after the bounded retry limit", async () => {
   const frame = (value: unknown) => `data: ${JSON.stringify(value)}\n\n`
   const truncated = async (): Promise<PreparedSse> => {
@@ -688,7 +738,7 @@ test("stops normal stream continuation after the bounded retry limit", async () 
   })
   const output = await new Response(relay).text()
 
-  assert.equal(refetchCalls, 2)
+  assert.equal(refetchCalls, 10)
   assert.match(output, /"finish_reason":"length"/)
   assert.match(output, /data: \[DONE\]/)
 })
@@ -963,7 +1013,7 @@ test("continues a length-truncated tool reasoning turn without changing the clie
   assert.equal(refetchCalls, 1)
   assert.match(output, /then emit the action/)
   assert.match(output, /tool_calls/)
-  assert.doesNotMatch(output, /NWERR-START/)
+  assert.match(output, /NWERR-START/)
   assert.ok(events.every((event) => event.id === "truncated"))
   assert.deepEqual(usage?.usage, { prompt_tokens: 109, completion_tokens: 8204, total_tokens: 8313 })
 })
@@ -991,19 +1041,59 @@ test("bounds repeated length-truncated tool turns", async () => {
   const relay = createToolSseRelay(await truncated("first fragment"), "kimi-k3", false, request.toolPlan!, async (retry) => {
     refetchCalls += 1
     assert.equal(retry.cause, "length")
-    if (refetchCalls === 1) {
-      assert.match(retry.reasoning, /first fragment/)
-      return truncated("second fragment")
-    }
-    assert.match(retry.reasoning, /first fragment/)
-    assert.match(retry.reasoning, /second fragment/)
-    return truncated("third fragment")
+    assert.equal(retry.reasoning, refetchCalls === 1 ? "first fragment" : `fragment ${refetchCalls}`)
+    return truncated(`fragment ${refetchCalls + 1}`)
   })
   const output = await new Response(relay).text()
 
-  assert.equal(refetchCalls, 2)
+  assert.equal(refetchCalls, 10)
   assert.match(output, /tool_action_length_exceeded/)
   assert.match(output, /data: \[DONE\]/)
+})
+
+test("continues a length-truncated non-streaming text completion", async () => {
+  let refetchCalls = 0
+  const completion = await normalizeCompletionWithLengthContinuation({
+    choices: [{ message: { reasoning: "first reasoning", content: "first content" }, finish_reason: "length" }]
+  }, "kimi-k3", async (retry) => {
+    refetchCalls += 1
+    assert.equal(retry.reasoning, "first reasoning")
+    assert.equal(retry.content, "first content")
+    return { choices: [{ message: { reasoning: "final reasoning", content: " final content" }, finish_reason: "stop" }] }
+  })
+  const message = ((completion.choices as Array<Record<string, unknown>>)[0].message as Record<string, unknown>)
+
+  assert.equal(refetchCalls, 1)
+  assert.equal(message.content, "first content final content")
+  assert.match(message.reasoning_content as string, /NWERR-START/)
+
+  const replayed = validateChatRequest({
+    model: "kimi-k3",
+    messages: [{
+      role: "assistant",
+      reasoning_content: message.reasoning_content,
+      content: message.content
+    }]
+  })
+  const replayedMessages = replayed.portalPayload.messages as Array<Record<string, unknown>>
+  assert.deepEqual(replayedMessages[0], { role: "assistant", reasoning: "first reasoning", content: "first content" })
+  assert.equal(replayedMessages[1].role, "user")
+  assert.match(replayedMessages[1].content as string, /output token limit/)
+  assert.deepEqual(replayedMessages[2], { role: "assistant", reasoning: "final reasoning", content: " final content" })
+})
+
+test("stops non-streaming text continuation after ten length retries", async () => {
+  let refetchCalls = 0
+  const completion = await normalizeCompletionWithLengthContinuation({
+    choices: [{ message: { content: "segment" }, finish_reason: "length" }]
+  }, "kimi-k3", async () => {
+    refetchCalls += 1
+    return { choices: [{ message: { content: "segment" }, finish_reason: "length" }] }
+  })
+  const choice = (completion.choices as Array<Record<string, unknown>>)[0]
+
+  assert.equal(refetchCalls, 10)
+  assert.equal(choice.finish_reason, "length")
 })
 
 test("continues a length-truncated non-streaming tool completion", async () => {
@@ -1035,7 +1125,7 @@ test("continues a length-truncated non-streaming tool completion", async () => {
   assert.deepEqual(completion.usage, { prompt_tokens: 109, completion_tokens: 8204, total_tokens: 8313 })
 })
 
-test("accumulates public context across non-streaming length continuations", async () => {
+test("keeps each non-streaming tool continuation bounded to its current attempt", async () => {
   const request = validateChatRequest({
     model: "kimi-k3",
     messages: [{ role: "user", content: "Weather in Paris" }],
@@ -1051,11 +1141,10 @@ test("accumulates public context across non-streaming length continuations", asy
     refetchCalls += 1
     assert.equal(retry.cause, "length")
     if (refetchCalls === 1) {
-      assert.match(retry.reasoning, /first fragment/)
+      assert.equal(retry.reasoning, "first fragment")
       return { choices: [{ message: { reasoning: "second fragment", content: "" }, finish_reason: "length" }] }
     }
-    assert.match(retry.reasoning, /first fragment/)
-    assert.match(retry.reasoning, /second fragment/)
+    assert.equal(retry.reasoning, "second fragment")
     return {
       choices: [{ message: { content: '{"type":"tool_calls","tool_calls":[{"name":"get_weather","arguments":{"city":"Paris"}}]}' }, finish_reason: "stop" }]
     }
@@ -1064,6 +1153,75 @@ test("accumulates public context across non-streaming length continuations", asy
 
   assert.equal(refetchCalls, 2)
   assert.equal(choice.finish_reason, "tool_calls")
+})
+
+test("stops non-streaming tool continuation after ten length retries", async () => {
+  const request = validateChatRequest({
+    model: "kimi-k3",
+    messages: [{ role: "user", content: "Weather in Paris" }],
+    tools: [weatherTool],
+    tool_choice: "required"
+  })
+  assert.ok(request.toolPlan)
+  let refetchCalls = 0
+
+  await assert.rejects(
+    () => normalizeToolCompletionWithRetry({
+      choices: [{ message: { reasoning: "partial action", content: "" }, finish_reason: "length" }]
+    }, "kimi-k3", request.toolPlan!, async () => {
+      refetchCalls += 1
+      return { choices: [{ message: { reasoning: "partial action", content: "" }, finish_reason: "length" }] }
+    }),
+    (error: unknown) => error instanceof AppError && error.code === "tool_action_length_exceeded"
+  )
+  assert.equal(refetchCalls, 10)
+})
+
+test("stops tool correction retries after five invalid actions", async () => {
+  const request = validateChatRequest({
+    model: "kimi-k3",
+    messages: [{ role: "user", content: "Weather in Paris" }],
+    tools: [weatherTool],
+    tool_choice: "required"
+  })
+  assert.ok(request.toolPlan)
+  let refetchCalls = 0
+
+  await assert.rejects(
+    () => normalizeToolCompletionWithRetry({
+      choices: [{ message: { content: "not a JSON action" }, finish_reason: "stop" }]
+    }, "kimi-k3", request.toolPlan!, async () => {
+      refetchCalls += 1
+      return { choices: [{ message: { content: "not a JSON action" }, finish_reason: "stop" }] }
+    }),
+    (error: unknown) => error instanceof AppError && error.code === "invalid_tool_action"
+  )
+  assert.equal(refetchCalls, 5)
+})
+
+test("stops tool stream correction retries after five invalid actions", async () => {
+  const request = validateChatRequest({
+    model: "kimi-k3",
+    messages: [{ role: "user", content: "Weather in Paris" }],
+    stream: true,
+    tools: [weatherTool],
+    tool_choice: "required"
+  })
+  assert.ok(request.toolPlan)
+
+  const invalidAction = async (): Promise<PreparedSse> => prepareSse(new Response([
+    'data: {"id":"invalid-retry","model":"kimi-k3","choices":[{"index":0,"delta":{"content":"not a JSON action"},"finish_reason":"stop"}]}\n\n',
+    "data: [DONE]\n\n"
+  ].join("")).body)
+  let refetchCalls = 0
+  const output = await new Response(createToolSseRelay(await invalidAction(), "kimi-k3", false, request.toolPlan!, async () => {
+    refetchCalls += 1
+    return invalidAction()
+  })).text()
+
+  assert.equal(refetchCalls, 5)
+  assert.match(output, /invalid_tool_action/)
+  assert.match(output, /data: \[DONE\]/)
 })
 
 test("feeds the JSON parse reason back when retrying broken JSON", async () => {
