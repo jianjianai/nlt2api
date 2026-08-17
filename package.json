@@ -4,10 +4,12 @@
   "scripts": {
     "build": "nitro build",
     "dev": "nitro dev",
+    "debug": "cross-env NEURALWATT_DEBUG_TRACE=1 nitro dev",
     "preview": "node .output/server/index.mjs",
     "test": "tsx --test \"tests/**/*.test.ts\""
   },
   "devDependencies": {
+    "cross-env": "^7.0.3",
     "h3": "^1.15.4",
     "nitropack": "^2.12.4",
     "tsx": "^4.23.12"
