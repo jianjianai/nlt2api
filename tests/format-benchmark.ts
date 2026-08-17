@@ -8,37 +8,36 @@ import YAML from "yaml"
 import { buildToolProtocol, parseToolAction, parseToolPlan, ToolActionError, type ToolPlan } from "../server/utils/tools"
 
 const TRIALS = 12
+const FORMATS = ["compact", "verbose"] as const
 const MAX_RETRIES = 5
 const MAX_TOKENS = 1024
 const MODEL = "kimi-k3"
 const TOOL_NAME = "calculate"
 
 interface Outcome {
+  format: "compact" | "verbose"
   attempts: number
   failedAfterRetries: boolean
   failures: string[]
   lengthTruncations: number
+  outputChars: number
+  outputTokens: number
   contentHead: string
   failedContents: string[]
 }
-function xmlContract(plan: ToolPlan): string {
-  const final = plan.choice === "required"
-    ? " A final answer is not allowed for this request."
-    : " If no tool is needed, emit <final><![CDATA[completed answer]]></final>."
-  return `Reply with exactly one XML action. For a tool call, emit <tool_calls><tool_call><name><![CDATA[${TOOL_NAME}]]></name><arguments><arg><key><![CDATA[expression]]></key><string><![CDATA[value]]></string></arg></arguments></tool_call></tool_calls>. Use CDATA for keys and strings, use typed XML value elements for other JSON values, and do not emit <id>. Start XML at the first non-whitespace character with no prose or code fence.${final}`
-}
-
-function nudgeFor(content: string, error: unknown, plan: ToolPlan): string {
-  const contract = xmlContract(plan)
+function nudgeFor(content: string, error: unknown, plan: ToolPlan, format: "compact" | "verbose"): string {
+  const contract = format === "compact"
+    ? "Return one compact XML action using the system protocol."
+    : "Return one verbose XML action using the system protocol."
   const failure = error instanceof ToolActionError ? error.failure : undefined
   if (failure?.kind === "empty_content") return `Your previous reply was empty. ${contract}`
   if (content.trim() && !content.trim().startsWith("<")) {
-    return `Your previous reply was unmarked prose; the proxy did not run a tool. Return the matching XML action now. ${contract}`
+    return `Your previous reply was unmarked prose; the proxy did not run a tool. Return the XML action now. ${contract}`
   }
   if (failure?.kind === "schema_validation") return `Arguments failed schema validation. ${contract}`
   return `Your previous reply did not provide a usable XML action${failure ? ` (${failure.kind})` : ""}. ${contract}`
 }
-async function portalChat(cookie: string, messages: Array<{ role: string; content: string }>): Promise<{ content: string; finishReason: string; doneSentinel: boolean }> {
+async function portalChat(cookie: string, messages: Array<{ role: string; content: string }>): Promise<{ content: string; finishReason: string; doneSentinel: boolean; completionTokens: number }> {
   const url = process.env.NEURALWATT_PORTAL_ORIGIN || "https://portal.neuralwatt.com"
   let lastError: unknown
   for (let attempt = 1; attempt <= 3; attempt += 1) {
@@ -62,6 +61,7 @@ async function portalChat(cookie: string, messages: Array<{ role: string; conten
       let content = ""
       let finishReason = ""
       let doneSentinel = false
+      let completionTokens = 0
       while (true) {
         const { done, value } = await reader.read()
         if (done) break
@@ -79,8 +79,10 @@ async function portalChat(cookie: string, messages: Array<{ role: string; conten
           try {
             const data = JSON.parse(line.slice(5).trim()) as {
               choices?: Array<{ delta?: { content?: string }; finish_reason?: string }>
+              usage?: { completion_tokens?: number }
             }
             const choice = data.choices?.[0]
+            if (typeof data.usage?.completion_tokens === "number") completionTokens = data.usage.completion_tokens
             if (typeof choice?.delta?.content === "string") content += choice.delta.content
             if (typeof choice?.finish_reason === "string") finishReason = choice.finish_reason
           } catch {
@@ -88,7 +90,7 @@ async function portalChat(cookie: string, messages: Array<{ role: string; conten
           }
         }
       }
-      return { content, finishReason, doneSentinel }
+      return { content, finishReason, doneSentinel, completionTokens }
     } catch (error) {
       lastError = error
       console.warn(`[bench] portal fetch attempt ${attempt}/3 failed: ${error instanceof Error ? error.message : "unknown"}`)
@@ -98,7 +100,7 @@ async function portalChat(cookie: string, messages: Array<{ role: string; conten
   throw lastError
 }
 
-async function runTrial(cookie: string, task: string): Promise<Outcome> {
+async function runTrial(cookie: string, format: "compact" | "verbose", task: string): Promise<Outcome> {
   const plan = parseToolPlan({
     tools: [{
       type: "function",
@@ -114,14 +116,16 @@ async function runTrial(cookie: string, task: string): Promise<Outcome> {
   if (!plan) throw new Error("plan failed")
 
   const messages: Array<{ role: string; content: string }> = [
-    { role: "system", content: buildToolProtocol(plan) },
+    { role: "system", content: buildToolProtocol(plan, format) },
     { role: "user", content: task }
   ]
-  const outcome: Outcome = { attempts: 0, failedAfterRetries: false, failures: [], lengthTruncations: 0, contentHead: "", failedContents: [] }
+  const outcome: Outcome = { format, attempts: 0, failedAfterRetries: false, failures: [], lengthTruncations: 0, outputChars: 0, outputTokens: 0, contentHead: "", failedContents: [] }
 
   for (let attempt = 1; attempt <= MAX_RETRIES + 1; attempt += 1) {
     outcome.attempts = attempt
-    const { content, finishReason, doneSentinel } = await portalChat(cookie, messages)
+    const { content, finishReason, doneSentinel, completionTokens } = await portalChat(cookie, messages)
+    outcome.outputChars += content.length
+    outcome.outputTokens += completionTokens
     if (outcome.contentHead === "" && content) outcome.contentHead = content.slice(0, 100)
 
     if (finishReason === "length" && !content.trim()) {
@@ -144,11 +148,11 @@ async function runTrial(cookie: string, task: string): Promise<Outcome> {
       outcome.failures.push(kind)
       outcome.failedContents.push(content)
       messages.push({ role: "assistant", content })
-      messages.push({ role: "user", content: nudgeFor(content, error, plan) })
+      messages.push({ role: "user", content: nudgeFor(content, error, plan, format) })
       if (attempt === MAX_RETRIES + 1) outcome.failedAfterRetries = true
     }
   }
-  if (outcome.failures.length > 0) console.log(`[bench] XML task="${task.slice(0, 24)}" attempts=${outcome.attempts} failures=${outcome.failures.join(",")}\n  failed=${JSON.stringify(outcome.failedContents.map((c) => c.slice(0, 400)))}`)
+  if (outcome.failures.length > 0) console.log(`[bench] ${format} task="${task.slice(0, 24)}" attempts=${outcome.attempts} failures=${outcome.failures.join(",")}\n  failed=${JSON.stringify(outcome.failedContents.map((c) => c.slice(0, 400)))}`)
   return outcome
 }
 
@@ -175,23 +179,32 @@ async function main(): Promise<void> {
   ]
 
   const results: Outcome[] = []
-  for (const task of tasks.slice(0, TRIALS)) {
-    results.push(await runTrial(cookie, task))
+  for (let i = 0; i < TRIALS; i += 1) {
+    for (const format of FORMATS) {
+      results.push(await runTrial(cookie, format, tasks[i]))
+    }
   }
 
-  const firstTry = results.filter((result) => result.attempts === 1).length
-  const totalRetries = results.reduce((sum, result) => sum + result.attempts - 1, 0)
-  const totalCalls = results.reduce((sum, result) => sum + result.attempts, 0)
-  const allFailures = results.flatMap((result) => result.failures)
-  const kindCounts = new Map<string, number>()
-  for (const kind of allFailures) kindCounts.set(kind, (kindCounts.get(kind) ?? 0) + 1)
-  const lengthTrunc = results.reduce((sum, result) => sum + result.lengthTruncations, 0)
-  console.log(`\n=== XML (n=${results.length}) ===`)
-  console.log(`first-try success: ${firstTry}/${results.length}`)
-  console.log(`error rate (needs >=1 retry): ${(1 - firstTry / results.length) * 100}%`)
-  console.log(`avg attempts per trial: ${(totalCalls / results.length).toFixed(2)}`)
-  console.log(`total correction retries: ${totalRetries} (length truncations: ${lengthTrunc})`)
-  console.log(`failure kinds: ${[...kindCounts.entries()].map(([kind, count]) => `${kind}=${count}`).join(", ")}`)
+  for (const format of FORMATS) {
+    const group = results.filter((result) => result.format === format)
+    const firstTry = group.filter((result) => result.attempts === 1).length
+    const totalRetries = group.reduce((sum, result) => sum + result.attempts - 1, 0)
+    const totalCalls = group.reduce((sum, result) => sum + result.attempts, 0)
+    const allFailures = group.flatMap((result) => result.failures)
+    const kindCounts = new Map<string, number>()
+    for (const kind of allFailures) kindCounts.set(kind, (kindCounts.get(kind) ?? 0) + 1)
+    const lengthTrunc = group.reduce((sum, result) => sum + result.lengthTruncations, 0)
+    const outputChars = group.reduce((sum, result) => sum + result.outputChars, 0)
+    const outputTokens = group.reduce((sum, result) => sum + result.outputTokens, 0)
+    console.log(`\n=== ${format.toUpperCase()} (n=${group.length}) ===`)
+    console.log(`first-try success: ${firstTry}/${group.length}`)
+    console.log(`error rate (needs >=1 retry): ${(1 - firstTry / group.length) * 100}%`)
+    console.log(`avg attempts per trial: ${(totalCalls / group.length).toFixed(2)}`)
+    console.log(`total correction retries: ${totalRetries} (length truncations: ${lengthTrunc})`)
+    console.log(`average output chars: ${(outputChars / group.length).toFixed(1)}`)
+    console.log(`average output tokens: ${(outputTokens / group.length).toFixed(1)}`)
+    console.log(`failure kinds: ${[...kindCounts.entries()].map(([kind, count]) => `${kind}=${count}`).join(", ")}`)
+  }
 }
 
 void main()

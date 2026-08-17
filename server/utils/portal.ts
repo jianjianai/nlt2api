@@ -42,6 +42,12 @@ function timeoutSignal(milliseconds: number): AbortSignal {
   return AbortSignal.timeout(milliseconds)
 }
 
+export function isPortalTimeoutError(error: unknown): boolean {
+  if (error instanceof DOMException && error.name === "TimeoutError") return true
+  if (!(error instanceof Error)) return false
+  return error.name === "TimeoutError" || /aborted due to timeout|timed out|timeout/i.test(error.message)
+}
+
 export async function checkPortalSession(cookie: string): Promise<SessionCheck> {
   if (!cookie.trim()) {
     return { ok: false, status: 401, reason: "missing_session" }
@@ -127,6 +133,10 @@ export async function fetchPortalChat(cookie: string, payload: Record<string, un
     }
     return response
   } catch (error) {
+    if (isPortalTimeoutError(error)) {
+      console.error("[portal] chat request timed out")
+      throw new AppError("The Neuralwatt portal chat request timed out", 504, "upstream_timeout")
+    }
     console.error(`[portal] chat request failed: portal unreachable (${error instanceof Error ? error.message : "unknown"})`)
     throw new AppError("The Neuralwatt portal is unreachable", 502, "portal_unreachable")
   }

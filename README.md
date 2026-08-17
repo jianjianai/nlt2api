@@ -77,7 +77,7 @@ curl.exe http://127.0.0.1:3000/v1/chat/completions `
 
 ### 工具调用实现
 
-门户不会原生解析 Kimi K3 的工具定义。本适配器采用经过真实接口验证的兼容方案：将 function tools 编译为受约束的 YAML 动作协议，并使用 Ajv 按调用方提供的参数 Schema 校验，最后转换为 OpenAI 标准工具响应。工具由调用方执行，代理本身不会执行函数。
+门户不会原生解析 Kimi K3 的工具定义。本适配器采用经过真实接口验证的兼容方案：将 function tools 编译为模型到代理内部的 compact XML 动作协议，并使用 Ajv 按调用方提供的参数 Schema 校验，最后转换为 OpenAI 标准工具响应。代理同时接受旧 verbose XML 历史；工具由调用方执行，代理本身不会执行函数。
 
 支持的选择方式：
 
@@ -90,7 +90,7 @@ curl.exe http://127.0.0.1:3000/v1/chat/completions `
 
 `tool_choice` 是逐请求约束。`required` 要求当前响应必须产生至少一个工具调用，即使历史中已经有工具结果；若要让模型基于结果生成最终答案，下一次请求必须省略 `tool_choice` 或改为 `auto`。工具调用消息可以同时携带简短的用户可见 `content`，但客户端应以 `finish_reason: "tool_calls"` 和完整的 `tool_calls` 数组驱动执行循环，而不能把进度正文当作状态信号。
 
-流式请求会实时转发 `reasoning_content`，但不会把内部动作 JSON 暴露给客户端；动作完整且校验通过后才发出 `delta.tool_calls` 和 `finish_reason: "tool_calls"`。若模型生成无效 JSON、未知工具或不符合 Schema 的参数，非流式请求返回 HTTP 502 `invalid_tool_action`；流式响应已经开始后则通过 SSE error 事件结束。该方案是模型协议仿真，不等同于上游推理框架原生的 `kimi_k3` tool parser。
+流式请求会实时转发 `reasoning_content`，但不会把内部 XML 动作暴露给客户端；动作完整且校验通过后才发出 `delta.tool_calls` 和 `finish_reason: "tool_calls"`。若模型生成无效 XML、未知工具或不符合 Schema 的参数，非流式请求返回 HTTP 502 `invalid_tool_action`；流式响应已经开始后则通过 SSE error 事件结束。XML 只存在于模型到代理的内部边界，不等同于上游推理框架原生的 `kimi_k3` tool parser。
 
 当上游明确以 `finish_reason: "length"` 截断时，代理会为 `response_format: text` 响应和尚未形成合法工具动作的工具请求，最多发起 10 次内部续轮；工具协议产生无效动作时，模型纠错最多连续重试 5 次。续轮只使用已公开的 `reasoning_content` 和 `content`，不可能恢复模型的隐藏推理状态。代理保留完整初始请求，并按实际发送顺序追加每个 `assistant -> user` 重试对，使下一次上游请求成为前一次请求的严格前缀，以便上游提示缓存复用；客户端回传带有 `reasoning_content` 的历史时，也会据此还原同一组实际重试消息。每次上游请求仍复用该请求的有效 `max_tokens` 上限，流式客户端会收到一个连续的 SSE 响应及累计 usage。`response_format: json_object` 保持单次响应语义，不自动拼接截断 JSON；第 11 次连续截断时，文本响应最终保留 `finish_reason: "length"`，工具请求返回 `tool_action_length_exceeded`。
 

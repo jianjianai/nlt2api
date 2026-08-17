@@ -448,7 +448,7 @@ function completionChunkIdentity(value: JsonObject, model: string): JsonObject {
   }
 }
 
-export type ToolActionRetryCause = "invalid_action" | "length"
+export type ToolActionRetryCause = "invalid_action" | "length" | "timeout"
 
 export interface ToolActionRetry {
   cause: ToolActionRetryCause
@@ -485,7 +485,7 @@ function markedProseFinal(content: unknown, plan: ToolPlan): string | null {
 }
 
 function looksLikeXmlAction(content: string): boolean {
-  return content.trim().startsWith("<")
+  return /^\s*(?:```xml\s*)?<tool_calls\b/i.test(content)
 }
 
 // Identifies bare prose so retries can explain how to attach it to a tool action.
@@ -524,19 +524,34 @@ function encodeErrorBlock(
 
 function retryActionContract(plan: ToolPlan): string {
   const final = allowsMarkedProse(plan)
-    ? ` Only if no tool is needed and the answer is complete, emit FINAL: ${TOOL_PROSE_FINAL_PREFIX}<completed answer>.`
+    ? ` If no tool is needed, emit ${TOOL_PROSE_FINAL_PREFIX}<completed answer>.`
     : plan.choice === "auto"
-      ? " Only if no tool is needed and the answer is complete, emit <final><![CDATA[completed answer]]></final>."
-      : " A final answer is not allowed for this request."
-  return `Reply with exactly one complete protocol action. For a tool call, emit this XML document:\n<tool_calls>\n  <progress><![CDATA[optional short progress update]]></progress>\n  <tool_call><name><![CDATA[tool_name]]></name><arguments><arg><key><![CDATA[argument_name]]></key><string><![CDATA[value]]></string></arg></arguments></tool_call>\n</tool_calls>\nprogress is optional, user-visible, and at most 240 characters. Put any progress update inside <progress> beside the actual <tool_call>; never emit it separately. Encode keys and strings in CDATA, use number/boolean/null/object/array value elements for other JSON types, and do not emit <id>. Start XML at the first non-whitespace character with no prose or code fence.${final}`
+      ? " If no tool is needed, emit <final><![CDATA[completed answer]]></final>."
+      : " A final answer is not allowed in this request."
+  return `Return only one corrected XML action using the system protocol. Do not emit a plan, prose, Markdown fence, or <id>.${final}`
 }
 
 function buildUnmarkedProseRetryNudge(plan: ToolPlan): string {
-  return `Your previous reply was unmarked prose, not a protocol action. The proxy did not run or queue a tool from that text. If it describes work that remains, immediately return the matching <tool_calls> XML action; put that progress update in <progress>, not in a separate message. ${retryActionContract(plan)}`
+  return `The previous reply was unmarked prose; the proxy did not run a tool. Put only a short user-facing sentence in <progress>, include the actual <tool_call>, and return the complete XML action. ${retryActionContract(plan)}`
 }
 
 function isLengthTruncation(finishReason: unknown): boolean {
   return finishReason === "length"
+}
+
+function isUpstreamTimeout(error: unknown): boolean {
+  if (error instanceof AppError && error.code === "upstream_timeout") return true
+  if (!(error instanceof Error)) return false
+  return error.name === "TimeoutError" || /aborted due to timeout|timed out|timeout/i.test(error.message)
+}
+
+function buildTimeoutRetry(reasoning: string, content: string, plan: ToolPlan): ToolActionRetry {
+  return {
+    cause: "timeout",
+    reasoning: tailForRetry(reasoning, TOOL_INVALID_ACTION_REASONING_MAX_CHARS),
+    content: tailForRetry(content, TOOL_INVALID_ACTION_CONTENT_MAX_CHARS),
+    nudge: `The upstream response timed out before a complete action. Continue once and return only the XML action from the system protocol. Do not repeat prior reasoning. ${plan.choice === "required" ? "A tool call is required." : "Use <final> only when no tool is needed."}`
+  }
 }
 
 function tailForRetry(value: string, maximum: number): string {
@@ -582,19 +597,17 @@ function buildRetryNudge(content: string, error: unknown, plan: ToolPlan): strin
     case "empty_content":
       return `Your previous reply was empty. ${contract}`
     case "invalid_xml":
-      return `Your previous reply was invalid XML${failure.detail ? ` (${failure.detail})` : ""}. ${contract}`
+      return `XML parse failed${failure.detail ? ` (${failure.detail})` : ""}. ${contract}`
     case "invalid_xml_root":
-      return `XML root <${failure.name}> is invalid; use <tool_calls> or <final>. ${contract}`
+      return `Use one <tool_calls> or <final> root; the previous root was <${failure.name}>. ${contract}`
     case "invalid_xml_structure":
-      return `Your XML action has an invalid structure: ${failure.detail}. ${contract}`
+      return `XML structure failed: ${failure.detail}. ${contract}`
     case "empty_tool_calls":
-      return `<tool_calls> must contain at least one <tool_call>. ${contract}`
-    case "tool_call_content_too_long":
-      return `<progress> must be at most 240 characters. ${contract}`
+      return `<tool_calls> needs at least one <tool_call>. ${contract}`
     case "parallel_calls_not_allowed":
       return `Only one <tool_call> is allowed in this turn. ${contract}`
     case "missing_function_name":
-      return `<tool_call> ${failure.index + 1} is missing <name>. ${contract}`
+      return `<tool_call> ${failure.index + 1} needs a <name>. ${contract}`
     case "unknown_function":
       return `Unknown function ${failure.name}. Use only a name from TOOL DEFINITIONS. ${contract}`
     case "schema_validation":
@@ -708,12 +721,15 @@ export function createToolSseRelay(
         try {
           let lengthRetries = 0
           let correctionRetries = 0
+          let timeoutRetries = 0
+          let toolCallDelivered = false
           let action: ParsedToolAction | undefined
           while (true) {
             let pending = current.pending
             xmlStream = undefined
             sawDoneSentinel = current.firstDoneSentinel === true
             if (current.firstChunk) processToolChunk(current.firstChunk)
+            let timeoutRetry: ToolActionRetry | undefined
             let upstreamDone = current.firstDone
             while (!upstreamDone) {
               const frame = takeFrame(pending)
@@ -723,7 +739,15 @@ export function createToolSseRelay(
                 continue
               }
 
-              const next = await current.reader.read()
+              let next: ReadableStreamReadResult<Uint8Array>
+              try {
+                next = await current.reader.read()
+              } catch (error) {
+                if (!isUpstreamTimeout(error) || !refetch || timeoutRetries >= 1 || toolCallDelivered) throw error
+                timeoutRetries += 1
+                timeoutRetry = buildTimeoutRetry(reasoningText, content, plan)
+                break
+              }
               if (next.done) {
                 pending += decoder.decode()
                 if (pending) {
@@ -741,6 +765,33 @@ export function createToolSseRelay(
                 break
               }
               pending += decoder.decode(next.value, { stream: true })
+            }
+            if (timeoutRetry) {
+              const retry = timeoutRetry
+              try {
+                current.reader.releaseLock()
+              } catch {
+                // The reader may already be released after an upstream abort.
+              }
+              console.warn(`[proxy] tool action retry cause=timeout attempt=${timeoutRetries}/1 reasoning_chars=${reasoningText.length} content_chars=${content.length}`)
+              controller.enqueue(formatSse({
+                ...(identity ?? completionChunkIdentity({}, model)),
+                choices: [{ index: 0, delta: { reasoning_content: encodeErrorBlock(retry) }, finish_reason: null }]
+              }))
+              totalUsage = mergeUsage(totalUsage, usage)
+              content = ""
+              usage = undefined
+              upstreamFinishReason = "stop"
+              reasoningText = ""
+              markedProse = false
+              markedProseContent = ""
+              xmlStream = undefined
+              sawDoneSentinel = false
+              const retryFetch: ToolSseRefetch = refetch ?? (() => {
+                throw new AppError("The upstream timed out before a tool action was completed", 502, "upstream_timeout")
+              })
+              current = await retryFetch(retry)
+              continue
             }
             current.reader.releaseLock()
 
@@ -767,9 +818,6 @@ export function createToolSseRelay(
               if (!refetch || retryCount >= retryLimit) {
                 throw terminalToolActionError(error, upstreamFinishReason)
               }
-
-              // Retry turns are appended by the proxy as assistant -> user pairs,
-              // preserving the exact prior request prefix for upstream caching.
               const retry = buildToolActionRetry(error, plan, upstreamFinishReason, reasoningText, content)
               if (cause === "length") lengthRetries += 1
               else correctionRetries += 1
@@ -791,6 +839,7 @@ export function createToolSseRelay(
 
           identity ??= completionChunkIdentity({}, model)
           const parsedAction = action as ParsedToolAction
+          if (parsedAction.kind === "tool_calls") toolCallDelivered = true
           if (parsedAction.kind === "tool_calls" && parsedAction.content !== null) {
             const progressDelta: JsonObject = roleSent
               ? { content: parsedAction.content }
@@ -997,13 +1046,14 @@ export async function normalizeToolCompletionWithRetry(
       if (!refetch || retryCount >= retryLimit) {
         throw terminalToolActionError(error, attempt?.finishReason)
       }
+      const retryFetch = refetch
 
       const retry = buildToolActionRetry(error, plan, attempt?.finishReason, attempt?.reasoning ?? "", attempt?.content ?? "")
       if (cause === "length") lengthRetries += 1
       else correctionRetries += 1
       replayReasoning += `${retry.reasoning}${encodeErrorBlock(retry)}`
       totalUsage = mergeUsage(totalUsage, isRecord(normalized.usage) ? normalized.usage : undefined)
-      current = await refetch(retry)
+      current = await retryFetch(retry)
     }
   }
 }

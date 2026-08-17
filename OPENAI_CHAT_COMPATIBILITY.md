@@ -195,14 +195,16 @@
 
 ### 6.1 自建适配器的工具协议仿真
 
-进一步测试表明，问题位于门户网关/推理服务的工具定义传递或模板解析层，而不是 Kimi K3 模型完全不具备工具决策能力。当前最可落地的方案不是继续把 `tools` 原样转发，而是：
+进一步测试表明，问题位于门户网关/推理服务的工具定义传递或模板解析层，而不是 Kimi K3 模型完全不具备工具决策能力。当前适配器不把外部 `tools` 原样转发给门户，而是在模型与代理之间使用独立的 XML 动作协议：
 
-1. 将 OpenAI function tools 写入独立 system 协议，要求模型只返回 `tool_calls` 或 `final` 两种 JSON 动作。
-2. 对门户强制使用 `response_format: {"type":"json_object"}`，不把外部 `tools` 字段传给门户。
-3. 在代理本地解析动作，限制可调用的函数名，并用 Ajv 按每个函数的 `parameters` JSON Schema 校验 arguments；根据 `$schema` 选择 draft-06/07、draft-2019-09 或 draft-2020-12 校验器。
-4. 为合法调用生成代理侧 call ID，并转换为标准 `choices[].message.tool_calls` / 流式 `delta.tool_calls`，同时把 finish_reason 改为 `tool_calls`。
+1. 将 OpenAI function tools 写入独立 system 协议，要求模型只返回 `<tool_calls>` 或 `<final>` XML 动作。生产默认使用 compact XML；解析器同时接受旧 verbose XML。
+2. 对门户不透传外部 `tools` 字段；XML 只存在于模型到代理的内部边界，客户端仍接收标准 OpenAI JSON/SSE `tool_calls`。
+3. 在代理本地用严格 SAX XML 解析器增量解析动作，限制可调用的函数名，并用 Ajv 按每个函数的 `parameters` JSON Schema 校验 arguments。compact 参数使用 `<arg name="..." type="...">`，verbose 参数作为兼容输入。
+4. 为合法调用生成代理侧 call ID，并转换为标准 `choices[].message.tool_calls` / 流式 `delta.tool_calls`，同时把 finish_reason 改为 `tool_calls`。模型可见的历史 XML 不包含 `<id>`；若模型复现 `<id>`，解析器会忽略它并重新生成代理 ID。
 5. 下一轮把客户端传回的完整 assistant tool_calls 重新编码成动作历史，并要求其后紧接每个调用各一条具有匹配 `tool_call_id` 的 `role: "tool"` 结果；遗漏、重复、未知或被其他角色消息打断的结果返回 400 `invalid_message`。
 6. `tool_choice` 按请求独立生效：`required` 在每一次请求中都禁止最终回答并要求至少一个调用；客户端回传工具结果后若要生成最终正文，必须省略该字段或改为 `auto`。
+
+XML 解析采用整份动作原子提交：SSE chunk 会增量喂入解析器，但只有根元素、结构和 Ajv 校验全部通过后才下发工具调用。超长或包含 reasoning/protocol 的 `<progress>` 会被丢弃而不阻断调用；上游 `TimeoutError` 归类为 `upstream_timeout`，与 XML correction retry 分开。
 
 2026-08-16 在本地适配器连接真实 `/api/chat` 登录态后得到以下结果：
 
@@ -210,13 +212,13 @@
 | --- | --- |
 | 非流式 `tool_choice: required` | 返回标准 `message.tool_calls`，函数名和 JSON arguments 正确 |
 | 两轮调用循环 | 首轮 `required` 返回调用；客户端回传完整 tool results 并以 `auto` 发起次轮后返回最终正文 |
-| 流式工具调用 | 思考增量实时返回，内部动作 JSON 被隐藏，末尾返回标准 `delta.tool_calls`、usage 和 `[DONE]` |
+| 流式工具调用 | 思考增量实时返回，内部 XML 动作被隐藏，末尾返回标准 `delta.tool_calls`、usage 和 `[DONE]` |
 | `tool_choice: none` | 走普通文本路径，不生成工具调用 |
 | 并行调用 | 单轮正确返回两个标准 tool calls；`parallel_tool_calls: false` 由代理严格限制 |
 | 指定函数 | 当前 `{ "type": "function", "name": "..." }` 形状正确强制目标函数 |
 | 本地自动化测试 | 覆盖 Schema 拒绝、逐请求选择语义、完整/损坏工具事务、并行限制、历史转换和流式转换 |
 
-该实现仍是模型协议仿真，而不是推理框架原生 tool parser。模型若输出无效动作，代理会失败关闭并返回 `invalid_tool_action`；代理也只负责生成调用，不负责执行用户函数。若未来门户启用 vLLM 的 Kimi K3 工具解析器，优先切换到原生通道并保留当前方案作为兼容回退。
+该实现仍是模型协议仿真，而不是推理框架原生 tool parser。XML 只在模型到代理的内部边界使用；客户端看到的仍是标准 OpenAI `tool_calls`。模型若输出无效动作，代理会失败关闭并返回 `invalid_tool_action`；代理也只负责生成调用，不负责执行用户函数。若未来门户启用 vLLM 的 Kimi K3 工具解析器，优先切换到原生通道并保留当前方案作为兼容回退。
 
 ## 7. 响应协议形状
 
@@ -445,6 +447,6 @@ image_url content parts（仅基础验证）
 - `POST /v1/chat/completions` 将已验证的 OpenAI 字段映射为门户 `POST /api/chat`；
 - 流式响应会移除门户的 pricing、energy、routing 注释，并将门户 `reasoning` / `reasoning_content` 统一映射为兼容扩展 `delta.reasoning_content`；非流式响应对应映射到 `choices[].message.reasoning_content`。连续对话中，客户端 assistant 消息携带的 `reasoning_content` 会反向映射为门户 `reasoning`。这不是 OpenAI Chat Completions 的正式字段，但可兼容常见的推理模型客户端约定。
 - `max_completion_tokens` 在本地转换为 `max_tokens`，已知无效语义字段返回标准 400；
-- 现代 function tools 会转换为受约束的 JSON 动作协议，本地执行函数名/参数 Schema/并行数量校验，并还原为 OpenAI 标准非流式和流式 `tool_calls`；严格校验 assistant tool calls 与对应 tool results 的完整事务，并按每次请求执行 `tool_choice` 语义；
+- 现代 function tools 会转换为模型到代理内部的 compact XML 动作协议，本地执行函数名/参数 Schema/并行数量校验，并还原为 OpenAI 标准非流式和流式 `tool_calls`；严格校验 assistant tool calls 与对应 tool results 的完整事务，并按每次请求执行 `tool_choice` 语义；旧 verbose XML 仅作为兼容输入。
 - 账号密码和会话 Cookie 保存于被 Git 忽略的 `.data/neuralwatt-accounts.yaml`，会话失效时先用 `/api/usage` 检查并自动重新登录；
 - 代理只在认证失败且上游尚未开始推理时切换账号，避免对未知执行状态的请求重复发送。
