@@ -466,7 +466,6 @@ export interface ToolCompletionRefetch {
 
 const TOOL_LENGTH_CONTINUATION_MAX_RETRIES = 10
 const TOOL_MODEL_CORRECTION_MAX_RETRIES = 5
-const UNMARKED_PROSE_MAX_RETRIES = 1
 const TOOL_LENGTH_CONTINUATION_REASONING_MAX_CHARS = 32_000
 const TOOL_LENGTH_CONTINUATION_CONTENT_MAX_CHARS = 8_000
 const TOOL_INVALID_ACTION_REASONING_MAX_CHARS = 2_000
@@ -766,18 +765,6 @@ export function createToolSseRelay(
               const invalidAction = error instanceof AppError && error.code === "invalid_tool_action"
               if (!invalidAction) {
                 throw error
-              }
-
-              // Bare prose is ambiguous: ask once for the direct-answer
-              // marker or a YAML action, then preserve availability by
-              // delivering any remaining prose instead of spending more calls.
-              if (!isLengthTruncation(upstreamFinishReason) && plan.choice === "auto" && plan.finalResponseFormat === "text") {
-                const prose = proseCandidate(content, error)
-                if (prose !== null && (!refetch || correctionRetries >= UNMARKED_PROSE_MAX_RETRIES)) {
-                  console.warn(`[proxy] tool action fallback: delivering unmarked prose as final (auto choice) content_chars=${content.length}`)
-                  action = { kind: "final", content: prose }
-                  break
-                }
               }
 
               const cause: ToolActionRetryCause = isLengthTruncation(upstreamFinishReason) ? "length" : "invalid_action"

@@ -953,7 +953,7 @@ test("streams a marked direct answer immediately without a tool-action retry", a
   assert.match(output, /data: \[DONE\]/)
 })
 
-test("retries prose first when a retry is available (auto choice keeps tool preference)", async () => {
+test("retries consecutive unmarked prose until the model returns a valid action", async () => {
   const request = validateChatRequest({
     model: "kimi-k3",
     messages: [{ role: "user", content: "Weather in Paris" }],
@@ -967,8 +967,11 @@ test("retries prose first when a retry is available (auto choice keeps tool pref
     refetchCalls += 1
     assert.match(failed.nudge, /unmarked prose/)
     assert.match(failed.nudge, /\u25c6/)
+    const content = refetchCalls === 1
+      ? "Let me just answer directly again: it is 21C in Paris."
+      : "type: tool_calls\ntool_calls:\n  - name: get_weather\n    arguments:\n      city: Paris"
     const upstream = new Response([
-      `data: ${JSON.stringify({ id: "retry", model: "kimi-k3", choices: [{ index: 0, delta: { role: "assistant", content: "type: tool_calls\ntool_calls:\n  - name: get_weather\n    arguments:\n      city: Paris" }, finish_reason: "stop" }] })}\n\n`,
+      `data: ${JSON.stringify({ id: `retry-${refetchCalls}`, model: "kimi-k3", choices: [{ index: 0, delta: { role: "assistant", content }, finish_reason: "stop" }] })}\n\n`,
       "data: [DONE]\n\n"
     ].join(""))
     return prepareSse(upstream.body)
@@ -982,7 +985,7 @@ test("retries prose first when a retry is available (auto choice keeps tool pref
   const relay = createToolSseRelay(prepared, "kimi-k3", false, request.toolPlan!, refetch)
   const output = await new Response(relay).text()
 
-  assert.equal(refetchCalls, 1)
+  assert.equal(refetchCalls, 2)
   assert.match(output, /tool_calls/)
   assert.match(output, /get_weather/)
   assert.doesNotMatch(output, /"error":/)
