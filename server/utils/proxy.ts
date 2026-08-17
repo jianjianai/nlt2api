@@ -1,4 +1,5 @@
 import { AccountAuthError, AppError } from "./errors"
+import type { DebugTrace } from "./debug"
 import { validateChatRequest, type ValidatedChatRequest } from "./openai"
 import { checkPortalSession, ensurePortalLogin, fetchPortalChat } from "./portal"
 import {
@@ -70,15 +71,20 @@ async function prepareAccountCookie(account: StoredAccount): Promise<string> {
   return refreshAccount(account)
 }
 
-async function fetchWithAuthRecovery(account: StoredAccount, request: ValidatedChatRequest): Promise<Response> {
+async function fetchWithAuthRecovery(
+  account: StoredAccount,
+  request: ValidatedChatRequest,
+  trace: DebugTrace | undefined,
+  nextUpstreamAttempt: () => number
+): Promise<Response> {
   let cookie = await prepareAccountCookie(account)
-  let response = await fetchPortalChat(cookie, request.portalPayload)
+  let response = await fetchPortalChat(cookie, request.portalPayload, trace, nextUpstreamAttempt())
 
   if (isAuthStatus(response.status)) {
     console.warn(`[proxy] portal returned ${response.status} for account=${account.label}; refreshing session`)
     await discardResponse(response)
     cookie = await refreshAccount(account)
-    response = await fetchPortalChat(cookie, request.portalPayload)
+    response = await fetchPortalChat(cookie, request.portalPayload, trace, nextUpstreamAttempt())
   }
 
   if (isAuthStatus(response.status)) {
@@ -90,10 +96,15 @@ async function fetchWithAuthRecovery(account: StoredAccount, request: ValidatedC
   return response
 }
 
-async function preparePortalSse(account: StoredAccount, request: ValidatedChatRequest): Promise<PreparedSse> {
+async function preparePortalSse(
+  account: StoredAccount,
+  request: ValidatedChatRequest,
+  trace: DebugTrace | undefined,
+  nextUpstreamAttempt: () => number
+): Promise<PreparedSse> {
   let response: Response
   try {
-    response = await fetchWithAuthRecovery(account, request)
+    response = await fetchWithAuthRecovery(account, request, trace, nextUpstreamAttempt)
   } catch (error) {
     if (error instanceof AccountAuthError) {
       await recordAccountStatus(account.id, error.code === "manual_cookie_required" ? "manual_cookie_required" : "login_failed", error.message)
@@ -160,7 +171,12 @@ export function createContinuationPayloadBuilder(portalPayload: Record<string, u
   }
 }
 
-async function proxyForAccount(account: StoredAccount, request: ValidatedChatRequest): Promise<ProxyResult> {
+async function proxyForAccount(
+  account: StoredAccount,
+  request: ValidatedChatRequest,
+  trace: DebugTrace | undefined,
+  nextUpstreamAttempt: () => number
+): Promise<ProxyResult> {
   console.info(`[proxy] chat request account=${account.label} model=${request.model} stream=${request.stream} tools=${request.toolPlan ? "yes" : "no"} max_tokens=${request.portalPayload.max_tokens ?? "default"}`)
   const continuationPayload = createContinuationPayloadBuilder(request.portalPayload)
   const responseFormat = request.portalPayload.response_format
@@ -173,7 +189,7 @@ async function proxyForAccount(account: StoredAccount, request: ValidatedChatReq
     const fetchJson = async (portalPayload: Record<string, unknown>): Promise<unknown> => {
       let response: Response
       try {
-        response = await fetchWithAuthRecovery(account, { ...request, portalPayload })
+        response = await fetchWithAuthRecovery(account, { ...request, portalPayload }, trace, nextUpstreamAttempt)
       } catch (error) {
         if (error instanceof AccountAuthError) {
           await recordAccountStatus(account.id, error.code === "manual_cookie_required" ? "manual_cookie_required" : "login_failed", error.message)
@@ -219,12 +235,12 @@ async function proxyForAccount(account: StoredAccount, request: ValidatedChatReq
     }
   }
 
-  const prepared = await preparePortalSse(account, request)
+  const prepared = await preparePortalSse(account, request, trace, nextUpstreamAttempt)
   if (request.toolPlan) {
     const refetch = async (retry: ToolActionRetry): Promise<PreparedSse> => {
       console.warn(`[proxy] tool action retry cause=${retry.cause} attempt=${retry.attempt} context=${retry.context} retry_after_ms=${retry.retryAfterMs} account=${account.label} model=${request.model} preserved reasoning_chars=${retry.reasoning.length} content_chars=${retry.content.length}`)
       await waitForRetry(retry)
-      return preparePortalSse(account, { ...request, portalPayload: continuationPayload(retry) })
+      return preparePortalSse(account, { ...request, portalPayload: continuationPayload(retry) }, trace, nextUpstreamAttempt)
     }
     return {
       kind: "stream",
@@ -236,7 +252,7 @@ async function proxyForAccount(account: StoredAccount, request: ValidatedChatReq
     ? undefined
     : async (continuation: OutputLengthContinuation): Promise<PreparedSse> => {
         console.warn(`[proxy] output continuation account=${account.label} model=${request.model} preserved reasoning_chars=${continuation.reasoning.length} content_chars=${continuation.content.length}`)
-        return preparePortalSse(account, { ...request, portalPayload: continuationPayload(continuation) })
+        return preparePortalSse(account, { ...request, portalPayload: continuationPayload(continuation) }, trace, nextUpstreamAttempt)
       }
   return {
     kind: "stream",
@@ -244,7 +260,7 @@ async function proxyForAccount(account: StoredAccount, request: ValidatedChatReq
   }
 }
 
-export async function handleChatRequest(input: unknown): Promise<ProxyResult> {
+export async function handleChatRequest(input: unknown, trace?: DebugTrace): Promise<ProxyResult> {
   const request = validateChatRequest(input)
   const accounts = orderedAccounts(await getEnabledAccounts())
   if (accounts.length === 0) {
@@ -252,9 +268,11 @@ export async function handleChatRequest(input: unknown): Promise<ProxyResult> {
   }
 
   let authFailures = 0
+  let upstreamAttempt = 0
+  const nextUpstreamAttempt = (): number => ++upstreamAttempt
   for (const account of accounts) {
     try {
-      return await proxyForAccount(account, request)
+      return await proxyForAccount(account, request, trace, nextUpstreamAttempt)
     } catch (error) {
       if (error instanceof AccountAuthError) {
         authFailures += 1

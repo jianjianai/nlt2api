@@ -27,6 +27,17 @@ pnpm dev
 
 局域网访问必须使用代理 Bearer Key。不要把服务直接暴露到公网。
 
+## 调试追踪
+
+设置 `NEURALWATT_DEBUG_TRACE=1` 后启动服务，`/v1/chat/completions` 的每次已认证请求都会在 `.data/debug/<trace-id>/` 创建独立目录。目录中按实际顺序保存单独的 JSON 文件：客户端原始请求、每次上游请求及其原始响应（包括内部续推和工具纠错重试），以及最终发给客户端的 JSON 或 SSE 响应。
+
+```powershell
+$env:NEURALWATT_DEBUG_TRACE = "1"
+pnpm dev
+```
+
+默认每个流式响应最多记录 8 MiB；通过 `NEURALWATT_DEBUG_MAX_BYTES` 调整上限，或通过 `NEURALWATT_DEBUG_DIR` 指定其他根目录。认证请求头不会写入文件，Cookie、密码、API Key 和 Bearer 值会脱敏。调试完成后关闭环境变量并按需删除 `.data/debug/`。
+
 ## 账号和会话
 
 账号数据保存在 `.data/neuralwatt-accounts.yaml`，其中密码和会话 Cookie 按项目需求以明文保存。该文件已加入 `.gitignore`，仍应限制操作系统文件权限。

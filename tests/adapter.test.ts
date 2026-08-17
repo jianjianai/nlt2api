@@ -1,6 +1,10 @@
 import assert from "node:assert/strict"
+import { mkdtemp, readFile, readdir, rm } from "node:fs/promises"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
 import test from "node:test"
 import { AppError } from "../server/utils/errors"
+import { createDebugTrace } from "../server/utils/debug"
 import { validateChatRequest, TOOL_PROTOCOL_MIN_MAX_TOKENS } from "../server/utils/openai"
 import { createContinuationPayloadBuilder } from "../server/utils/proxy"
 import { isPortalTimeoutError } from "../server/utils/portal"
@@ -74,6 +78,41 @@ function xmlToolCalls(
 function xmlFinal(content: string): string {
   return `<final>${xmlCdata(content)}</final>`
 }
+test("captures a redacted debug trace without changing an SSE response", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "neuralwatt-debug-"))
+  try {
+    const trace = await createDebugTrace({ enabled: true, directory, maxCaptureBytes: 1024 })
+    if (!trace) throw new Error("debug trace was not created")
+    await trace.recordText("client-request", JSON.stringify({
+      model: "kimi-k3",
+      messages: [{ role: "user", content: "hello" }],
+      api_key: "private-key",
+      cookie: "session=private-cookie"
+    }))
+    const source = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode("data: first\n\ndata: [DONE]\n\n"))
+        controller.close()
+      }
+    })
+    const output = await new Response(trace.captureStream("client-response", source, { stream: true })).text()
+    assert.equal(output, "data: first\n\ndata: [DONE]\n\n")
+
+    const traceDirectory = trace.directory
+    const files = (await readdir(traceDirectory)).sort()
+    assert.deepEqual(files, ["001-trace.json", "002-client-request.json", "003-client-response.json"])
+    const requestRecord = JSON.parse(await readFile(join(traceDirectory, "002-client-request.json"), "utf8")) as { body: string }
+    const responseRecord = JSON.parse(await readFile(join(traceDirectory, "003-client-response.json"), "utf8")) as { body: string; metadata: Record<string, unknown> }
+    assert.match(requestRecord.body, /"api_key":"\[REDACTED\]"/)
+    assert.match(requestRecord.body, /"cookie":"\[REDACTED\]"/)
+    assert.doesNotMatch(requestRecord.body, /private-key|private-cookie/)
+    assert.match(responseRecord.body, /data: first/)
+    assert.equal(responseRecord.metadata.stream_state, "complete")
+  } finally {
+    await rm(directory, { recursive: true, force: true })
+  }
+})
+
 test("maps max_completion_tokens to the portal max_tokens field", () => {
   const result = validateChatRequest({
     model: "kimi-k3",

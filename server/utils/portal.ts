@@ -1,5 +1,6 @@
 import { splitCookiesString } from "h3"
 import { AccountAuthError, AppError } from "./errors"
+import { captureDebugResponse, type DebugTrace } from "./debug"
 import type { StoredAccount } from "./store"
 
 const PORTAL_ORIGIN = process.env.NEURALWATT_PORTAL_ORIGIN || "https://portal.neuralwatt.com"
@@ -116,27 +117,31 @@ export async function loginToPortal(account: Pick<StoredAccount, "email" | "pass
   }
 }
 
-export async function fetchPortalChat(cookie: string, payload: Record<string, unknown>): Promise<Response> {
+export async function fetchPortalChat(cookie: string, payload: Record<string, unknown>, trace?: DebugTrace, attempt = 1): Promise<Response> {
+  const body = JSON.stringify(payload)
+  await trace?.recordText("upstream-request", body, { attempt, stream: payload.stream === true })
   try {
-    const response = await fetch(CHAT_URL, {
+    const response = await captureDebugResponse(trace, "upstream-response", await fetch(CHAT_URL, {
       method: "POST",
       headers: {
         accept: payload.stream === true ? "text/event-stream" : "application/json",
         "content-type": "application/json",
         cookie
       },
-      body: JSON.stringify(payload),
+      body,
       signal: timeoutSignal(180_000)
-    })
+    }), { attempt, stream: payload.stream === true })
     if (!response.ok) {
       console.error(`[portal] chat rejected status=${response.status} stream=${String(payload.stream)}`)
     }
     return response
   } catch (error) {
     if (isPortalTimeoutError(error)) {
+      await trace?.recordJson("upstream-response", { error: "upstream_timeout" }, { attempt, stream: payload.stream === true })
       console.error("[portal] chat request timed out")
       throw new AppError("The Neuralwatt portal chat request timed out", 504, "upstream_timeout")
     }
+    await trace?.recordJson("upstream-response", { error: "portal_unreachable" }, { attempt, stream: payload.stream === true })
     console.error(`[portal] chat request failed: portal unreachable (${error instanceof Error ? error.message : "unknown"})`)
     throw new AppError("The Neuralwatt portal is unreachable", 502, "portal_unreachable")
   }
