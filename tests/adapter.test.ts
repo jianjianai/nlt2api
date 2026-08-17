@@ -1175,9 +1175,11 @@ test("retries with a corrective nudge when the model streams reasoning but no XM
   assert.ok(request.toolPlan)
 
   let refetchCalls = 0
-  const refetch = async (failed: { reasoning: string; content: string; nudge: string }): Promise<PreparedSse> => {
+  const refetch = async (failed: { reasoning: string; content: string; nudge: string; context: string }): Promise<PreparedSse> => {
     refetchCalls += 1
-    assert.match(failed.nudge, /corrected XML action/)
+    assert.equal(failed.context, "isolated")
+    assert.match(failed.nudge, /Regenerate a fresh action/)
+    assert.match(failed.nudge, /Format recovery/)
     assert.match(failed.reasoning, /thinking hard/)
     const upstream = new Response([
       `data: ${JSON.stringify({ id: "retry", model: "kimi-k3", choices: [{ index: 0, delta: { role: "assistant", content: xmlToolCalls([{ name: "get_weather", arguments: { city: "Paris" } }]) }, finish_reason: "stop" }] })}\n\n`,
@@ -1202,7 +1204,7 @@ test("retries with a corrective nudge when the model streams reasoning but no XM
   assert.match(output, /data: \[DONE\]/)
 })
 
-test("encodes the failed attempt into the reasoning stream on retry", async () => {
+test("marks a reasoning-only empty action as an isolated retry", async () => {
   const request = validateChatRequest({
     model: "kimi-k3",
     messages: [{ role: "user", content: "Weather in Paris" }],
@@ -1230,7 +1232,9 @@ test("encodes the failed attempt into the reasoning stream on retry", async () =
   const output = await new Response(relay).text()
 
   assert.match(output, /NWERR-START/)
-  assert.match(output, /reply was empty/)
+  assert.match(output, /\\"assistant\\":false/)
+  assert.match(output, /\\"replay\\":\\"omit/)
+  assert.match(output, /Regenerate a fresh action/)
   assert.doesNotMatch(output, /Kimi returned an invalid tool action/)
   assert.match(output, /tool_calls/)
 })
@@ -1786,11 +1790,13 @@ test("isolates empty upstream tool completions with bounded backoff metadata", a
   assert.ok(request.toolPlan)
 
   const completion = await normalizeToolCompletionWithRetry({
-    choices: [{ message: { content: "" }, finish_reason: "stop" }]
+    choices: [{ message: { reasoning_content: "Plan the call carefully.", content: "" }, finish_reason: "stop" }]
   }, "kimi-k3", request.toolPlan!, async (retry) => {
     assert.equal(retry.cause, "invalid_action")
     assert.equal(retry.attempt, 1)
     assert.equal(retry.context, "isolated")
+    assert.equal(retry.reasoning, "Plan the call carefully.")
+    assert.equal(retry.content, "")
     assert.equal(retry.retryAfterMs, 500)
     assert.match(retry.nudge, /upstream completed without any action content/)
     return {

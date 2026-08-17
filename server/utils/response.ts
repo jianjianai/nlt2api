@@ -586,10 +586,9 @@ function isXmlFormatFailure(error: unknown, content: string): boolean {
     || error.failure.kind === "invalid_xml_structure"
 }
 
-function isEmptyUpstreamAction(error: unknown, reasoning: string, content: string): boolean {
+function isEmptyUpstreamAction(error: unknown, content: string): boolean {
   return error instanceof ToolActionError
     && error.failure.kind === "empty_content"
-    && !reasoning.trim()
     && !content.trim()
 }
 
@@ -626,7 +625,7 @@ function buildToolActionRetry(
   const cause: ToolActionRetryCause = isLengthTruncation(finishReason) ? "length" : "invalid_action"
   const reasoningLimit = cause === "length" ? TOOL_LENGTH_CONTINUATION_REASONING_MAX_CHARS : TOOL_INVALID_ACTION_REASONING_MAX_CHARS
   const contentLimit = cause === "length" ? TOOL_LENGTH_CONTINUATION_CONTENT_MAX_CHARS : TOOL_INVALID_ACTION_CONTENT_MAX_CHARS
-  const emptyUpstreamAction = cause === "invalid_action" && isEmptyUpstreamAction(error, reasoning, content)
+  const emptyUpstreamAction = cause === "invalid_action" && isEmptyUpstreamAction(error, content)
   const strictFormatRecovery = cause === "invalid_action" && consecutiveFormatFailures >= 2
   const isolated = isolatedRecoveryActive || emptyUpstreamAction || strictFormatRecovery
   return {
