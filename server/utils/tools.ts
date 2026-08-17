@@ -126,10 +126,6 @@ function normalizeFunctionTools(value: unknown): FunctionToolDefinition[] {
   if (!Array.isArray(value) || value.length === 0) {
     return invalidParameter("tools must be a non-empty array", "tools")
   }
-  if (value.length > 128) {
-    return invalidParameter("tools cannot contain more than 128 entries", "tools")
-  }
-
   const names = new Set<string>()
   return value.map((rawTool, index) => {
     const param = `tools[${index}]`

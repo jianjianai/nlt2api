@@ -1,14 +1,14 @@
 import { defineEventHandler, getRouterParam } from "h3"
-import { requireManagementAuth } from "../../../utils/auth"
+import { requireWebAccessSession } from "../../../utils/auth"
 import { sendManagementError } from "../../../utils/errors"
-import { deleteAccount } from "../../../utils/store"
+import { deleteProxyKey } from "../../../utils/store"
 
 export default defineEventHandler(async (event) => {
   try {
-    await requireManagementAuth(event)
+    requireWebAccessSession(event)
     const id = getRouterParam(event, "id")
-    if (!id) throw new Error("Account id is required")
-    await deleteAccount(id)
+    if (!id) throw new Error("Proxy key id is required")
+    await deleteProxyKey(id)
     return { ok: true }
   } catch (error) {
     return sendManagementError(event, error)

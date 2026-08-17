@@ -1,11 +1,11 @@
 import { defineEventHandler, getRouterParam, readBody } from "h3"
-import { requireAdminAuth } from "../../../utils/admin-auth"
+import { requireManagementAuth } from "../../../utils/auth"
 import { sendManagementError } from "../../../utils/errors"
 import { updateAccount } from "../../../utils/store"
 
 export default defineEventHandler(async (event) => {
   try {
-    await requireAdminAuth(event)
+    await requireManagementAuth(event)
     const id = getRouterParam(event, "id")
     if (!id) throw new Error("Account id is required")
     const body = await readBody<{ label?: unknown; email?: unknown; password?: unknown; enabled?: unknown }>(event)

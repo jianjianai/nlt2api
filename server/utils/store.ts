@@ -21,16 +21,50 @@ export interface StoredAccount {
   updatedAt: string
 }
 
+export type StoredModel = Record<string, unknown>
+
+export interface StoredModelCatalog {
+  data: StoredModel[]
+  scope: string | null
+  fetchedAt: string | null
+}
+
+export interface StoredProxyKey {
+  id: string
+  label: string
+  value: string
+  enabled: boolean
+  createdAt: string
+  updatedAt: string
+}
+
+export interface GenerationDefaults {
+  temperature: number
+  maxTokens: number
+  topP: number
+}
+
 export interface AccountStore {
   version: 1
   proxy: {
-    apiKey: string
+    keys: StoredProxyKey[]
   }
   admin: {
     passwordHash: string
     sessionSecret: string
   }
+  generationDefaults: GenerationDefaults
   accounts: StoredAccount[]
+  models: StoredModelCatalog
+}
+
+export interface PublicProxyKey {
+  id: string
+  label: string
+  value: string
+  enabled: boolean
+  createdAt: string
+  updatedAt: string
 }
 
 export interface PublicAccount {
@@ -98,6 +132,61 @@ function normalizeAccount(value: unknown): StoredAccount | null {
   }
 }
 
+export function filterCatalogModels(value: unknown): StoredModel[] {
+  if (!Array.isArray(value)) return []
+
+  const ids = new Set<string>()
+  return value.flatMap((candidate) => {
+    if (!isRecord(candidate) || typeof candidate.id !== "string" || !candidate.id) return []
+    const id = candidate.id
+    if (id.toLowerCase().endsWith("-flex") || ids.has(id)) return []
+    // This is the 0731 canary alias of the canonical deepseek-v4-flash entry.
+    if (id === "deepseek-ai/DeepSeek-V4-Flash") return []
+    ids.add(id)
+    return [candidate]
+  })
+}
+
+function normalizeModelCatalog(value: unknown): StoredModelCatalog {
+  const record = isRecord(value) ? value : {}
+  return {
+    data: filterCatalogModels(record.data),
+    scope: asNullableString(record.scope),
+    fetchedAt: asNullableString(record.fetchedAt)
+  }
+}
+
+function boundedNumber(value: unknown, fallback: number, minimum: number, maximum: number): number {
+  return typeof value === "number" && Number.isFinite(value) && value >= minimum && value <= maximum ? value : fallback
+}
+
+function normalizeGenerationDefaults(value: unknown): GenerationDefaults {
+  const record = isRecord(value) ? value : {}
+  const maxTokens = boundedNumber(record.maxTokens, 4096, 50, 8150)
+  return {
+    temperature: boundedNumber(record.temperature, 0.7, 0, 2),
+    maxTokens: Number.isInteger(maxTokens) ? maxTokens : 4096,
+    topP: boundedNumber(record.topP, 1, 0.1, 1)
+  }
+}
+
+function normalizeProxyKey(value: unknown): StoredProxyKey | null {
+  if (!isRecord(value)) return null
+
+  const key = asString(value.value).trim()
+  if (!key) return null
+
+  const now = new Date().toISOString()
+  return {
+    id: asString(value.id, randomUUID()),
+    label: asString(value.label, "Default key").trim() || "Default key",
+    value: key,
+    enabled: asBoolean(value.enabled, true),
+    createdAt: asString(value.createdAt, now),
+    updatedAt: asString(value.updatedAt, now)
+  }
+}
+
 function normalizeStore(value: unknown): AccountStore {
   const record = isRecord(value) ? value : {}
   const proxy = isRecord(record.proxy) ? record.proxy : {}
@@ -105,17 +194,28 @@ function normalizeStore(value: unknown): AccountStore {
   const accounts = Array.isArray(record.accounts)
     ? record.accounts.map(normalizeAccount).filter((account): account is StoredAccount => account !== null)
     : []
+  const keys = Array.isArray(proxy.keys)
+    ? proxy.keys.map(normalizeProxyKey).filter((key): key is StoredProxyKey => key !== null)
+    : []
+  const legacyApiKey = asString(proxy.apiKey).trim()
+
+  if (keys.length === 0 && legacyApiKey) {
+    const now = new Date().toISOString()
+    keys.push({ id: randomUUID(), label: "Default key", value: legacyApiKey, enabled: true, createdAt: now, updatedAt: now })
+  }
 
   return {
     version: 1,
     proxy: {
-      apiKey: asString(proxy.apiKey)
+      keys
     },
     admin: {
       passwordHash: asString(admin.passwordHash),
       sessionSecret: asString(admin.sessionSecret)
     },
-    accounts
+    generationDefaults: normalizeGenerationDefaults(record.generationDefaults),
+    accounts,
+    models: normalizeModelCatalog(record.models)
   }
 }
 
@@ -166,23 +266,26 @@ async function loadStore(): Promise<AccountStore> {
   }
 
   const store = normalizeStore(value)
-  if (!store.proxy.apiKey) {
-    store.proxy.apiKey = process.env.NEURALWATT_PROXY_KEY || generateProxyKey()
-    console.info(`Generated local proxy API key: ${store.proxy.apiKey}`)
+  const storedKeys = isRecord(value) && isRecord(value.proxy) && Array.isArray(value.proxy.keys)
+  const storedAdminSession = isRecord(value) && isRecord(value.admin) && Boolean(asString(value.admin.sessionSecret))
+  const storedGenerationDefaults = isRecord(value) && isRecord(value.generationDefaults)
+  const configuredKey = process.env.NEURALWATT_PROXY_KEY?.trim()
+  if (!storedKeys && configuredKey && !store.proxy.keys.some((key) => key.value === configuredKey)) {
+    const now = new Date().toISOString()
+    store.proxy.keys.push({ id: randomUUID(), label: "Environment key", value: configuredKey, enabled: true, createdAt: now, updatedAt: now })
+  }
+  if (store.proxy.keys.length === 0) {
+    const value = configuredKey || generateProxyKey()
+    const now = new Date().toISOString()
+    store.proxy.keys.push({ id: randomUUID(), label: configuredKey ? "Environment key" : "Default key", value, enabled: true, createdAt: now, updatedAt: now })
+    if (!configuredKey) console.info(`Generated local proxy API key: ${value}`)
   }
   if (!store.admin.sessionSecret) {
     store.admin.sessionSecret = randomBytes(32).toString("base64url")
   }
 
   loadedStore = store
-  if (
-    !fileExists ||
-    !isRecord(value) ||
-    !isRecord(value.proxy) ||
-    !asString(value.proxy.apiKey) ||
-    !isRecord(value.admin) ||
-    !asString(value.admin.sessionSecret)
-  ) {
+  if (!fileExists || !storedKeys || !storedAdminSession || !storedGenerationDefaults) {
     await persistStore(store)
   }
 
@@ -200,25 +303,19 @@ async function updateStore<T>(mutator: (store: AccountStore) => Promise<T> | T):
   return operation
 }
 
-export async function getProxyKey(): Promise<string> {
-  return process.env.NEURALWATT_PROXY_KEY || (await loadStore()).proxy.apiKey
+export async function getGenerationDefaults(): Promise<GenerationDefaults> {
+  return { ...(await loadStore()).generationDefaults }
 }
 
-export async function rotateProxyKey(): Promise<string> {
-  return updateStore((store) => {
-    store.proxy.apiKey = generateProxyKey()
-    return store.proxy.apiKey
-  })
-}
-
-export async function setProxyKey(apiKey: string): Promise<string> {
-  const key = apiKey.trim()
-  if (key.length < 8) {
-    throw new AppError("API key must be at least 8 characters", 400, "invalid_proxy_key")
+export async function updateGenerationDefaults(input: GenerationDefaults): Promise<GenerationDefaults> {
+  const defaults = normalizeGenerationDefaults(input)
+  if (defaults.temperature !== input.temperature || defaults.maxTokens !== input.maxTokens || defaults.topP !== input.topP) {
+    throw new AppError("Generation defaults are outside the supported range", 400, "invalid_generation_defaults")
   }
+
   return updateStore((store) => {
-    store.proxy.apiKey = key
-    return store.proxy.apiKey
+    store.generationDefaults = defaults
+    return { ...defaults }
   })
 }
 
@@ -242,6 +339,79 @@ export async function rotateAdminSessionSecret(): Promise<string> {
     return store.admin.sessionSecret
   })
 }
+
+export async function listProxyKeys(): Promise<PublicProxyKey[]> {
+  const store = await loadStore()
+  return store.proxy.keys.map((key) => ({ ...key }))
+}
+
+export async function createProxyKey(input: { label: string }): Promise<PublicProxyKey> {
+  const label = input.label.trim() || "Untitled key"
+  if (label.length > 80) {
+    throw new AppError("Key label must be 80 characters or fewer", 400, "invalid_proxy_key", "label")
+  }
+
+  return updateStore((store) => {
+    const now = new Date().toISOString()
+    const key: StoredProxyKey = {
+      id: randomUUID(),
+      label,
+      value: generateProxyKey(),
+      enabled: true,
+      createdAt: now,
+      updatedAt: now
+    }
+    store.proxy.keys.push(key)
+    return { ...key }
+  })
+}
+
+export async function updateProxyKey(id: string, input: { label?: string; enabled?: boolean }): Promise<PublicProxyKey> {
+  return updateStore((store) => {
+    const key = store.proxy.keys.find((candidate) => candidate.id === id)
+    if (!key) throw new AppError("Proxy key not found", 404, "proxy_key_not_found")
+
+    if (input.label !== undefined) {
+      const label = input.label.trim()
+      if (!label || label.length > 80) {
+        throw new AppError("Key label must be between 1 and 80 characters", 400, "invalid_proxy_key", "label")
+      }
+      key.label = label
+    }
+    if (input.enabled !== undefined) key.enabled = input.enabled
+    key.updatedAt = new Date().toISOString()
+    return { ...key }
+  })
+}
+
+export async function deleteProxyKey(id: string): Promise<void> {
+  await updateStore((store) => {
+    const index = store.proxy.keys.findIndex((candidate) => candidate.id === id)
+    if (index < 0) throw new AppError("Proxy key not found", 404, "proxy_key_not_found")
+    if (store.proxy.keys.length === 1) {
+      throw new AppError("At least one proxy key must remain", 400, "last_proxy_key")
+    }
+    store.proxy.keys.splice(index, 1)
+  })
+}
+
+export async function getSavedModelCatalog(): Promise<StoredModelCatalog> {
+  const catalog = (await loadStore()).models
+  return { ...catalog, data: [...catalog.data] }
+}
+
+export async function saveModelCatalog(input: { data: unknown; scope: string | null }): Promise<StoredModelCatalog> {
+  return updateStore((store) => {
+    const catalog: StoredModelCatalog = {
+      data: filterCatalogModels(input.data),
+      scope: input.scope?.trim() || null,
+      fetchedAt: new Date().toISOString()
+    }
+    store.models = catalog
+    return { ...catalog, data: [...catalog.data] }
+  })
+}
+
 
 export function toPublicAccount(account: StoredAccount): PublicAccount {
   return {

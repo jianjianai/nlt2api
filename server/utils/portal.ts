@@ -7,6 +7,7 @@ const PORTAL_ORIGIN = process.env.NEURALWATT_PORTAL_ORIGIN || "https://portal.ne
 const LOGIN_URL = `${PORTAL_ORIGIN}/auth/login`
 const CHAT_URL = `${PORTAL_ORIGIN}/api/chat`
 const USAGE_URL = `${PORTAL_ORIGIN}/api/usage`
+const MODEL_CATALOG_URL = process.env.NEURALWATT_MODEL_CATALOG_URL || "https://api.neuralwatt.com/v1/models"
 
 export interface SessionCheck {
   ok: boolean
@@ -19,6 +20,11 @@ export interface LoginResult {
   cookie?: string
   status: number
   reason?: string
+}
+
+export interface ModelCatalog {
+  body: Record<string, unknown>
+  scope: string | null
 }
 
 function getSetCookieValues(headers: Headers): string[] {
@@ -75,6 +81,38 @@ export async function checkPortalSession(cookie: string): Promise<SessionCheck> 
   } catch {
     console.warn("[portal] session check failed: portal unreachable")
     return { ok: false, status: 502, reason: "portal_unreachable" }
+  }
+}
+
+export async function fetchPortalModelCatalog(): Promise<ModelCatalog> {
+  try {
+    const response = await fetch(MODEL_CATALOG_URL, {
+      method: "GET",
+      headers: { accept: "application/json" },
+      signal: timeoutSignal(20_000)
+    })
+    if (!response.ok) {
+      await response.body?.cancel()
+      throw new AppError("The Neuralwatt model catalog is unavailable", 502, "model_catalog_unavailable")
+    }
+
+    const body: unknown = await response.json()
+    if (typeof body !== "object" || body === null || Array.isArray(body)) {
+      throw new AppError("The Neuralwatt model catalog returned invalid JSON", 502, "invalid_model_catalog")
+    }
+    const catalog = body as Record<string, unknown>
+    if (catalog.object !== "list" || !Array.isArray(catalog.data)) {
+      throw new AppError("The Neuralwatt model catalog returned an invalid response", 502, "invalid_model_catalog")
+    }
+
+    return {
+      body: catalog,
+      scope: response.headers.get("x-models-scope") ?? (typeof catalog.scope === "string" ? catalog.scope : null)
+    }
+  } catch (error) {
+    if (error instanceof AppError) throw error
+    console.error(`[portal] model catalog request failed: ${error instanceof Error ? error.message : "unknown"}`)
+    throw new AppError("The Neuralwatt model catalog is unreachable", 502, "model_catalog_unavailable")
   }
 }
 
