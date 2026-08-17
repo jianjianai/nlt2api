@@ -9,5 +9,11 @@ export default defineNitroConfig({
     {
       dir: "../public"
     }
+  ],
+  serverAssets: [
+    {
+      baseName: "ui",
+      dir: "./ui"
+    }
   ]
 });

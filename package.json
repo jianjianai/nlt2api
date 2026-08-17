@@ -6,7 +6,8 @@
     "dev": "nitro dev",
     "debug": "cross-env NEURALWATT_DEBUG_TRACE=1 nitro dev",
     "preview": "node .output/server/index.mjs",
-    "test": "tsx --test \"tests/**/*.test.ts\""
+    "test": "tsx --test \"tests/**/*.test.ts\"",
+    "benchmark:portal": "tsx tests/portal-proxy-benchmark.ts"
   },
   "devDependencies": {
     "cross-env": "^7.0.3",

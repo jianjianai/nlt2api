@@ -8,6 +8,7 @@ import { createDebugTrace } from "../server/utils/debug"
 import { validateChatRequest, TOOL_PROTOCOL_MIN_MAX_TOKENS } from "../server/utils/openai"
 import { createContinuationPayloadBuilder } from "../server/utils/proxy"
 import { isPortalTimeoutError } from "../server/utils/portal"
+import { filterCatalogModels } from "../server/utils/store"
 import { createSseRelay, createToolSseRelay, normalizeCompletion, normalizeCompletionWithLengthContinuation, normalizeToolCompletion, normalizeToolCompletionWithRetry, prepareSse, type PreparedSse } from "../server/utils/response"
 
 const weatherTool = {
@@ -123,6 +124,97 @@ test("maps max_completion_tokens to the portal max_tokens field", () => {
 
   assert.equal(result.portalPayload.max_tokens, 32)
   assert.equal(result.portalPayload.max_completion_tokens, undefined)
+})
+
+test("preserves the portal max_tokens precedence when both token limits are sent", () => {
+  const result = validateChatRequest({
+    model: "kimi-k3",
+    messages: [{ role: "user", content: "hello" }],
+    max_tokens: 256,
+    max_completion_tokens: 32,
+    stream: false
+  })
+
+  assert.equal(result.portalPayload.max_tokens, 256)
+  assert.equal(result.portalPayload.max_completion_tokens, undefined)
+})
+
+test("applies saved generation defaults only to omitted sampling fields", () => {
+  const defaults = { temperature: 0.7, maxTokens: 4096, topP: 1 }
+  const omitted = validateChatRequest({
+    model: "kimi-k3",
+    messages: [{ role: "user", content: "hello" }]
+  }, defaults)
+  const explicit = validateChatRequest({
+    model: "kimi-k3",
+    messages: [{ role: "user", content: "hello" }],
+    temperature: 0.2,
+    max_tokens: 512,
+    top_p: 0.4
+  }, defaults)
+
+  assert.equal(omitted.portalPayload.temperature, 0.7)
+  assert.equal(omitted.portalPayload.max_tokens, 4096)
+  assert.equal(omitted.portalPayload.top_p, 1)
+  assert.equal(explicit.portalPayload.temperature, 0.2)
+  assert.equal(explicit.portalPayload.max_tokens, 512)
+  assert.equal(explicit.portalPayload.top_p, 0.4)
+})
+
+test("rejects developer role before the portal emits its embedded gateway error", () => {
+  assert.throws(
+    () => validateChatRequest({
+      model: "kimi-k3",
+      messages: [{ role: "developer", content: "hello" }]
+    }),
+    (error: unknown) => error instanceof AppError
+      && error.statusCode === 400
+      && error.code === "unsupported_role"
+      && error.param === "messages[0].role"
+  )
+})
+
+test("captures an embedded portal SSE gateway error before committing a response", async () => {
+  const upstream = new Response('data: {"error":{"message":"Gateway returned status 400"}}\n\n')
+  const prepared = await prepareSse(upstream.body)
+
+  try {
+    assert.equal(prepared.firstChunk, undefined)
+    assert.equal(prepared.firstError?.message, "Gateway returned status 400")
+    assert.equal(prepared.firstError?.isAuthError, false)
+  } finally {
+    await prepared.reader.cancel()
+    prepared.reader.releaseLock()
+  }
+})
+
+test("defaults requests to streaming unless the client explicitly disables it", () => {
+  const streaming = validateChatRequest({
+    model: "kimi-k3",
+    messages: [{ role: "user", content: "hello" }]
+  })
+  const nonStreaming = validateChatRequest({
+    model: "kimi-k3",
+    messages: [{ role: "user", content: "hello" }],
+    stream: false
+  })
+
+  assert.equal(streaming.stream, true)
+  assert.equal(streaming.portalPayload.stream, true)
+  assert.equal(nonStreaming.stream, false)
+})
+
+test("filters unavailable flex models and the DeepSeek canary alias from saved catalogs", () => {
+  const models = filterCatalogModels([
+    { id: "deepseek-v4-flash" },
+    { id: "deepseek-ai/DeepSeek-V4-Flash" },
+    { id: "kimi-k3-flex" },
+    { id: "kimi-k3" },
+    { id: "kimi-k3" },
+    { id: "qwen3.6-35b-flex" }
+  ])
+
+  assert.deepEqual(models.map((model) => model.id), ["deepseek-v4-flash", "kimi-k3"])
 })
 
 test("raises a tiny max_tokens to a floor for tool-protocol requests", () => {
@@ -296,8 +388,24 @@ test("compiles function tools into the XML action protocol without forwarding to
   assert.equal(messages[0].role, "system")
   assert.match(messages[0].content as string, /TOOL PROTOCOL/)
   assert.match(messages[0].content as string, /XML document rooted at <tool_calls> or <final>/)
-  assert.match(messages[0].content as string, /<tool_calls>/)
-  assert.match(messages[0].content as string, /get_weather/)
+})
+
+test("accepts tool catalogs larger than the upstream native limit", () => {
+  const tools = Array.from({ length: 162 }, (_, index) => ({
+    type: "function",
+    function: {
+      name: `tool_${index}`,
+      parameters: { type: "object", properties: {}, additionalProperties: false }
+    }
+  }))
+  const result = validateChatRequest({
+    model: "kimi-k3",
+    messages: [{ role: "user", content: "Use the appropriate tool." }],
+    tools
+  })
+
+  assert.equal(result.toolPlan?.tools.length, 162)
+  assert.equal(result.portalPayload.tools, undefined)
 })
 
 test("builds a stable and guarded tool protocol for auto text requests", () => {

@@ -1,4 +1,5 @@
 import { AppError } from "./errors"
+import type { GenerationDefaults } from "./store"
 import { TOOL_PROSE_FINAL_PREFIX, buildToolProtocol, encodeAssistantToolCalls, parseToolPlan, type ToolPlan } from "./tools"
 
 type JsonObject = Record<string, unknown>
@@ -326,7 +327,7 @@ function normalizeMessages(value: unknown, restoreMarkedProse: boolean): JsonObj
   })
 }
 
-export function validateChatRequest(input: unknown): ValidatedChatRequest {
+export function validateChatRequest(input: unknown, generationDefaults?: GenerationDefaults): ValidatedChatRequest {
   if (!isRecord(input)) {
     throw new AppError("The request body must be a JSON object", 400, "invalid_request", undefined, "invalid_request_error")
   }
@@ -345,7 +346,7 @@ export function validateChatRequest(input: unknown): ValidatedChatRequest {
     throw new AppError("model is required", 400, "missing_parameter", "model", "invalid_request_error")
   }
 
-  const stream = input.stream === undefined ? false : input.stream
+  const stream = input.stream === undefined ? true : input.stream
   if (typeof stream !== "boolean") {
     throw new AppError("stream must be a boolean", 400, "invalid_parameter", "stream", "invalid_request_error")
   }
@@ -366,9 +367,11 @@ export function validateChatRequest(input: unknown): ValidatedChatRequest {
     stream
   }
 
-  for (const key of ["temperature", "top_p"]) {
+  for (const [key, defaultValue] of [["temperature", generationDefaults?.temperature], ["top_p", generationDefaults?.topP]] as const) {
     if (hasOwn(input, key)) {
       portalPayload[key] = assertFiniteNumber(input[key], key)
+    } else if (defaultValue !== undefined) {
+      portalPayload[key] = defaultValue
     }
   }
 
@@ -376,11 +379,12 @@ export function validateChatRequest(input: unknown): ValidatedChatRequest {
   const maxCompletionTokens = hasOwn(input, "max_completion_tokens")
     ? assertPositiveInteger(input.max_completion_tokens, "max_completion_tokens")
     : undefined
-  if (maxTokens !== undefined && maxCompletionTokens !== undefined && maxTokens !== maxCompletionTokens) {
-    throw new AppError("max_tokens and max_completion_tokens must match when both are provided", 400, "conflicting_parameters", "max_completion_tokens", "invalid_request_error")
-  }
+  // Playground requests show that /api/chat uses max_tokens when both limits
+  // are present. Convert the newer field only when the portal field is absent.
   if (maxTokens !== undefined || maxCompletionTokens !== undefined) {
     portalPayload.max_tokens = maxTokens ?? maxCompletionTokens
+  } else if (generationDefaults) {
+    portalPayload.max_tokens = generationDefaults.maxTokens
   }
 
   if (toolPlan) {

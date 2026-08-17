@@ -9,16 +9,16 @@ pnpm install
 pnpm dev
 ```
 
-首次启动时会在终端输出本地代理 Bearer Key（供脚本调用和初始化管理员密码使用）。打开 `http://127.0.0.1:3000/`：首次访问输入该 Key 设置管理员密码，之后凭密码登录管理台。管理台中可以轮换或自定义代理 Key、维护门户账号、测试兼容接口、修改管理员密码。
+打开 `http://127.0.0.1:3000/` 后，先使用网页访问密钥解锁管理页面。管理页面会显示、生成和管理本地代理 Bearer Key；首次没有配置 `NEURALWATT_PROXY_KEY` 时，服务会在终端输出新生成的 Key，供脚本调用和初始化管理员密码使用。
 
-也可以用环境变量固定管理员密码（优先级高于管理台保存的密码，忘记密码时可用它恢复）：
+账号和模型管理 API 同时接受网页访问会话、管理员密码会话或启用的代理 Bearer Key，现有脚本无需修改。`/v1/*` 始终只接受启用的 Bearer Key。
+
+也可以使用环境变量固定管理员密码（优先级高于保存的密码，忘记密码时可用于恢复）：
 
 ```powershell
 $env:NEURALWATT_ADMIN_PASSWORD = "your-strong-password"
 pnpm dev
 ```
-
-管理 API（`/api/...`）同时接受管理员会话 Cookie 和代理 Bearer Key，现有脚本无需修改。
 
 构建和预览：
 
@@ -34,7 +34,17 @@ $env:NITRO_HOST = "0.0.0.0"
 pnpm dev
 ```
 
-局域网访问必须使用代理 Bearer Key。不要把服务直接暴露到公网。
+OpenAI 兼容接口始终需要代理 Bearer Key。管理网页可使用独立网页访问密钥保护，但公开部署时仍应通过 HTTPS、网络边界和访问控制限制服务暴露范围。
+
+## 网页访问密钥
+
+公网部署时，管理页面 `/` 需要独立的网页访问密钥。启动前在被忽略的 `.env.local` 中设置 `NEURALWATT_WEB_ACCESS_KEY`；解锁后服务器会写入一个仅限网页使用的 HttpOnly Cookie，有效期为 12 小时，服务重启后需要再次解锁。
+
+该门禁保护管理页面及其静态资源。管理 API 在已建立网页会话时可直接调用，也继续兼容已启用的代理 Bearer Key；`/v1/*` 始终只接受已启用的代理 Bearer Key，`/health` 不需要认证。
+
+## 代理 Key 管理
+
+代理 Key 以明文保存在被忽略的 `.data/neuralwatt-accounts.yaml` 中，并只会在已解锁的管理页面返回。可以创建多个 Key、重命名、启用/停用或删除；停用和删除会立即撤销对应的 `/v1/*` 访问权限。旧版 YAML 中的 `proxy.apiKey` 会在首次加载时自动迁移为「Default key」。
 
 ## 调试追踪
 
@@ -67,10 +77,13 @@ email=...&password=...
 接口地址：
 
 ```text
+GET  http://127.0.0.1:3000/v1/models
 POST http://127.0.0.1:3000/v1/chat/completions
 Authorization: Bearer <local-proxy-key>
 Content-Type: application/json
 ```
+
+`GET /v1/models` 只返回本地 YAML 中已保存的模型目录，不会联网。管理面板的「获取并保存模型」按钮会手动读取官网目录、过滤不可调用的 `-flex` 模型及 DeepSeek Canary 别名，然后覆盖保存；响应保留模型原始元数据与目录 `scope`。当前本地登录态不含官网 API Key，因此手动获取的范围通常是公开目录。Chat Completions 在调用方省略 `stream` 时默认使用 SSE；传入 `stream: false` 可请求完整 JSON 响应。
 
 示例：
 
@@ -86,7 +99,7 @@ curl.exe http://127.0.0.1:3000/v1/chat/completions `
 - 文本消息、system/user/assistant 以及历史 tool/function 消息；
 - `stream` 流式和非流式响应；
 - `temperature`、`top_p`、`max_tokens`；
-- `max_completion_tokens` 到 `max_tokens` 的转换；
+- `max_completion_tokens` 到 `max_tokens` 的转换；两者同时存在时按门户实测优先使用 `max_tokens`；
 - 文本图片输入；
 - `response_format: text` 和 `json_object`；
 - 标准 JSON/SSE 响应和 OpenAI 风格错误。

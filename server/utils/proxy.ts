@@ -16,6 +16,7 @@ import {
 import {
   getAccount,
   getEnabledAccounts,
+  getGenerationDefaults,
   recordAccountLogin,
   recordAccountStatus,
   type StoredAccount
@@ -261,7 +262,7 @@ async function proxyForAccount(
 }
 
 export async function handleChatRequest(input: unknown, trace?: DebugTrace): Promise<ProxyResult> {
-  const request = validateChatRequest(input)
+  const request = validateChatRequest(input, await getGenerationDefaults())
   const accounts = orderedAccounts(await getEnabledAccounts())
   if (accounts.length === 0) {
     throw new AppError("No enabled Neuralwatt accounts are configured", 503, "no_enabled_accounts")

@@ -2,7 +2,7 @@ import { createHmac, randomBytes, scrypt as scryptCallback, timingSafeEqual } fr
 import { promisify } from "node:util"
 import { deleteCookie, getCookie, getHeader, setCookie, type H3Event } from "h3"
 import { AppError } from "./errors"
-import { getAdminPasswordHash, getAdminSessionSecret, getProxyKey } from "./store"
+import { getAdminPasswordHash, getAdminSessionSecret, listProxyKeys } from "./store"
 
 const scrypt = promisify(scryptCallback)
 
@@ -95,11 +95,13 @@ export async function requireAdminAuth(event: H3Event): Promise<void> {
   const header = getHeader(event, "authorization")
   const match = header?.match(/^Bearer\s+(.+)$/i)
   const provided = match?.[1] ?? ""
-  const expected = await getProxyKey()
   const providedBuffer = Buffer.from(provided)
-  const expectedBuffer = Buffer.from(expected)
-  if (providedBuffer.length > 0 && providedBuffer.length === expectedBuffer.length && timingSafeEqual(providedBuffer, expectedBuffer)) {
-    return
+  for (const key of await listProxyKeys()) {
+    const expectedBuffer = Buffer.from(key.value)
+    const matches = providedBuffer.length > 0
+      && providedBuffer.length === expectedBuffer.length
+      && timingSafeEqual(providedBuffer, expectedBuffer)
+    if (key.enabled && matches) return
   }
 
   throw new AppError("Admin authentication required", 401, "admin_auth_required")

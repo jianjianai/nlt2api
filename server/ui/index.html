@@ -1,0 +1,184 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="light dark" />
+    <title>Neuralwatt AI Proxy</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <main class="page-shell">
+      <header class="page-header">
+        <div>
+          <p class="eyebrow">LOCAL OPENAI COMPATIBILITY LAYER</p>
+          <h1>Neuralwatt AI Proxy</h1>
+          <p class="subtitle">管理登录会话，并将 OpenAI Chat Completions 请求转发到 Neuralwatt Playground。</p>
+        </div>
+        <div class="header-actions">
+          <form method="post" action="/access/logout">
+            <button class="button button-ghost" type="submit">退出网页访问</button>
+          </form>
+          <div id="health-badge" class="status-badge status-unknown">检查服务</div>
+        </div>
+      </header>
+
+      <section class="panel access-panel">
+        <div class="panel-heading">
+          <div>
+            <h2>本地代理 Key</h2>
+            <p>每个启用的 Key 都可用于 OpenAI 兼容接口；管理页面通过独立网页访问会话操作。</p>
+          </div>
+        </div>
+        <form id="proxy-key-form" class="inline-form key-form">
+          <label class="field grow" for="new-proxy-key-label">
+            <span>Key 名称</span>
+            <input id="new-proxy-key-label" maxlength="80" autocomplete="off" placeholder="例如：桌面客户端" />
+          </label>
+          <button class="button button-primary" type="submit">生成 Key</button>
+        </form>
+        <div class="table-wrap">
+          <table class="key-table">
+            <thead>
+              <tr>
+                <th>名称</th>
+                <th>Bearer Key</th>
+                <th>状态</th>
+                <th>创建时间</th>
+                <th>操作</th>
+              </tr>
+            </thead>
+            <tbody id="proxy-keys-body">
+              <tr><td colspan="5" class="empty-state">尚未加载代理 Key</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-heading">
+          <div>
+            <h2>账号管理</h2>
+            <p>密码和会话 Cookie 不会在列表中显示。</p>
+          </div>
+          <button id="refresh-accounts" class="button button-secondary" type="button">刷新</button>
+        </div>
+
+        <form id="account-form" class="account-form">
+          <input id="editing-id" type="hidden" />
+          <label class="field">
+            <span>显示名称</span>
+            <input id="account-label" required maxlength="80" placeholder="例如：主账号" />
+          </label>
+          <label class="field">
+            <span>邮箱</span>
+            <input id="account-email" required type="email" autocomplete="username" placeholder="name@example.com" />
+          </label>
+          <label class="field">
+            <span>密码</span>
+            <input id="account-password" type="password" autocomplete="new-password" placeholder="新增必填，编辑留空则保留" />
+          </label>
+          <label class="field field-wide">
+            <span>手动 Cookie（可选）</span>
+            <textarea id="account-cookie" rows="2" autocomplete="off" placeholder="登录遇到挑战时，在这里粘贴 Cookie 请求头"></textarea>
+          </label>
+          <div class="form-actions field-wide">
+            <button class="button button-primary" type="submit">保存账号</button>
+            <button id="clear-account-form" class="button button-ghost" type="button">清空</button>
+          </div>
+        </form>
+
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>账号</th>
+                <th>状态</th>
+                <th>登录时间</th>
+                <th>属性</th>
+                <th>操作</th>
+              </tr>
+            </thead>
+            <tbody id="accounts-body">
+              <tr><td colspan="5" class="empty-state">尚未加载账号</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-heading">
+          <div>
+            <h2>模型目录</h2>
+            <p id="model-catalog-status">尚未加载本地保存的模型目录。</p>
+          </div>
+          <button id="refresh-models" class="button button-secondary" type="button">获取并保存模型</button>
+        </div>
+        <div id="model-catalog" class="model-catalog empty-state">尚未保存模型目录</div>
+      </section>
+
+      <section class="panel generation-defaults-panel">
+        <div class="panel-heading">
+          <div>
+            <h2>全局生成参数</h2>
+            <p>应用到所有未显式传入对应字段的 OpenAI 兼容请求；客户端显式参数优先。</p>
+          </div>
+        </div>
+        <form id="generation-defaults-form" class="generation-defaults-form">
+          <label class="range-field" for="generation-temperature">
+            <span class="range-heading">Temperature <output id="generation-temperature-value" for="generation-temperature">0.7</output></span>
+            <input id="generation-temperature" type="range" min="0" max="2" step="0.1" value="0.7" />
+            <span class="range-scale" aria-hidden="true"><span>0.0</span><span>2.0</span></span>
+          </label>
+          <label class="range-field" for="generation-max-tokens">
+            <span class="range-heading">Max Tokens <output id="generation-max-tokens-value" for="generation-max-tokens">4096</output></span>
+            <input id="generation-max-tokens" type="range" min="50" max="8150" step="1" value="4096" />
+            <span class="range-scale" aria-hidden="true"><span>50</span><span>8150</span></span>
+          </label>
+          <label class="range-field" for="generation-top-p">
+            <span class="range-heading">Top P <output id="generation-top-p-value" for="generation-top-p">1.0</output></span>
+            <input id="generation-top-p" type="range" min="0.1" max="1" step="0.1" value="1" />
+            <span class="range-scale" aria-hidden="true"><span>0.1</span><span>1.0</span></span>
+          </label>
+          <div class="form-actions field-wide">
+            <button id="save-generation-defaults" class="button button-primary" type="submit">保存全局默认值</button>
+          </div>
+        </form>
+      </section>
+
+      <section class="panel test-panel">
+        <div class="panel-heading">
+          <div>
+            <h2>兼容接口测试</h2>
+            <p>使用当前启用的代理 Key 发起一次真实流式 Chat Completions 请求。</p>
+          </div>
+        </div>
+        <form id="test-form" class="test-form">
+          <label class="field">
+            <span>模型</span>
+            <select id="test-model" required disabled>
+              <option value="">先获取并保存模型目录</option>
+            </select>
+          </label>
+          <label class="field">
+            <span>代理 Key</span>
+            <select id="test-proxy-key" required disabled>
+              <option value="">先创建或启用代理 Key</option>
+            </select>
+          </label>
+          <label class="field field-wide">
+            <span>消息</span>
+            <textarea id="test-message" rows="3" required>请只回复 TEST_OK</textarea>
+          </label>
+          <div class="form-actions field-wide">
+            <button class="button button-primary" type="submit">发送测试请求</button>
+          </div>
+        </form>
+        <pre id="test-output" class="output-box">等待测试</pre>
+      </section>
+
+      <p id="notice" class="notice" role="status" aria-live="polite"></p>
+    </main>
+    <script src="/app.js" defer></script>
+  </body>
+</html>
