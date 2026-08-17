@@ -484,14 +484,22 @@ function markedProseFinal(content: unknown, plan: ToolPlan): string | null {
   return prose.trim() ? prose : null
 }
 
-// If the model answered in bare prose instead of an attempted JSON action,
+function looksLikeYamlAction(content: string): boolean {
+  const source = content.trim()
+  return /^(?:type|content|tool_calls)\s*:/.test(source) || source.startsWith("{") || source.startsWith("[")
+}
+
+// If the model answered in bare prose instead of an attempted YAML action,
 // returns it so the caller can request the explicit direct-answer marker.
-// "Attempted JSON" (starts with { or [) is a broken action, not a final answer.
 function proseCandidate(content: string, error: unknown): string | null {
   const text = content.trim()
-  if (!text || !(error instanceof ToolActionError) || error.failure.kind !== "invalid_json") return null
-  const first = text[0]
-  return first === "{" || first === "[" ? null : text
+  if (!text || !(error instanceof ToolActionError)) return null
+  if (
+    error.failure.kind !== "invalid_yaml" &&
+    error.failure.kind !== "not_yaml_object" &&
+    error.failure.kind !== "invalid_action_type"
+  ) return null
+  return looksLikeYamlAction(text) ? null : text
 }
 
 // Encodes the failed attempt (error output + reason) as a self-contained
@@ -520,9 +528,11 @@ function retryActionContract(plan: ToolPlan): string {
   const final = allowsMarkedProse(plan)
     ? ` or FINAL: ${TOOL_PROSE_FINAL_PREFIX}<completed answer>`
     : plan.choice === "auto"
-      ? ', or FINAL: {"type":"final","content":"..."}'
+      ? ` or FINAL YAML:
+type: final
+content: completed answer`
       : ""
-  return `Reply with exactly one CALL JSON object {"type":"tool_calls","content":"optional short progress update","tool_calls":[{"name":"tool_name","arguments":{}}]}. content is optional, user-visible, and at most 240 characters.${final} The proxy assigns ids; do not emit id.`
+  return `Reply with exactly one CALL YAML mapping:\ntype: tool_calls\ncontent: optional short progress update\ntool_calls:\n  - name: tool_name\n    arguments:\n      argument_name: value\ncontent is optional, user-visible, and at most 240 characters. Start block-style YAML at the first character with no prose or code fence.${final} The proxy assigns call ids; do not emit id.`
 }
 
 function isLengthTruncation(finishReason: unknown): boolean {
@@ -571,16 +581,22 @@ function buildRetryNudge(content: string, error: unknown, plan: ToolPlan): strin
   switch (failure.kind) {
     case "empty_content":
       return `Your previous reply was empty. ${contract}`
-    case "invalid_json":
-      if (text && !/^[{[]/.test(text)) {
+    case "invalid_yaml":
+      if (text && !looksLikeYamlAction(text)) {
         if (allowsMarkedProse(plan)) {
           return `Your previous reply was unmarked prose. If it is a completed answer, re-emit it with "${TOOL_PROSE_FINAL_PREFIX}" as the first character; otherwise ${contract}`
         }
         return `Your previous reply was unmarked prose. ${contract}`
       }
-      return `Your previous reply was invalid JSON${failure.detail ? ` (${failure.detail})` : ""}. ${contract}`
-    case "not_json_object":
-      return `Your previous reply must be a JSON object. ${contract}`
+      return `Your previous reply was invalid YAML${failure.detail ? ` (${failure.detail})` : ""}. ${contract}`
+    case "not_yaml_object":
+      if (text && !looksLikeYamlAction(text)) {
+        if (allowsMarkedProse(plan)) {
+          return `Your previous reply was unmarked prose. If it is a completed answer, re-emit it with "${TOOL_PROSE_FINAL_PREFIX}" as the first character; otherwise ${contract}`
+        }
+        return `Your previous reply was unmarked prose. ${contract}`
+      }
+      return `Your previous reply must be a YAML mapping. ${contract}`
     case "empty_tool_calls":
       return `tool_calls must contain at least one call. ${contract}`
     case "tool_call_content_not_string":
@@ -593,10 +609,8 @@ function buildRetryNudge(content: string, error: unknown, plan: ToolPlan): strin
       return `tool_calls[${failure.index}] must be an object with name and arguments. ${contract}`
     case "missing_function_name":
       return `tool_calls[${failure.index}] is missing a function name. ${contract}`
-    case "arguments_invalid_json":
-      return `Arguments for ${failure.name} must be valid JSON. ${contract}`
     case "arguments_not_object":
-      return `Arguments for ${failure.name} must be a JSON object. ${contract}`
+      return `Arguments for ${failure.name} must be a YAML mapping. ${contract}`
     case "unknown_function":
       return `Unknown function ${failure.name}. Use only a name from TOOL DEFINITIONS. ${contract}`
     case "schema_validation":
@@ -608,6 +622,12 @@ function buildRetryNudge(content: string, error: unknown, plan: ToolPlan): strin
     case "final_content_not_string":
       return `FINAL content must be a string. ${contract}`
     case "invalid_action_type":
+      if (proseCandidate(content, error) !== null) {
+        if (allowsMarkedProse(plan)) {
+          return `Your previous reply was unmarked prose. If it is a completed answer, re-emit it with "${TOOL_PROSE_FINAL_PREFIX}" as the first character; otherwise ${contract}`
+        }
+        return `Your previous reply was unmarked prose. ${contract}`
+      }
       return `Action type must be tool_calls or final. ${contract}`
   }
   return `Your previous reply did not provide a usable action. ${contract}`
@@ -749,7 +769,7 @@ export function createToolSseRelay(
               }
 
               // Bare prose is ambiguous: ask once for the direct-answer
-              // marker or a JSON action, then preserve availability by
+              // marker or a YAML action, then preserve availability by
               // delivering any remaining prose instead of spending more calls.
               if (!isLengthTruncation(upstreamFinishReason) && plan.choice === "auto" && plan.finalResponseFormat === "text") {
                 const prose = proseCandidate(content, error)
