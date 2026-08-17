@@ -378,10 +378,10 @@ export function validateChatRequest(input: unknown): ValidatedChatRequest {
     let insertionIndex = 0
     while (insertionIndex < messages.length && messages[insertionIndex].role === "system") insertionIndex += 1
     messages.splice(insertionIndex, 0, { role: "system", content: buildToolProtocol(toolPlan) })
-    // Tool actions are emitted as YAML, so a JSON-object response constraint
-    // would conflict with the protocol regardless of the requested tool mode.
+    // XML actions use their own model-facing contract, so an upstream
+    // JSON-object response constraint would conflict with every tool mode.
 
-    // Kimi K3 reasons before emitting the YAML action; a tiny client cap would
+    // Kimi K3 reasons before emitting the XML action; a tiny client cap would
     // spend the whole budget on thinking and return no action at all.
     const maxTokens = portalPayload.max_tokens
     if (typeof maxTokens === "number" && maxTokens < TOOL_PROTOCOL_MIN_MAX_TOKENS) {

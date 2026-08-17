@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto"
 import { AppError } from "./errors"
-import { TOOL_PROSE_FINAL_PREFIX, ToolActionError, parseToolAction, type ParsedToolAction, type ToolPlan } from "./tools"
+import { TOOL_PROSE_FINAL_PREFIX, ToolActionError, ToolActionXmlStream, parseToolAction, type ParsedToolAction, type ToolPlan } from "./tools"
 
 type JsonObject = Record<string, unknown>
 
@@ -19,6 +19,7 @@ export interface PreparedSse {
   pending: string
   firstChunk?: JsonObject
   firstDone: boolean
+  firstDoneSentinel?: boolean
   firstError?: UpstreamStreamError
 }
 
@@ -88,7 +89,7 @@ export async function prepareSse(body: ReadableStream<Uint8Array> | null): Promi
       if (!data) continue
       try {
         const parsed = parseData(data)
-        if (parsed === "DONE") return { reader, pending, firstDone: true }
+        if (parsed === "DONE") return { reader, pending, firstDone: true, firstDoneSentinel: true }
         return { reader, pending, firstChunk: parsed, firstDone: false }
       } catch (error) {
         if (error instanceof UpstreamStreamError) return { reader, pending, firstError: error, firstDone: false }
@@ -105,7 +106,7 @@ export async function prepareSse(body: ReadableStream<Uint8Array> | null): Promi
       if (!data) return { reader, pending: "", firstDone: true }
       try {
         const parsed = parseData(data)
-        if (parsed === "DONE") return { reader, pending: "", firstDone: true }
+        if (parsed === "DONE") return { reader, pending: "", firstDone: true, firstDoneSentinel: true }
         return { reader, pending: "", firstChunk: parsed, firstDone: false }
       } catch (error) {
         if (error instanceof UpstreamStreamError) return { reader, pending: "", firstError: error, firstDone: false }
@@ -483,9 +484,8 @@ function markedProseFinal(content: unknown, plan: ToolPlan): string | null {
   return prose.trim() ? prose : null
 }
 
-function looksLikeYamlAction(content: string): boolean {
-  const source = content.trim()
-  return /^(?:type|content|tool_calls)\s*:/.test(source) || source.startsWith("{") || source.startsWith("[")
+function looksLikeXmlAction(content: string): boolean {
+  return content.trim().startsWith("<")
 }
 
 // Identifies bare prose so retries can explain how to attach it to a tool action.
@@ -493,11 +493,11 @@ function proseCandidate(content: string, error: unknown): string | null {
   const text = content.trim()
   if (!text || !(error instanceof ToolActionError)) return null
   if (
-    error.failure.kind !== "invalid_yaml" &&
-    error.failure.kind !== "not_yaml_object" &&
-    error.failure.kind !== "invalid_action_type"
+    error.failure.kind !== "invalid_xml" &&
+    error.failure.kind !== "invalid_xml_root" &&
+    error.failure.kind !== "invalid_xml_structure"
   ) return null
-  return looksLikeYamlAction(text) ? null : text
+  return looksLikeXmlAction(text) ? null : text
 }
 
 // Encodes the failed attempt (error output + reason) as a self-contained
@@ -526,13 +526,13 @@ function retryActionContract(plan: ToolPlan): string {
   const final = allowsMarkedProse(plan)
     ? ` Only if no tool is needed and the answer is complete, emit FINAL: ${TOOL_PROSE_FINAL_PREFIX}<completed answer>.`
     : plan.choice === "auto"
-      ? " Only if no tool is needed and the answer is complete, emit FINAL YAML:\ntype: final\ncontent: completed answer."
+      ? " Only if no tool is needed and the answer is complete, emit <final><![CDATA[completed answer]]></final>."
       : " A final answer is not allowed for this request."
-  return `Reply with exactly one complete protocol action. For a tool call, emit this YAML mapping:\ntype: tool_calls\ncontent: optional short progress update\ntool_calls:\n  - name: tool_name\n    arguments:\n      argument_name: value\ncontent is optional, user-visible, and at most 240 characters. If text announces work, put it in content beside the actual tool_calls in this same YAML mapping; never emit it separately. The proxy cannot infer or wait for a later tool call. Start a YAML action at the first character with no prose or code fence.${final} The proxy assigns call ids; do not emit id.`
+  return `Reply with exactly one complete protocol action. For a tool call, emit this XML document:\n<tool_calls>\n  <progress><![CDATA[optional short progress update]]></progress>\n  <tool_call><name><![CDATA[tool_name]]></name><arguments><arg><key><![CDATA[argument_name]]></key><string><![CDATA[value]]></string></arg></arguments></tool_call>\n</tool_calls>\nprogress is optional, user-visible, and at most 240 characters. Put any progress update inside <progress> beside the actual <tool_call>; never emit it separately. Encode keys and strings in CDATA, use number/boolean/null/object/array value elements for other JSON types, and do not emit <id>. Start XML at the first non-whitespace character with no prose or code fence.${final}`
 }
 
 function buildUnmarkedProseRetryNudge(plan: ToolPlan): string {
-  return `Your previous reply was unmarked prose, not a protocol action. The proxy did not run or queue a tool from that text. If it describes work that remains, immediately return the matching tool_calls; put that progress update in the action's content field, not in a separate message. ${retryActionContract(plan)}`
+  return `Your previous reply was unmarked prose, not a protocol action. The proxy did not run or queue a tool from that text. If it describes work that remains, immediately return the matching <tool_calls> XML action; put that progress update in <progress>, not in a separate message. ${retryActionContract(plan)}`
 }
 
 function isLengthTruncation(finishReason: unknown): boolean {
@@ -581,24 +581,20 @@ function buildRetryNudge(content: string, error: unknown, plan: ToolPlan): strin
   switch (failure.kind) {
     case "empty_content":
       return `Your previous reply was empty. ${contract}`
-    case "invalid_yaml":
-      return `Your previous reply was invalid YAML${failure.detail ? ` (${failure.detail})` : ""}. ${contract}`
-    case "not_yaml_object":
-      return `Your previous reply must be a YAML mapping. ${contract}`
+    case "invalid_xml":
+      return `Your previous reply was invalid XML${failure.detail ? ` (${failure.detail})` : ""}. ${contract}`
+    case "invalid_xml_root":
+      return `XML root <${failure.name}> is invalid; use <tool_calls> or <final>. ${contract}`
+    case "invalid_xml_structure":
+      return `Your XML action has an invalid structure: ${failure.detail}. ${contract}`
     case "empty_tool_calls":
-      return `tool_calls must contain at least one call. ${contract}`
-    case "tool_call_content_not_string":
-      return `tool_calls.content must be a string or null. ${contract}`
+      return `<tool_calls> must contain at least one <tool_call>. ${contract}`
     case "tool_call_content_too_long":
-      return `tool_calls.content must be at most 240 characters. ${contract}`
+      return `<progress> must be at most 240 characters. ${contract}`
     case "parallel_calls_not_allowed":
-      return `Only one tool call is allowed in this turn. ${contract}`
-    case "invalid_tool_call":
-      return `tool_calls[${failure.index}] must be an object with name and arguments. ${contract}`
+      return `Only one <tool_call> is allowed in this turn. ${contract}`
     case "missing_function_name":
-      return `tool_calls[${failure.index}] is missing a function name. ${contract}`
-    case "arguments_not_object":
-      return `Arguments for ${failure.name} must be a YAML mapping. ${contract}`
+      return `<tool_call> ${failure.index + 1} is missing <name>. ${contract}`
     case "unknown_function":
       return `Unknown function ${failure.name}. Use only a name from TOOL DEFINITIONS. ${contract}`
     case "schema_validation":
@@ -606,11 +602,9 @@ function buildRetryNudge(content: string, error: unknown, plan: ToolPlan): strin
     case "final_when_tool_required":
       return `tool_choice=required requires one or more tool calls in this response. ${contract}`
     case "final_content_not_json_object":
-      return `FINAL content must be one JSON object. ${contract}`
+      return `<final> must contain one <object>. ${contract}`
     case "final_content_not_string":
-      return `FINAL content must be a string. ${contract}`
-    case "invalid_action_type":
-      return `Action type must be tool_calls or final. ${contract}`
+      return `<final> must contain text or one <string>. ${contract}`
   }
   return `Your previous reply did not provide a usable action. ${contract}`
 }
@@ -636,6 +630,8 @@ export function createToolSseRelay(
         let reasoningText = ""
         let markedProse = false
         let markedProseContent = ""
+        let xmlStream: ToolActionXmlStream | undefined
+        let sawDoneSentinel = false
 
         const processToolChunk = (value: JsonObject): void => {
           identity ??= completionChunkIdentity(value, model)
@@ -658,6 +654,13 @@ export function createToolSseRelay(
                 markedProse = true
                 markedProseContent = prose
                 visibleContent = prose
+                xmlStream = undefined
+              } else if (!(allowsMarkedProse(plan) && content === TOOL_PROSE_FINAL_PREFIX)) {
+                if (xmlStream) xmlStream.write(chunk)
+                else {
+                  xmlStream = new ToolActionXmlStream(plan)
+                  xmlStream.write(content)
+                }
               }
             }
           } else if (rawDelta.content !== undefined && rawDelta.content !== null) {
@@ -694,7 +697,10 @@ export function createToolSseRelay(
           const data = dataFromFrame(frame)
           if (!data) return false
           const parsed = parseData(data)
-          if (parsed === "DONE") return true
+          if (parsed === "DONE") {
+            sawDoneSentinel = true
+            return true
+          }
           processToolChunk(parsed)
           return false
         }
@@ -705,6 +711,8 @@ export function createToolSseRelay(
           let action: ParsedToolAction | undefined
           while (true) {
             let pending = current.pending
+            xmlStream = undefined
+            sawDoneSentinel = current.firstDoneSentinel === true
             if (current.firstChunk) processToolChunk(current.firstChunk)
             let upstreamDone = current.firstDone
             while (!upstreamDone) {
@@ -742,7 +750,10 @@ export function createToolSseRelay(
             }
 
             try {
-              action = parseToolAction(content, plan)
+              const allowAutoClose = upstreamFinishReason === "stop" && sawDoneSentinel
+              action = xmlStream
+                ? xmlStream.finish(allowAutoClose)
+                : parseToolAction(content, plan, allowAutoClose)
               break
             } catch (error) {
               const invalidAction = error instanceof AppError && error.code === "invalid_tool_action"
@@ -932,7 +943,7 @@ function normalizeToolCompletionFromNormalized(normalized: JsonObject, plan: Too
     return normalized
   }
 
-  const action = parseToolAction(message.content, plan)
+  const action = parseToolAction(message.content, plan, choice.finish_reason === "stop")
   if (action.kind === "tool_calls") {
     message.content = action.content
     message.tool_calls = action.toolCalls
