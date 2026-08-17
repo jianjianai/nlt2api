@@ -378,13 +378,10 @@ export function validateChatRequest(input: unknown): ValidatedChatRequest {
     let insertionIndex = 0
     while (insertionIndex < messages.length && messages[insertionIndex].role === "system") insertionIndex += 1
     messages.splice(insertionIndex, 0, { role: "system", content: buildToolProtocol(toolPlan) })
-    // Auto text mode permits an explicitly marked direct answer, so forcing
-    // JSON upstream would make that protocol branch impossible to produce.
-    if (toolPlan.choice !== "auto" || toolPlan.finalResponseFormat !== "text") {
-      portalPayload.response_format = { type: "json_object" }
-    }
+    // Tool actions are emitted as YAML, so a JSON-object response constraint
+    // would conflict with the protocol regardless of the requested tool mode.
 
-    // Kimi K3 reasons before emitting the JSON action; a tiny client cap would
+    // Kimi K3 reasons before emitting the YAML action; a tiny client cap would
     // spend the whole budget on thinking and return no action at all.
     const maxTokens = portalPayload.max_tokens
     if (typeof maxTokens === "number" && maxTokens < TOOL_PROTOCOL_MIN_MAX_TOKENS) {

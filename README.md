@@ -77,7 +77,7 @@ curl.exe http://127.0.0.1:3000/v1/chat/completions `
 
 ### 工具调用实现
 
-门户不会原生解析 Kimi K3 的工具定义。本适配器采用经过真实接口验证的兼容方案：将 function tools 编译为受约束的 JSON 动作协议，强制门户生成 JSON Object，再使用 Ajv 按调用方提供的参数 Schema 校验，最后转换为 OpenAI 标准工具响应。工具由调用方执行，代理本身不会执行函数。
+门户不会原生解析 Kimi K3 的工具定义。本适配器采用经过真实接口验证的兼容方案：将 function tools 编译为受约束的 YAML 动作协议，并使用 Ajv 按调用方提供的参数 Schema 校验，最后转换为 OpenAI 标准工具响应。工具由调用方执行，代理本身不会执行函数。
 
 支持的选择方式：
 
