@@ -26,6 +26,10 @@ export interface AccountStore {
   proxy: {
     apiKey: string
   }
+  admin: {
+    passwordHash: string
+    sessionSecret: string
+  }
   accounts: StoredAccount[]
 }
 
@@ -97,6 +101,7 @@ function normalizeAccount(value: unknown): StoredAccount | null {
 function normalizeStore(value: unknown): AccountStore {
   const record = isRecord(value) ? value : {}
   const proxy = isRecord(record.proxy) ? record.proxy : {}
+  const admin = isRecord(record.admin) ? record.admin : {}
   const accounts = Array.isArray(record.accounts)
     ? record.accounts.map(normalizeAccount).filter((account): account is StoredAccount => account !== null)
     : []
@@ -105,6 +110,10 @@ function normalizeStore(value: unknown): AccountStore {
     version: 1,
     proxy: {
       apiKey: asString(proxy.apiKey)
+    },
+    admin: {
+      passwordHash: asString(admin.passwordHash),
+      sessionSecret: asString(admin.sessionSecret)
     },
     accounts
   }
@@ -161,9 +170,19 @@ async function loadStore(): Promise<AccountStore> {
     store.proxy.apiKey = process.env.NEURALWATT_PROXY_KEY || generateProxyKey()
     console.info(`Generated local proxy API key: ${store.proxy.apiKey}`)
   }
+  if (!store.admin.sessionSecret) {
+    store.admin.sessionSecret = randomBytes(32).toString("base64url")
+  }
 
   loadedStore = store
-  if (!fileExists || !isRecord(value) || !isRecord(value.proxy) || !asString(value.proxy.apiKey)) {
+  if (
+    !fileExists ||
+    !isRecord(value) ||
+    !isRecord(value.proxy) ||
+    !asString(value.proxy.apiKey) ||
+    !isRecord(value.admin) ||
+    !asString(value.admin.sessionSecret)
+  ) {
     await persistStore(store)
   }
 
@@ -189,6 +208,38 @@ export async function rotateProxyKey(): Promise<string> {
   return updateStore((store) => {
     store.proxy.apiKey = generateProxyKey()
     return store.proxy.apiKey
+  })
+}
+
+export async function setProxyKey(apiKey: string): Promise<string> {
+  const key = apiKey.trim()
+  if (key.length < 8) {
+    throw new AppError("API key must be at least 8 characters", 400, "invalid_proxy_key")
+  }
+  return updateStore((store) => {
+    store.proxy.apiKey = key
+    return store.proxy.apiKey
+  })
+}
+
+export async function getAdminPasswordHash(): Promise<string> {
+  return (await loadStore()).admin.passwordHash
+}
+
+export async function setAdminPasswordHash(passwordHash: string): Promise<void> {
+  await updateStore((store) => {
+    store.admin.passwordHash = passwordHash
+  })
+}
+
+export async function getAdminSessionSecret(): Promise<string> {
+  return (await loadStore()).admin.sessionSecret
+}
+
+export async function rotateAdminSessionSecret(): Promise<string> {
+  return updateStore((store) => {
+    store.admin.sessionSecret = randomBytes(32).toString("base64url")
+    return store.admin.sessionSecret
   })
 }
 

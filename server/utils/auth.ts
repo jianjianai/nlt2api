@@ -1,7 +1,8 @@
 import { timingSafeEqual } from "node:crypto"
-import { getHeader, type H3Event } from "h3"
+import { getCookie, getHeader, type H3Event } from "h3"
+import { ADMIN_SESSION_COOKIE, verifySessionToken } from "./admin-auth"
 import { AppError } from "./errors"
-import { getProxyKey } from "./store"
+import { getAdminSessionSecret, getProxyKey } from "./store"
 
 export async function requireProxyAuth(event: H3Event): Promise<void> {
   const header = getHeader(event, "authorization")
@@ -10,9 +11,11 @@ export async function requireProxyAuth(event: H3Event): Promise<void> {
   const expected = await getProxyKey()
   const providedBuffer = Buffer.from(provided)
   const expectedBuffer = Buffer.from(expected)
-  const valid = providedBuffer.length === expectedBuffer.length && timingSafeEqual(providedBuffer, expectedBuffer)
+  if (providedBuffer.length === expectedBuffer.length && timingSafeEqual(providedBuffer, expectedBuffer)) return
 
-  if (!valid) {
-    throw new AppError("A valid local proxy API key is required", 401, "invalid_proxy_key", undefined, "authentication_error")
-  }
+  // The admin UI test panel calls the proxy API with its session cookie instead of the key.
+  const token = getCookie(event, ADMIN_SESSION_COOKIE)
+  if (token && verifySessionToken(token, await getAdminSessionSecret())) return
+
+  throw new AppError("A valid local proxy API key is required", 401, "invalid_proxy_key", undefined, "authentication_error")
 }

@@ -9,7 +9,16 @@ pnpm install
 pnpm dev
 ```
 
-首次访问服务时会在终端输出本地代理 Bearer Key。打开 `http://127.0.0.1:3000/`，输入该 Key 后管理账号。
+首次启动时会在终端输出本地代理 Bearer Key（供脚本调用和初始化管理员密码使用）。打开 `http://127.0.0.1:3000/`：首次访问输入该 Key 设置管理员密码，之后凭密码登录管理台。管理台中可以轮换或自定义代理 Key、维护门户账号、测试兼容接口、修改管理员密码。
+
+也可以用环境变量固定管理员密码（优先级高于管理台保存的密码，忘记密码时可用它恢复）：
+
+```powershell
+$env:NEURALWATT_ADMIN_PASSWORD = "your-strong-password"
+pnpm dev
+```
+
+管理 API（`/api/...`）同时接受管理员会话 Cookie 和代理 Bearer Key，现有脚本无需修改。
 
 构建和预览：
 

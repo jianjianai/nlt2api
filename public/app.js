@@ -1,260 +1,291 @@
-const state = { key: sessionStorage.getItem("neuralwatt-proxy-key") || "", accounts: [] }
+/* global Vue */
+const { createApp } = Vue
 
-const $ = (selector) => document.querySelector(selector)
-const notice = $("#notice")
-
-function showNotice(message, kind = "") {
-  notice.textContent = message
-  notice.className = `notice ${kind}`
-}
-
-function formatTime(value) {
-  if (!value) return "-"
-  const date = new Date(value)
-  return Number.isNaN(date.getTime()) ? value : date.toLocaleString()
-}
-
-function statusLabel(status) {
-  return ({
-    unknown: "未检查",
-    ready: "可用",
-    expired: "已过期",
-    login_failed: "登录失败",
-    manual_cookie_required: "需要 Cookie"
-  })[status] || status
-}
-
-function statusClass(status) {
-  if (status === "ready") return "status-ready"
-  if (status === "login_failed" || status === "expired") return "status-error"
-  if (status === "manual_cookie_required") return "status-warning"
-  return "status-unknown"
-}
-
-function apiHeaders(withBody = false) {
-  const headers = { Authorization: `Bearer ${state.key}` }
-  if (withBody) headers["Content-Type"] = "application/json"
-  return headers
-}
-
-async function api(path, options = {}) {
-  const response = await fetch(path, {
-    ...options,
-    headers: { ...apiHeaders(Boolean(options.body)), ...(options.headers || {}) }
-  })
-  const data = await response.json().catch(() => ({}))
-  if (!response.ok) {
-    throw new Error(typeof data.error === "string" ? data.error : data.error?.message || `请求失败（${response.status}）`)
-  }
-  return data
-}
-
-function setHealth(text, className) {
-  const badge = $("#health-badge")
-  badge.textContent = text
-  badge.className = `status-badge ${className}`
-}
-
-async function checkHealth() {
-  try {
-    const response = await fetch("/health")
-    if (!response.ok) throw new Error("health")
-    setHealth("服务在线", "status-ready")
-  } catch {
-    setHealth("服务不可用", "status-error")
-  }
-}
-
-function clearAccountForm() {
-  $("#editing-id").value = ""
-  $("#account-label").value = ""
-  $("#account-email").value = ""
-  $("#account-password").value = ""
-  $("#account-cookie").value = ""
-}
-
-function renderAccounts() {
-  const body = $("#accounts-body")
-  body.replaceChildren()
-  if (state.accounts.length === 0) {
-    const row = document.createElement("tr")
-    row.innerHTML = '<td colspan="5" class="empty-state">尚未配置账号</td>'
-    body.append(row)
-    return
-  }
-
-  for (const account of state.accounts) {
-    const row = document.createElement("tr")
-    const accountCell = document.createElement("td")
-    accountCell.innerHTML = `<div class="account-name"></div><div class="account-email"></div>`
-    accountCell.querySelector(".account-name").textContent = account.label
-    accountCell.querySelector(".account-email").textContent = account.email
-
-    const statusCell = document.createElement("td")
-    const badge = document.createElement("span")
-    badge.className = `status-badge ${statusClass(account.status)}`
-    badge.textContent = statusLabel(account.status)
-    statusCell.append(badge)
-
-    const loginCell = document.createElement("td")
-    loginCell.textContent = formatTime(account.lastLoginAt)
-
-    const propertiesCell = document.createElement("td")
-    propertiesCell.textContent = `${account.enabled ? "已启用" : "已停用"} · ${account.hasPassword ? "有密码" : "无密码"} · ${account.hasCookie ? "有会话" : "无会话"}`
-
-    const actionsCell = document.createElement("td")
-    actionsCell.className = "cell-actions"
-    for (const [action, label, className] of [
-      ["edit", "编辑", "button-secondary"],
-      ["login", "登录", "button-primary"],
-      ["check", "检查", "button-secondary"],
-      ["toggle", account.enabled ? "停用" : "启用", "button-ghost"],
-      ["delete", "删除", "button-danger"]
-    ]) {
-      const button = document.createElement("button")
-      button.type = "button"
-      button.dataset.action = action
-      button.dataset.id = account.id
-      button.className = `button ${className}`
-      button.textContent = label
-      actionsCell.append(button)
+createApp({
+  data() {
+    return {
+      authed: false,
+      hasPassword: true,
+      loginPassword: "",
+      loginConfirm: "",
+      setupKey: "",
+      loginError: "",
+      loginPending: false,
+      health: { text: "检查服务…", className: "status-unknown" },
+      accounts: [],
+      editingId: "",
+      form: { label: "", email: "", password: "", cookie: "" },
+      saving: false,
+      busyId: "",
+      keyInput: "",
+      keyBanner: "",
+      keyPending: false,
+      pwd: { current: "", next: "", confirm: "" },
+      pwdPending: false,
+      test: { model: "kimi-k3", message: "请只回复 TEST_OK", output: "等待测试", pending: false },
+      notice: { text: "", kind: "" },
+      noticeTimer: 0
     }
-
-    row.append(accountCell, statusCell, loginCell, propertiesCell, actionsCell)
-    body.append(row)
-  }
-}
-
-async function loadAccounts() {
-  if (!state.key) {
-    showNotice("请先输入本地代理 Key。", "error")
-    return
-  }
-  const data = await api("/api/accounts")
-  state.accounts = data.accounts || []
-  renderAccounts()
-  showNotice(`已加载 ${state.accounts.length} 个账号。`, "success")
-}
-
-async function saveAccount(event) {
-  event.preventDefault()
-  const id = $("#editing-id").value
-  const label = $("#account-label").value.trim()
-  const email = $("#account-email").value.trim()
-  const password = $("#account-password").value
-  const cookie = $("#account-cookie").value.trim()
-  if (!label || !email || (!id && !password)) {
-    showNotice("新增账号必须填写名称、邮箱和密码。", "error")
-    return
-  }
-
-  try {
-    const data = await api(id ? `/api/accounts/${id}` : "/api/accounts", {
-      method: id ? "PATCH" : "POST",
-      body: JSON.stringify({ label, email, password: password || undefined })
-    })
-    const accountId = data.account.id
-    if (cookie) {
-      await api(`/api/accounts/${accountId}/session-cookie`, { method: "POST", body: JSON.stringify({ cookie }) })
+  },
+  methods: {
+    notify(text, kind = "") {
+      this.notice = { text, kind }
+      clearTimeout(this.noticeTimer)
+      if (text) {
+        this.noticeTimer = setTimeout(() => { this.notice = { text: "", kind: "" } }, 4000)
+      }
+    },
+    async api(path, options = {}) {
+      const headers = { ...(options.headers || {}) }
+      if (options.body) headers["Content-Type"] = "application/json"
+      const response = await fetch(path, { ...options, headers })
+      const data = await response.json().catch(() => ({}))
+      if (response.status === 401 && data.code === "admin_auth_required") {
+        this.authed = false
+        throw new Error("登录已过期，请重新登录")
+      }
+      if (!response.ok) {
+        throw new Error(typeof data.error === "string" ? data.error : (data.error && data.error.message) || `请求失败（${response.status}）`)
+      }
+      return data
+    },
+    async bootstrap() {
+      this.checkHealth()
+      try {
+        const session = await (await fetch("/api/admin/session")).json()
+        this.hasPassword = Boolean(session.hasPassword)
+        this.authed = Boolean(session.authenticated)
+        if (this.authed) await this.loadAccounts()
+      } catch {
+        this.notify("无法连接服务", "error")
+      }
+    },
+    async login() {
+      if (!this.loginPassword) {
+        this.loginError = "请输入密码"
+        return
+      }
+      this.loginPending = true
+      this.loginError = ""
+      try {
+        await this.api("/api/admin/login", { method: "POST", body: JSON.stringify({ password: this.loginPassword }) })
+        this.authed = true
+        this.loginPassword = ""
+        await this.loadAccounts()
+      } catch (error) {
+        this.loginError = error.message
+      } finally {
+        this.loginPending = false
+      }
+    },
+    async setupPassword() {
+      if (!this.setupKey) {
+        this.loginError = "请输入本地代理 Key"
+        return
+      }
+      if (this.loginPassword.length < 8) {
+        this.loginError = "新密码至少 8 位"
+        return
+      }
+      if (this.loginPassword !== this.loginConfirm) {
+        this.loginError = "两次输入的密码不一致"
+        return
+      }
+      this.loginPending = true
+      this.loginError = ""
+      try {
+        await this.api("/api/admin/password", {
+          method: "POST",
+          headers: { Authorization: `Bearer ${this.setupKey}` },
+          body: JSON.stringify({ password: this.loginPassword })
+        })
+        this.hasPassword = true
+        this.authed = true
+        this.loginPassword = ""
+        this.loginConfirm = ""
+        this.setupKey = ""
+        await this.loadAccounts()
+      } catch (error) {
+        this.loginError = error.message
+      } finally {
+        this.loginPending = false
+      }
+    },
+    async logout() {
+      await fetch("/api/admin/logout", { method: "POST" }).catch(() => {})
+      this.authed = false
+      this.accounts = []
+      this.keyBanner = ""
+    },
+    async checkHealth() {
+      try {
+        const response = await fetch("/health")
+        if (!response.ok) throw new Error("health")
+        this.health = { text: "服务在线", className: "status-ready" }
+      } catch {
+        this.health = { text: "服务不可用", className: "status-error" }
+      }
+    },
+    async loadAccounts() {
+      try {
+        const data = await this.api("/api/accounts")
+        this.accounts = data.accounts || []
+      } catch (error) {
+        this.notify(error.message, "error")
+      }
+    },
+    resetForm() {
+      this.editingId = ""
+      this.form = { label: "", email: "", password: "", cookie: "" }
+    },
+    editAccount(account) {
+      this.editingId = account.id
+      this.form = { label: account.label, email: account.email, password: "", cookie: "" }
+    },
+    async saveAccount() {
+      this.saving = true
+      try {
+        if (this.editingId) {
+          const payload = { label: this.form.label, email: this.form.email }
+          if (this.form.password) payload.password = this.form.password
+          await this.api(`/api/accounts/${this.editingId}`, { method: "PATCH", body: JSON.stringify(payload) })
+          if (this.form.cookie) {
+            await this.api(`/api/accounts/${this.editingId}/session-cookie`, { method: "POST", body: JSON.stringify({ cookie: this.form.cookie }) })
+          }
+          this.notify("账号已更新。", "success")
+        } else {
+          if (!this.form.password) {
+            this.notify("新增账号必须填写密码。", "error")
+            return
+          }
+          const data = await this.api("/api/accounts", {
+            method: "POST",
+            body: JSON.stringify({ label: this.form.label, email: this.form.email, password: this.form.password })
+          })
+          if (this.form.cookie && data.account) {
+            await this.api(`/api/accounts/${data.account.id}/session-cookie`, { method: "POST", body: JSON.stringify({ cookie: this.form.cookie }) })
+          }
+          this.notify("账号已添加。", "success")
+        }
+        this.resetForm()
+        await this.loadAccounts()
+      } catch (error) {
+        this.notify(error.message, "error")
+      } finally {
+        this.saving = false
+      }
+    },
+    async accountAction(action, account) {
+      if (action === "delete" && !window.confirm(`确认删除账号「${account.label}」？`)) return
+      this.busyId = account.id
+      try {
+        if (action === "delete") {
+          await this.api(`/api/accounts/${account.id}`, { method: "DELETE" })
+          this.notify("账号已删除。", "success")
+        } else if (action === "toggle") {
+          await this.api(`/api/accounts/${account.id}`, { method: "PATCH", body: JSON.stringify({ enabled: !account.enabled }) })
+        } else if (action === "login") {
+          this.notify(`正在登录 ${account.label}，请稍候。`)
+          await this.api(`/api/accounts/${account.id}/login`, { method: "POST" })
+          this.notify(`${account.label} 登录成功。`, "success")
+        } else if (action === "check") {
+          const result = await this.api(`/api/accounts/${account.id}/check`, { method: "POST" })
+          this.notify(result.ok ? `${account.label} 会话有效。` : `${account.label} 会话不可用：${result.reason || "未知原因"}`, result.ok ? "success" : "error")
+        }
+        await this.loadAccounts()
+      } catch (error) {
+        this.notify(error.message, "error")
+        await this.loadAccounts()
+      } finally {
+        this.busyId = ""
+      }
+    },
+    async applyKey() {
+      if (this.keyInput && this.keyInput.length < 8) {
+        this.notify("Key 至少 8 个字符。", "error")
+        return
+      }
+      const message = this.keyInput ? "设置后旧 Key 会立即失效，确认继续？" : "轮换后旧 Key 会立即失效，确认继续？"
+      if (!window.confirm(message)) return
+      this.keyPending = true
+      try {
+        const data = await this.api("/api/proxy-key/rotate", {
+          method: "POST",
+          body: JSON.stringify(this.keyInput ? { apiKey: this.keyInput } : {})
+        })
+        this.keyBanner = data.apiKey
+        this.keyInput = ""
+        this.notify("Key 已更新，请立即保存。", "success")
+      } catch (error) {
+        this.notify(error.message, "error")
+      } finally {
+        this.keyPending = false
+      }
+    },
+    async copyKey() {
+      try {
+        await navigator.clipboard.writeText(this.keyBanner)
+        this.notify("已复制。", "success")
+      } catch {
+        this.notify("复制失败，请手动选择复制。", "error")
+      }
+    },
+    async changePassword() {
+      if (this.pwd.next.length < 8) {
+        this.notify("新密码至少 8 位。", "error")
+        return
+      }
+      if (this.pwd.next !== this.pwd.confirm) {
+        this.notify("两次输入的新密码不一致。", "error")
+        return
+      }
+      this.pwdPending = true
+      try {
+        await this.api("/api/admin/password", {
+          method: "POST",
+          body: JSON.stringify({ currentPassword: this.pwd.current, password: this.pwd.next })
+        })
+        this.pwd = { current: "", next: "", confirm: "" }
+        this.notify("管理员密码已更新。", "success")
+      } catch (error) {
+        this.notify(error.message, "error")
+      } finally {
+        this.pwdPending = false
+      }
+    },
+    async runTest() {
+      this.test.pending = true
+      this.test.output = "请求中..."
+      try {
+        const data = await this.api("/v1/chat/completions", {
+          method: "POST",
+          body: JSON.stringify({ model: this.test.model, messages: [{ role: "user", content: this.test.message }], stream: false, max_tokens: 32 })
+        })
+        this.test.output = JSON.stringify(data, null, 2)
+        this.notify("测试请求完成。", "success")
+      } catch (error) {
+        this.test.output = error.message
+        this.notify(error.message, "error")
+      } finally {
+        this.test.pending = false
+      }
+    },
+    formatTime(value) {
+      if (!value) return "-"
+      const date = new Date(value)
+      return Number.isNaN(date.getTime()) ? value : date.toLocaleString()
+    },
+    statusLabel(status) {
+      return ({ unknown: "未检查", ready: "可用", expired: "已过期", login_failed: "登录失败", manual_cookie_required: "需要 Cookie" })[status] || status
+    },
+    statusClass(status) {
+      if (status === "ready") return "status-ready"
+      if (status === "login_failed" || status === "expired") return "status-error"
+      if (status === "manual_cookie_required") return "status-warning"
+      return "status-unknown"
     }
-    clearAccountForm()
-    await loadAccounts()
-    showNotice("账号已保存。", "success")
-  } catch (error) {
-    showNotice(error.message, "error")
+  },
+  mounted() {
+    this.bootstrap()
   }
-}
-
-function editAccount(account) {
-  $("#editing-id").value = account.id
-  $("#account-label").value = account.label
-  $("#account-email").value = account.email
-  $("#account-password").value = ""
-  $("#account-cookie").value = ""
-  window.scrollTo({ top: 0, behavior: "smooth" })
-  showNotice("编辑模式：密码留空表示保留原密码；需要替换 Cookie 时再填写。")
-}
-
-async function accountAction(action, id) {
-  const account = state.accounts.find((item) => item.id === id)
-  if (!account) return
-  try {
-    if (action === "edit") return editAccount(account)
-    if (action === "delete") {
-      if (!window.confirm(`确认删除账号“${account.label}”？`)) return
-      await api(`/api/accounts/${id}`, { method: "DELETE" })
-    }
-    if (action === "toggle") {
-      await api(`/api/accounts/${id}`, { method: "PATCH", body: JSON.stringify({ enabled: !account.enabled }) })
-    }
-    if (action === "login") {
-      showNotice(`正在登录 ${account.label}，请稍候。`)
-      await api(`/api/accounts/${id}/login`, { method: "POST" })
-    }
-    if (action === "check") {
-      const result = await api(`/api/accounts/${id}/check`, { method: "POST" })
-      showNotice(result.ok ? `${account.label} 会话有效。` : `${account.label} 会话不可用：${result.reason || "未知原因"}`, result.ok ? "success" : "error")
-    }
-    await loadAccounts()
-    if (action === "login") showNotice(`${account.label} 登录成功。`, "success")
-  } catch (error) {
-    showNotice(error.message, "error")
-    await loadAccounts().catch(() => {})
-  }
-}
-
-async function runTest(event) {
-  event.preventDefault()
-  const output = $("#test-output")
-  output.textContent = "请求中..."
-  try {
-    const data = await api("/v1/chat/completions", {
-      method: "POST",
-      body: JSON.stringify({
-        model: $("#test-model").value.trim(),
-        messages: [{ role: "user", content: $("#test-message").value }],
-        stream: false,
-        max_tokens: 32
-      })
-    })
-    output.textContent = JSON.stringify(data, null, 2)
-    showNotice("测试请求完成。", "success")
-  } catch (error) {
-    output.textContent = error.message
-    showNotice(error.message, "error")
-  }
-}
-
-$("#proxy-key").value = state.key
-$("#save-key").addEventListener("click", async () => {
-  state.key = $("#proxy-key").value.trim()
-  if (!state.key) {
-    showNotice("请输入代理 Key。", "error")
-    return
-  }
-  sessionStorage.setItem("neuralwatt-proxy-key", state.key)
-  await loadAccounts().catch((error) => showNotice(error.message, "error"))
-})
-$("#refresh-accounts").addEventListener("click", () => loadAccounts().catch((error) => showNotice(error.message, "error")))
-$("#clear-account-form").addEventListener("click", clearAccountForm)
-$("#account-form").addEventListener("submit", saveAccount)
-$("#test-form").addEventListener("submit", runTest)
-$("#accounts-body").addEventListener("click", (event) => {
-  const button = event.target.closest("button[data-action]")
-  if (button) accountAction(button.dataset.action, button.dataset.id)
-})
-$("#rotate-key").addEventListener("click", async () => {
-  if (!state.key || !window.confirm("轮换后旧 Key 会立即失效，确认继续？")) return
-  try {
-    const data = await api("/api/proxy-key/rotate", { method: "POST" })
-    state.key = data.apiKey
-    $("#proxy-key").value = state.key
-    sessionStorage.setItem("neuralwatt-proxy-key", state.key)
-    showNotice("Key 已轮换，请确认已保存当前浏览器会话。", "success")
-  } catch (error) {
-    showNotice(error.message, "error")
-  }
-})
-
-checkHealth()
-if (state.key) loadAccounts().catch((error) => showNotice(error.message, "error"))
+}).mount("#app")

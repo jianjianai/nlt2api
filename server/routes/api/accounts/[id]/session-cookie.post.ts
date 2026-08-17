@@ -1,11 +1,11 @@
 import { defineEventHandler, getRouterParam, readBody } from "h3"
-import { requireProxyAuth } from "../../../../utils/auth"
+import { requireAdminAuth } from "../../../../utils/admin-auth"
 import { sendManagementError } from "../../../../utils/errors"
 import { setAccountCookie } from "../../../../utils/store"
 
 export default defineEventHandler(async (event) => {
   try {
-    await requireProxyAuth(event)
+    await requireAdminAuth(event)
     const id = getRouterParam(event, "id")
     if (!id) throw new Error("Account id is required")
     const body = await readBody<{ cookie?: unknown }>(event)
