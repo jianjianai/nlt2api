@@ -3,7 +3,9 @@
   "scripts": {
     "build": "vite build",
     "dev": "vite dev",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "test": "node --experimental-strip-types --test tests/core.test.ts",
+    "typecheck": "tsc --noEmit"
   },
   "devDependencies": {
     "@types/node": "latest",
@@ -13,6 +15,7 @@
     "vite": "latest"
   },
   "dependencies": {
+    "ajv": "8.17.1",
     "vue": "^3.5.41"
   }
 }
