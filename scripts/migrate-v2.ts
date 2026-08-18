@@ -110,7 +110,8 @@ function legacyToV2(value: unknown): V2State {
       scope: typeof modelRoot.scope === "string" ? modelRoot.scope : null,
       fetchedAt: optionalTimestamp(modelRoot.fetchedAt, null)
     },
-    inferenceApiKeys
+    inferenceApiKeys,
+    requestLogging: { enabled: false }
   }
   parseV2State(candidate)
   return candidate

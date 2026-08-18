@@ -78,6 +78,10 @@ export interface StoredModelCatalog {
   fetchedAt: string | null
 }
 
+export interface RequestLoggingSettings {
+  enabled: boolean
+}
+
 export interface V2State {
   version: 2
   admin: {
@@ -87,9 +91,10 @@ export interface V2State {
   accounts: StoredAccount[]
   modelCatalog: StoredModelCatalog
   inferenceApiKeys: StoredInferenceApiKey[]
+  requestLogging: RequestLoggingSettings
 }
 
-const ROOT_KEYS = ["version", "admin", "generationDefaults", "accounts", "modelCatalog", "inferenceApiKeys"]
+const ROOT_KEYS = ["version", "admin", "generationDefaults", "accounts", "modelCatalog", "inferenceApiKeys", "requestLogging"]
 const ADMIN_KEYS = ["passwordHash"]
 const GENERATION_KEYS = ["temperature", "maxTokens", "topP"]
 const ACCOUNT_KEYS = [
@@ -109,6 +114,7 @@ const ACCOUNT_KEYS = [
 ]
 const MODEL_CATALOG_KEYS = ["data", "scope", "fetchedAt"]
 const API_KEY_KEYS = ["id", "label", "digest", "preview", "enabled", "createdAt", "updatedAt"]
+const REQUEST_LOGGING_KEYS = ["enabled"]
 const ID_PATTERN = /^[A-Za-z0-9_-]{8,128}$/
 const SHA256_PATTERN = /^[a-f0-9]{64}$/
 const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/
@@ -315,6 +321,9 @@ export function validateV2State(value: unknown): asserts value is V2State {
   }
 
   validateModelCatalog(root.modelCatalog)
+  const requestLogging = objectAt(root.requestLogging, "requestLogging")
+  exactKeys(requestLogging, REQUEST_LOGGING_KEYS, "requestLogging")
+  booleanAt(requestLogging.enabled, "requestLogging.enabled")
   if (!Array.isArray(root.inferenceApiKeys) || root.inferenceApiKeys.length > 10_000) {
     schemaError("inferenceApiKeys must be a bounded array")
   }
@@ -330,8 +339,11 @@ export function validateV2State(value: unknown): asserts value is V2State {
 }
 
 export function parseV2State(value: unknown): V2State {
-  validateV2State(value)
-  return cloneJson(value)
+  const candidate = isJsonObject(value) && value.version === 2 && !("requestLogging" in value)
+    ? { ...cloneJson(value), requestLogging: { enabled: false } }
+    : value
+  validateV2State(candidate)
+  return cloneJson(candidate)
 }
 
 export function createEmptyV2State(): V2State {
@@ -341,7 +353,8 @@ export function createEmptyV2State(): V2State {
     generationDefaults: { temperature: 0.7, maxTokens: 4_096, topP: 1 },
     accounts: [],
     modelCatalog: { data: [], scope: null, fetchedAt: null },
-    inferenceApiKeys: []
+    inferenceApiKeys: [],
+    requestLogging: { enabled: false }
   }
 }
 

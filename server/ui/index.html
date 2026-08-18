@@ -60,6 +60,7 @@
             <button v-for="item in navItems" :key="item.id" class="nav-item" :class="{ active: activeTab === item.id }" type="button" @click="selectTab(item.id)">
               <i :data-lucide="item.icon"></i><span>{{ item.label }}</span>
               <em v-if="item.id === 'accounts' && accounts.length" class="nav-count">{{ accounts.length }}</em>
+              <em v-if="item.id === 'requestRecords' && requestRecords.length" class="nav-count">{{ requestRecords.length }}</em>
             </button>
           </nav>
           <div class="sidebar-foot">
@@ -137,6 +138,113 @@
                 <form class="inline-form" @submit.prevent="createKey"><label class="field grow"><span>名称</span><input v-model.trim="keyLabel" maxlength="80" required placeholder="例如：生产客户端" /></label><button class="button primary" type="submit" :disabled="keyPending"><i :data-lucide="keyPending ? 'loader-circle' : 'key-round'"></i>{{ keyPending ? "生成中" : "生成密钥" }}</button></form>
               </section>
               <section class="panel"><div class="panel-head"><div><p class="overline">KEY INVENTORY</p><h2>API keys</h2></div><span class="panel-meta">不保存明文密钥</span></div><div v-if="resourceErrors.keys" class="resource-error">{{ resourceErrors.keys }}</div><div v-if="loading.keys" class="loading-row"><i data-lucide="loader-circle"></i> 正在加载密钥…</div><div v-else-if="!keys.length" class="empty"><i data-lucide="key-round"></i><p>暂无 API key</p></div><div v-else class="table-scroll"><table><thead><tr><th>名称</th><th>预览</th><th>状态</th><th>更新时间</th><th class="align-right">操作</th></tr></thead><tbody><tr v-for="key in keys" :key="key.id"><td><b>{{ key.label }}</b><small>{{ key.id }}</small></td><td><code>{{ key.preview }}</code></td><td><span class="status-pill" :class="key.enabled ? 'ready' : 'muted'"><span class="status-dot"></span>{{ key.enabled ? "启用" : "停用" }}</span></td><td>{{ formatTime(key.updatedAt) }}</td><td class="row-actions"><button class="icon-button" type="button" title="重命名" aria-label="重命名" @click="renameKey(key)"><i data-lucide="pencil"></i></button><button class="icon-button" type="button" :title="key.enabled ? '停用密钥' : '启用密钥'" :aria-label="key.enabled ? '停用密钥' : '启用密钥'" @click="toggleKey(key)"><i :data-lucide="key.enabled ? 'pause' : 'play'"></i></button><button class="icon-button danger" type="button" title="删除密钥" aria-label="删除密钥" @click="deleteKey(key)"><i data-lucide="trash-2"></i></button></td></tr></tbody></table></div></section>
+            </section>
+
+            <section v-if="activeTab === 'requestRecords'" class="view-stack">
+              <section class="panel request-record-settings">
+                <div class="panel-head">
+                  <div>
+                    <p class="overline">REQUEST CAPTURE</p>
+                    <h2>记录控制</h2>
+                    <p class="panel-note">默认关闭。记录仅用于临时排障，可能包含提示词、响应正文和上游交互内容。</p>
+                  </div>
+                  <span class="status-pill" :class="requestRecordsEnabled ? 'warning' : 'muted'"><span class="status-dot"></span>{{ requestRecordsEnabled ? "记录中" : "已关闭（默认）" }}</span>
+                </div>
+                <div class="recording-control" :class="{ enabled: requestRecordsEnabled }">
+                  <div class="recording-risk">
+                    <i :data-lucide="requestRecordsEnabled ? 'shield-alert' : 'shield-check'"></i>
+                    <div>
+                      <b>{{ requestRecordsEnabled ? "请求记录已开启" : "请求记录保持关闭" }}</b>
+                      <p>{{ requestRecordsEnabled ? "排障完成后请及时关闭并清空记录，减少敏感内容驻留。" : "开启后，新请求及所有真实上游尝试会暂存在服务内存中。" }}</p>
+                    </div>
+                  </div>
+                  <label class="toggle-control">
+                    <input class="toggle-input" type="checkbox" :checked="requestRecordsEnabled" :disabled="requestRecordPending.settings" @change="setRequestRecording($event.target.checked)" />
+                    <span class="toggle-track" aria-hidden="true"></span>
+                    <span>{{ requestRecordPending.settings ? "正在更新" : (requestRecordsEnabled ? "关闭记录" : "开启记录") }}</span>
+                  </label>
+                </div>
+                <div class="capture-limits" aria-label="记录容量">
+                  <span><i data-lucide="list"></i><b>{{ requestRecords.length }}</b> / {{ requestRecordLimits.maxRecords || "-" }} 条</span>
+                  <span><i data-lucide="file-json-2"></i>单正文最多 <b>{{ formatBytes(requestRecordLimits.maxCaptureBytes) }}</b></span>
+                  <span><i data-lucide="database"></i>内存上限 <b>{{ formatBytes(requestRecordLimits.maxTotalBytes) }}</b></span>
+                </div>
+              </section>
+
+              <section class="panel request-record-panel">
+                <div class="panel-head">
+                  <div>
+                    <p class="overline">REQUEST TIMELINE</p>
+                    <h2>请求明细</h2>
+                    <p class="panel-note">按开始时间从新到旧排列；展开一条记录查看客户端与上游数据。</p>
+                  </div>
+                  <div class="panel-actions">
+                    <button class="button subtle" type="button" :disabled="loading.requestRecords" @click="refreshRequestRecords"><i :data-lucide="loading.requestRecords ? 'loader-circle' : 'refresh-cw'"></i>{{ loading.requestRecords ? "刷新中" : "刷新" }}</button>
+                    <button class="button danger" type="button" :disabled="!requestRecords.length || requestRecordPending.clear" @click="clearRequestRecords"><i :data-lucide="requestRecordPending.clear ? 'loader-circle' : 'trash-2'"></i>{{ requestRecordPending.clear ? "清除中" : "清除全部" }}</button>
+                  </div>
+                </div>
+                <div v-if="resourceErrors.requestRecords" class="resource-error" role="alert">{{ resourceErrors.requestRecords }}</div>
+                <div v-if="loading.requestRecords" class="loading-row"><i data-lucide="loader-circle"></i> 正在加载请求记录…</div>
+                <div v-else-if="!requestRecords.length" class="empty request-record-empty"><i :data-lucide="requestRecordsEnabled ? 'radio' : 'scroll-text'"></i><p>{{ requestRecordsEnabled ? "正在等待新的请求" : "暂无请求记录" }}</p><small>{{ requestRecordsEnabled ? "发送请求后点击刷新即可查看。" : "开启记录后，新请求才会被采集。" }}</small></div>
+                <div v-else class="request-record-list">
+                  <article v-for="record in requestRecords" :key="record.id" class="request-record" :class="{ expanded: isRequestRecordExpanded(record.id) }">
+                    <button class="request-record-summary" type="button" :aria-expanded="isRequestRecordExpanded(record.id)" @click="toggleRequestRecord(record.id)">
+                      <span class="status-pill" :class="requestRecordStatusClass(record)"><span class="status-dot"></span>{{ requestRecordStatusLabel(record) }}</span>
+                      <span class="request-route">
+                        <span><b class="method-badge">{{ (record.client && record.client.request && record.client.request.method) || "-" }}</b><code>{{ (record.client && record.client.request && record.client.request.url) || "未记录客户端 URL" }}</code></span>
+                        <small>{{ formatRequestSource(record.source) }} · {{ record.id }}</small>
+                      </span>
+                      <span class="request-summary-meta"><span><i data-lucide="clock-3"></i>{{ formatRequestTime(record.startedAt) }}</span><span><i data-lucide="timer"></i>{{ formatDuration(record.durationMs) }}</span><span><i data-lucide="route"></i>{{ record.upstream ? record.upstream.length : 0 }} 次上游</span></span>
+                      <i class="request-chevron" :data-lucide="isRequestRecordExpanded(record.id) ? 'chevron-up' : 'chevron-down'"></i>
+                    </button>
+
+                    <div v-if="isRequestRecordExpanded(record.id)" class="request-record-detail">
+                      <section class="trace-section client-trace">
+                        <div class="trace-section-head"><div><span class="trace-step">客户端</span><h3>收到的请求与返回结果</h3></div><span class="trace-time">{{ formatRequestTime(record.startedAt) }} → {{ formatRequestTime(record.completedAt) }}</span></div>
+                        <div class="trace-meta-grid">
+                          <div><span>方法</span><b>{{ (record.client && record.client.request && record.client.request.method) || "-" }}</b></div>
+                          <div><span>URL</span><code>{{ (record.client && record.client.request && record.client.request.url) || "-" }}</code></div>
+                          <div><span>总耗时</span><b>{{ formatDuration(record.durationMs) }}</b></div>
+                          <div><span>来源</span><b>{{ formatRequestSource(record.source) }}</b></div>
+                        </div>
+                        <div class="trace-payload-grid">
+                          <div class="trace-block"><h4>客户端请求头</h4><pre>{{ formatJson(record.client && record.client.request && record.client.request.headers) }}</pre></div>
+                          <div class="trace-block"><h4>客户端请求体 <span v-if="record.client && record.client.request && record.client.request.bodyTruncated" class="truncated-label">已截断</span></h4><pre>{{ formatJson(record.client && record.client.request && record.client.request.body) }}</pre></div>
+                          <div class="trace-block"><h4>返回客户端的结果 <span v-if="record.client && record.client.result && record.client.result.bodyTruncated" class="truncated-label">正文已截断</span></h4><pre>{{ formatJson(record.client && record.client.result) }}</pre></div>
+                          <div v-if="record.client && record.client.error" class="trace-block error-block"><h4>客户端错误</h4><pre>{{ formatJson(record.client.error) }}</pre></div>
+                        </div>
+                      </section>
+
+                      <section class="trace-section upstream-trace">
+                        <div class="trace-section-head"><div><span class="trace-step">上游</span><h3>实际发送的请求</h3></div><span class="trace-time">{{ record.upstream ? record.upstream.length : 0 }} 次尝试</span></div>
+                        <div v-if="!record.upstream || !record.upstream.length" class="trace-inline-empty"><i data-lucide="route-off"></i>该请求没有发送到上游</div>
+                        <div v-else class="upstream-attempts">
+                          <article v-for="(attempt, attemptIndex) in record.upstream" :key="`${record.id}-upstream-${attemptIndex}`" class="upstream-attempt">
+                            <div class="upstream-attempt-head">
+                              <div><span class="attempt-number">尝试 {{ attemptIndex + 1 }}</span><code>{{ attempt.accountId || "未记录账号" }}</code></div>
+                              <span class="status-pill" :class="upstreamStatusClass(attempt)"><span class="status-dot"></span>{{ upstreamStatusLabel(attempt) }}</span>
+                            </div>
+                            <div class="trace-meta-grid upstream-meta">
+                              <div><span>方法</span><b>{{ (attempt.request && attempt.request.method) || "-" }}</b></div>
+                              <div><span>URL</span><code>{{ (attempt.request && attempt.request.url) || "-" }}</code></div>
+                              <div><span>耗时</span><b>{{ formatDuration(attempt.durationMs) }}</b></div>
+                              <div><span>账号 ID</span><code>{{ attempt.accountId || "-" }}</code></div>
+                              <div><span>开始</span><b>{{ formatRequestTime(attempt.startedAt) }}</b></div>
+                              <div><span>完成</span><b>{{ formatRequestTime(attempt.completedAt) }}</b></div>
+                            </div>
+                            <div class="trace-payload-grid">
+                              <div class="trace-block"><h4>实际上游请求头</h4><pre>{{ formatJson(attempt.request && attempt.request.headers) }}</pre></div>
+                              <div class="trace-block"><h4>实际上游请求体 <span v-if="attempt.request && attempt.request.bodyTruncated" class="truncated-label">已截断</span></h4><pre>{{ formatJson(attempt.request && attempt.request.body) }}</pre></div>
+                              <div class="trace-block"><h4>上游响应 <span v-if="attempt.response && attempt.response.bodyTruncated" class="truncated-label">正文已截断</span></h4><pre>{{ formatJson(attempt.response) }}</pre></div>
+                              <div v-if="attempt.error" class="trace-block error-block"><h4>上游错误</h4><pre>{{ formatJson(attempt.error) }}</pre></div>
+                            </div>
+                          </article>
+                        </div>
+                      </section>
+                    </div>
+                  </article>
+                </div>
+              </section>
             </section>
 
             <section v-if="activeTab === 'models'" class="view-stack">

@@ -1,6 +1,6 @@
 services:
   nlt2api:
-    image: ${NEURALWATT_IMAGE:-ghcr.io/jianjianai/nlt2api:2.0.0}
+    image: ${NEURALWATT_IMAGE:-ghcr.io/jianjianai/nlt2api:2.1.0}
     container_name: nlt2api
     restart: unless-stopped
     ports:

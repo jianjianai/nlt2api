@@ -50,6 +50,7 @@ createApp({
         { id: "overview", label: "概览", title: "运行概览", icon: "layout-dashboard" },
         { id: "accounts", label: "账号", title: "上游账号", icon: "users-round" },
         { id: "keys", label: "API keys", title: "访问密钥", icon: "key-round" },
+        { id: "requestRecords", label: "请求记录", title: "请求记录", icon: "scroll-text" },
         { id: "models", label: "模型", title: "模型目录", icon: "boxes" },
         { id: "settings", label: "参数", title: "生成参数", icon: "sliders-horizontal" },
         { id: "tester", label: "测试台", title: "接口测试台", icon: "flask-conical" },
@@ -59,10 +60,15 @@ createApp({
       globalError: "",
       notice: { text: "", kind: "" },
       noticeTimer: 0,
-      resourceErrors: { accounts: "", keys: "", models: "", defaults: "" },
-      loading: { accounts: false, keys: false, models: false, defaults: false },
+      resourceErrors: { accounts: "", keys: "", models: "", defaults: "", requestRecords: "" },
+      loading: { accounts: false, keys: false, models: false, defaults: false, requestRecords: false },
       accounts: [],
       keys: [],
+      requestRecords: [],
+      requestRecordsEnabled: false,
+      requestRecordLimits: { maxRecords: 0, maxCaptureBytes: 0, maxTotalBytes: 0 },
+      requestRecordPending: { settings: false, clear: false },
+      expandedRequestRecordIds: [],
       catalog: { data: [], scope: null, fetchedAt: null },
       defaults: { temperature: 0.7, maxTokens: 4096, topP: 1 },
       accountForm: newAccountForm(),
@@ -120,8 +126,13 @@ createApp({
       this.expiresAt = ""
       this.accounts = []
       this.keys = []
+      this.requestRecords = []
+      this.requestRecordsEnabled = false
+      this.requestRecordLimits = { maxRecords: 0, maxCaptureBytes: 0, maxTotalBytes: 0 }
+      this.requestRecordPending = { settings: false, clear: false }
+      this.expandedRequestRecordIds = []
       this.catalog = { data: [], scope: null, fetchedAt: null }
-      this.resourceErrors = { accounts: "", keys: "", models: "", defaults: "" }
+      this.resourceErrors = { accounts: "", keys: "", models: "", defaults: "", requestRecords: "" }
       this.accountForm = newAccountForm()
       this.keySecret = null
     },
@@ -289,7 +300,8 @@ createApp({
       } catch (error) {
         if (error.status !== 401) {
           this.resourceErrors[name] = error.message
-          this.globalError = `${name === "accounts" ? "账号" : name === "keys" ? "API key" : name === "models" ? "模型目录" : "生成参数"}加载失败：${error.message}`
+          const resourceLabel = { accounts: "账号", keys: "API key", models: "模型目录", defaults: "生成参数", requestRecords: "请求记录" }[name] || name
+          this.globalError = `${resourceLabel}加载失败：${error.message}`
         }
       } finally {
         this.loading[name] = false
@@ -303,7 +315,8 @@ createApp({
         this.loadResource("accounts", () => this.loadAccounts()),
         this.loadResource("keys", () => this.loadKeys()),
         this.loadResource("models", () => this.loadModels()),
-        this.loadResource("defaults", () => this.loadDefaults())
+        this.loadResource("defaults", () => this.loadDefaults()),
+        this.loadResource("requestRecords", () => this.loadRequestRecords())
       ])
       await this.checkHealth()
     },
@@ -314,6 +327,71 @@ createApp({
     async loadKeys() {
       const data = await this.api("/api/proxy-keys")
       this.keys = Array.isArray(data.keys) ? data.keys : []
+    },
+    async loadRequestRecords() {
+      const data = await this.api("/api/request-records")
+      if (typeof data.enabled !== "boolean" || !Array.isArray(data.records)) {
+        throw new ApiRequestError("服务返回的请求记录格式无效。")
+      }
+      this.requestRecordsEnabled = data.enabled
+      this.requestRecords = data.records
+      const limits = data.retention && typeof data.retention === "object" ? data.retention : data.limits || {}
+      this.requestRecordLimits = {
+        maxRecords: Number(limits.maxRecords) || 0,
+        maxCaptureBytes: Number(limits.maxBodyBytes ?? limits.maxCaptureBytes) || 0,
+        maxTotalBytes: Number(limits.maxTotalBytes) || 0
+      }
+      const availableIds = new Set(this.requestRecords.map((record) => record.id))
+      this.expandedRequestRecordIds = this.expandedRequestRecordIds.filter((id) => availableIds.has(id))
+    },
+    async refreshRequestRecords() {
+      await this.loadResource("requestRecords", () => this.loadRequestRecords())
+    },
+    async setRequestRecording(enabled) {
+      if (this.requestRecordPending.settings) return
+      this.requestRecordPending.settings = true
+      try {
+        const data = await this.api("/api/request-records/settings", {
+          method: "PUT",
+          body: JSON.stringify({ enabled: Boolean(enabled) })
+        })
+        if (typeof data.enabled !== "boolean") throw new ApiRequestError("服务没有返回请求记录状态。")
+        this.requestRecordsEnabled = data.enabled
+        this.notify(data.enabled ? "请求记录已开启，请在排障结束后及时关闭并清空。" : "请求记录已关闭。")
+      } catch (error) {
+        this.notify(error.message, "error")
+      } finally {
+        this.requestRecordPending.settings = false
+        this.afterRender()
+      }
+    },
+    async clearRequestRecords() {
+      if (!this.requestRecords.length || this.requestRecordPending.clear) return
+      const count = this.requestRecords.length
+      if (!window.confirm(`清除全部 ${count} 条请求记录？记录内容将无法恢复。`)) return
+      this.requestRecordPending.clear = true
+      try {
+        const data = await this.api("/api/request-records", { method: "DELETE" })
+        this.requestRecords = []
+        this.expandedRequestRecordIds = []
+        const deletedCount = Number.isInteger(data.deletedCount) ? data.deletedCount : count
+        this.notify(`已清除 ${deletedCount} 条请求记录。`)
+      } catch (error) {
+        this.notify(error.message, "error")
+      } finally {
+        this.requestRecordPending.clear = false
+        this.afterRender()
+      }
+    },
+    toggleRequestRecord(id) {
+      if (!id) return
+      this.expandedRequestRecordIds = this.expandedRequestRecordIds.includes(id)
+        ? this.expandedRequestRecordIds.filter((value) => value !== id)
+        : [...this.expandedRequestRecordIds, id]
+      this.afterRender()
+    },
+    isRequestRecordExpanded(id) {
+      return this.expandedRequestRecordIds.includes(id)
     },
     async loadModels() {
       const data = await this.api("/api/models")
@@ -333,6 +411,9 @@ createApp({
     selectTab(tab) {
       this.activeTab = tab
       this.sidebarOpen = false
+      if (tab === "requestRecords" && this.authenticated) {
+        void this.refreshRequestRecords()
+      }
       this.afterRender()
     },
     resetAccountForm() {
@@ -668,6 +749,97 @@ createApp({
     },
     modelName(model) {
       return model?.metadata?.display_name || model?.display_name || model?.id || "未命名模型"
+    },
+    formatRequestSource(source) {
+      return {
+        openai: "OpenAI API",
+        openai_api: "OpenAI API",
+        chat_completions: "OpenAI API",
+        admin_test: "管理测试台",
+        test_chat: "管理测试台"
+      }[source] || source || "未知来源"
+    },
+    formatRequestTime(value) {
+      if (!value) return "-"
+      const date = new Date(value)
+      if (Number.isNaN(date.getTime())) return String(value)
+      return date.toLocaleString("zh-CN", {
+        year: "numeric",
+        month: "2-digit",
+        day: "2-digit",
+        hour: "2-digit",
+        minute: "2-digit",
+        second: "2-digit",
+        fractionalSecondDigits: 3,
+        hour12: false
+      })
+    },
+    formatDuration(value) {
+      const milliseconds = Number(value)
+      if (!Number.isFinite(milliseconds) || milliseconds < 0) return "-"
+      if (milliseconds < 1000) return `${Math.round(milliseconds)} ms`
+      if (milliseconds < 60000) return `${(milliseconds / 1000).toFixed(milliseconds < 10000 ? 2 : 1)} s`
+      return `${(milliseconds / 60000).toFixed(1)} min`
+    },
+    formatBytes(value) {
+      const bytes = Number(value)
+      if (!Number.isFinite(bytes) || bytes <= 0) return "未提供"
+      if (bytes < 1024) return `${Math.round(bytes)} B`
+      if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(bytes < 10240 ? 1 : 0)} KiB`
+      return `${(bytes / (1024 * 1024)).toFixed(1)} MiB`
+    },
+    formatJson(value) {
+      if (value === undefined) return "未记录"
+      if (typeof value === "string") {
+        if (!value) return "（空字符串）"
+        try {
+          return JSON.stringify(JSON.parse(value), null, 2)
+        } catch (error) {
+          return value
+        }
+      }
+      try {
+        return JSON.stringify(value, null, 2)
+      } catch (error) {
+        return String(value)
+      }
+    },
+    requestStatusCode(value) {
+      if (Number.isInteger(value)) return value
+      if (!value || typeof value !== "object") return null
+      for (const key of ["status", "statusCode", "httpStatus"]) {
+        if (Number.isInteger(value[key])) return value[key]
+      }
+      return null
+    },
+    requestRecordStatusClass(record) {
+      if (record?.client?.error) return "failed"
+      const status = this.requestStatusCode(record?.client?.result)
+      if (status !== null) {
+        if (status >= 200 && status < 400) return "ready"
+        if (status >= 400) return "failed"
+        return "warning"
+      }
+      return record?.completedAt ? "ready" : "warning"
+    },
+    requestRecordStatusLabel(record) {
+      if (record?.client?.error) return "失败"
+      const status = this.requestStatusCode(record?.client?.result)
+      if (status !== null) return `HTTP ${status}`
+      return record?.completedAt ? "已完成" : "进行中"
+    },
+    upstreamStatusClass(attempt) {
+      if (attempt?.error) return "failed"
+      const status = this.requestStatusCode(attempt?.response) ?? this.requestStatusCode(attempt?.status)
+      if (status === null) return "warning"
+      if (status >= 200 && status < 400) return "ready"
+      if (status >= 400) return "failed"
+      return "warning"
+    },
+    upstreamStatusLabel(attempt) {
+      const status = this.requestStatusCode(attempt?.response) ?? this.requestStatusCode(attempt?.status)
+      if (attempt?.error && status === null) return "失败"
+      return status !== null ? `HTTP ${status}` : "无响应"
     },
     formatTime(value) {
       if (!value) return "-"

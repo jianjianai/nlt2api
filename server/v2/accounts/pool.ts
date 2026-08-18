@@ -1,7 +1,12 @@
 import { ApiError } from "../shared/errors"
 import { MAX_PORTAL_JSON_BYTES } from "../shared/limits"
 import { isJsonObject, type JsonObject } from "../shared/json"
-import { readPortalJson, type PortalCredentials, type PortalSessionResult } from "../portal/client"
+import {
+  readPortalJson,
+  type PortalChatTrace,
+  type PortalCredentials,
+  type PortalSessionResult
+} from "../portal/client"
 import { parseSseJson, SseDecoder } from "../portal/sse"
 import type { AccountService } from "../state/accounts"
 import type { StoredAccount } from "../state/schema"
@@ -9,7 +14,7 @@ import type { StoredAccount } from "../state/schema"
 export interface AccountPortalClient {
   login(credentials: PortalCredentials, signal?: AbortSignal): Promise<PortalSessionResult>
   checkSession(cookie: string, signal?: AbortSignal): Promise<PortalSessionResult>
-  chat(cookie: string, payload: JsonObject, signal?: AbortSignal): Promise<Response>
+  chat(cookie: string, payload: JsonObject, signal?: AbortSignal, trace?: PortalChatTrace): Promise<Response>
 }
 
 export type PortalChatExchange =
@@ -19,6 +24,7 @@ export type PortalChatExchange =
 export interface OpenPortalChatOptions {
   signal?: AbortSignal
   maximumJsonBytes?: number
+  requestLogId?: string
 }
 
 type AttemptFailure = "authentication" | "rate_limit"
@@ -121,7 +127,8 @@ export class AccountPool {
     let refreshed = false
     while (true) {
       const cookie = account.cookie || await this.login(account, options.signal, false)
-      const response = await this.portal.chat(cookie, payload, options.signal)
+      const trace = options.requestLogId ? { requestId: options.requestLogId, accountId: account.id } : undefined
+      const response = await this.portal.chat(cookie, payload, options.signal, trace)
       if (response.status === 401) {
         await cancelResponse(response)
         if (refreshed) {

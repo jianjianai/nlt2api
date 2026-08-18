@@ -3,6 +3,7 @@ import { resolve } from "node:path"
 import { AccountPool } from "./accounts/pool"
 import { ChatService } from "./chat/service"
 import { PortalClient } from "./portal/client"
+import { RequestLogService } from "./request-log/service"
 import { AdminSecurityService } from "./security/admin-security"
 import { InferenceApiKeyService } from "./security/inference-api-keys"
 import { AccountService } from "./state/accounts"
@@ -16,6 +17,7 @@ export interface RuntimeServices {
   inferenceKeys: InferenceApiKeyService
   adminSecurity: AdminSecurityService
   portal: PortalClient
+  requestLogs: RequestLogService
   accountPool: AccountPool
   chat: ChatService
   bootstrap: {
@@ -53,7 +55,8 @@ async function createRuntime(): Promise<RuntimeServices> {
   if (!await adminSecurity.hasPassword() && !bootstrapConfigured) {
     console.info(`[bootstrap] Administrator setup token: ${bootstrapToken}`)
   }
-  const portal = new PortalClient()
+  const requestLogs = await RequestLogService.open(repository)
+  const portal = new PortalClient({ requestLogs })
   const accountPool = new AccountPool(accounts, portal)
   const chat = new ChatService(accountPool, settings)
   return {
@@ -63,6 +66,7 @@ async function createRuntime(): Promise<RuntimeServices> {
     inferenceKeys,
     adminSecurity,
     portal,
+    requestLogs,
     accountPool,
     chat,
     bootstrap

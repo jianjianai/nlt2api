@@ -5,6 +5,7 @@ import {
   PORTAL_CONNECT_TIMEOUT_MS
 } from "../shared/limits"
 import { isJsonObject, type JsonObject } from "../shared/json"
+import type { RequestLogService } from "../request-log/service"
 
 export interface PortalCredentials {
   email: string
@@ -25,6 +26,12 @@ export interface PortalClientOptions {
   connectTimeoutMs?: number
   chatTimeoutMs?: number
   maximumJsonBytes?: number
+  requestLogs?: RequestLogService
+}
+
+export interface PortalChatTrace {
+  requestId: string
+  accountId: string
 }
 
 export class PortalClient {
@@ -34,6 +41,7 @@ export class PortalClient {
   private readonly connectTimeoutMs: number
   private readonly chatTimeoutMs: number
   private readonly maximumJsonBytes: number
+  private readonly requestLogs?: RequestLogService
 
   constructor(options: PortalClientOptions = {}) {
     this.origin = normalizedOrigin(options.origin ?? process.env.NEURALWATT_PORTAL_ORIGIN ?? "https://portal.neuralwatt.com")
@@ -44,6 +52,7 @@ export class PortalClient {
     this.connectTimeoutMs = options.connectTimeoutMs ?? PORTAL_CONNECT_TIMEOUT_MS
     this.chatTimeoutMs = options.chatTimeoutMs ?? PORTAL_CHAT_TIMEOUT_MS
     this.maximumJsonBytes = options.maximumJsonBytes ?? MAX_PORTAL_JSON_BYTES
+    this.requestLogs = options.requestLogs
   }
 
   async login(credentials: PortalCredentials, signal?: AbortSignal): Promise<PortalSessionResult> {
@@ -122,28 +131,42 @@ export class PortalClient {
     }
   }
 
-  async chat(cookie: string, payload: JsonObject, signal?: AbortSignal): Promise<Response> {
+  async chat(cookie: string, payload: JsonObject, signal?: AbortSignal, trace?: PortalChatTrace): Promise<Response> {
+    const url = new URL("/api/chat", this.origin)
+    const headers = {
+      accept: payload.stream === true ? "text/event-stream" : "application/json",
+      "content-type": "application/json",
+      cookie
+    }
+    const attemptId = this.requestLogs?.beginUpstreamRequest(trace?.requestId, {
+      accountId: trace?.accountId ?? "unknown",
+      method: "POST",
+      url: url.toString(),
+      headers,
+      body: payload
+    })
     let response: Response
     try {
-      response = await this.fetchImpl(new URL("/api/chat", this.origin), {
+      response = await this.fetchImpl(url, {
         method: "POST",
         redirect: "manual",
-        headers: {
-          accept: payload.stream === true ? "text/event-stream" : "application/json",
-          "content-type": "application/json",
-          cookie
-        },
+        headers,
         body: JSON.stringify(payload),
         signal: requestSignal(signal, this.chatTimeoutMs)
       })
     } catch (error) {
-      if (isAbortError(error)) throw timeoutError(error)
-      throw new ApiError("The NeuralWatt portal is unreachable", {
-        status: 502,
-        code: "upstream_unreachable",
-        cause: error
-      })
+      const mapped = isAbortError(error)
+        ? timeoutError(error)
+        : new ApiError("The NeuralWatt portal is unreachable", {
+            status: 502,
+            code: "upstream_unreachable",
+            cause: error
+          })
+      this.requestLogs?.finishUpstreamError(trace?.requestId, attemptId, mapped)
+      throw mapped
     }
+
+    response = this.requestLogs?.observeUpstreamResponse(trace?.requestId, attemptId, response) ?? response
 
     if (isRedirect(response.status)) {
       await discardBody(response)

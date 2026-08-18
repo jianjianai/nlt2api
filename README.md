@@ -61,10 +61,31 @@ pnpm dev
 - 推理 Key 创建、一次性展示、重命名、启停和撤销；
 - 模型目录手动同步；
 - `temperature`、`maxTokens`、`topP` 全局默认值；
+- 请求记录开关、客户端请求与真实上游尝试的关联查看，以及一键清空；
 - 复用同一服务链路的流式/非流式测试台；
 - 管理员密码轮换和全会话撤销。
 
 管理页面不会使用 localStorage/sessionStorage 保存密码、Cookie、CSRF token 或推理 Key。
+
+## 请求记录与调试
+
+管理员可以在“请求记录”页面开启临时采集。采集范围包括通过认证的
+`POST /v1/chat/completions` 和管理测试台请求；一条客户端请求会关联账号切换、认证刷新以及
+Agent 多轮产生的每一次真实 `/api/chat` 上游尝试。
+
+- 默认关闭，开关状态写入 v2 状态文件；
+- 记录只保存在当前进程内存中，服务重启即清空；
+- 最多保留 200 条、单个请求或响应正文最多 64 KiB、总量最多 8 MiB，超过上限会淘汰最旧记录；
+- Authorization、Cookie、常见 token、密码、API key 和 secret 字段会脱敏；
+- 自由文本提示词和回复仍可能包含业务敏感信息，排障结束后应关闭并清空记录。
+
+请求记录管理接口只接受管理员 Cookie；开关和清空操作同时要求同源与 CSRF：
+
+```text
+GET    /api/request-records
+PUT    /api/request-records/settings
+DELETE /api/request-records
+```
 
 ## OpenAI 兼容接口
 
@@ -151,7 +172,7 @@ docker compose up -d
 docker compose ps
 ```
 
-默认镜像为 `ghcr.io/jianjianai/nlt2api:2.0.0`，只绑定宿主 `127.0.0.1`，状态保存在 `neuralwatt-data` 命名卷中。Compose 会显式传入 bootstrap、门户、代理信任和 Secure Cookie 配置；若未设置 bootstrap token，仍会生成并打印一次临时 token。容器内应用以非 root 用户运行，`/health` 会验证 v2 状态可读且状态目录可写。
+默认镜像为 `ghcr.io/jianjianai/nlt2api:2.1.0`，只绑定宿主 `127.0.0.1`，状态保存在 `neuralwatt-data` 命名卷中。Compose 会显式传入 bootstrap、门户、代理信任和 Secure Cookie 配置；若未设置 bootstrap token，仍会生成并打印一次临时 token。容器内应用以非 root 用户运行，`/health` 会验证 v2 状态可读且状态目录可写。
 
 ## 验证
 
@@ -161,4 +182,4 @@ pnpm run typecheck
 pnpm run build
 ```
 
-测试覆盖 OpenAI 请求合同、工具历史与调用循环、JSON Schema 方言、累计 token 预算、状态事务、账号故障转移、SSE 预检/透传、摘要式 Key、管理员会话/CSRF 和错误归一化。
+测试覆盖 OpenAI 请求合同、工具历史与调用循环、JSON Schema 方言、累计 token 预算、状态事务、账号故障转移、SSE 预检/透传、请求记录关联/脱敏/容量限制、摘要式 Key、管理员会话/CSRF 和错误归一化。

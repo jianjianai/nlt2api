@@ -19,6 +19,7 @@ export type ChatServiceResult =
 
 export interface HandleChatOptions {
   signal?: AbortSignal
+  requestLogId?: string
 }
 
 export class ChatService {
@@ -43,11 +44,11 @@ export class ChatService {
           model: request.model,
           includeUsage: request.includeUsage,
           signal: options.signal,
-          run: ({ signal, onProgress }) => this.runAgent(request, signal, onProgress)
+          run: ({ signal, onProgress }) => this.runAgent(request, signal, onProgress, options.requestLogId)
         })
       }
     }
-    const result = await this.runAgent(request, options.signal)
+    const result = await this.runAgent(request, options.signal, undefined, options.requestLogId)
     return { kind: "json", body: completionFromAgent(result, request.model) }
   }
 
@@ -59,7 +60,10 @@ export class ChatService {
   }
 
   private async direct(request: ParsedChatCompletionRequest, options: HandleChatOptions): Promise<ChatServiceResult> {
-    const exchange = await this.pool.openChat(request.portalPayload, { signal: options.signal })
+    const exchange = await this.pool.openChat(request.portalPayload, {
+      signal: options.signal,
+      requestLogId: options.requestLogId
+    })
     if (request.stream) {
       if (exchange.kind !== "stream") throw wrongExchange("stream")
       return {
@@ -74,7 +78,8 @@ export class ChatService {
   private async runAgent(
     request: ParsedChatCompletionRequest,
     signal: AbortSignal | undefined,
-    onProgress?: (content: string) => void
+    onProgress?: (content: string) => void,
+    requestLogId?: string
   ): Promise<AgentProtocolResult> {
     const configuredMaxTokens = request.portalPayload.max_tokens
     const maxTokens = typeof configuredMaxTokens === "number" && Number.isSafeInteger(configuredMaxTokens)
@@ -95,7 +100,7 @@ export class ChatService {
         }
         if (context.maxTokens !== undefined) payload.max_tokens = context.maxTokens
         delete payload.response_format
-        const exchange: PortalChatExchange = await this.pool.openChat(payload, { signal })
+        const exchange: PortalChatExchange = await this.pool.openChat(payload, { signal, requestLogId })
         if (exchange.kind !== "json") throw wrongExchange("json")
         return portalCompletionToAgentOutput(exchange.value)
       }

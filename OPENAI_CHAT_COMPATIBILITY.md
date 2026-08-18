@@ -366,52 +366,6 @@ developer role 的错误不是一个干净的 HTTP 4xx：
 | followup-web-search-options | 200，但模型明确无实时搜索能力，无引用或搜索结果 |
 | raw-logit-baseline | provider choice 中没有可用生成 token_ids，无法建立可靠的 logit_bias token 反事实对照 |
 
-## 9. 对 OpenAI 兼容代理的建议
-
-### 9.1 可以直接映射的最小子集
-
-以下字段在本轮有足够证据作为代理的“兼容基础子集”：
-
-~~~text
-model
-messages: system/user/assistant/tool/function history
-stream
-temperature
-top_p
-max_tokens
-response_format: text/json_object
-text content parts
-image_url content parts（仅基础验证）
-~~~
-
-`max_completion_tokens` 不能直接透传：代理需要把它转换为 `max_tokens`，并定义两个字段同时存在时的冲突策略。`json_schema` 只能作为“尽量输出 JSON”的请求转发，不能承诺 strict schema；需要严格结构时应在代理侧校验并在失败时返回标准错误。
-
-### 9.2 代理必须做的转换
-
-1. 将外部 /v1/chat/completions 路径映射到门户 /api/chat，不要假设门户自动提供标准路径。
-2. stream:true 时过滤或容忍 SSE 注释，保留标准 id/object/created/model/choices/usage，并决定是否移除 provider 专用键。
-3. reasoning、prompt_token_ids、token_ids、stop_reason 等扩展放入可选扩展，不能让严格 OpenAI 客户端依赖它们。
-4. stream:false 时直接返回规范 JSON；不要让调用方误以为网页的 SSE 解析器也能处理它。
-5. 把 SSE 内嵌错误转换成 HTTP 4xx/5xx 和标准 error object。
-6. 对 functions、developer、logprobs、音频、文件、web search、moderation、prompt cache、prediction 和 n>1 显式拒绝。tools 不能原样透传；如需支持，必须实现第 6.1 节的动作协议、Schema 校验和响应还原，并明确标注为仿真能力。
-7. 对 max_tokens 与 max_completion_tokens 做自己的映射和冲突校验；当前上游只按 max_tokens 控制。
-8. 对 json_schema 做本地 schema 校验；上游 strict 不可靠，不能把返回的 JSON 外形当作约束通过。
-9. 不要把浏览器 Cookie 转发给外部 API 调用者。代理应在服务端管理登录态或使用正式 API key，并隔离用户会话。
-
-### 9.3 不应做的承诺
-
-在没有额外验证前，不应宣称以下能力已支持：
-
-- 门户原生函数执行，或由代理代替调用方执行函数；
-- 多候选 n；
-- token logprobs；
-- 音频输入/输出；
-- developer role；
-- web search；
-- metadata/store 的持久化；
-- seed 的确定性；
-- service tier 的计费或路由保证。
-- 严格 JSON Schema、prompt caching、Predicted Outputs 或 moderation 结果。
 
 ## 10. 限制、未决问题和后续验证
 
@@ -437,16 +391,3 @@ image_url content parts（仅基础验证）
 - 基础图片输入代理：可以试用，但应标注验证范围；
 - 完整 OpenAI Chat Completions drop-in：目前不能声称；
 - 门户原生工具解析、developer role、logprobs、n>1、音频、文件、web search、moderation、prompt cache、prediction：当前实测不应宣称支持；本仓库适配器可以通过第 6.1 节的协议仿真提供现代 function tools。
-
-最稳妥的生产策略是建立一个“支持子集 + 显式拒绝列表”的适配层，而不是把所有外部字段原样透传。
-
-## 自建适配器实现状态
-
-本仓库现已实现一个本地 Nitro 适配器：
-
-- `POST /v1/chat/completions` 将已验证的 OpenAI 字段映射为门户 `POST /api/chat`；
-- 流式响应会移除门户的 pricing、energy、routing 注释，并将门户 `reasoning` / `reasoning_content` 统一映射为兼容扩展 `delta.reasoning_content`；非流式响应对应映射到 `choices[].message.reasoning_content`。连续对话中，客户端 assistant 消息携带的 `reasoning_content` 会反向映射为门户 `reasoning`。这不是 OpenAI Chat Completions 的正式字段，但可兼容常见的推理模型客户端约定。
-- `max_completion_tokens` 在本地转换为 `max_tokens`，已知无效语义字段返回标准 400；
-- 现代 function tools 会转换为模型到代理内部的 compact XML 动作协议，本地执行函数名/参数 Schema/并行数量校验，并还原为 OpenAI 标准非流式和流式 `tool_calls`；严格校验 assistant tool calls 与对应 tool results 的完整事务，并按每次请求执行 `tool_choice` 语义；旧 verbose XML 仅作为兼容输入。
-- 账号密码和会话 Cookie 保存于被 Git 忽略的 `.data/neuralwatt-accounts.yaml`，会话失效时先用 `/api/usage` 检查并自动重新登录；
-- 代理只在认证失败且上游尚未开始推理时切换账号，避免对未知执行状态的请求重复发送。
