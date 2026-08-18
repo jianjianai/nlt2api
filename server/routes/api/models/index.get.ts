@@ -1,13 +1,14 @@
 import { defineEventHandler } from "h3"
-import { requireManagementAuth } from "../../../utils/auth"
-import { sendManagementError } from "../../../utils/errors"
-import { getSavedModelCatalog } from "../../../utils/store"
+import { requireAdmin } from "../../../v2/http/auth"
+import { sendApiError } from "../../../v2/http/errors"
+import { getRuntime } from "../../../v2/runtime"
 
 export default defineEventHandler(async (event) => {
   try {
-    await requireManagementAuth(event)
-    return { models: await getSavedModelCatalog() }
+    const runtime = await getRuntime()
+    requireAdmin(event, runtime)
+    return { models: await runtime.settings.getModelCatalog() }
   } catch (error) {
-    return sendManagementError(event, error)
+    return sendApiError(event, error)
   }
 })

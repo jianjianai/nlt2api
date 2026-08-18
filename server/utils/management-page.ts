@@ -1,10 +1,10 @@
 import { useStorage } from "nitropack/runtime"
-import { AppError } from "./errors"
+import { ApiError } from "../v2/shared/errors"
 
 async function getManagementAsset(name: string): Promise<string> {
   const asset = await useStorage("/assets").getItem<string>(`ui/${name}`)
   if (!asset) {
-    throw new AppError("The management page is unavailable", 500, "management_page_unavailable")
+    throw new ApiError("The management page is unavailable", { status: 500, code: "management_page_unavailable" })
   }
   return asset
 }
@@ -19,16 +19,4 @@ export function getManagementScript(): Promise<string> {
 
 export function getManagementStyles(): Promise<string> {
   return getManagementAsset("styles.css")
-}
-
-export function getDebugPage(): Promise<string> {
-  return getManagementAsset("debug.html")
-}
-
-export function getDebugScript(): Promise<string> {
-  return getManagementAsset("debug.js")
-}
-
-export function getDebugStyles(): Promise<string> {
-  return getManagementAsset("debug.css")
 }

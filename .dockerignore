@@ -5,8 +5,12 @@ node_modules
 .output
 .nitro
 .data
+data
 .env
 .env.local
+--port
+.codegraph
+breezell
 compose.yaml
 Dockerfile
 .dockerignore

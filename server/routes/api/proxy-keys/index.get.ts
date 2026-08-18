@@ -1,13 +1,14 @@
 import { defineEventHandler } from "h3"
-import { requireWebAccessSession } from "../../../utils/auth"
-import { sendManagementError } from "../../../utils/errors"
-import { listProxyKeys } from "../../../utils/store"
+import { requireAdmin } from "../../../v2/http/auth"
+import { sendApiError } from "../../../v2/http/errors"
+import { getRuntime } from "../../../v2/runtime"
 
 export default defineEventHandler(async (event) => {
   try {
-    requireWebAccessSession(event)
-    return { keys: await listProxyKeys() }
+    const runtime = await getRuntime()
+    requireAdmin(event, runtime)
+    return { keys: await runtime.inferenceKeys.list() }
   } catch (error) {
-    return sendManagementError(event, error)
+    return sendApiError(event, error)
   }
 })

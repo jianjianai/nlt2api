@@ -1,15 +1,19 @@
 import { defineEventHandler, getRouterParam } from "h3"
-import { requireManagementAuth } from "../../../../utils/auth"
-import { sendManagementError } from "../../../../utils/errors"
-import { checkAccount } from "../../../../utils/proxy"
+import { requireAdmin } from "../../../../v2/http/auth"
+import { sendApiError } from "../../../../v2/http/errors"
+import { ApiError } from "../../../../v2/shared/errors"
+import { getRuntime } from "../../../../v2/runtime"
 
 export default defineEventHandler(async (event) => {
   try {
-    await requireManagementAuth(event)
+    const runtime = await getRuntime()
+    requireAdmin(event, runtime, true)
     const id = getRouterParam(event, "id")
-    if (!id) throw new Error("Account id is required")
-    return await checkAccount(id)
+    if (!id) throw new ApiError("Account not found", { status: 404, code: "account_not_found" })
+    const result = await runtime.accountPool.checkAccount(id)
+    const account = (await runtime.accounts.listAccounts()).find((item) => item.id === id)
+    return { ...result, account }
   } catch (error) {
-    return sendManagementError(event, error)
+    return sendApiError(event, error)
   }
 })

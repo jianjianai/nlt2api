@@ -1,138 +1,164 @@
-# Nlt 2 api
+# Neuralwatt AI v2
 
-这是一个本地/局域网 Nitro 服务，将 OpenAI `v1/chat/completions` 请求转换为 Nlt 门户的 `/api/chat` 请求，并提供账号和会话管理面板。
+Neuralwatt AI 是一个 Nitro 服务，将 OpenAI Chat Completions 请求转换为 NeuralWatt 门户会话请求，并提供独立的管理员控制台。v2 删除了旧版双重网页门禁、明文代理 Key、调试请求落盘和运行时自动迁移。
 
-## 启动
+## 快速启动
+
+需要 Node.js 22.12 或更高的 22.x 版本，以及 pnpm 10.34.5。
 
 ```powershell
 pnpm install
+$env:NEURALWATT_BOOTSTRAP_TOKEN = "replace-with-a-long-random-token"
 pnpm dev
 ```
 
-打开 `http://127.0.0.1:3000/` 后，先使用网页访问密钥解锁管理页面。管理页面会显示、生成和管理本地代理 Bearer Key；首次没有配置 `NEURALWATT_PROXY_KEY` 时，服务会在终端输出新生成的 Key，供脚本调用和初始化管理员密码使用。
+打开 `http://127.0.0.1:3000/`，输入 bootstrap token 并设置管理员密码。bootstrap token 仅用于首次初始化；如果未设置环境变量，服务会在启动终端中生成并显示一次临时 token。
 
-账号和模型管理 API 同时接受网页访问会话、管理员密码会话或启用的代理 Bearer Key，现有脚本无需修改。`/v1/*` 始终只接受启用的 Bearer Key。
-
-也可以使用环境变量固定管理员密码（优先级高于保存的密码，忘记密码时可用于恢复）：
+生产构建：
 
 ```powershell
-$env:NEURALWATT_ADMIN_PASSWORD = "your-strong-password"
-pnpm dev
-```
-
-构建和预览：
-
-```powershell
+pnpm test
+pnpm run typecheck
 pnpm run build
 pnpm run preview
 ```
 
-需要局域网访问时，在 PowerShell 中显式绑定地址：
+## v1 数据迁移
+
+运行时只接受 `version: 2`，不会静默读取或改写 v1 文件。一次性迁移工具默认生成旁路文件，不覆盖原文件：
 
 ```powershell
-$env:NITRO_HOST = "0.0.0.0"
+pnpm run data:migrate-v2
+```
+
+输出为 `.data/neuralwatt-accounts.yaml.v2.yaml`。确认后可将它作为运行文件：
+
+```powershell
+$env:NEURALWATT_DATA_FILE = ".data/neuralwatt-accounts.yaml.v2.yaml"
 pnpm dev
 ```
 
-OpenAI 兼容接口始终需要代理 Bearer Key。管理网页可使用独立网页访问密钥保护，但公开部署时仍应通过 HTTPS、网络边界和访问控制限制服务暴露范围。
+迁移会保留账号凭据、Cookie、管理员密码哈希和现有推理 Key 的有效性；推理 Key 在 v2 文件中只保存 SHA-256 摘要和非敏感预览。迁移输出仍含门户账号密码和 Cookie，必须留在被 Git 忽略的 `.data/` 中。
 
-## 网页访问密钥
+## 管理与安全边界
 
-公网部署时，管理页面 `/` 需要独立的网页访问密钥。启动前在被忽略的 `.env.local` 中设置 `NEURALWATT_WEB_ACCESS_KEY`；解锁后服务器会写入一个仅限网页使用的 HttpOnly Cookie，有效期为 12 小时，服务重启后需要再次解锁。
+- 管理 API 只接受 `nw_v2_admin` HttpOnly Cookie，不接受推理 Bearer Key。
+- 管理员会话保存在内存中，有效期 12 小时；服务重启、退出或修改密码会使相应会话失效。
+- 所有管理写操作要求同源请求和当前会话的 `x-csrf-token`。
+- 登录和首次初始化按来源地址限速。
+- 推理 Key 仅在创建时返回一次明文；持久化文件和列表 API 只含摘要或预览。
+- 账号列表不返回门户密码或 Cookie，只返回 `hasPassword` / `hasCookie`。
+- 状态写入采用串行 copy-on-write、schema 校验、临时文件提交和备份恢复；文件权限尽力设置为 `0600`。
+- 页面和 API 默认发送 CSP、禁止嵌入、`nosniff`、同源资源策略和 `no-store` 等响应头。
 
-该门禁保护管理页面及其静态资源。管理 API 在已建立网页会话时可直接调用，也继续兼容已启用的代理 Bearer Key；`/v1/*` 始终只接受已启用的代理 Bearer Key，`/health` 不需要认证。
+账号密码和门户 Cookie 必须由服务端用于登录，因此仍以明文存在本地状态文件中。不要提交 `.data/`、`data/`、环境文件或任何凭据。
 
-## 代理 Key 管理
+## 管理控制台
 
-代理 Key 以明文保存在被忽略的 `.data/neuralwatt-accounts.yaml` 中，并只会在已解锁的管理页面返回。可以创建多个 Key、重命名、启用/停用或删除；停用和删除会立即撤销对应的 `/v1/*` 访问权限。旧版 YAML 中的 `proxy.apiKey` 会在首次加载时自动迁移为「Default key」。
+控制台包含：
 
-## 调试追踪
+- 账号新增、编辑、启停、登录、会话检查和 revision 并发保护；
+- 推理 Key 创建、一次性展示、重命名、启停和撤销；
+- 模型目录手动同步；
+- `temperature`、`maxTokens`、`topP` 全局默认值；
+- 复用同一服务链路的流式/非流式测试台；
+- 管理员密码轮换和全会话撤销。
 
-设置 `NEURALWATT_DEBUG_TRACE=1` 后启动服务，`/v1/chat/completions` 的每次已认证请求都会在 `.data/debug/<trace-id>/` 创建独立目录。目录按实际顺序保存客户端原始请求、每轮重建后的上游请求及其原始响应，以及最终发给客户端的 JSON 或 SSE 响应。
-
-```powershell
-$env:NEURALWATT_DEBUG_TRACE = "1"
-pnpm dev
-```
-
-默认每个流式响应最多记录 8 MiB；通过 `NEURALWATT_DEBUG_MAX_BYTES` 调整上限，或通过 `NEURALWATT_DEBUG_DIR` 指定其他根目录。认证请求头不会写入文件，Cookie、密码、API Key 和 Bearer 值会脱敏。调试完成后关闭环境变量并按需删除 `.data/debug/`。
-
-## 账号和会话
-
-账号数据保存在 `.data/neuralwatt-accounts.yaml`，其中密码和会话 Cookie 按项目需求以明文保存。该文件已加入 `.gitignore`，仍应限制操作系统文件权限。
-
-直接登录使用门户当前公开的表单接口：
-
-```text
-POST https://portal.neuralwatt.com/auth/login
-Content-Type: application/x-www-form-urlencoded
-
-email=...&password=...
-```
-
-登录成功后缓存 `Set-Cookie`，并使用 `/api/usage` 检查会话。遇到 Cloudflare 挑战、验证码或其他异常时，在面板中粘贴手动 Cookie。密码、Cookie 和代理 Key 不会通过账号列表接口返回。
+管理页面不会使用 localStorage/sessionStorage 保存密码、Cookie、CSRF token 或推理 Key。
 
 ## OpenAI 兼容接口
 
-接口地址：
-
 ```text
-GET  http://127.0.0.1:3000/v1/models
-POST http://127.0.0.1:3000/v1/chat/completions
-Authorization: Bearer <local-proxy-key>
+GET  /v1/models
+POST /v1/chat/completions
+Authorization: Bearer <inference-key>
 Content-Type: application/json
 ```
 
-`GET /v1/models` 只返回本地 YAML 中已保存的模型目录，不会联网。管理面板的「获取并保存模型」按钮会手动读取官网目录、过滤不可调用的 `-flex` 模型及 DeepSeek Canary 别名，然后覆盖保存；响应保留模型原始元数据与目录 `scope`。当前本地登录态不含官网 API Key，因此手动获取的范围通常是公开目录。Chat Completions 在调用方省略 `stream` 时默认使用 SSE；传入 `stream: false` 可请求完整 JSON 响应。
-
-示例：
+`stream` 省略时默认 `false`。示例：
 
 ```powershell
 curl.exe http://127.0.0.1:3000/v1/chat/completions `
-  -H "Authorization: Bearer <local-proxy-key>" `
+  -H "Authorization: Bearer <inference-key>" `
   -H "Content-Type: application/json" `
-  -d '{"model":"kimi-k3","messages":[{"role":"user","content":"请只回复 TEST_OK"}],"stream":false,"max_tokens":32}'
+  -d '{"model":"kimi-k3","messages":[{"role":"user","content":"只回复 TEST_OK"}],"stream":false,"max_tokens":32}'
 ```
 
-已实现并映射：
+已实现的请求子集：
 
-- 文本消息、system/user/assistant 以及历史 tool/function 消息；
-- `stream` 流式和非流式响应；
+- `model`、`messages`、`stream`、`n: 1`；
 - `temperature`、`top_p`、`max_tokens`；
-- `max_completion_tokens` 到 `max_tokens` 的转换；两者同时存在时按门户实测优先使用 `max_tokens`；
-- 文本图片输入；
-- `response_format: text` 和 `json_object`；
-- 标准 JSON/SSE 响应和 OpenAI 风格错误。
-- 上游 `reasoning` / `reasoning_content` 会作为兼容扩展统一输出为 `reasoning_content`；连续对话中客户端传入的 assistant `reasoning_content` 会映射回门户 `reasoning`；正文仍在标准 `content` 字段中。
-- 现代 function tools：`tools`、`tool_choice` 和 `parallel_tool_calls`，响应还原为标准 `message.tool_calls` / `delta.tool_calls`；参数 Schema 支持未声明版本、draft-06/07、draft-2019-09 和 draft-2020-12。
+- `max_completion_tokens` 映射到 `max_tokens`，两者同时存在时 `max_tokens` 优先；
+- system/user/assistant/tool/function 历史和匹配的工具事务；
+- 文本 content parts 和 user `image_url` parts；
+- `modalities: ["text"]`；
+- `response_format: text | json_object`；
+- function `tools`、`tool_choice` 和 `parallel_tool_calls`；
+- `stream_options.include_usage`。
 
-已确认不具备标准语义、静默丢弃会造成误导的字段会返回 400，包括旧版 `functions` / `function_call`、custom tools、developer role、音频、文件、web search、prediction、logprobs、stop、seed、`n > 1` 和 OpenAI Structured Outputs 的 `json_schema` 模式。纯提示性字段（`reasoning_effort`、`prompt_cache_key`、`prompt_cache_options`、`prompt_cache_retention`、`store`、`metadata`、`service_tier`、`verbosity`、`safety_identifier`、`user`）会被接受并忽略，门户对这些字段没有对应语义，拒绝它们会无谓地阻断 opencode 等真实客户端。
+以下提示性字段会被接受但不会转发：`reasoning_effort`、`prompt_cache_key`、`prompt_cache_options`、`prompt_cache_retention`、`store`、`metadata`、`service_tier`、`verbosity`、`safety_identifier`、`user`。
 
-### 工具调用实现
+旧 `functions` / `function_call`、developer role、音频、文件、web search、prediction、logprobs、stop、seed、`n > 1`、custom tools 和 `response_format: json_schema` 会返回明确的 400 错误。完整矩阵见 [OPENAI_CHAT_COMPATIBILITY.md](./OPENAI_CHAT_COMPATIBILITY.md)。
 
-门户不会原生解析工具定义。适配器使用显式 JSON Agent loop：每次模型生成前，都会从原始消息、已确认的工具调用/结果和当前纠错状态重新构建请求；包含当前工具目录、JSON 调用格式和完成约束的 `<tool_context>` 始终位于最后一条 user 消息。
+## JSON Agent 调用循环
 
-模型输出以 `{` 或 `[` 开头时，必须是完整 JSON 工具调用：单个调用使用 `{ "name": "tool_name", "arguments": { ... } }`，数组仅在 `parallel_tool_calls` 允许时可用。代理用 Ajv 按调用方提供的完整 Schema 校验工具名和参数，然后以标准 OpenAI `tool_calls` 返回；工具仍由调用方执行。
+NeuralWatt 门户不会原生产生标准 function tool calls。v2 使用严格的 JSON Agent 消息规则，外部客户端仍只看到标准 OpenAI `tool_calls`。
 
-模型以 `<~end~>` 开头时结束生成，sentinel 后的内容作为最终报告。普通状态文本不会被当作最终回复，而会进入下一轮并要求模型继续输出合法工具调用或最终 sentinel。
+每次新任务或明确的继续指令之后，内部消息只插入一份完整 `<tool_context>`。历史工具结果保持 `tool` 角色；纠错提示和意图询问不是新任务，其后不会追加另一份工具上下文。
 
-JSON 解析失败、结构错误、未知工具、Schema 错误和并行策略冲突都会进入统一纠错流程。纠错上下文只保留最新失败候选，不会累积多个错误输出；第一次模型 reasoning 会保留，错误详情始终对应最新候选。纠错次数和 Agent 总轮次均有上限，超过上限会返回结构化错误。
+模型输出处理顺序：
 
-支持的选择方式：
+1. 剥离可选的 `思考内容：` 和 `回复内容：` 标签。
+2. 以 `{` / `[` 开头时，解析一个或多个 JSON 工具动作。
+3. 按工具名、JSON Schema、命名选择和并行策略校验动作。
+4. 以 `<~end~>` 开头时，移除 sentinel 并返回最终内容。
+5. 普通状态文本在流式响应中展示，并作为上下文保留后询问继续或结束。
 
-- `tool_choice: "auto" | "none" | "required"`；
-- 指定函数的 `{ "type": "function", "name": "..." }`；
-- `parallel_tool_calls: false` 会严格限制为一次最多一个调用。
+`tool_choice: required` 或命名工具不能用 `<~end~>` 绕过调用。失败候选会被最新候选替换，只保留首轮 reasoning；最多 4 次纠错、6 个模型轮次。调用方给出的 `max_tokens` 是整个内部循环的累计 completion token 预算，不会按轮次重复使用。
 
-合法工具调用被确认后会以标准 `message.tool_calls` 或 `delta.tool_calls` 返回给客户端。客户端执行工具并发送对应的 `role: "tool"` 结果后，下一次请求会重新进入 Agent loop。内部 `<tool_context>`、纠错提示和 `<~end~>` sentinel 不会泄漏给 OpenAI 客户端。
+工具由客户端执行。客户端回传完整 `assistant.tool_calls` 和逐一匹配的 `role: tool` 结果后，再发起下一次请求；若要得到最终正文，应使用 `tool_choice: auto` 或省略该字段。
 
-账号按轮询使用。只有在上游尚未开始推理且明确是会话认证失败时，代理才会刷新登录或切换下一个账号；流式数据开始、超时或未知请求状态不会自动重发。
+## 流式与重试
+
+- 普通文本 `stream: true` 直接转换上游 SSE，不先缓冲完整响应。
+- 客户端取消会传递到账号池和门户请求。
+- SSE 注释被忽略；JSON 数据帧、`finish_reason`、usage 和 `[DONE]` 被标准化。
+- Agent 工具动作在完整 JSON 和 Schema 校验成功后原子输出；中间状态可逐轮流式展示。
+- 只有在上游尚未开始输出且明确为认证失败时，才刷新会话或切换账号。
+- 429 可以切换下一个账号；超时、未知执行状态或已开始的流不会自动重放。
+
+## 环境变量
+
+| 变量 | 用途 |
+| --- | --- |
+| `NEURALWATT_DATA_FILE` | v2 YAML 状态文件，默认 `.data/neuralwatt-accounts.yaml` |
+| `NEURALWATT_BOOTSTRAP_TOKEN` | 首次管理员初始化 token；生产环境建议显式设置 |
+| `NEURALWATT_PORTAL_ORIGIN` | 门户源站，默认 `https://portal.neuralwatt.com`；非回环地址必须 HTTPS |
+| `NEURALWATT_MODEL_CATALOG_URL` | 模型目录地址，默认 NeuralWatt 公共 `/v1/models` |
+| `NEURALWATT_TRUST_PROXY=1` | 信任 `x-forwarded-*` 以识别外部协议、主机和来源地址 |
+| `NEURALWATT_SECURE_COOKIES=1` | 强制管理员 Cookie 使用 `Secure` |
+| `NITRO_HOST` / `NITRO_PORT` | 监听地址和端口 |
+
+Compose 额外读取 `NEURALWATT_HOST_PORT` 作为宿主端口，默认 `3000`。
+
+公网部署必须使用 HTTPS，并在反向代理或防火墙层限制管理控制台的可达范围。
+
+## Docker
+
+```powershell
+$env:NEURALWATT_BOOTSTRAP_TOKEN = "replace-with-a-long-random-token"
+docker compose up -d
+docker compose ps
+```
+
+默认镜像为 `ghcr.io/jianjianai/nlt2api:2.0.0`，只绑定宿主 `127.0.0.1`，状态保存在 `neuralwatt-data` 命名卷中。Compose 会显式传入 bootstrap、门户、代理信任和 Secure Cookie 配置；若未设置 bootstrap token，仍会生成并打印一次临时 token。容器内应用以非 root 用户运行，`/health` 会验证 v2 状态可读且状态目录可写。
 
 ## 验证
 
 ```powershell
 pnpm test
+pnpm run typecheck
 pnpm run build
 ```
 
-`tests/` 覆盖请求字段校验、token 映射、工具协议、参数 Schema、JSON 归一化和 SSE 归一化。真实账号登录应通过面板手动触发，凭据不会放入测试文件。
+测试覆盖 OpenAI 请求合同、工具历史与调用循环、JSON Schema 方言、累计 token 预算、状态事务、账号故障转移、SSE 预检/透传、摘要式 Key、管理员会话/CSRF 和错误归一化。

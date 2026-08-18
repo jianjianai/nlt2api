@@ -1,14 +1,25 @@
-import { defineEventHandler, readBody } from "h3"
-import { requireManagementAuth } from "../../../utils/auth"
-import { sendManagementError } from "../../../utils/errors"
-import { createAccount } from "../../../utils/store"
+import { defineEventHandler } from "h3"
+import { requireAdmin } from "../../../v2/http/auth"
+import { readJsonBody } from "../../../v2/http/body"
+import { sendApiError } from "../../../v2/http/errors"
+import { allowKeys, objectBody } from "../../../v2/http/validation"
+import { getRuntime } from "../../../v2/runtime"
 
 export default defineEventHandler(async (event) => {
   try {
-    await requireManagementAuth(event)
-    const body = await readBody<{ label?: unknown; email?: unknown; password?: unknown }>(event)
-    return { account: await createAccount({ label: String(body?.label ?? ""), email: String(body?.email ?? ""), password: String(body?.password ?? "") }) }
+    const runtime = await getRuntime()
+    requireAdmin(event, runtime, true)
+    const body = objectBody(await readJsonBody(event))
+    allowKeys(body, ["label", "email", "password", "cookie", "enabled"])
+    const account = await runtime.accounts.createAccount({
+      label: body.label as string,
+      email: body.email as string,
+      password: body.password as string,
+      ...(body.cookie !== undefined ? { cookie: body.cookie as string | null } : {}),
+      ...(body.enabled !== undefined ? { enabled: body.enabled as boolean } : {})
+    })
+    return { account }
   } catch (error) {
-    return sendManagementError(event, error)
+    return sendApiError(event, error)
   }
 })

@@ -1,16 +1,18 @@
 import { defineEventHandler, getRouterParam } from "h3"
-import { requireWebAccessSession } from "../../../utils/auth"
-import { sendManagementError } from "../../../utils/errors"
-import { deleteProxyKey } from "../../../utils/store"
+import { requireAdmin } from "../../../v2/http/auth"
+import { sendApiError } from "../../../v2/http/errors"
+import { ApiError } from "../../../v2/shared/errors"
+import { getRuntime } from "../../../v2/runtime"
 
 export default defineEventHandler(async (event) => {
   try {
-    requireWebAccessSession(event)
+    const runtime = await getRuntime()
+    requireAdmin(event, runtime, true)
     const id = getRouterParam(event, "id")
-    if (!id) throw new Error("Proxy key id is required")
-    await deleteProxyKey(id)
+    if (!id) throw new ApiError("Inference API key not found", { status: 404, code: "inference_api_key_not_found" })
+    await runtime.inferenceKeys.delete(id)
     return { ok: true }
   } catch (error) {
-    return sendManagementError(event, error)
+    return sendApiError(event, error)
   }
 })

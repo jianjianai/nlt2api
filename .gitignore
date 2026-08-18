@@ -1,9 +1,12 @@
 node_modules
 dist
 .data
+data/
 .nitro
 .cache
 .output
+.codegraph/
+--port/
 .env
 .env.local
 .data/neuralwatt-accounts.yaml

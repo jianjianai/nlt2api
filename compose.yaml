@@ -1,10 +1,19 @@
 services:
   nlt2api:
-    image: ghcr.io/jianjianai/nlt2api:latest
+    image: ${NEURALWATT_IMAGE:-ghcr.io/jianjianai/nlt2api:2.0.0}
     container_name: nlt2api
     restart: unless-stopped
     ports:
-      - "3000:3000"
+      - "127.0.0.1:${NEURALWATT_HOST_PORT:-3000}:3000"
+    environment:
+      NEURALWATT_BOOTSTRAP_TOKEN: ${NEURALWATT_BOOTSTRAP_TOKEN:-}
+      NEURALWATT_PORTAL_ORIGIN: ${NEURALWATT_PORTAL_ORIGIN:-https://portal.neuralwatt.com}
+      NEURALWATT_MODEL_CATALOG_URL: ${NEURALWATT_MODEL_CATALOG_URL:-https://api.neuralwatt.com/v1/models}
+      NEURALWATT_TRUST_PROXY: ${NEURALWATT_TRUST_PROXY:-0}
+      NEURALWATT_SECURE_COOKIES: ${NEURALWATT_SECURE_COOKIES:-0}
     volumes:
-      # Account data persists on the host at ./data/neuralwatt-accounts.yaml
-      - ./data:/app/.data
+      # A named volume preserves the non-root ownership from the image.
+      - neuralwatt-data:/app/.data
+
+volumes:
+  neuralwatt-data:
