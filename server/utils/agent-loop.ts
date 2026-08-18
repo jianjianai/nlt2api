@@ -101,7 +101,8 @@ function safeToolResult(result: AgentToolResult): string {
 }
 
 function assistantCandidate(state: AgentLoopState): AgentMessage | undefined {
-  if (state.latestCandidate === undefined) return undefined
+  // A reasoning-only response is not a candidate; resending empty assistant content can make the upstream continue reasoning indefinitely.
+  if (state.latestCandidate === undefined || state.latestCandidate.trim() === "") return undefined
   return {
     role: "assistant",
     ...(state.firstReasoning ? { reasoning: state.firstReasoning } : {}),

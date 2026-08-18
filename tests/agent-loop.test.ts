@@ -56,6 +56,27 @@ test("replaces the failed candidate and preserves the first reasoning snapshot",
   assert.doesNotMatch(JSON.stringify(messages[2]), /first reasoning.*second reasoning/)
 })
 
+test("does not resend a reasoning-only response as empty assistant content", async () => {
+  const messages: AgentMessage[][] = []
+  let call = 0
+  const result = await runAgentLoop({
+    baseMessages: [{ role: "user", content: "读取 package.json" }],
+    toolPlan: plan(),
+    requestModel: async (current) => {
+      messages.push(current)
+      call += 1
+      if (call <= 2) return { reasoning: `第 ${call} 次分析`, content: "" }
+      return { content: "{\"name\":\"read_file\",\"arguments\":{\"path\":\"package.json\"}}" }
+    }
+  })
+
+  assert.equal(result.kind, "tool_calls")
+  assert.equal(messages.length, 3)
+  assert.equal(messages[1].filter((item) => item.role === "assistant").length, 0)
+  assert.equal(messages[2].filter((item) => item.role === "assistant").length, 0)
+  assert.match(messages[1].filter((item) => item.role === "user")[1]?.content as string, /上一轮只是状态文本/)
+})
+
 test("puts tool context in the final user message and submits legal calls once", async () => {
   const messages: AgentMessage[][] = []
   let executed = 0
