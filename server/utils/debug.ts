@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto"
-import { mkdir, writeFile } from "node:fs/promises"
+import { mkdir, readdir, rm, writeFile } from "node:fs/promises"
 import { join, resolve } from "node:path"
 
 type JsonObject = Record<string, unknown>
@@ -10,6 +10,7 @@ export interface DebugTrace {
   recordJson(label: string, body: unknown, metadata?: JsonObject): Promise<void>
   recordText(label: string, body: string, metadata?: JsonObject): Promise<void>
   captureStream(label: string, stream: ReadableStream<Uint8Array>, metadata?: JsonObject): ReadableStream<Uint8Array>
+  close(): void
 }
 
 const DEFAULT_MAX_CAPTURE_BYTES = 8 * 1024 * 1024
@@ -63,6 +64,31 @@ function traceEnabled(): boolean {
   return process.env.NEURALWATT_DEBUG_TRACE === "1"
 }
 
+const TRACE_ID_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-\d{3}Z-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
+const activeTraces = new Set<FileDebugTrace>()
+let storageBarrier: Promise<void> = Promise.resolve()
+
+export function isDebugTraceEnabled(): boolean {
+  return traceEnabled()
+}
+
+export function getDebugTraceDirectory(): string {
+  return captureDirectory()
+}
+
+export function isDebugTraceId(value: string): boolean {
+  return TRACE_ID_PATTERN.test(value)
+}
+
+function queueStorageOperation<T>(operation: () => Promise<T>): Promise<T> {
+  const previous = storageBarrier
+  let release: (() => void) | undefined
+  storageBarrier = new Promise<void>((resolve) => {
+    release = resolve
+  })
+  return previous.then(operation).finally(() => release?.())
+}
+
 function safeLabel(label: string): string {
   return label.replace(/[^a-z0-9-]/gi, "-").toLowerCase()
 }
@@ -90,14 +116,23 @@ export interface DebugTraceOptions {
 class FileDebugTrace implements DebugTrace {
   readonly id: string
   readonly directory: string
-  readonly #maxCaptureBytes: number
+  #maxCaptureBytes: number
   #recordIndex = 0
   #writeChain: Promise<void> = Promise.resolve()
-
+  #closed = false
   constructor(id: string, directory: string, maxCaptureBytes: number) {
     this.id = id
     this.directory = directory
     this.#maxCaptureBytes = maxCaptureBytes
+  }
+
+  close(): void {
+    this.#closed = true
+    activeTraces.delete(this)
+  }
+
+  async waitForWrites(): Promise<void> {
+    await this.#writeChain
   }
 
   async recordJson(label: string, body: unknown, metadata: JsonObject = {}): Promise<void> {
@@ -106,6 +141,7 @@ class FileDebugTrace implements DebugTrace {
 
   async recordText(label: string, body: string, metadata: JsonObject = {}): Promise<void> {
     await this.#write(label, sanitizeText(body), metadata)
+    if (label === "client-response") this.close()
   }
 
   captureStream(label: string, stream: ReadableStream<Uint8Array>, metadata: JsonObject = {}): ReadableStream<Uint8Array> {
@@ -121,15 +157,19 @@ class FileDebugTrace implements DebugTrace {
       if (finished) return
       finished = true
       const captured = joinChunks(chunks, capturedBytes)
-      await this.recordText(label, new TextDecoder().decode(captured), {
-        ...metadata,
-        stream_state: state,
-        total_bytes: totalBytes,
-        captured_bytes: capturedBytes,
-        truncated: totalBytes > capturedBytes,
-        sha256: hash.digest("hex"),
-        ...(error === undefined ? {} : { error: errorMessage(error) })
-      })
+      try {
+        await this.recordText(label, new TextDecoder().decode(captured), {
+          ...metadata,
+          stream_state: state,
+          total_bytes: totalBytes,
+          captured_bytes: capturedBytes,
+          truncated: totalBytes > capturedBytes,
+          sha256: hash.digest("hex"),
+          ...(error === undefined ? {} : { error: errorMessage(error) })
+        })
+      } finally {
+        if (label === "client-response") this.close()
+      }
     }
 
     return new ReadableStream<Uint8Array>({
@@ -167,6 +207,7 @@ class FileDebugTrace implements DebugTrace {
   }
 
   async #write(label: string, body: unknown, metadata: JsonObject): Promise<void> {
+    if (this.#closed) return
     const index = String(++this.#recordIndex).padStart(3, "0")
     const file = join(this.directory, `${index}-${safeLabel(label)}.json`)
     const record = JSON.stringify({
@@ -178,6 +219,7 @@ class FileDebugTrace implements DebugTrace {
     }, null, 2)
 
     const write = this.#writeChain.then(async () => {
+      if (this.#closed) return
       await writeFile(file, record, { encoding: "utf8", mode: 0o600 })
     })
     this.#writeChain = write.catch((error) => {
@@ -190,23 +232,51 @@ class FileDebugTrace implements DebugTrace {
 export async function createDebugTrace(options: DebugTraceOptions = {}): Promise<DebugTrace | undefined> {
   if (!(options.enabled ?? traceEnabled())) return undefined
 
-  const id = `${new Date().toISOString().replace(/[:.]/g, "-")}-${randomUUID()}`
-  const rootDirectory = options.directory ? resolve(options.directory) : captureDirectory()
-  const maxCaptureBytes = captureLimit(options.maxCaptureBytes)
-  const directory = join(rootDirectory, id)
-  try {
-    await mkdir(directory, { recursive: true, mode: 0o700 })
-    const trace = new FileDebugTrace(id, directory, maxCaptureBytes)
-    console.info(`[debug] trace directory=${directory}`)
-    await trace.recordJson("trace", {
-      enabled: true,
-      max_capture_bytes: maxCaptureBytes
-    })
-    return trace
-  } catch (error) {
-    console.error(`[debug] trace initialization failed: ${errorMessage(error)}`)
-    return undefined
-  }
+  return queueStorageOperation(async () => {
+    const id = `${new Date().toISOString().replace(/[:.]/g, "-")}-${randomUUID()}`
+    const rootDirectory = options.directory ? resolve(options.directory) : captureDirectory()
+    const maxCaptureBytes = captureLimit(options.maxCaptureBytes)
+    const directory = join(rootDirectory, id)
+    try {
+      await mkdir(directory, { recursive: true, mode: 0o700 })
+      const trace = new FileDebugTrace(id, directory, maxCaptureBytes)
+      activeTraces.add(trace)
+      console.info(`[debug] trace directory=${directory}`)
+      await trace.recordJson("trace", {
+        enabled: true,
+        max_capture_bytes: maxCaptureBytes
+      })
+      return trace
+    } catch (error) {
+      console.error(`[debug] trace initialization failed: ${errorMessage(error)}`)
+      return undefined
+    }
+  })
+}
+
+export function clearDebugTraceStorage(): Promise<number> {
+  return queueStorageOperation(async () => {
+    const traces = [...activeTraces]
+    for (const trace of traces) trace.close()
+    await Promise.all(traces.map((trace) => trace.waitForWrites()))
+
+    const rootDirectory = captureDirectory()
+    let entries
+    try {
+      entries = await readdir(rootDirectory, { withFileTypes: true })
+    } catch (error) {
+      if (isRecord(error) && error.code === "ENOENT") return 0
+      throw error
+    }
+
+    let cleared = 0
+    for (const entry of entries) {
+      if (!entry.isDirectory() || !isDebugTraceId(entry.name)) continue
+      await rm(join(rootDirectory, entry.name), { recursive: true, force: true })
+      cleared += 1
+    }
+    return cleared
+  })
 }
 
 export async function captureDebugResponse(

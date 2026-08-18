@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="light dark" />
+    <title>调试历史 · Neuralwatt AI Proxy</title>
+    <link rel="stylesheet" href="/debug.css" />
+  </head>
+  <body>
+    <main class="debug-shell">
+      <header class="debug-header">
+        <div>
+          <a class="back-link" href="/">← 管理控制台</a>
+          <p class="debug-eyebrow">DEBUG TRACE INSPECTOR</p>
+          <h1>对话调用历史</h1>
+          <p class="debug-subtitle">按请求查看客户端与上游之间的完整消息转换、重试和工具协议过程。</p>
+        </div>
+        <div class="debug-header-actions">
+          <span id="debug-status" class="status-badge status-unknown">检查 Debug 状态</span>
+          <button id="clear-history" class="button button-danger" type="button">清空全部历史</button>
+        </div>
+      </header>
+
+      <section id="debug-disabled" class="notice-panel" hidden>
+        <strong>Debug 记录未开启</strong>
+        <p>请使用 <code>NEURALWATT_DEBUG_TRACE=1</code> 启动服务。开启后，新的 Chat Completions 请求会出现在这里。</p>
+      </section>
+
+      <section class="debug-layout">
+        <aside class="history-panel" aria-label="对话历史列表">
+          <div class="panel-heading">
+            <div>
+              <h2>请求记录</h2>
+              <p id="history-count">正在加载</p>
+            </div>
+            <button id="refresh-history" class="icon-button" type="button" title="刷新历史" aria-label="刷新历史">↻</button>
+          </div>
+          <div id="history-list" class="history-list" aria-live="polite">
+            <p class="empty-state">正在加载调试记录...</p>
+          </div>
+          <div class="pagination" aria-label="历史分页">
+            <button id="previous-page" class="button button-secondary" type="button">上一页</button>
+            <span id="page-indicator">第 1 页</span>
+            <button id="next-page" class="button button-secondary" type="button">下一页</button>
+          </div>
+        </aside>
+
+        <section class="detail-panel" aria-label="对话详情">
+          <div id="detail-empty" class="detail-empty">
+            <div class="empty-mark">⌁</div>
+            <h2>选择一条请求记录</h2>
+            <p>左侧选择记录后，这里会显示客户端消息、上游消息和每一步原始记录。</p>
+          </div>
+          <div id="detail-content" hidden>
+            <div class="detail-heading">
+              <div>
+                <p class="detail-kicker">TRACE</p>
+                <h2 id="detail-title">-</h2>
+                <p id="detail-meta" class="detail-meta">-</p>
+              </div>
+              <button id="copy-trace-id" class="button button-ghost" type="button">复制 Trace ID</button>
+            </div>
+            <nav class="view-tabs" aria-label="消息视图">
+              <button class="view-tab is-active" type="button" data-view="client">客户端消息</button>
+              <button class="view-tab" type="button" data-view="upstream">发往上游</button>
+              <button class="view-tab" type="button" data-view="all">全部记录</button>
+            </nav>
+            <div id="detail-view" class="detail-view"></div>
+          </div>
+        </section>
+      </section>
+      <p id="debug-notice" class="debug-notice" role="status" aria-live="polite"></p>
+    </main>
+    <script src="/debug.js" defer></script>
+  </body>
+</html>

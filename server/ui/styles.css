@@ -89,8 +89,10 @@ textarea { resize: vertical; min-height: 68px; }
 input:focus, select:focus, textarea:focus { border-color: var(--accent); box-shadow: 0 0 0 3px rgba(187, 91, 64, .12); }
 
 .button {
+  display: inline-block;
   border: 1px solid transparent;
   border-radius: 5px;
+  text-decoration: none;
   padding: 9px 14px;
   white-space: nowrap;
   font-weight: 650;

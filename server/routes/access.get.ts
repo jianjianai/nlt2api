@@ -2,7 +2,7 @@ import { defineEventHandler, getQuery, sendRedirect } from "h3"
 import { hasWebAccessSession } from "../utils/web-access"
 
 function requestedPage(value: unknown): string {
-  return value === "/" || value === "/index.html" ? value : "/"
+  return value === "/" || value === "/index.html" || value === "/debug" || value === "/debug.html" ? value : "/"
 }
 
 export default defineEventHandler((event) => {

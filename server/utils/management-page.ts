@@ -20,3 +20,15 @@ export function getManagementScript(): Promise<string> {
 export function getManagementStyles(): Promise<string> {
   return getManagementAsset("styles.css")
 }
+
+export function getDebugPage(): Promise<string> {
+  return getManagementAsset("debug.html")
+}
+
+export function getDebugScript(): Promise<string> {
+  return getManagementAsset("debug.js")
+}
+
+export function getDebugStyles(): Promise<string> {
+  return getManagementAsset("debug.css")
+}
