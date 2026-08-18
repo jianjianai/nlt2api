@@ -1,19 +1,19 @@
-# Nitro starter
+# NeuralWatt
 
-Create your full-stack apps and deploy it anywhere with this [Vite](https://vite.dev/) + [Nitro](https://nitro.build/) starter.
+Vue 3 single-page application served through [Vite](https://vite.dev/) and [Nitro](https://nitro.build/).
 
 ## Getting started
 
 ```bash
-npm install
-npm run dev
+pnpm install
+pnpm dev
 ```
 
 ## Deploying
 
 ```bash
-npm run build
-npm run preview
+pnpm build
+pnpm preview
 ```
 
 Then checkout the [Nitro documentation](https://nitro.build/deploy) to learn more about the different deployment presets.

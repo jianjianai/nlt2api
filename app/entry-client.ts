@@ -1,3 +1,4 @@
-import { setupApp } from "./app";
+import { createApp } from "vue";
+import App from "./App.vue";
 
-setupApp(document.querySelector<HTMLButtonElement>("#app")!);
+createApp(App).mount("#app");
