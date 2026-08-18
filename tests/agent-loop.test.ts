@@ -101,6 +101,8 @@ test("puts tool context in the final user message and submits legal calls once",
   assert.equal(messages.length, 2)
   const second = messages[1]
   assert.equal(second.at(-1)?.role, "user")
+  assert.match(second.at(-2)?.content as string, /工具结果已返回/)
+  assert.match(second.at(-2)?.content as string, /合法工具调用 JSON/)
   assert.match(second.at(-1)?.content as string, /^<tool_context>/)
   assert.equal(second.filter((item) => item.role === "assistant").length, 1)
   assert.equal(second.filter((item) => item.role === "tool").length, 1)

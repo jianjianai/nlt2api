@@ -92,6 +92,10 @@ function correctionPrompt(error: JsonToolActionFailure): string {
   return `json解析出错，请重新输出正确的json,错误详情: ${encoded}`
 }
 
+function toolResultContinuationPrompt(): string {
+  return "工具结果已返回。继续处理原始任务，不要输出普通思考或状态文本；请立即输出下一个合法工具调用 JSON，或以 <~end~> 开头输出最终答案。"
+}
+
 function safeToolResult(result: AgentToolResult): string {
   const value = JSON.stringify({
     ok: result.isError !== true,
@@ -135,6 +139,7 @@ export function buildAgentMessages(state: AgentLoopState, toolPlan?: ToolPlan): 
   const candidate = assistantCandidate(state)
   if (candidate) messages.push(candidate)
   if (state.latestError) messages.push({ role: "user", content: correctionPrompt(state.latestError) })
+  if (messages.at(-1)?.role === "tool") messages.push({ role: "user", content: toolResultContinuationPrompt() })
 
   messages.push({ role: "user", content: buildJsonToolContext(toolPlan) })
   return messages
