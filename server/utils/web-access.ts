@@ -6,7 +6,6 @@ import { AppError } from "./errors"
 const WEB_ACCESS_COOKIE = "neuralwatt-web-access"
 const SESSION_TTL_SECONDS = 12 * 60 * 60
 const sessionSecret = randomBytes(32)
-let localEnvironmentLoaded = false
 
 function secureEqual(left: string, right: string): boolean {
   const leftBuffer = Buffer.from(left)
@@ -15,12 +14,11 @@ function secureEqual(left: string, right: string): boolean {
 }
 
 function getWebAccessKey(): string {
-  if (!localEnvironmentLoaded && !process.env.NEURALWATT_WEB_ACCESS_KEY) {
-    localEnvironmentLoaded = true
+  if (!process.env.NEURALWATT_WEB_ACCESS_KEY) {
     try {
       process.loadEnvFile(resolve(process.cwd(), ".env.local"))
     } catch {
-      throw new AppError("The local web access configuration could not be read", 500, "web_access_config_read_failed")
+      // .env.local 缺失或不可读时，由下面的未配置错误统一提示
     }
   }
 
