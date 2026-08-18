@@ -2,28 +2,14 @@ import { AccountAuthError, AppError } from "./errors"
 import type { DebugTrace } from "./debug"
 import { validateChatRequest, type ValidatedChatRequest } from "./openai"
 import { checkPortalSession, ensurePortalLogin, fetchPortalChat } from "./portal"
-import {
-  createSseRelay,
-  createToolSseRelay,
-  normalizeCompletionWithLengthContinuation,
-  normalizeToolCompletionWithRetry,
-  prepareSse,
-  type OutputLengthContinuation,
-  type PreparedSse,
-  type ToolActionRetry,
-  type UpstreamStreamError
-} from "./response"
-import {
-  getAccount,
-  getEnabledAccounts,
-  getGenerationDefaults,
-  recordAccountLogin,
-  recordAccountStatus,
-  type StoredAccount
-} from "./store"
+import { completionFromAgentResult, completionToModelOutput, createOpenAIStream, readJsonCompletion, readSseCompletion } from "./response"
+import { runAgentLoop, type AgentMessage, type AgentModelOutput } from "./agent-loop"
+import { getAccount, getEnabledAccounts, getGenerationDefaults, recordAccountLogin, recordAccountStatus, type StoredAccount } from "./store"
+
+type JsonObject = Record<string, unknown>
 
 export type ProxyResult =
-  | { kind: "json"; body: Record<string, unknown> }
+  | { kind: "json"; body: JsonObject }
   | { kind: "stream"; body: ReadableStream<Uint8Array> }
 
 let roundRobinCursor = 0
@@ -40,11 +26,7 @@ function isAuthStatus(status: number): boolean {
 }
 
 async function discardResponse(response: Response): Promise<void> {
-  try {
-    await response.body?.cancel()
-  } catch {
-    // The response is already being discarded.
-  }
+  try { await response.body?.cancel() } catch { /* response discarded */ }
 }
 
 async function refreshAccount(account: StoredAccount): Promise<string> {
@@ -53,227 +35,68 @@ async function refreshAccount(account: StoredAccount): Promise<string> {
   return cookie
 }
 
-async function prepareAccountCookie(account: StoredAccount): Promise<string> {
+async function prepareCookie(account: StoredAccount): Promise<string> {
   if (account.cookie) {
-    const lastChecked = account.lastCheckedAt ? Date.parse(account.lastCheckedAt) : 0
-    const checkIsFresh = account.status === "ready" && Number.isFinite(lastChecked) && Date.now() - lastChecked < 60_000
-    if (checkIsFresh) return account.cookie
-
+    const checked = account.lastCheckedAt ? Date.parse(account.lastCheckedAt) : 0
+    if (account.status === "ready" && Number.isFinite(checked) && Date.now() - checked < 60_000) return account.cookie
     const session = await checkPortalSession(account.cookie)
     if (session.ok) {
       await recordAccountStatus(account.id, "ready", null)
       return account.cookie
     }
-    if (session.reason !== "session_expired" && session.status !== 401 && session.status !== 403) {
-      return account.cookie
-    }
-    return refreshAccount(account)
+    if (session.reason !== "session_expired" && session.status !== 401 && session.status !== 403) return account.cookie
   }
   return refreshAccount(account)
 }
 
-async function fetchWithAuthRecovery(
-  account: StoredAccount,
-  request: ValidatedChatRequest,
-  trace: DebugTrace | undefined,
-  nextUpstreamAttempt: () => number
-): Promise<Response> {
-  let cookie = await prepareAccountCookie(account)
-  let response = await fetchPortalChat(cookie, request.portalPayload, trace, nextUpstreamAttempt())
-
+async function fetchWithAuth(account: StoredAccount, payload: JsonObject, trace: DebugTrace | undefined, attempt: number): Promise<Response> {
+  let response = await fetchPortalChat(await prepareCookie(account), payload, trace, attempt)
   if (isAuthStatus(response.status)) {
-    console.warn(`[proxy] portal returned ${response.status} for account=${account.label}; refreshing session`)
     await discardResponse(response)
-    cookie = await refreshAccount(account)
-    response = await fetchPortalChat(cookie, request.portalPayload, trace, nextUpstreamAttempt())
+    response = await fetchPortalChat(await refreshAccount(account), payload, trace, attempt + 1)
   }
-
   if (isAuthStatus(response.status)) {
-    console.error(`[proxy] account=${account.label} session still invalid after refresh; aborting request`)
     await discardResponse(response)
     throw new AccountAuthError("The cached account session is not valid", "session_expired")
   }
-
   return response
 }
 
-async function preparePortalSse(
-  account: StoredAccount,
-  request: ValidatedChatRequest,
-  trace: DebugTrace | undefined,
-  nextUpstreamAttempt: () => number
-): Promise<PreparedSse> {
-  let response: Response
-  try {
-    response = await fetchWithAuthRecovery(account, request, trace, nextUpstreamAttempt)
-  } catch (error) {
-    if (error instanceof AccountAuthError) {
-      await recordAccountStatus(account.id, error.code === "manual_cookie_required" ? "manual_cookie_required" : "login_failed", error.message)
-    }
-    throw error
-  }
-
-  if (!response.ok) {
-    const status = response.status === 429 ? 429 : response.status >= 500 ? 502 : response.status
-    console.error(`[proxy] portal rejected streaming request account=${account.label} status=${response.status}`)
-    await discardResponse(response)
-    throw new AppError(`Neuralwatt rejected the request with HTTP ${response.status}`, status, "upstream_http_error", undefined, status === 429 ? "rate_limit_error" : "server_error")
-  }
-
-  const prepared = await prepareSse(response.body)
-  if (prepared.firstError) {
-    try {
-      await prepared.reader.cancel()
-    } catch {
-      // The first SSE frame already contains the terminal error.
-    } finally {
-      prepared.reader.releaseLock()
-    }
-    const streamError: UpstreamStreamError = prepared.firstError
-    if (streamError.isAuthError) {
-      console.error(`[proxy] portal stream auth error account=${account.label} message=${streamError.message}`)
-      await recordAccountStatus(account.id, "expired", streamError.message)
-      throw new AccountAuthError("The upstream reported an expired session", "session_expired")
-    }
-    console.error(`[proxy] portal stream error account=${account.label} message=${streamError.message}`)
-    throw new AppError(streamError.message, 502, "upstream_stream_error")
-  }
-
-  return prepared
+function baseMessages(payload: JsonObject): AgentMessage[] {
+  if (!Array.isArray(payload.messages)) return []
+  return payload.messages.filter((value): value is AgentMessage => typeof value === "object" && value !== null && !Array.isArray(value) && typeof (value as JsonObject).role === "string").map((value) => ({ ...value }))
 }
 
-type ReplayableContinuation = Pick<OutputLengthContinuation, "reasoning" | "content" | "nudge">
-  & Partial<Pick<ToolActionRetry, "context">>
-
-function waitForRetry(retry: ToolActionRetry): Promise<void> {
-  if (retry.retryAfterMs <= 0) return Promise.resolve()
-  return new Promise((resolve) => setTimeout(resolve, retry.retryAfterMs))
-}
-
-export function createContinuationPayloadBuilder(portalPayload: Record<string, unknown>): (continuation: ReplayableContinuation) => Record<string, unknown> {
-  const baseMessages = Array.isArray(portalPayload.messages) ? [...portalPayload.messages] : []
-  let messages = [...baseMessages]
-  let isolatedRecoveryActive = false
-  return (continuation) => {
-    if (continuation.context === "isolated" || (isolatedRecoveryActive && continuation.context !== undefined)) {
-      // Format recovery starts from the original request so malformed output
-      // cannot become instructions in any later correction turn.
-      messages = [...baseMessages]
-      isolatedRecoveryActive = true
-    } else if (continuation.content || continuation.reasoning) {
-      messages.push({
-        role: "assistant",
-        ...(continuation.reasoning ? { reasoning: continuation.reasoning } : {}),
-        content: continuation.content || null
-      })
-    }
-    messages.push({ role: "user", content: continuation.nudge })
-    return { ...portalPayload, messages: [...messages] }
-  }
-}
-
-async function proxyForAccount(
-  account: StoredAccount,
-  request: ValidatedChatRequest,
-  trace: DebugTrace | undefined,
-  nextUpstreamAttempt: () => number
-): Promise<ProxyResult> {
-  console.info(`[proxy] chat request account=${account.label} model=${request.model} stream=${request.stream} tools=${request.toolPlan ? "yes" : "no"} max_tokens=${request.portalPayload.max_tokens ?? "default"}`)
-  const continuationPayload = createContinuationPayloadBuilder(request.portalPayload)
-  const responseFormat = request.portalPayload.response_format
-  const isJsonObjectResponse = typeof responseFormat === "object"
-    && responseFormat !== null
-    && !Array.isArray(responseFormat)
-    && (responseFormat as Record<string, unknown>).type === "json_object"
-
-  if (!request.stream) {
-    const fetchJson = async (portalPayload: Record<string, unknown>): Promise<unknown> => {
-      let response: Response
-      try {
-        response = await fetchWithAuthRecovery(account, { ...request, portalPayload }, trace, nextUpstreamAttempt)
-      } catch (error) {
-        if (error instanceof AccountAuthError) {
-          await recordAccountStatus(account.id, error.code === "manual_cookie_required" ? "manual_cookie_required" : "login_failed", error.message)
-        }
-        throw error
-      }
-
+async function proxyForAccount(account: StoredAccount, request: ValidatedChatRequest, trace: DebugTrace | undefined, nextAttempt: () => number): Promise<ProxyResult> {
+  console.info("[proxy] agent request account=" + account.label + " model=" + request.model + " stream=" + String(request.stream) + " tools=" + String(Boolean(request.toolPlan)))
+  const result = await runAgentLoop({
+    baseMessages: baseMessages(request.portalPayload),
+    toolPlan: request.toolPlan,
+    requestModel: async (messages: AgentMessage[]): Promise<AgentModelOutput> => {
+      const payload = { ...request.portalPayload, messages, stream: request.stream }
+      const response = await fetchWithAuth(account, payload, trace, nextAttempt())
       if (!response.ok) {
         const status = response.status === 429 ? 429 : response.status >= 500 ? 502 : response.status
         await discardResponse(response)
-        throw new AppError(`Neuralwatt rejected the request with HTTP ${response.status}`, status, "upstream_http_error", undefined, status === 429 ? "rate_limit_error" : "server_error")
+        throw new AppError("Neuralwatt rejected the request with HTTP " + response.status, status, "upstream_http_error")
       }
-
-      try {
-        return await response.json()
-      } catch (error) {
-        if (error instanceof AppError) throw error
-        throw new AppError("The upstream returned invalid JSON", 502, "invalid_upstream_json")
-      }
+      if (request.stream) return readSseCompletion(response.body)
+      return completionToModelOutput(await readJsonCompletion(response), request.model)
     }
-
-    const value = await fetchJson(request.portalPayload)
-    if (!request.toolPlan) {
-      const outputRefetch = isJsonObjectResponse
-        ? undefined
-        : async (continuation: OutputLengthContinuation): Promise<unknown> => {
-            console.warn(`[proxy] output continuation account=${account.label} model=${request.model} preserved reasoning_chars=${continuation.reasoning.length} content_chars=${continuation.content.length}`)
-            return fetchJson(continuationPayload(continuation))
-          }
-      return {
-        kind: "json",
-        body: await normalizeCompletionWithLengthContinuation(value, request.model, outputRefetch)
-      }
-    }
-    const refetch = async (retry: ToolActionRetry): Promise<unknown> => {
-      console.warn(`[proxy] tool action retry cause=${retry.cause} attempt=${retry.attempt} context=${retry.context} retry_after_ms=${retry.retryAfterMs} account=${account.label} model=${request.model} preserved reasoning_chars=${retry.reasoning.length} content_chars=${retry.content.length}`)
-      await waitForRetry(retry)
-      return fetchJson(continuationPayload(retry))
-    }
-    return {
-      kind: "json",
-      body: await normalizeToolCompletionWithRetry(value, request.model, request.toolPlan, refetch)
-    }
-  }
-
-  const prepared = await preparePortalSse(account, request, trace, nextUpstreamAttempt)
-  if (request.toolPlan) {
-    const refetch = async (retry: ToolActionRetry): Promise<PreparedSse> => {
-      console.warn(`[proxy] tool action retry cause=${retry.cause} attempt=${retry.attempt} context=${retry.context} retry_after_ms=${retry.retryAfterMs} account=${account.label} model=${request.model} preserved reasoning_chars=${retry.reasoning.length} content_chars=${retry.content.length}`)
-      await waitForRetry(retry)
-      return preparePortalSse(account, { ...request, portalPayload: continuationPayload(retry) }, trace, nextUpstreamAttempt)
-    }
-    return {
-      kind: "stream",
-      body: createToolSseRelay(prepared, request.model, request.includeUsage, request.toolPlan, refetch)
-    }
-  }
-
-  const outputRefetch = isJsonObjectResponse
-    ? undefined
-    : async (continuation: OutputLengthContinuation): Promise<PreparedSse> => {
-        console.warn(`[proxy] output continuation account=${account.label} model=${request.model} preserved reasoning_chars=${continuation.reasoning.length} content_chars=${continuation.content.length}`)
-        return preparePortalSse(account, { ...request, portalPayload: continuationPayload(continuation) }, trace, nextUpstreamAttempt)
-      }
-  return {
-    kind: "stream",
-    body: createSseRelay(prepared, request.model, request.includeUsage, outputRefetch)
-  }
+  })
+  if (request.stream) return { kind: "stream", body: createOpenAIStream(result, request.model, request.includeUsage) }
+  return { kind: "json", body: completionFromAgentResult(result, request.model) }
 }
 
 export async function handleChatRequest(input: unknown, trace?: DebugTrace): Promise<ProxyResult> {
   const request = validateChatRequest(input, await getGenerationDefaults())
   const accounts = orderedAccounts(await getEnabledAccounts())
-  if (accounts.length === 0) {
-    throw new AppError("No enabled Neuralwatt accounts are configured", 503, "no_enabled_accounts")
-  }
-
+  if (accounts.length === 0) throw new AppError("No enabled Neuralwatt accounts are configured", 503, "no_enabled_accounts")
   let authFailures = 0
-  let upstreamAttempt = 0
-  const nextUpstreamAttempt = (): number => ++upstreamAttempt
+  let attempt = 0
   for (const account of accounts) {
     try {
-      return await proxyForAccount(account, request, trace, nextUpstreamAttempt)
+      return await proxyForAccount(account, request, trace, () => ++attempt)
     } catch (error) {
       if (error instanceof AccountAuthError) {
         authFailures += 1
@@ -282,15 +105,7 @@ export async function handleChatRequest(input: unknown, trace?: DebugTrace): Pro
       throw error
     }
   }
-
-  console.error(`[proxy] all ${authFailures} enabled account session(s) unavailable`)
-  throw new AppError(
-    `All ${authFailures} enabled account session${authFailures === 1 ? " is" : "s are"} unavailable`,
-    401,
-    "all_accounts_unauthorized",
-    undefined,
-    "authentication_error"
-  )
+  throw new AppError("All " + authFailures + " enabled account sessions are unavailable", 401, "all_accounts_unauthorized", undefined, "authentication_error")
 }
 
 export async function checkAccount(id: string): Promise<{ ok: boolean; status: number; reason?: string }> {

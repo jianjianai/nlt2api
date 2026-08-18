@@ -48,7 +48,7 @@ OpenAI 兼容接口始终需要代理 Bearer Key。管理网页可使用独立�
 
 ## 调试追踪
 
-设置 `NEURALWATT_DEBUG_TRACE=1` 后启动服务，`/v1/chat/completions` 的每次已认证请求都会在 `.data/debug/<trace-id>/` 创建独立目录。目录中按实际顺序保存单独的 JSON 文件：客户端原始请求、每次上游请求及其原始响应（包括内部续推和工具纠错重试），以及最终发给客户端的 JSON 或 SSE 响应。
+设置 `NEURALWATT_DEBUG_TRACE=1` 后启动服务，`/v1/chat/completions` 的每次已认证请求都会在 `.data/debug/<trace-id>/` 创建独立目录。目录按实际顺序保存客户端原始请求、每轮重建后的上游请求及其原始响应，以及最终发给客户端的 JSON 或 SSE 响应。
 
 ```powershell
 $env:NEURALWATT_DEBUG_TRACE = "1"
@@ -110,22 +110,21 @@ curl.exe http://127.0.0.1:3000/v1/chat/completions `
 
 ### 工具调用实现
 
-门户不会原生解析 Kimi K3 的工具定义。本适配器采用经过真实接口验证的兼容方案：将 function tools 编译为模型到代理内部的 compact XML 动作协议，并使用 Ajv 按调用方提供的参数 Schema 校验，最后转换为 OpenAI 标准工具响应。代理同时接受旧 verbose XML 历史；工具由调用方执行，代理本身不会执行函数。
+门户不会原生解析工具定义。适配器使用显式 JSON Agent loop：每次模型生成前，都会从原始消息、已确认的工具调用/结果和当前纠错状态重新构建请求；包含当前工具目录、JSON 调用格式和完成约束的 `<tool_context>` 始终位于最后一条 user 消息。
+
+模型输出以 `{` 或 `[` 开头时，必须是完整 JSON 工具调用：单个调用使用 `{ "name": "tool_name", "arguments": { ... } }`，数组仅在 `parallel_tool_calls` 允许时可用。代理用 Ajv 按调用方提供的完整 Schema 校验工具名和参数，然后以标准 OpenAI `tool_calls` 返回；工具仍由调用方执行。
+
+模型以 `<~end~>` 开头时结束生成，sentinel 后的内容作为最终报告。普通状态文本不会被当作最终回复，而会进入下一轮并要求模型继续输出合法工具调用或最终 sentinel。
+
+JSON 解析失败、结构错误、未知工具、Schema 错误和并行策略冲突都会进入统一纠错流程。纠错上下文只保留最新失败候选，不会累积多个错误输出；第一次模型 reasoning 会保留，错误详情始终对应最新候选。纠错次数和 Agent 总轮次均有上限，超过上限会返回结构化错误。
 
 支持的选择方式：
 
 - `tool_choice: "auto" | "none" | "required"`；
-- 指定函数的 `{ "type": "function", "name": "..." }`，同时兼容传统的嵌套 `function.name` 形状；
-- `allowed_tools` 的 `auto` / `required` 子集；
+- 指定函数的 `{ "type": "function", "name": "..." }`；
 - `parallel_tool_calls: false` 会严格限制为一次最多一个调用。
 
-工具循环遵循 [OpenAI Function calling 指南](https://developers.openai.com/api/docs/guides/function-calling)中的 Chat Completions 流程：把首轮完整的 assistant message 追加到历史，紧接着为其中每个调用追加一条具有相同 `tool_call_id` 的 `role: "tool"` 消息，再发起新的 `/v1/chat/completions` 请求。代理会拒绝遗漏、重复、未知或被其他角色消息打断的工具结果，并把合法的 `assistant.tool_calls` 历史重新编码给 Kimi。
-
-`tool_choice` 是逐请求约束。`required` 要求当前响应必须产生至少一个工具调用，即使历史中已经有工具结果；若要让模型基于结果生成最终答案，下一次请求必须省略 `tool_choice` 或改为 `auto`。工具调用消息可以同时携带简短的用户可见 `content`，但客户端应以 `finish_reason: "tool_calls"` 和完整的 `tool_calls` 数组驱动执行循环，而不能把进度正文当作状态信号。
-
-流式请求会实时转发 `reasoning_content`，但不会把内部 XML 动作暴露给客户端；动作完整且校验通过后才发出 `delta.tool_calls` 和 `finish_reason: "tool_calls"`。若模型生成无效 XML、未知工具或不符合 Schema 的参数，非流式请求返回 HTTP 502 `invalid_tool_action`；流式响应已经开始后则通过 SSE error 事件结束。XML 只存在于模型到代理的内部边界，不等同于上游推理框架原生的 `kimi_k3` tool parser。
-
-当上游明确以 `finish_reason: "length"` 截断时，代理会为 `response_format: text` 响应和尚未形成合法工具动作的工具请求，最多发起 10 次内部续轮；工具协议产生无效动作时，模型纠错最多连续重试 5 次。续轮只使用已公开的 `reasoning_content` 和 `content`，不可能恢复模型的隐藏推理状态。代理保留完整初始请求，并按实际发送顺序追加每个 `assistant -> user` 重试对，使下一次上游请求成为前一次请求的严格前缀，以便上游提示缓存复用；客户端回传带有 `reasoning_content` 的历史时，也会据此还原同一组实际重试消息。每次上游请求仍复用该请求的有效 `max_tokens` 上限，流式客户端会收到一个连续的 SSE 响应及累计 usage。`response_format: json_object` 保持单次响应语义，不自动拼接截断 JSON；第 11 次连续截断时，文本响应最终保留 `finish_reason: "length"`，工具请求返回 `tool_action_length_exceeded`。
+合法工具调用被确认后会以标准 `message.tool_calls` 或 `delta.tool_calls` 返回给客户端。客户端执行工具并发送对应的 `role: "tool"` 结果后，下一次请求会重新进入 Agent loop。内部 `<tool_context>`、纠错提示和 `<~end~>` sentinel 不会泄漏给 OpenAI 客户端。
 
 账号按轮询使用。只有在上游尚未开始推理且明确是会话认证失败时，代理才会刷新登录或切换下一个账号；流式数据开始、超时或未知请求状态不会自动重发。
 

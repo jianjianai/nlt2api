@@ -1,74 +1,32 @@
 import assert from "node:assert/strict"
 import test from "node:test"
+import { buildJsonToolContext, JsonToolActionError, parseJsonToolAction } from "../server/utils/tools"
 import { validateChatRequest } from "../server/utils/openai"
-import { parseToolAction, ToolActionError } from "../server/utils/tools"
 
-const documentedTool = {
-  type: "function",
-  function: {
-    name: "create_ticket",
-    description: "Creates a ticket from a subject.",
-    parameters: {
-      $schema: "https://json-schema.org/draft/2020-12/schema",
-      title: "Ticket",
-      description: "Internal documentation that must not consume model context.",
-      type: "object",
-      properties: {
-        subject: {
-          title: "Subject",
-          description: "A concise ticket subject.",
-          type: "string",
-          minLength: 3,
-          default: "Review"
-        },
-        priority: {
-          description: "The selected urgency.",
-          type: "string",
-          enum: ["low", "high"]
-        }
-      },
-      required: ["subject", "priority"],
-      additionalProperties: false,
-      examples: [{ subject: "Review deployment", priority: "high" }]
-    }
-  }
-}
+const request = validateChatRequest({
+  model: "agent",
+  messages: [{ role: "user", content: "读取文件" }],
+  tools: [{ type: "function", function: { name: "read_file", parameters: { type: "object", properties: { path: { type: "string" } }, required: ["path"], additionalProperties: false } } }],
+  tool_choice: "required",
+  parallel_tool_calls: false
+})
 
-function catalogFrom(protocol: string): unknown[] {
-  const match = protocol.match(/BEGIN_TOOL_DEFINITIONS\n([\s\S]*?)\nEND_TOOL_DEFINITIONS/)
-  if (!match) throw new Error("tool catalog was not found")
-  return JSON.parse(match[1]) as unknown[]
-}
+assert.ok(request.toolPlan)
 
-test("projects tool documentation out of model context without relaxing validation", () => {
-  const request = validateChatRequest({
-    model: "kimi-k3",
-    messages: [{ role: "user", content: "Create a ticket." }],
-    tools: [documentedTool],
-    tool_choice: "required"
-  })
-  assert.ok(request.toolPlan)
+test("projects JSON tool definitions into the final user context", () => {
+  const context = buildJsonToolContext(request.toolPlan)
+  assert.match(context, /^<tool_context>/)
+  assert.match(context, /read_file/)
+  assert.match(context, /<~end~>/)
+})
 
-  const protocol = (request.portalPayload.messages as Array<Record<string, unknown>>)[0].content as string
-  assert.deepEqual(catalogFrom(protocol), [{
-    name: "create_ticket",
-    description: "Creates a ticket from a subject.",
-    parameters: {
-      type: "object",
-      properties: {
-        subject: { type: "string", minLength: 3 },
-        priority: { type: "string", enum: ["low", "high"] }
-      },
-      required: ["subject", "priority"],
-      additionalProperties: false
-    }
-  }])
-  assert.match(protocol, /PRIORITY: this executable tool-turn protocol overrides outer formatting/)
-  assert.doesNotMatch(protocol, /Internal documentation/)
-  assert.doesNotMatch(protocol, /A concise ticket subject/)
+test("parses and validates a single JSON call", () => {
+  const action = parseJsonToolAction("{\"name\":\"read_file\",\"arguments\":{\"path\":\"package.json\"}}", request.toolPlan)
+  assert.equal(action.toolCalls[0].function.name, "read_file")
+  assert.equal(action.toolCalls[0].function.arguments, "{\"path\":\"package.json\"}")
+})
 
-  assert.throws(() => parseToolAction(
-    "<tool_calls><tool_call><name><![CDATA[create_ticket]]></name><arguments><arg name=\"subject\"><![CDATA[ok]]></arg><arg name=\"priority\"><![CDATA[urgent]]></arg></arguments></tool_call></tool_calls>",
-    request.toolPlan!
-  ), (error: unknown) => error instanceof ToolActionError && error.failure.kind === "schema_validation")
+test("returns structured failures for malformed JSON and schema errors", () => {
+  assert.throws(() => parseJsonToolAction("{broken", request.toolPlan), (error: unknown) => error instanceof JsonToolActionError && error.failure.kind === "invalid_json")
+  assert.throws(() => parseJsonToolAction("{\"name\":\"read_file\",\"arguments\":{}}", request.toolPlan), (error: unknown) => error instanceof JsonToolActionError && error.failure.kind === "schema_validation")
 })
