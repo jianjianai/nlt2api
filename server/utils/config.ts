@@ -12,7 +12,6 @@ export interface ProxyConfig {
   maxResponseHistoryBytes: number;
   maxResponseStateBytes: number;
   maxUpstreamBytes: number;
-  storeKey: string;
   upstreamTimeoutMs: number;
 }
 
@@ -54,7 +53,6 @@ export function getProxyConfig(): ProxyConfig {
     maxUpstreamBytes: Number.isFinite(rawMaxUpstreamBytes) && rawMaxUpstreamBytes > 0
       ? Math.floor(rawMaxUpstreamBytes)
       : 16_777_216,
-    storeKey: process.env.NEURALWATT_STORE_KEY ?? "",
     upstreamTimeoutMs: Number.isFinite(rawUpstreamTimeoutMs) && rawUpstreamTimeoutMs > 0
       ? Math.floor(rawUpstreamTimeoutMs)
       : 120_000,

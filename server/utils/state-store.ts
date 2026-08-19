@@ -1,5 +1,5 @@
-import { createCipheriv, createDecipheriv, createHash, randomBytes, randomUUID } from "node:crypto";
-import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { randomBytes, randomUUID } from "node:crypto";
+import { mkdir, readFile, readdir, rename, unlink, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { getProxyConfig } from "~/server/utils/config.ts";
 import type {
@@ -13,9 +13,10 @@ import type {
   JsonValue,
 } from "~/server/utils/types.ts";
 
-const STORE_FILE = "accounts.enc";
-const ENCRYPTED_PREFIX = "nw1";
+const STORE_FILE = "accounts.json";
+const RECORDS_DIR = "records";
 const MAX_DEBUG_STRING_BYTES = 64 * 1024;
+const MAX_DEBUG_RECORDS = 500;
 
 export class ResponseStateLimitError extends Error {
   constructor() {
@@ -30,44 +31,7 @@ function emptyState(): PersistentState {
     settings: { recordMessages: false },
     accounts: [],
     responses: [],
-    debugRecords: [],
   };
-}
-
-function encryptionKey(): Buffer {
-  const secret = getProxyConfig().storeKey;
-  if (!secret) {
-    throw new Error("NEURALWATT_STORE_KEY is required before storing portal accounts.");
-  }
-
-  return createHash("sha256").update(secret).digest();
-}
-
-function encrypt(value: string): string {
-  const iv = randomBytes(12);
-  const cipher = createCipheriv("aes-256-gcm", encryptionKey(), iv);
-  const encrypted = Buffer.concat([cipher.update(value, "utf8"), cipher.final()]);
-  const tag = cipher.getAuthTag();
-  return [
-    ENCRYPTED_PREFIX,
-    iv.toString("base64url"),
-    tag.toString("base64url"),
-    encrypted.toString("base64url"),
-  ].join(".");
-}
-
-function decrypt(value: string): string {
-  const [prefix, ivValue, tagValue, encryptedValue] = value.split(".");
-  if (prefix !== ENCRYPTED_PREFIX || !ivValue || !tagValue || !encryptedValue) {
-    throw new Error("The encrypted account store has an invalid format.");
-  }
-
-  const decipher = createDecipheriv("aes-256-gcm", encryptionKey(), Buffer.from(ivValue, "base64url"));
-  decipher.setAuthTag(Buffer.from(tagValue, "base64url"));
-  return Buffer.concat([
-    decipher.update(Buffer.from(encryptedValue, "base64url")),
-    decipher.final(),
-  ]).toString("utf8");
 }
 
 function normaliseAccount(account: ManagedAccount): ManagedAccount {
@@ -138,12 +102,26 @@ function boundResponseStates(responses: ResponseState[]): ResponseState[] {
   return retained;
 }
 
+function compareAt(a: string, b: string): number {
+  if (a < b) return -1;
+  if (a > b) return 1;
+  return 0;
+}
+
 export class StateStore {
   private state: PersistentState | undefined;
   private mutationQueue: Promise<void> = Promise.resolve();
 
   private get storePath(): string {
     return join(getProxyConfig().dataDir, STORE_FILE);
+  }
+
+  private get recordsDir(): string {
+    return join(getProxyConfig().dataDir, RECORDS_DIR);
+  }
+
+  private recordPath(id: string): string {
+    return join(this.recordsDir, `${id}.json`);
   }
 
   async getState(): Promise<PersistentState> {
@@ -153,9 +131,9 @@ export class StateStore {
 
     try {
       const raw = await readFile(this.storePath, "utf8");
-      const parsed = JSON.parse(decrypt(raw)) as PersistentState;
+      const parsed = JSON.parse(raw) as PersistentState;
       if (parsed.version !== 1 || !Array.isArray(parsed.accounts)) {
-        throw new Error("The encrypted account store has an unsupported schema.");
+        throw new Error("The account store has an unsupported schema.");
       }
 
       this.state = {
@@ -163,7 +141,6 @@ export class StateStore {
         settings: { recordMessages: Boolean(parsed.settings?.recordMessages) },
         accounts: parsed.accounts.map(normaliseAccount),
         responses: boundResponseStates((parsed.responses ?? []).filter((response) => response.createdAt > Date.now() - 12 * 60 * 60 * 1_000)),
-        debugRecords: Array.isArray(parsed.debugRecords) ? parsed.debugRecords : [],
       };
     } catch (error) {
       const code = error instanceof Error && "code" in error ? (error as NodeJS.ErrnoException).code : undefined;
@@ -307,40 +284,80 @@ export class StateStore {
   }
 
   async appendDebugRecord(record: DebugRecord): Promise<void> {
-    await this.mutate((state) => {
-      if (!state.settings.recordMessages) {
-        return;
-      }
-      const maxBytes = getProxyConfig().maxRecordBytes;
-      const records = [...(state.debugRecords ?? []), boundDebugRecord(record, maxBytes)].slice(-500);
-      while (records.length > 1 && Buffer.byteLength(JSON.stringify(records), "utf8") > maxBytes) {
-        records.shift();
-      }
-      state.debugRecords = records;
-    });
+    if (!(await this.getSettings()).recordMessages) {
+      return;
+    }
+    const bounded = boundDebugRecord(record, getProxyConfig().maxRecordBytes);
+    const target = this.recordPath(record.id);
+    await mkdir(this.recordsDir, { recursive: true });
+    const temporary = `${target}.${process.pid}.${randomBytes(6).toString("hex")}.tmp`;
+    await writeFile(temporary, JSON.stringify(bounded), { encoding: "utf8", mode: 0o600 });
+    await rename(temporary, target);
+    await this.pruneDebugRecords();
   }
 
   async listDebugRecords(limit = 100): Promise<DebugRecord[]> {
-    return [...((await this.getState()).debugRecords ?? [])]
-      .slice(-Math.max(1, Math.min(limit, 500)))
-      .reverse();
+    const records = await this.readAllDebugRecords();
+    return records
+      .slice(-Math.max(1, Math.min(limit, MAX_DEBUG_RECORDS)))
+      .reverse()
+      .map((entry) => entry.record);
   }
 
   async deleteDebugRecordsForAccount(accountId: string): Promise<number> {
-    return this.mutate((state) => {
-      const before = state.debugRecords ?? [];
-      const after = before.filter((record) => record.accountId !== accountId);
-      state.debugRecords = after;
-      return before.length - after.length;
-    });
+    const records = await this.readAllDebugRecords();
+    const matches = records.filter((entry) => entry.record.accountId === accountId);
+    await Promise.all(matches.map((entry) => unlink(entry.file).catch(() => undefined)));
+    return matches.length;
   }
 
   async deleteAllDebugRecords(): Promise<number> {
-    return this.mutate((state) => {
-      const deleted = state.debugRecords?.length ?? 0;
-      state.debugRecords = [];
-      return deleted;
-    });
+    const files = await this.listRecordFiles();
+    await Promise.all(files.map((file) => unlink(file).catch(() => undefined)));
+    return files.length;
+  }
+
+  private async listRecordFiles(): Promise<string[]> {
+    try {
+      const entries = await readdir(this.recordsDir, { withFileTypes: true });
+      return entries
+        .filter((entry) => entry.isFile() && entry.name.endsWith(".json"))
+        .map((entry) => join(this.recordsDir, entry.name));
+    } catch (error) {
+      const code = error instanceof Error && "code" in error ? (error as NodeJS.ErrnoException).code : undefined;
+      if (code === "ENOENT") {
+        return [];
+      }
+      throw error;
+    }
+  }
+
+  private async readRecordFile(file: string): Promise<DebugRecord | undefined> {
+    try {
+      const parsed = JSON.parse(await readFile(file, "utf8")) as DebugRecord;
+      return typeof parsed.id === "string" && typeof parsed.at === "string" ? parsed : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  private async readAllDebugRecords(): Promise<Array<{ file: string; record: DebugRecord }>> {
+    const files = await this.listRecordFiles();
+    const records: Array<{ file: string; record: DebugRecord }> = [];
+    for (const file of files) {
+      const record = await this.readRecordFile(file);
+      if (record) {
+        records.push({ file, record });
+      }
+    }
+    records.sort((a, b) => compareAt(a.record.at, b.record.at));
+    return records;
+  }
+
+  private async pruneDebugRecords(): Promise<void> {
+    const records = await this.readAllDebugRecords();
+    const excess = records.slice(0, Math.max(0, records.length - MAX_DEBUG_RECORDS));
+    await Promise.all(excess.map((entry) => unlink(entry.file).catch(() => undefined)));
   }
 
   private async mutate<T>(operation: (state: PersistentState) => T): Promise<T> {
@@ -374,7 +391,7 @@ export class StateStore {
     const target = this.storePath;
     await mkdir(dirname(target), { recursive: true });
     const temporary = `${target}.${process.pid}.${randomBytes(6).toString("hex")}.tmp`;
-    await writeFile(temporary, encrypt(JSON.stringify(state)), { encoding: "utf8", mode: 0o600 });
+    await writeFile(temporary, JSON.stringify(state), { encoding: "utf8", mode: 0o600 });
     await rename(temporary, target);
   }
 }

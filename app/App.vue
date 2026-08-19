@@ -53,7 +53,6 @@ interface ApiPayload {
   config?: {
     adminTokenConfigured: boolean;
     clientApiKeyRequired: boolean;
-    storeKeyConfigured: boolean;
     defaultModel: string;
   };
   records?: DebugRecord[];
@@ -97,7 +96,6 @@ const settings = reactive({ recordMessages: false });
 const config = reactive({
   adminTokenConfigured: false,
   clientApiKeyRequired: false,
-  storeKeyConfigured: false,
   defaultModel: "",
 });
 const newAccount = reactive({ label: "", email: "", password: "", weight: 1 });
@@ -588,7 +586,6 @@ onMounted(() => {
       </section>
 
       <p v-if="errorMessage" class="banner banner-error" role="alert">{{ errorMessage }}</p>
-      <p v-if="!config.storeKeyConfigured" class="banner banner-warning">尚未配置 NEURALWATT_STORE_KEY。在启用加密存储前无法修改账号。</p>
 
       <section class="metric-grid" aria-label="网关状态">
         <article class="metric">

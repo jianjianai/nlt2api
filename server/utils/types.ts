@@ -92,7 +92,6 @@ export interface PersistentState {
   settings: ProxySettings;
   accounts: ManagedAccount[];
   responses?: ResponseState[];
-  debugRecords?: DebugRecord[];
 }
 
 export interface AccountRuntimeState {

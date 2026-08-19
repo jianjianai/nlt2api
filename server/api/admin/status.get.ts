@@ -19,7 +19,6 @@ export default defineHandler(async (event) => {
       config: {
         adminTokenConfigured: Boolean(config.adminToken),
         clientApiKeyRequired: Boolean(config.apiKey),
-        storeKeyConfigured: Boolean(config.storeKey),
         defaultModel: config.defaultModel,
       },
     });
