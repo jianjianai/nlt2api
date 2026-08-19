@@ -32,6 +32,12 @@ import {
   UpstreamStreamError,
 } from "../server/utils/upstream-stream.ts";
 import { redact } from "../server/utils/redaction.ts";
+import {
+  MAX_PORTAL_CHAT_ATTEMPTS,
+  portalRetryDelayMs,
+  retryablePortalError,
+  retryablePortalStatus,
+} from "../server/utils/upstream-retry.ts";
 
 const tools = [{
   type: "function" as const,
@@ -425,6 +431,21 @@ test("compiled JSON Schema caches stay bounded", () => {
   if (stats.ajvSchemas !== null) {
     assert.ok(stats.ajvSchemas <= stats.compiledSchemas + 32);
   }
+});
+
+test("portal retry policy retries transient failures without retrying rate limits", () => {
+  assert.equal(MAX_PORTAL_CHAT_ATTEMPTS, 3);
+  assert.equal(retryablePortalStatus(408), true);
+  assert.equal(retryablePortalStatus(425), true);
+  assert.equal(retryablePortalStatus(500), true);
+  assert.equal(retryablePortalStatus(429), false);
+  assert.equal(retryablePortalStatus(400), false);
+  assert.equal(retryablePortalError(new TypeError("fetch failed")), true);
+  assert.equal(retryablePortalError({ status: 504 }), true);
+  assert.equal(retryablePortalError({ status: 429 }), false);
+  assert.equal(portalRetryDelayMs(1), 100);
+  assert.equal(portalRetryDelayMs(2), 200);
+  assert.equal(portalRetryDelayMs(99), 2_000);
 });
 
 test("fragmented upstream SSE is assembled without losing deltas", async () => {

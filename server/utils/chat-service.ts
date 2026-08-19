@@ -403,7 +403,6 @@ async function getCompletion(
       ? createDebugCall(trace, account, body)
       : undefined;
     debugCall && trace!.calls.push(debugCall);
-    let sessionRetry = false;
     let streamedOutput = false;
     let receivedSse = false;
 
@@ -417,18 +416,22 @@ async function getCompletion(
         signal,
         trace
           ? (retry) => {
-            if (debugCall) {
-              debugCall.responseStatus = retry.status;
-              debugCall.response = responseDebugBody(retry.body, retry.contentType);
+            if (debugCall && trace) {
+              if (retry.status > 0) {
+                debugCall.responseStatus = retry.status;
+              }
+              if (retry.body) {
+                debugCall.response = responseDebugBody(retry.body, retry.contentType);
+              }
+              if (retry.error) {
+                debugCall.error = retry.error;
+              }
+              debugCall = createDebugCall(trace, account, body);
+              trace.calls.push(debugCall);
             }
-            sessionRetry = true;
           }
           : undefined,
       );
-      if (sessionRetry && trace) {
-        debugCall = createDebugCall(trace, account, body);
-        trace.calls.push(debugCall);
-      }
       const contentType = response.headers.get("content-type")?.toLowerCase() ?? "";
       debugCall && (debugCall.responseStatus = response.status);
       if (!response.ok) {

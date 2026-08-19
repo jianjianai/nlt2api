@@ -593,7 +593,7 @@ function callTitle(call: DebugUpstreamCall): string {
     : call.type === "continuation"
       ? `续写轮 ${call.round}`
       : "首次请求";
-  return call.attempt > 1 ? `${base} · 账号重试 ${call.attempt - 1}` : base;
+  return call.attempt > 1 ? `${base} · 上游重试 ${call.attempt - 1}` : base;
 }
 
 function recordTraces(record: DebugRecord): ConversationTrace[] {

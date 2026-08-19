@@ -1,5 +1,11 @@
 import { stateStore } from "~/server/utils/state-store.ts";
 import { getProxyConfig } from "~/server/utils/config.ts";
+import {
+  MAX_PORTAL_CHAT_ATTEMPTS,
+  portalRetryDelayMs,
+  retryablePortalError,
+  retryablePortalStatus,
+} from "~/server/utils/upstream-retry.ts";
 import type { ManagedAccount, PortalSession } from "~/server/utils/types.ts";
 
 const PORTAL_ORIGIN = "https://portal.neuralwatt.com";
@@ -294,10 +300,31 @@ async function responseMessage(response: Response): Promise<string> {
   return `Portal request failed with HTTP ${response.status}.`;
 }
 
-export interface PortalChatSessionRetry {
+export interface PortalChatRetry {
   status: number;
   contentType: string;
   body: string;
+  error?: string;
+}
+
+export type PortalChatSessionRetry = PortalChatRetry;
+
+async function waitForChatRetry(delayMs: number, signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted) {
+    throw clientAbortError();
+  }
+  await new Promise<void>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, delayMs);
+    const onAbort = () => {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
+      reject(clientAbortError());
+    };
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
 }
 
 export class PortalClient {
@@ -335,38 +362,73 @@ export class PortalClient {
     account: ManagedAccount,
     body: Record<string, unknown>,
     signal?: AbortSignal,
-    onSessionRetry?: (attempt: PortalChatSessionRetry) => void,
+    onRetry?: (attempt: PortalChatRetry) => void,
   ): Promise<Response> {
     let session = await this.ensureSession(account, signal);
-    if (signal?.aborted) {
-      throw clientAbortError();
-    }
-    let response = await this.sendChat(session, body, signal);
-    if (response.status !== 401 && response.status !== 403 && (response.status < 300 || response.status >= 400)) {
+    let sessionRetried = false;
+
+    for (let attempt = 1; attempt <= MAX_PORTAL_CHAT_ATTEMPTS; attempt += 1) {
+      let response: Response;
+      try {
+        if (signal?.aborted) {
+          throw clientAbortError();
+        }
+        response = await this.sendChat(session, body, signal);
+      } catch (error) {
+        if (signal?.aborted || error instanceof PortalError && error.status === 499) {
+          throw clientAbortError();
+        }
+        if (attempt >= MAX_PORTAL_CHAT_ATTEMPTS || !retryablePortalError(error)) {
+          throw error;
+        }
+        onRetry?.({
+          status: 0,
+          contentType: "",
+          body: "",
+          error: error instanceof Error ? error.message : "Unknown portal transport error.",
+        });
+        await waitForChatRetry(portalRetryDelayMs(attempt), signal);
+        continue;
+      }
+
+      if ((response.status === 401 || response.status === 403) && !sessionRetried) {
+        let responseBody = "";
+        try {
+          responseBody = await readPortalText(response);
+        } catch {
+          // The session refresh remains useful even when the expired-session
+          // response is malformed.
+        }
+        onRetry?.({
+          status: response.status,
+          contentType: response.headers.get("content-type")?.toLowerCase() ?? "",
+          body: responseBody,
+        });
+        session = await this.refreshSession(account, signal);
+        sessionRetried = true;
+        continue;
+      }
+
+      if (retryablePortalStatus(response.status) && attempt < MAX_PORTAL_CHAT_ATTEMPTS) {
+        let responseBody = "";
+        try {
+          responseBody = await readPortalText(response);
+        } catch {
+          // The next attempt should still proceed when the error body is invalid.
+        }
+        onRetry?.({
+          status: response.status,
+          contentType: response.headers.get("content-type")?.toLowerCase() ?? "",
+          body: responseBody,
+        });
+        await waitForChatRetry(portalRetryDelayMs(attempt), signal);
+        continue;
+      }
+
       return response;
     }
 
-    if (onSessionRetry) {
-      let responseBody = "";
-      try {
-        responseBody = await readPortalText(response);
-      } catch {
-        // The retry must remain available even when an expired-session page is malformed.
-      }
-      onSessionRetry({
-        status: response.status,
-        contentType: response.headers.get("content-type")?.toLowerCase() ?? "",
-        body: responseBody,
-      });
-    } else {
-      await discardPortalResponse(response);
-    }
-    session = await this.refreshSession(account, signal);
-    if (signal?.aborted) {
-      throw clientAbortError();
-    }
-    response = await this.sendChat(session, body, signal);
-    return response;
+    throw new PortalError("The NeuralWatt portal request exhausted its retry budget.", 502);
   }
 
   finishResponse(response: Response): void {
