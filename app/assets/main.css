@@ -136,6 +136,8 @@ input:focus { border-color: var(--teal); box-shadow: 0 0 0 3px rgba(20, 125, 120
 .message-item { min-width: 0; border: 1px solid var(--line); border-radius: 4px; padding: 11px 12px; background: #fff; }
 .message-sent { border-left: 3px solid var(--teal); background: #f8fcfb; }
 .message-received { border-left: 3px solid #4f7890; background: #fbfcfd; }
+.message-thinking { border-left: 3px solid #b0831f; background: #fffaf0; }
+.message-thinking .message-heading strong { color: #8a6417; }
 .message-heading { display: flex; align-items: baseline; gap: 7px; margin-bottom: 5px; }
 .message-heading strong { color: var(--navy); font-size: 12px; }
 .message-content { margin: 0; color: #354550; font-size: 12px; line-height: 1.6; white-space: pre-wrap; overflow-wrap: anywhere; }

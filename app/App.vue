@@ -486,6 +486,260 @@ function displayMessage(value: unknown): DisplayMessage | null {
   };
 }
 
+/** Extract thinking/reasoning text from a single message object. */
+function messageReasoningText(message: JsonRecord): string {
+  const reasoning = message.reasoning;
+  if (typeof reasoning === "string") return reasoning;
+  const reasoningContent = message.reasoning_content;
+  if (typeof reasoningContent === "string") return reasoningContent;
+  const summary = message.summary;
+  if (typeof summary === "string") return summary;
+  if (Array.isArray(summary)) {
+    return summary.map((entry) => {
+      const part = asObject(entry);
+      if (!part) return displayValue(entry);
+      if (typeof part.text === "string") return part.text;
+      return displayValue(part);
+    }).filter(Boolean).join("");
+  }
+  return "";
+}
+
+/**
+ * Render one message, splitting assistant reasoning into its own 思考 box so
+ * thinking and the final reply are always separate boxes.
+ */
+function splitMessage(value: unknown): DisplayMessage[] {
+  const rendered = displayMessage(value);
+  if (!rendered) return [];
+  const message = asObject(value);
+  if (!message || rendered.role !== "assistant") return [rendered];
+  const reasoning = messageReasoningText(message);
+  const body = contentText(message.output ?? message.content ?? message.text ?? message.refusal ?? message.arguments);
+  const calls = rendered.toolCalls;
+  if (reasoning && body) {
+    return [
+      { ...rendered, roleLabel: "思考", content: reasoning, toolCalls: [] },
+      { ...rendered, roleLabel: "最终回复", content: body, toolCalls: calls },
+    ];
+  }
+  if (reasoning) {
+    return [
+      { ...rendered, roleLabel: "思考", content: reasoning, toolCalls: [] },
+      ...(calls.length ? [{ ...rendered, roleLabel: "工具调用", content: "", toolCalls: calls }] : []),
+    ];
+  }
+  return [rendered];
+}
+
+/** True when a parsed SSE datum belongs to a stream (chat chunks or Responses events). */
+function isStreamingChunk(value: unknown): boolean {
+  const source = asObject(value);
+  if (!source) return false;
+  if (source.object === "chat.completion.chunk") return true;
+  const type = String(source.type ?? "");
+  if (type.startsWith("response.") || type === "error") return true;
+  const choice = asObject(Array.isArray(source.choices) ? source.choices[0] : undefined);
+  return choice?.delta !== undefined;
+}
+
+/** Strip internal adapter markers so debug output shows clean content. */
+function cleanMarkers(value: string): string {
+  return value.split("@@REPAIR_REASONING@@").join(" ").split("@@FINAL_REPLY@@").join("").replace(/\s+/g, " ").trim();
+}
+
+function buildAggregatedMessages(options: {
+  reasoning: string;
+  content: string;
+  toolCalls: DisplayToolCall[];
+  errors?: string[];
+}): DisplayMessage[] {
+  const messages: DisplayMessage[] = [];
+  const reasoning = options.reasoning.trim();
+  if (reasoning) {
+    messages.push({ role: "assistant", roleLabel: "思考", content: reasoning, toolCalls: [] });
+  }
+  const content = options.content.trim();
+  if (content) {
+    messages.push({ role: "assistant", roleLabel: "最终回复", content, toolCalls: options.toolCalls });
+  } else if (options.toolCalls.length > 0) {
+    messages.push({ role: "assistant", roleLabel: "工具调用", content: "", toolCalls: options.toolCalls });
+  }
+  for (const error of options.errors ?? []) {
+    messages.push({ role: "error", roleLabel: "错误", content: error, toolCalls: [] });
+  }
+  return messages;
+}
+
+/** Merge chat.completion.chunk deltas into 思考 / 最终回复 / 工具调用 boxes. */
+function aggregateChatCompletionChunks(chunks: unknown[]): DisplayMessage[] {
+  let content = "";
+  let reasoning = "";
+  let reasoningContent = "";
+  let refusal = "";
+  const toolCalls = new Map<number, DisplayToolCall>();
+  for (const raw of chunks) {
+    const source = asObject(raw);
+    const choice = asObject(Array.isArray(source?.choices) ? source.choices[0] : undefined);
+    const delta = asObject(choice?.delta);
+    if (!delta) continue;
+    if (typeof delta.content === "string") content += delta.content;
+    if (typeof delta.reasoning === "string") reasoning += delta.reasoning;
+    if (typeof delta.reasoning_content === "string") reasoningContent += delta.reasoning_content;
+    if (typeof delta.refusal === "string") refusal += delta.refusal;
+    if (Array.isArray(delta.tool_calls)) {
+      for (const partialValue of delta.tool_calls) {
+        const partial = asObject(partialValue) ?? {};
+        const index = typeof partial.index === "number" ? partial.index : toolCalls.size;
+        const fn = asObject(partial.function) ?? {};
+        const known = toolCalls.get(index);
+        if (!known) {
+          toolCalls.set(index, {
+            id: typeof partial.id === "string" ? partial.id : `tool_${index + 1}`,
+            name: typeof fn.name === "string" ? fn.name : "未命名工具",
+            arguments: typeof fn.arguments === "string" ? fn.arguments : "",
+          });
+        } else {
+          if (typeof partial.id === "string") known.id = partial.id;
+          if (typeof fn.name === "string") known.name = fn.name;
+          if (typeof fn.arguments === "string") known.arguments += fn.arguments;
+        }
+      }
+    }
+  }
+  return buildAggregatedMessages({
+    reasoning: cleanMarkers(reasoning || reasoningContent),
+    content: cleanMarkers(content || refusal),
+    toolCalls: [...toolCalls.values()],
+  });
+}
+
+/** Merge Responses API stream events into 思考 / 最终回复 / 工具调用 boxes. */
+function aggregateResponseEvents(chunks: unknown[]): DisplayMessage[] {
+  const reasoningByItem = new Map<string, string>();
+  const textByItem = new Map<string, string>();
+  const toolByItem = new Map<string, DisplayToolCall>();
+  const errors: string[] = [];
+  for (const raw of chunks) {
+    const source = asObject(raw);
+    if (!source) continue;
+    const type = String(source.type ?? "");
+    const itemId = typeof source.item_id === "string" ? source.item_id : "";
+    if (type === "response.reasoning_text.delta" || type === "response.reasoning_summary_text.delta") {
+      const delta = typeof source.delta === "string" ? source.delta : "";
+      if (delta) {
+        const key = itemId || "__fallback";
+        reasoningByItem.set(key, `${reasoningByItem.get(key) ?? ""}${delta}`);
+      }
+    } else if (type === "response.reasoning_text.done" || type === "response.reasoning_summary_text.done") {
+      const text = typeof source.text === "string" ? source.text : "";
+      if (text) reasoningByItem.set(itemId || "__fallback", text);
+    } else if (type === "response.output_text.delta" || type === "response.refusal.delta") {
+      const delta = typeof source.delta === "string" ? source.delta : "";
+      if (delta) {
+        const key = itemId || "__fallback";
+        textByItem.set(key, `${textByItem.get(key) ?? ""}${delta}`);
+      }
+    } else if (type === "response.output_text.done" || type === "response.refusal.done") {
+      const text = typeof source.text === "string" ? source.text : typeof source.refusal === "string" ? source.refusal : "";
+      if (text) textByItem.set(itemId || "__fallback", text);
+    } else if (type === "response.function_call_arguments.delta") {
+      const delta = typeof source.delta === "string" ? source.delta : "";
+      const key = itemId || "__fallback";
+      const known = toolByItem.get(key) ?? { id: itemId || "tool_call", name: "未命名工具", arguments: "" };
+      known.arguments += delta;
+      toolByItem.set(key, known);
+    } else if (type === "response.function_call_arguments.done") {
+      const key = itemId || "__fallback";
+      const name = typeof source.name === "string" ? source.name : "";
+      const argumentsText = typeof source.arguments === "string" ? source.arguments : "";
+      const known = toolByItem.get(key) ?? { id: itemId || "tool_call", name, arguments: argumentsText };
+      if (name) known.name = name;
+      if (argumentsText) known.arguments = argumentsText;
+      toolByItem.set(key, known);
+    } else if (type === "response.output_item.added" || type === "response.output_item.done") {
+      const item = asObject(source.item);
+      if (!item) continue;
+      const itemType = String(item.type ?? "");
+      const resolvedId = typeof item.id === "string" ? item.id : itemId;
+      if (itemType === "reasoning") {
+        const summary = Array.isArray(item.summary)
+          ? item.summary.map((entry) => {
+              const part = asObject(entry);
+              return part && typeof part.text === "string" ? part.text : displayValue(entry);
+            }).filter(Boolean).join("")
+          : typeof item.summary === "string"
+            ? item.summary
+            : "";
+        if (summary) reasoningByItem.set(resolvedId || "__fallback", summary);
+      } else if (itemType === "function_call") {
+        const fn = asObject(item.function) ?? {};
+        const key = resolvedId || "__fallback";
+        const known = toolByItem.get(key) ?? {
+          id: resolvedId || "tool_call",
+          name: typeof fn.name === "string" ? fn.name : "未命名工具",
+          arguments: "",
+        };
+        if (typeof fn.name === "string" && fn.name) known.name = fn.name;
+        if (typeof fn.arguments === "string" && fn.arguments) known.arguments = fn.arguments;
+        toolByItem.set(key, known);
+      } else if (itemType === "message") {
+        const text = contentText(item.content ?? "");
+        if (text) textByItem.set(resolvedId || "__fallback", text);
+      }
+    } else if (type === "response.completed" || type === "response.incomplete" || type === "response.failed") {
+      const response = asObject(source.response);
+      if (response && reasoningByItem.size === 0 && textByItem.size === 0 && toolByItem.size === 0) {
+        // Terminal events may carry complete output when delta events are missing.
+        for (const item of Array.isArray(response.output) ? response.output : []) {
+          const itemObject = asObject(item);
+          if (!itemObject) continue;
+          const itemType = String(itemObject.type ?? "");
+          const resolvedId = typeof itemObject.id === "string" ? itemObject.id : "";
+          if (itemType === "reasoning") {
+            reasoningByItem.set(resolvedId || "__fallback", contentText(itemObject.summary ?? ""));
+          } else if (itemType === "function_call") {
+            const fn = asObject(itemObject.function) ?? {};
+            toolByItem.set(resolvedId || "tool_call", {
+              id: resolvedId || "tool_call",
+              name: typeof fn.name === "string" ? fn.name : "未命名工具",
+              arguments: contentText(itemObject.arguments ?? fn.arguments ?? ""),
+            });
+          } else if (itemType === "message") {
+            textByItem.set(resolvedId || "__fallback", contentText(itemObject.content ?? ""));
+          }
+        }
+      }
+    } else if (type === "error") {
+      const messageText = typeof source.message === "string" ? source.message : "";
+      if (messageText) errors.push(messageText);
+    }
+  }
+  return buildAggregatedMessages({
+    reasoning: cleanMarkers([...reasoningByItem.values()].join("\n")),
+    content: cleanMarkers([...textByItem.values()].join("\n")),
+    toolCalls: [...toolByItem.values()],
+    errors,
+  });
+}
+
+function aggregateStreamingMessages(values: unknown[]): DisplayMessage[] {
+  const chunks = values.filter(isStreamingChunk);
+  if (chunks.length === 0) return [];
+  const chatChunks = chunks.some((value) => asObject(value)?.object === "chat.completion.chunk");
+  return chatChunks ? aggregateChatCompletionChunks(chunks) : aggregateResponseEvents(chunks);
+}
+
+/** Collect messages from a body, concatenating streaming chunks into one box per kind. */
+function collectBodyMessages(value: DebugRawBody | JsonRecord | undefined): DisplayMessage[] {
+  const values = parsedBodyValues(value);
+  if (values.some(isStreamingChunk)) {
+    const aggregated = aggregateStreamingMessages(values);
+    if (aggregated.length > 0) return aggregated;
+  }
+  return values.flatMap(collectMessages);
+}
+
 function collectMessages(value: unknown): DisplayMessage[] {
   const source = asObject(value);
   const candidates: unknown[] = [];
@@ -502,7 +756,7 @@ function collectMessages(value: unknown): DisplayMessage[] {
   if (source?.role || ["message", "function_call", "function_call_output", "reasoning", "input_text", "output_text"].includes(String(source?.type))) {
     candidates.push(source);
   }
-  return candidates.map(displayMessage).filter((message): message is DisplayMessage => Boolean(message));
+  return candidates.flatMap(splitMessage);
 }
 
 const fieldNames: Record<string, string> = {
@@ -647,16 +901,29 @@ function selectTrace(trace: ConversationTrace): void {
 
 function presentBody(value: DebugRawBody | JsonRecord | undefined): BodyPresentation {
   const values = parsedBodyValues(value);
-  const messages = values.flatMap(collectMessages);
+  const streaming = values.some(isStreamingChunk);
+  const messages = collectBodyMessages(value);
   const raw = rawBodyText(value);
+  const fields = values.flatMap(recordFields);
   return {
     contentType: bodyContentType(value),
     raw,
-    fields: values.flatMap(recordFields),
+    fields: streaming ? dedupeFields(fields) : fields,
     messages: messages.length > 0 || !raw
       ? messages
       : [{ role: "raw", roleLabel: "原始文本", content: raw, toolCalls: [] }],
   };
+}
+
+function dedupeFields(fields: DisplayField[]): DisplayField[] {
+  const seen = new Set<string>();
+  const result: DisplayField[] = [];
+  for (const field of fields) {
+    if (seen.has(field.label)) continue;
+    seen.add(field.label);
+    result.push(field);
+  }
+  return result;
 }
 
 function traceRequest(trace: ConversationTrace): BodyPresentation {
