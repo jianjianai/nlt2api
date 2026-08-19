@@ -328,7 +328,7 @@ async function getCompletion(
   allowEmptyContent = false,
   onFrame?: UpstreamFrameHandler,
   signal?: AbortSignal,
-): Promise<{ account: ManagedAccount; completion: UpstreamCompletion }> {
+): Promise<{ account: ManagedAccount; completion: UpstreamCompletion; receivedSse: boolean }> {
   const excluded = new Set<string>();
   let lastError: PortalError | undefined;
   let lastContext: RequestDebugContext = { upstreamRequest: body };
@@ -363,6 +363,7 @@ async function getCompletion(
       upstreamRequest: body,
     };
     let streamedOutput = false;
+    let receivedSse = false;
 
     try {
       if (signal?.aborted) {
@@ -379,6 +380,7 @@ async function getCompletion(
       let completion: UpstreamCompletion;
       const contentType = response.headers.get("content-type")?.toLowerCase() ?? "";
       if (body.stream === true && contentType.includes("text/event-stream")) {
+        receivedSse = true;
         let collected;
         try {
           collected = await collectUpstreamStream(response, async (frame) => {
@@ -424,7 +426,7 @@ async function getCompletion(
         throw new PortalError("The NeuralWatt portal returned an invalid completion shape.", 502);
       }
       accountScheduler.markSuccess(account.id);
-      return { account, completion };
+      return { account, completion, receivedSse };
     } catch (error) {
       if (signal?.aborted || error instanceof ClientDisconnectedError) {
         throw new ClientDisconnectedError();
@@ -716,6 +718,18 @@ async function executeChatRequestOnce(
     // it remains the final instruction in every attempt.
     const originalUpstreamMessages = portalMessages(messages, true);
     const firstReasoning = initialReasoning(result.completion);
+    // The portal occasionally returns a JSON completion even after accepting
+    // a streaming request. Forward the original reasoning before a repair so
+    // clients retain the same progressive feedback as the SSE path.
+    if (
+      !result.receivedSse
+      && options?.onUpstreamFrame
+      && (firstReasoning.reasoning || firstReasoning.reasoning_content)
+    ) {
+      await options.onUpstreamFrame({
+        choices: [{ delta: { role: "assistant", ...firstReasoning } }],
+      });
+    }
     let repairCandidate = rawAssistantCandidate(result.completion);
     let repairReasoning: ReasoningFields | undefined;
     let repairReasoningOpen = false;
@@ -809,7 +823,10 @@ async function executeChatRequestOnce(
           toolCallAdapter,
         });
       }
-      if (!repairStream) {
+      // A stream-requesting portal may still fall back to a JSON completion.
+      // Its repair reasoning was not delivered through the frame callback, so
+      // forward/tag it here just as a non-streaming repair does.
+      if (!result.receivedSse) {
         const nextRepairReasoning = initialReasoning(result.completion);
         if (nextRepairReasoning.reasoning || nextRepairReasoning.reasoning_content) {
           await collectRepairReasoning(nextRepairReasoning);
@@ -1097,7 +1114,11 @@ export interface ChatStreamState {
   toolContentMode: "unknown" | "final" | "tool";
   toolContentBuffer: string;
   roleSent: boolean;
-  sawOutput: boolean;
+  contentSent: boolean;
+  reasoningSent: boolean;
+  reasoningContentSent: boolean;
+  refusalSent: boolean;
+  toolCallsSent: boolean;
   finishSeen: boolean;
   usageSeen: boolean;
 }
@@ -1113,7 +1134,11 @@ export function createChatStreamState(request: JsonObject): ChatStreamState {
     toolContentMode: toolTurn ? "unknown" : "final",
     toolContentBuffer: "",
     roleSent: false,
-    sawOutput: false,
+    contentSent: false,
+    reasoningSent: false,
+    reasoningContentSent: false,
+    refusalSent: false,
+    toolCallsSent: false,
     finishSeen: false,
     usageSeen: false,
   };
@@ -1153,7 +1178,7 @@ export function chatChunksFromUpstreamFrame(
   if (typeof delta?.content === "string" && delta.content.length > 0) {
     if (!state.toolTurn) {
       outputDelta.content = delta.content;
-      state.sawOutput = true;
+      state.contentSent = true;
     } else if (state.toolContentMode !== "tool") {
       state.toolContentBuffer += delta.content;
       if (state.toolContentMode === "unknown") {
@@ -1171,27 +1196,31 @@ export function chatChunksFromUpstreamFrame(
       if (state.toolContentMode === "final" && state.toolContentBuffer.length > 0) {
         outputDelta.content = state.toolContentBuffer;
         state.toolContentBuffer = "";
-        state.sawOutput = true;
+        state.contentSent = true;
       }
     }
   }
   if (typeof delta?.reasoning === "string" && delta.reasoning.length > 0) {
     outputDelta.reasoning = delta.reasoning;
-    state.sawOutput = true;
+    state.reasoningSent = true;
   }
   if (typeof delta?.reasoning_content === "string" && delta.reasoning_content.length > 0) {
     outputDelta.reasoning_content = delta.reasoning_content;
-    state.sawOutput = true;
+    state.reasoningContentSent = true;
   }
   if (typeof delta?.refusal === "string" && delta.refusal.length > 0) {
     outputDelta.refusal = delta.refusal;
-    state.sawOutput = true;
+    state.refusalSent = true;
   }
   const finishReason = choice?.finish_reason;
-  if (finishReason !== undefined && finishReason !== null) {
+  // A tool turn cannot expose the portal terminal frame: the controlled JSON
+  // still needs parsing and may trigger one or more repair attempts. Emit the
+  // validated OpenAI terminal state from finishChatStream instead.
+  const deferFinish = state.toolTurn && finishReason !== undefined && finishReason !== null;
+  if (!deferFinish && finishReason !== undefined && finishReason !== null) {
     state.finishSeen = true;
   }
-  if (Object.keys(outputDelta).length > 0 || (finishReason !== undefined && finishReason !== null)) {
+  if (Object.keys(outputDelta).length > 0 || (!deferFinish && finishReason !== undefined && finishReason !== null)) {
     chunks.push({
       ...chatStreamBase(state),
       choices: [{ index: choice?.index ?? 0, delta: outputDelta, finish_reason: finishReason ?? null }],
@@ -1216,31 +1245,33 @@ function appendFallbackChatDelta(
     state.roleSent = true;
   }
   const hasToolCalls = Boolean(execution.message.tool_calls?.length);
-  if (hasToolCalls || !state.sawOutput) {
-    if (state.toolTurn && state.toolContentMode === "unknown") {
-      state.toolContentMode = "tool";
-      state.toolContentBuffer = "";
-    }
-    if (!hasToolCalls && typeof execution.message.reasoning === "string" && execution.message.reasoning) {
-      delta.reasoning = execution.message.reasoning;
-    }
-    if (!hasToolCalls && typeof execution.message.reasoning_content === "string" && execution.message.reasoning_content) {
-      delta.reasoning_content = execution.message.reasoning_content;
-    }
-    if (!hasToolCalls && typeof execution.message.refusal === "string" && execution.message.refusal) {
-      delta.refusal = execution.message.refusal;
-    }
-    if (hasToolCalls) {
-      delta.tool_calls = execution.message.tool_calls!.map((call, index) => ({
-        index,
-        id: call.id,
-        type: "function",
-        function: call.function,
-      })) as unknown as JsonValue;
-    } else if (typeof execution.message.content === "string" && execution.message.content) {
-      delta.content = execution.message.content;
-    }
-    if (Object.keys(delta).length > 0) state.sawOutput = true;
+  if (state.toolTurn && state.toolContentMode === "unknown") {
+    state.toolContentMode = "tool";
+    state.toolContentBuffer = "";
+  }
+  if (!state.reasoningSent && typeof execution.message.reasoning === "string" && execution.message.reasoning) {
+    delta.reasoning = execution.message.reasoning;
+    state.reasoningSent = true;
+  }
+  if (!state.reasoningContentSent && typeof execution.message.reasoning_content === "string" && execution.message.reasoning_content) {
+    delta.reasoning_content = execution.message.reasoning_content;
+    state.reasoningContentSent = true;
+  }
+  if (!state.refusalSent && typeof execution.message.refusal === "string" && execution.message.refusal) {
+    delta.refusal = execution.message.refusal;
+    state.refusalSent = true;
+  }
+  if (hasToolCalls && !state.toolCallsSent) {
+    delta.tool_calls = execution.message.tool_calls!.map((call, index) => ({
+      index,
+      id: call.id,
+      type: "function",
+      function: call.function,
+    })) as unknown as JsonValue;
+    state.toolCallsSent = true;
+  } else if (!hasToolCalls && !state.contentSent && typeof execution.message.content === "string" && execution.message.content) {
+    delta.content = execution.message.content;
+    state.contentSent = true;
   }
   if (Object.keys(delta).length > 0) {
     chunks.push({ ...chatStreamBase(state), choices: [{ index: 0, delta, finish_reason: null }] });
