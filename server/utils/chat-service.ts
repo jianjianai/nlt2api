@@ -163,9 +163,11 @@ function validateTokenLimit(request: JsonObject): number | undefined {
   if (raw === undefined || raw === null) {
     return undefined;
   }
-  const maxOutputTokens = getProxyConfig().maxOutputTokens;
-  if (typeof raw !== "number" || !Number.isInteger(raw) || raw < 1 || raw > maxOutputTokens) {
-    throw new HttpError(400, `\`max_tokens\` must be an integer between 1 and ${maxOutputTokens}.`, "invalid_request_error", "max_tokens");
+  // Accept any positive integer budget. The upstream portal has its own
+  // per-model output cap, which is clamped below in upstreamBody instead of
+  // rejecting the client request here.
+  if (typeof raw !== "number" || !Number.isInteger(raw) || raw < 1) {
+    throw new HttpError(400, "`max_tokens` must be a positive integer.", "invalid_request_error", "max_tokens");
   }
   return raw;
 }
