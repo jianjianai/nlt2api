@@ -6,7 +6,6 @@ export interface ProxyConfig {
   allowAnonymous: boolean;
   dataDir: string;
   defaultModel: string;
-  maxRecordBytes: number;
   maxRequestBytes: number;
   maxOutputTokens: number;
   maxResponseHistoryBytes: number;
@@ -22,7 +21,6 @@ export function getProxyConfig(): ProxyConfig {
     return cachedConfig;
   }
 
-  const rawMaxRecordBytes = Number(process.env.NEURALWATT_MAX_RECORD_BYTES ?? "5242880");
   const rawMaxRequestBytes = Number(process.env.NEURALWATT_MAX_REQUEST_BYTES ?? "8388608");
   const rawMaxOutputTokens = Number(process.env.NEURALWATT_MAX_OUTPUT_TOKENS ?? "128000");
   const rawMaxResponseHistoryBytes = Number(process.env.NEURALWATT_MAX_RESPONSE_HISTORY_BYTES ?? "2097152");
@@ -35,9 +33,6 @@ export function getProxyConfig(): ProxyConfig {
     allowAnonymous: process.env.NEURALWATT_ALLOW_ANONYMOUS === "true",
     dataDir: resolve(process.env.NEURALWATT_DATA_DIR ?? ".data/neuralwatt"),
     defaultModel: process.env.NEURALWATT_DEFAULT_MODEL ?? "kimi-k3-fast",
-    maxRecordBytes: Number.isFinite(rawMaxRecordBytes) && rawMaxRecordBytes > 0
-      ? Math.floor(rawMaxRecordBytes)
-      : 5_242_880,
     maxRequestBytes: Number.isFinite(rawMaxRequestBytes) && rawMaxRequestBytes > 0
       ? Math.floor(rawMaxRequestBytes)
       : 8_388_608,

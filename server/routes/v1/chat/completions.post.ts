@@ -14,13 +14,26 @@ import {
   HttpError,
   jsonResponse,
   openAIErrorResponse,
-  readJsonObject,
+  readJsonObjectWithRaw,
   requireClientAuth,
 } from "~/server/utils/http.ts";
-import { openAIStreamingSse } from "~/server/utils/upstream-stream.ts";
-import { asJsonObject, recordDebug, upstreamHttpError } from "~/server/utils/route-helpers.ts";
+import { openAIStreamingSse, type SseEntry } from "~/server/utils/upstream-stream.ts";
+import { recordDebug, upstreamHttpError } from "~/server/utils/route-helpers.ts";
 import { requestDebugContext } from "~/server/utils/request-errors.ts";
-import type { JsonObject } from "~/server/utils/types.ts";
+import type { DebugRawBody, JsonObject } from "~/server/utils/types.ts";
+
+function jsonDebugBody(body: string): DebugRawBody {
+  return { contentType: "application/json", body };
+}
+
+function jsonDebugValue(value: JsonObject): DebugRawBody {
+  return jsonDebugBody(JSON.stringify(value));
+}
+
+function sseDebugBody(entries: SseEntry[]): DebugRawBody {
+  const body = entries.map((entry) => `${entry.event ? `event: ${entry.event}\n` : ""}data: ${JSON.stringify(entry.data)}\n\n`).join("");
+  return { contentType: "text/event-stream", body: `${body}data: [DONE]\n\n` };
+}
 
 function streamErrorData(error: unknown): JsonObject {
   const mapped = upstreamHttpError(error);
@@ -36,9 +49,12 @@ function streamErrorData(error: unknown): JsonObject {
 
 export default defineHandler(async (event) => {
   let body: JsonObject | undefined;
+  let clientRequest: DebugRawBody | undefined;
   try {
     requireClientAuth(event.req);
-    body = await readJsonObject(event.req);
+    const parsedRequest = await readJsonObjectWithRaw(event.req);
+    body = parsedRequest.body;
+    clientRequest = jsonDebugBody(parsedRequest.raw);
     const streamOptions = body.stream_options && typeof body.stream_options === "object" && !Array.isArray(body.stream_options)
       ? body.stream_options as JsonObject
       : undefined;
@@ -56,10 +72,15 @@ export default defineHandler(async (event) => {
       const includeUsage = streamOptions?.include_usage === true;
       const state = createChatStreamState(requestBody);
       return openAIStreamingSse(async (emit, signal) => {
+        const clientEvents: SseEntry[] = [];
+        const trackedEmit = async (entry: SseEntry): Promise<void> => {
+          clientEvents.push(entry);
+          await emit(entry);
+        };
         try {
           // Match the normal OpenAI lifecycle: the client can render an
           // assistant turn immediately, before the portal's first token.
-          await emit({ data: startChatStream(state) });
+          await trackedEmit({ data: startChatStream(state) });
           const execution = await executeChatRequest(requestBody, {
             stickyKey: stickyKeyFrom(event.req, requestBody),
             stream: true,
@@ -67,7 +88,7 @@ export default defineHandler(async (event) => {
             onUpstreamFrame: async (frame) => {
               const chunks = chatChunksFromUpstreamFrame(frame, state, includeUsage);
               for (const chunk of chunks) {
-                await emit({ data: chunk });
+                await trackedEmit({ data: chunk });
               }
               return chunks.length > 0;
             },
@@ -76,7 +97,7 @@ export default defineHandler(async (event) => {
                 choices: [{ delta: { role: "assistant", ...reasoning } }],
               }, state, false);
               for (const chunk of chunks) {
-                await emit({ data: chunk });
+                await trackedEmit({ data: chunk });
               }
             },
           });
@@ -86,7 +107,7 @@ export default defineHandler(async (event) => {
           // fills only data that was not already forwarded, avoiding duplicate
           // role/content deltas in both cases.
           for (const chunk of finishChatStream(execution, state, includeUsage)) {
-            await emit({ data: chunk });
+            await trackedEmit({ data: chunk });
           }
 
           const completion = asChatCompletion(execution);
@@ -94,10 +115,9 @@ export default defineHandler(async (event) => {
             endpoint: "/v1/chat/completions",
             accountId: execution.account.id,
             accountLabel: execution.account.label,
-            clientRequest: requestBody,
-            upstreamRequest: execution.upstreamRequest,
-            upstreamResponse: asJsonObject(execution.completion),
-            clientResponse: completion,
+            clientRequest: clientRequest!,
+            clientResponse: sseDebugBody(clientEvents),
+            upstreamCalls: execution.upstreamCalls,
             ...(execution.toolCallAdapter ? { toolCallAdapter: execution.toolCallAdapter } : {}),
             status: 200,
           });
@@ -109,8 +129,12 @@ export default defineHandler(async (event) => {
           const context = requestDebugContext(error);
           await recordDebug({
             endpoint: "/v1/chat/completions",
-            clientRequest: requestBody,
-            ...context,
+            accountId: context.accountId,
+            accountLabel: context.accountLabel,
+            clientRequest: clientRequest!,
+            clientResponse: sseDebugBody([...clientEvents, { data: streamErrorData(error) }]),
+            ...(context.upstreamCalls ? { upstreamCalls: context.upstreamCalls } : {}),
+            ...(context.toolCallAdapter ? { toolCallAdapter: context.toolCallAdapter } : {}),
             status: mapped.status,
             error: mapped.message,
           });
@@ -129,10 +153,9 @@ export default defineHandler(async (event) => {
       endpoint: "/v1/chat/completions",
       accountId: execution.account.id,
       accountLabel: execution.account.label,
-      clientRequest: body,
-      upstreamRequest: execution.upstreamRequest,
-      upstreamResponse: asJsonObject(execution.completion),
-      clientResponse: completion,
+      clientRequest: clientRequest!,
+      clientResponse: jsonDebugValue(completion),
+      upstreamCalls: execution.upstreamCalls,
       ...(execution.toolCallAdapter ? { toolCallAdapter: execution.toolCallAdapter } : {}),
       status: 200,
     });
@@ -140,12 +163,16 @@ export default defineHandler(async (event) => {
     return jsonResponse(completion);
   } catch (error) {
     const mapped = upstreamHttpError(error);
-    if (body) {
+    if (body && clientRequest) {
       const context = requestDebugContext(error);
       await recordDebug({
         endpoint: "/v1/chat/completions",
-        clientRequest: body,
-        ...context,
+        accountId: context.accountId,
+        accountLabel: context.accountLabel,
+        clientRequest,
+        clientResponse: jsonDebugValue(streamErrorData(error)),
+        ...(context.upstreamCalls ? { upstreamCalls: context.upstreamCalls } : {}),
+        ...(context.toolCallAdapter ? { toolCallAdapter: context.toolCallAdapter } : {}),
         status: mapped.status,
         error: mapped.message,
       });

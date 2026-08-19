@@ -127,16 +127,35 @@ export interface ToolCallAdapterTrace {
   errors: string[];
 }
 
+export interface DebugRawBody {
+  contentType: "application/json" | "text/event-stream" | "text/plain";
+  body: string;
+}
+
+export type DebugUpstreamCallType = "initial" | "repair" | "continuation";
+
+export interface DebugUpstreamCall {
+  sequence: number;
+  type: DebugUpstreamCallType;
+  round: number;
+  attempt: number;
+  accountId?: string;
+  accountLabel?: string;
+  request: DebugRawBody;
+  response?: DebugRawBody;
+  responseStatus?: number;
+  error?: string;
+}
+
 export interface DebugRecord {
   id: string;
   at: string;
   endpoint: "/v1/chat/completions" | "/v1/responses";
   accountId?: string;
   accountLabel?: string;
-  clientRequest: JsonObject;
-  upstreamRequest?: JsonObject;
-  clientResponse?: JsonObject;
-  upstreamResponse?: JsonObject;
+  clientRequest: DebugRawBody;
+  clientResponse?: DebugRawBody;
+  upstreamCalls?: DebugUpstreamCall[];
   toolCallAdapter?: ToolCallAdapterTrace;
   status: number;
   error?: string;

@@ -1,10 +1,11 @@
-import type { JsonObject, ToolCallAdapterTrace } from "~/server/utils/types.ts";
+import type { DebugUpstreamCall, JsonObject, ToolCallAdapterTrace } from "~/server/utils/types.ts";
 
 export interface RequestDebugContext {
   accountId?: string;
   accountLabel?: string;
   upstreamRequest?: JsonObject;
   upstreamResponse?: JsonObject;
+  upstreamCalls?: DebugUpstreamCall[];
   toolCallAdapter?: ToolCallAdapterTrace;
 }
 

@@ -9,13 +9,10 @@ import type {
   PortalSession,
   ProxySettings,
   ResponseState,
-  JsonObject,
-  JsonValue,
 } from "~/server/utils/types.ts";
 
 const STORE_FILE = "accounts.json";
 const RECORDS_DIR = "records";
-const MAX_DEBUG_STRING_BYTES = 64 * 1024;
 const MAX_DEBUG_RECORDS = 500;
 
 export class ResponseStateLimitError extends Error {
@@ -41,47 +38,6 @@ function normaliseAccount(account: ManagedAccount): ManagedAccount {
     email: account.email.trim().toLowerCase(),
     weight: Math.max(1, Math.min(100, Math.floor(account.weight || 1))),
     enabled: account.enabled !== false,
-  };
-}
-
-function boundJson(value: JsonValue): JsonValue {
-  if (typeof value === "string") {
-    if (Buffer.byteLength(value, "utf8") <= MAX_DEBUG_STRING_BYTES) {
-      return value;
-    }
-    const prefix = Buffer.from(value, "utf8").subarray(0, MAX_DEBUG_STRING_BYTES).toString("utf8");
-    return `${prefix}\n[truncated by debug record limit]`;
-  }
-  if (Array.isArray(value)) {
-    return value.map(boundJson);
-  }
-  if (value && typeof value === "object") {
-    const result: JsonObject = {};
-    for (const [key, item] of Object.entries(value)) {
-      result[key] = item === undefined ? null : boundJson(item);
-    }
-    return result;
-  }
-  return value;
-}
-
-function boundDebugRecord(record: DebugRecord, maxBytes: number): DebugRecord {
-  const bounded: DebugRecord = {
-    ...record,
-    clientRequest: boundJson(record.clientRequest) as JsonObject,
-    ...(record.upstreamRequest ? { upstreamRequest: boundJson(record.upstreamRequest) as JsonObject } : {}),
-    ...(record.clientResponse ? { clientResponse: boundJson(record.clientResponse) as JsonObject } : {}),
-    ...(record.upstreamResponse ? { upstreamResponse: boundJson(record.upstreamResponse) as JsonObject } : {}),
-  };
-  if (Buffer.byteLength(JSON.stringify(bounded), "utf8") <= maxBytes) {
-    return bounded;
-  }
-  return {
-    ...record,
-    clientRequest: { _truncated: "This record exceeded the configured storage limit." },
-    ...(record.upstreamRequest ? { upstreamRequest: { _truncated: "This record exceeded the configured storage limit." } } : {}),
-    ...(record.clientResponse ? { clientResponse: { _truncated: "This record exceeded the configured storage limit." } } : {}),
-    ...(record.upstreamResponse ? { upstreamResponse: { _truncated: "This record exceeded the configured storage limit." } } : {}),
   };
 }
 
@@ -287,11 +243,10 @@ export class StateStore {
     if (!(await this.getSettings()).recordMessages) {
       return;
     }
-    const bounded = boundDebugRecord(record, getProxyConfig().maxRecordBytes);
     const target = this.recordPath(record.id);
     await mkdir(this.recordsDir, { recursive: true });
     const temporary = `${target}.${process.pid}.${randomBytes(6).toString("hex")}.tmp`;
-    await writeFile(temporary, JSON.stringify(bounded), { encoding: "utf8", mode: 0o600 });
+    await writeFile(temporary, JSON.stringify(record), { encoding: "utf8", mode: 0o600 });
     await rename(temporary, target);
     await this.pruneDebugRecords();
   }

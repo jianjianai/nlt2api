@@ -391,6 +391,8 @@ test("fragmented upstream SSE is assembled without losing deltas", async () => {
   });
 
   assert.equal(collected.frames.length, 3);
+  assert.match(collected.raw, /"content":"hel"/);
+  assert.match(collected.raw, /data: \[DONE\]/);
   assert.deepEqual(forwarded, ["hel", "lo"]);
   assert.equal(collected.completion.choices?.[0]?.message?.content, "hello");
   assert.equal(collected.completion.choices?.[0]?.finish_reason, "stop");
@@ -472,7 +474,8 @@ test("upstream SSE error and empty streams fail closed", async () => {
     collectUpstreamStream(new Response('data: {"error":{"message":"unknown model"}}\n\n')),
     (error: unknown) => error instanceof UpstreamStreamError
       && error.status === 502
-      && error.message === "unknown model",
+      && error.message === "unknown model"
+      && error.rawResponse?.includes('"unknown model"') === true,
   );
   await assert.rejects(
     collectUpstreamStream(new Response('data: {"error":"Gateway returned status 404","status":404}\n\n')),

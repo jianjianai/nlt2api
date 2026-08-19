@@ -3,11 +3,26 @@ import { defineHandler } from "nitro";
 import { ClientDisconnectedError } from "~/server/utils/chat-service.ts";
 import { responseEnvelopeFields } from "~/server/utils/responses-compat.ts";
 import { executeResponsesRequest, prepareResponsesRequest } from "~/server/utils/responses-service.ts";
-import { jsonResponse, openAIErrorResponse, readJsonObject, requireClientAuth } from "~/server/utils/http.ts";
-import { openAIStreamingSse } from "~/server/utils/upstream-stream.ts";
+import { jsonResponse, openAIErrorResponse, readJsonObjectWithRaw, requireClientAuth } from "~/server/utils/http.ts";
+import { openAIStreamingSse, type SseEntry } from "~/server/utils/upstream-stream.ts";
 import { recordDebug, upstreamHttpError } from "~/server/utils/route-helpers.ts";
 import { requestDebugContext } from "~/server/utils/request-errors.ts";
-import type { JsonObject } from "~/server/utils/types.ts";
+import type { DebugRawBody, JsonObject } from "~/server/utils/types.ts";
+
+function jsonDebugBody(body: string): DebugRawBody {
+  return { contentType: "application/json", body };
+}
+
+function jsonDebugValue(value: JsonObject): DebugRawBody {
+  return jsonDebugBody(JSON.stringify(value));
+}
+
+function sseDebugBody(entries: SseEntry[]): DebugRawBody {
+  return {
+    contentType: "text/event-stream",
+    body: entries.map((entry) => `${entry.event ? `event: ${entry.event}\n` : ""}data: ${JSON.stringify(entry.data)}\n\n`).join(""),
+  };
+}
 
 function streamErrorData(error: unknown, sequenceNumber: number): JsonObject {
   const mapped = upstreamHttpError(error);
@@ -22,9 +37,12 @@ function streamErrorData(error: unknown, sequenceNumber: number): JsonObject {
 
 export default defineHandler(async (event) => {
   let body: JsonObject | undefined;
+  let clientRequest: DebugRawBody | undefined;
   try {
     requireClientAuth(event.req);
-    body = await readJsonObject(event.req);
+    const parsedRequest = await readJsonObjectWithRaw(event.req);
+    body = parsedRequest.body;
+    clientRequest = jsonDebugBody(parsedRequest.raw);
     const requestBody = body;
     if (requestBody.stream === true) {
       const prepared = await prepareResponsesRequest(requestBody);
@@ -32,7 +50,9 @@ export default defineHandler(async (event) => {
       const createdAt = Math.floor(Date.now() / 1_000);
       let nextSequenceNumber = 0;
       return openAIStreamingSse(async (emit, signal) => {
-        const trackedEmit = async (entry: { event?: string; data: unknown }) => {
+        const clientEvents: SseEntry[] = [];
+        const trackedEmit = async (entry: SseEntry): Promise<void> => {
+          clientEvents.push(entry);
           const data = entry.data as JsonObject;
           if (typeof data.sequence_number === "number") {
             nextSequenceNumber = Math.max(nextSequenceNumber, data.sequence_number + 1);
@@ -52,10 +72,9 @@ export default defineHandler(async (event) => {
             endpoint: "/v1/responses",
             accountId: execution.accountId,
             accountLabel: execution.accountLabel,
-            clientRequest: requestBody,
-            upstreamRequest: execution.upstreamRequest,
-            upstreamResponse: execution.upstreamResponse,
-            clientResponse: execution.response,
+            clientRequest: clientRequest!,
+            clientResponse: sseDebugBody(clientEvents),
+            upstreamCalls: execution.upstreamCalls,
             ...(execution.toolCallAdapter ? { toolCallAdapter: execution.toolCallAdapter } : {}),
             status: 200,
           });
@@ -65,13 +84,6 @@ export default defineHandler(async (event) => {
           }
           const mapped = upstreamHttpError(error);
           const context = requestDebugContext(error);
-          await recordDebug({
-            endpoint: "/v1/responses",
-            clientRequest: requestBody,
-            ...context,
-            status: mapped.status,
-            error: mapped.message,
-          });
           const failedResponse: JsonObject = {
             id: responseId,
             object: "response",
@@ -103,6 +115,17 @@ export default defineHandler(async (event) => {
               sequence_number: nextSequenceNumber,
             },
           });
+          await recordDebug({
+            endpoint: "/v1/responses",
+            accountId: context.accountId,
+            accountLabel: context.accountLabel,
+            clientRequest: clientRequest!,
+            clientResponse: sseDebugBody(clientEvents),
+            ...(context.upstreamCalls ? { upstreamCalls: context.upstreamCalls } : {}),
+            ...(context.toolCallAdapter ? { toolCallAdapter: context.toolCallAdapter } : {}),
+            status: mapped.status,
+            error: mapped.message,
+          });
         }
       }, {
         doneMarker: false,
@@ -115,10 +138,9 @@ export default defineHandler(async (event) => {
       endpoint: "/v1/responses",
       accountId: execution.accountId,
       accountLabel: execution.accountLabel,
-      clientRequest: body,
-      upstreamRequest: execution.upstreamRequest,
-      upstreamResponse: execution.upstreamResponse,
-      clientResponse: execution.response,
+      clientRequest: clientRequest!,
+      clientResponse: jsonDebugValue(execution.response),
+      upstreamCalls: execution.upstreamCalls,
       ...(execution.toolCallAdapter ? { toolCallAdapter: execution.toolCallAdapter } : {}),
       status: 200,
     });
@@ -126,12 +148,23 @@ export default defineHandler(async (event) => {
     return jsonResponse(execution.response);
   } catch (error) {
     const mapped = upstreamHttpError(error);
-    if (body) {
+    if (body && clientRequest) {
       const context = requestDebugContext(error);
       await recordDebug({
         endpoint: "/v1/responses",
-        clientRequest: body,
-        ...context,
+        accountId: context.accountId,
+        accountLabel: context.accountLabel,
+        clientRequest,
+        clientResponse: jsonDebugValue({
+          error: {
+            message: mapped.message,
+            type: mapped.type,
+            ...(mapped.param ? { param: mapped.param } : {}),
+            ...(mapped.code ? { code: mapped.code } : {}),
+          },
+        }),
+        ...(context.upstreamCalls ? { upstreamCalls: context.upstreamCalls } : {}),
+        ...(context.toolCallAdapter ? { toolCallAdapter: context.toolCallAdapter } : {}),
         status: mapped.status,
         error: mapped.message,
       });

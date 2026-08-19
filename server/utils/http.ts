@@ -52,7 +52,12 @@ export function jsonResponse(body: JsonValue | Record<string, unknown>, status =
   });
 }
 
-export async function readJsonObject(request: Request): Promise<JsonObject> {
+export interface ReadJsonObjectResult {
+  body: JsonObject;
+  raw: string;
+}
+
+export async function readJsonObjectWithRaw(request: Request): Promise<ReadJsonObjectResult> {
   const maxBytes = getProxyConfig().maxRequestBytes;
   const declaredLength = Number(request.headers.get("content-length") ?? "");
   if (Number.isFinite(declaredLength) && declaredLength > maxBytes) {
@@ -99,7 +104,11 @@ export async function readJsonObject(request: Request): Promise<JsonObject> {
   if (!body || typeof body !== "object" || Array.isArray(body)) {
     throw new HttpError(400, "Request body must be a JSON object.");
   }
-  return body as JsonObject;
+  return { body: body as JsonObject, raw: text };
+}
+
+export async function readJsonObject(request: Request): Promise<JsonObject> {
+  return (await readJsonObjectWithRaw(request)).body;
 }
 
 function bearerToken(request: Request): string | undefined {

@@ -3,7 +3,7 @@ import { accountScheduler } from "~/server/utils/account-scheduler.ts";
 import { getProxyConfig } from "~/server/utils/config.ts";
 import { HttpError } from "~/server/utils/http.ts";
 import { parseAndValidateToolArguments, validateSchemaDefinition } from "~/server/utils/json-schema.ts";
-import { portalClient, PortalError, readPortalJson, retryAfterSeconds } from "~/server/utils/portal-client.ts";
+import { portalClient, PortalError, readPortalJsonBody, retryAfterSeconds } from "~/server/utils/portal-client.ts";
 import { ProxyRequestError, type RequestDebugContext } from "~/server/utils/request-errors.ts";
 import { stateStore } from "~/server/utils/state-store.ts";
 import { collectUpstreamStream, UpstreamStreamError, type UpstreamFrameHandler } from "~/server/utils/upstream-stream.ts";
@@ -21,6 +21,9 @@ import {
 } from "~/server/utils/tool-calls.ts";
 import type {
   ChatMessage,
+  DebugRawBody,
+  DebugUpstreamCall,
+  DebugUpstreamCallType,
   JsonObject,
   JsonValue,
   ManagedAccount,
@@ -52,6 +55,7 @@ export interface ChatExecution {
   model: string;
   tools: ToolDefinition[];
   upstreamRequest: JsonObject;
+  upstreamCalls: DebugUpstreamCall[];
   toolCallAdapter?: ToolCallAdapterTrace;
 }
 
@@ -60,6 +64,39 @@ export class ClientDisconnectedError extends Error {
     super("The client disconnected before the completion finished.");
     this.name = "ClientDisconnectedError";
   }
+}
+
+interface UpstreamTrace {
+  calls: DebugUpstreamCall[];
+  type: DebugUpstreamCallType;
+  round: number;
+}
+
+function jsonDebugBody(body: string): DebugRawBody {
+  return { contentType: "application/json", body };
+}
+
+function responseDebugBody(body: string, contentType: string): DebugRawBody {
+  return {
+    contentType: contentType.includes("text/event-stream")
+      ? "text/event-stream"
+      : contentType.includes("application/json")
+        ? "application/json"
+        : "text/plain",
+    body,
+  };
+}
+
+function createDebugCall(trace: UpstreamTrace, account: ManagedAccount, body: JsonObject): DebugUpstreamCall {
+  return {
+    sequence: trace.calls.length + 1,
+    type: trace.type,
+    round: trace.round,
+    attempt: trace.calls.filter((call) => call.type === trace.type && call.round === trace.round).length + 1,
+    accountId: account.id,
+    accountLabel: account.label,
+    request: jsonDebugBody(JSON.stringify(body)),
+  };
 }
 
 function asRecord(value: unknown): Record<string, unknown> | undefined {
@@ -288,16 +325,9 @@ function upstreamBody(
   return body;
 }
 
-async function parsePortalError(response: Response): Promise<{ error: PortalError; payload?: JsonObject }> {
-  let payload: Record<string, unknown> | undefined;
-  try {
-    payload = asRecord(await readPortalJson(response));
-  } catch (error) {
-    if (error instanceof PortalError && !error.message.includes("returned invalid JSON")) {
-      throw error;
-    }
-    // Use a status-shaped message below.
-  }
+async function parsePortalError(response: Response): Promise<{ error: PortalError; payload?: JsonObject; raw: string }> {
+  const body = await readPortalJsonBody(response);
+  const payload = body.valid ? asRecord(body.value) : undefined;
   const error = asRecord(payload?.error);
   const message = typeof payload?.error === "string"
     ? payload.error
@@ -313,6 +343,7 @@ async function parsePortalError(response: Response): Promise<{ error: PortalErro
   const retryAfter = retryAfterSeconds(response) ?? bodyRetryAfter;
   return {
     error: new PortalError(message, response.status, retryAfter),
+    raw: body.raw,
     ...(payload ? { payload: payload as JsonObject } : {}),
   };
 }
@@ -328,10 +359,14 @@ async function getCompletion(
   allowEmptyContent = false,
   onFrame?: UpstreamFrameHandler,
   signal?: AbortSignal,
+  trace?: UpstreamTrace,
 ): Promise<{ account: ManagedAccount; completion: UpstreamCompletion; receivedSse: boolean }> {
   const excluded = new Set<string>();
   let lastError: PortalError | undefined;
-  let lastContext: RequestDebugContext = { upstreamRequest: body };
+  let lastContext: RequestDebugContext = {
+    upstreamRequest: body,
+    ...(trace ? { upstreamCalls: trace.calls } : {}),
+  };
   const attempts = requiredAccountId
     ? 1
     : Math.max(1, (await stateStore.listAccounts()).filter((account) => account.enabled).length);
@@ -361,7 +396,13 @@ async function getCompletion(
       accountId: account.id,
       accountLabel: account.label,
       upstreamRequest: body,
+      ...(trace ? { upstreamCalls: trace.calls } : {}),
     };
+    let debugCall: DebugUpstreamCall | undefined = trace
+      ? createDebugCall(trace, account, body)
+      : undefined;
+    debugCall && trace!.calls.push(debugCall);
+    let sessionRetry = false;
     let streamedOutput = false;
     let receivedSse = false;
 
@@ -369,16 +410,38 @@ async function getCompletion(
       if (signal?.aborted) {
         throw new ClientDisconnectedError();
       }
-      const response = await portalClient.requestChat(account, body as Record<string, unknown>, signal);
+      const response = await portalClient.requestChat(
+        account,
+        body as Record<string, unknown>,
+        signal,
+        trace
+          ? (retry) => {
+            if (debugCall) {
+              debugCall.responseStatus = retry.status;
+              debugCall.response = responseDebugBody(retry.body, retry.contentType);
+            }
+            sessionRetry = true;
+          }
+          : undefined,
+      );
+      if (sessionRetry && trace) {
+        debugCall = createDebugCall(trace, account, body);
+        trace.calls.push(debugCall);
+      }
+      const contentType = response.headers.get("content-type")?.toLowerCase() ?? "";
+      debugCall && (debugCall.responseStatus = response.status);
       if (!response.ok) {
         const parsed = await parsePortalError(response);
         currentContext.upstreamResponse = parsed.payload;
+        if (debugCall) {
+          debugCall.response = responseDebugBody(parsed.raw, contentType);
+          debugCall.error = parsed.error.message;
+        }
         throw parsed.error;
       }
 
       let payload: Record<string, unknown> | undefined;
       let completion: UpstreamCompletion;
-      const contentType = response.headers.get("content-type")?.toLowerCase() ?? "";
       if (body.stream === true && contentType.includes("text/event-stream")) {
         receivedSse = true;
         let collected;
@@ -398,8 +461,15 @@ async function getCompletion(
         }
         completion = collected.completion;
         payload = asRecord(completion);
+        if (debugCall) {
+          debugCall.response = responseDebugBody(collected.raw, contentType);
+        }
       } else {
-        payload = asRecord(await readPortalJson(response));
+        const parsed = await readPortalJsonBody(response);
+        if (debugCall) {
+          debugCall.response = responseDebugBody(parsed.raw, contentType);
+        }
+        payload = parsed.valid ? asRecord(parsed.value) : undefined;
         completion = payload as unknown as UpstreamCompletion;
       }
       currentContext.upstreamResponse = payload as JsonObject | undefined;
@@ -428,6 +498,12 @@ async function getCompletion(
       accountScheduler.markSuccess(account.id);
       return { account, completion, receivedSse };
     } catch (error) {
+      if (debugCall && !debugCall.error) {
+        if (error instanceof UpstreamStreamError && error.rawResponse !== undefined && !debugCall.response) {
+          debugCall.response = responseDebugBody(error.rawResponse, "text/event-stream");
+        }
+        debugCall.error = error instanceof Error ? error.message : "Unknown portal transport error.";
+      }
       if (signal?.aborted || error instanceof ClientDisconnectedError) {
         throw new ClientDisconnectedError();
       }
@@ -685,6 +761,9 @@ async function executeChatRequestOnce(
     onUpstreamFrame?: UpstreamFrameHandler;
     onRepairReasoning?: (reasoning: ReasoningFields) => void | Promise<void>;
     signal?: AbortSignal;
+    upstreamCalls?: DebugUpstreamCall[];
+    upstreamType?: DebugUpstreamCallType;
+    upstreamRound?: number;
   },
 ): Promise<ChatExecution> {
   validateChatRequest(request);
@@ -708,6 +787,9 @@ async function executeChatRequestOnce(
     toolTurn,
     streamUpstream ? options?.onUpstreamFrame : undefined,
     options?.signal,
+    options?.upstreamCalls
+      ? { calls: options.upstreamCalls, type: options.upstreamType ?? "initial", round: options.upstreamRound ?? 1 }
+      : undefined,
   );
   let message: ChatMessage;
   let toolCallAdapter: ToolCallAdapterTrace | undefined;
@@ -807,6 +889,9 @@ async function executeChatRequestOnce(
             }
             : undefined,
           options?.signal,
+          options?.upstreamCalls
+            ? { calls: options.upstreamCalls, type: "repair", round: toolCallAdapter.repairAttempts }
+            : undefined,
         );
       } catch (error) {
         if (error instanceof ClientDisconnectedError || options?.signal?.aborted) {
@@ -896,6 +981,7 @@ async function executeChatRequestOnce(
     model,
     tools,
     upstreamRequest,
+    upstreamCalls: options?.upstreamCalls ?? [],
     ...(toolCallAdapter ? { toolCallAdapter } : {}),
   };
 }
@@ -982,6 +1068,7 @@ export async function executeChatRequest(
   let accumulatedMessage: ChatMessage | undefined;
   let accumulatedUsage: UpstreamUsage | undefined;
   let didContinue = false;
+  const upstreamCalls: DebugUpstreamCall[] = [];
 
   for (let round = 0; round < maxRounds; round += 1) {
     const relayFrame: UpstreamFrameHandler | undefined = options?.onUpstreamFrame
@@ -999,12 +1086,27 @@ export async function executeChatRequest(
       }
       : undefined;
 
-    const current = await executeChatRequestOnce(currentRequest, {
-      ...options,
-      requiredAccountId: execution?.account.id ?? options?.requiredAccountId,
-      onUpstreamFrame: relayFrame,
-      onRepairReasoning: options?.onRepairReasoning,
-    });
+    let current: ChatExecution;
+    try {
+      current = await executeChatRequestOnce(currentRequest, {
+        ...options,
+        requiredAccountId: execution?.account.id ?? options?.requiredAccountId,
+        onUpstreamFrame: relayFrame,
+        onRepairReasoning: options?.onRepairReasoning,
+        upstreamCalls,
+        upstreamType: round === 0 ? "initial" : "continuation",
+        upstreamRound: round === 0 ? 1 : round,
+      });
+    } catch (error) {
+      if (error instanceof ProxyRequestError) {
+        error.debugContext.upstreamCalls = upstreamCalls;
+        throw error;
+      }
+      if (upstreamCalls.length > 0) {
+        throw new ProxyRequestError(error, { upstreamCalls });
+      }
+      throw error;
+    }
     execution = current;
     accumulatedMessage = accumulatedMessage
       ? appendContinuationMessage(accumulatedMessage, current.message)

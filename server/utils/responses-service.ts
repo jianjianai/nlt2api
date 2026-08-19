@@ -9,6 +9,7 @@ import { ProxyRequestError } from "~/server/utils/request-errors.ts";
 import { ResponseStateLimitError, stateStore } from "~/server/utils/state-store.ts";
 import type {
   ChatMessage,
+  DebugUpstreamCall,
   JsonObject,
   JsonValue,
   ResponseState,
@@ -38,6 +39,7 @@ export interface ResponseExecution {
   accountLabel: string;
   upstreamRequest: JsonObject;
   upstreamResponse: JsonObject;
+  upstreamCalls: DebugUpstreamCall[];
   toolCallAdapter?: ToolCallAdapterTrace;
 }
 
@@ -883,6 +885,7 @@ export async function executeResponsesRequest(
           accountLabel: execution.account.label,
           upstreamRequest: execution.upstreamRequest,
           upstreamResponse: execution.completion as unknown as JsonObject,
+          upstreamCalls: execution.upstreamCalls,
         },
       );
     }
@@ -897,6 +900,7 @@ export async function executeResponsesRequest(
             accountLabel: execution.account.label,
             upstreamRequest: execution.upstreamRequest,
             upstreamResponse: execution.completion as unknown as JsonObject,
+            upstreamCalls: execution.upstreamCalls,
           },
         );
       }
@@ -905,6 +909,7 @@ export async function executeResponsesRequest(
         accountLabel: execution.account.label,
         upstreamRequest: execution.upstreamRequest,
         upstreamResponse: execution.completion as unknown as JsonObject,
+        upstreamCalls: execution.upstreamCalls,
       });
     }
   }
@@ -920,6 +925,7 @@ export async function executeResponsesRequest(
     accountLabel: execution.account.label,
     upstreamRequest: execution.upstreamRequest,
     upstreamResponse: execution.completion as unknown as JsonObject,
+    upstreamCalls: execution.upstreamCalls,
     ...(execution.toolCallAdapter ? { toolCallAdapter: execution.toolCallAdapter } : {}),
   };
 }

@@ -4,22 +4,26 @@ import type { ChatMessage, UpstreamChoice, UpstreamCompletion, UpstreamUsage } f
 export class UpstreamStreamError extends Error {
   readonly status: number;
   readonly retryAfterSeconds: number | undefined;
+  readonly rawResponse: string | undefined;
 
   constructor(
     message: string,
     status = 502,
     retryAfterSeconds?: number,
+    rawResponse?: string,
   ) {
     super(message);
     this.name = "UpstreamStreamError";
     this.status = status;
     this.retryAfterSeconds = retryAfterSeconds;
+    this.rawResponse = rawResponse;
   }
 }
 
 export interface CollectedUpstreamStream {
   completion: UpstreamCompletion;
   frames: UpstreamCompletion[];
+  raw: string;
 }
 
 /**
@@ -171,39 +175,58 @@ export async function collectUpstreamStream(
 
   const decoder = new TextDecoder();
   let buffer = "";
+  let raw = "";
   let totalBytes = 0;
   const frames: UpstreamCompletion[] = [];
-  for await (const chunk of response.body) {
-    totalBytes += chunk.byteLength;
-    if (totalBytes > maxBytes) {
-      throw new Error("The NeuralWatt portal response exceeded the adapter limit.");
-    }
-    buffer += decoder.decode(chunk, { stream: true });
-    const lines = buffer.split("\n");
-    buffer = lines.pop() ?? "";
-    for (const line of lines) {
-      const frame = parseDataLine(line.replace(/\r$/, ""));
-      if (frame) {
-        frames.push(frame);
-        // Error frames are handled by assemble() so callers never render an
-        // upstream error as model output. Ordinary frames can be forwarded as
-        // soon as they arrive while we continue collecting the final shape.
-        if (!frame.error && onFrame) {
-          await onFrame(frame);
+  try {
+    for await (const chunk of response.body) {
+      totalBytes += chunk.byteLength;
+      if (totalBytes > maxBytes) {
+        throw new Error("The NeuralWatt portal response exceeded the adapter limit.");
+      }
+      const decoded = decoder.decode(chunk, { stream: true });
+      raw += decoded;
+      buffer += decoded;
+      const lines = buffer.split("\n");
+      buffer = lines.pop() ?? "";
+      for (const line of lines) {
+        const frame = parseDataLine(line.replace(/\r$/, ""));
+        if (frame) {
+          frames.push(frame);
+          // Error frames are handled by assemble() so callers never render an
+          // upstream error as model output. Ordinary frames can be forwarded as
+          // soon as they arrive while we continue collecting the final shape.
+          if (!frame.error && onFrame) {
+            await onFrame(frame);
+          }
         }
       }
     }
-  }
-  buffer += decoder.decode();
-  const finalFrame = parseDataLine(buffer.replace(/\r$/, ""));
-  if (finalFrame) {
-    frames.push(finalFrame);
-    if (!finalFrame.error && onFrame) {
-      await onFrame(finalFrame);
+    const finalDecoded = decoder.decode();
+    raw += finalDecoded;
+    buffer += finalDecoded;
+    const finalFrame = parseDataLine(buffer.replace(/\r$/, ""));
+    if (finalFrame) {
+      frames.push(finalFrame);
+      if (!finalFrame.error && onFrame) {
+        await onFrame(finalFrame);
+      }
     }
+    return { completion: assemble(frames), frames, raw };
+  } catch (error) {
+    if (error instanceof UpstreamStreamError) {
+      if (!error.rawResponse) {
+        throw new UpstreamStreamError(error.message, error.status, error.retryAfterSeconds, raw);
+      }
+      throw error;
+    }
+    throw new UpstreamStreamError(
+      error instanceof Error ? error.message : "The NeuralWatt portal streaming response failed.",
+      502,
+      undefined,
+      raw,
+    );
   }
-
-  return { completion: assemble(frames), frames };
 }
 
 function encodeSse(encoder: TextEncoder, entry: SseEntry): Uint8Array {

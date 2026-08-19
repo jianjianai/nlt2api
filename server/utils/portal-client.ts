@@ -182,13 +182,27 @@ async function readPortalText(response: Response): Promise<string> {
   return new TextDecoder().decode(bytes);
 }
 
-export async function readPortalJson(response: Response): Promise<unknown> {
+export interface PortalJsonBody {
+  raw: string;
+  value?: unknown;
+  valid: boolean;
+}
+
+export async function readPortalJsonBody(response: Response): Promise<PortalJsonBody> {
   const body = await readPortalText(response);
   try {
-    return JSON.parse(body);
+    return { raw: body, value: JSON.parse(body), valid: true };
   } catch {
+    return { raw: body, valid: false };
+  }
+}
+
+export async function readPortalJson(response: Response): Promise<unknown> {
+  const body = await readPortalJsonBody(response);
+  if (!body.valid) {
     throw new PortalError("The NeuralWatt portal returned invalid JSON.", 502);
   }
+  return body.value;
 }
 
 function sessionIsFresh(session: PortalSession | undefined): session is PortalSession {
@@ -280,6 +294,12 @@ async function responseMessage(response: Response): Promise<string> {
   return `Portal request failed with HTTP ${response.status}.`;
 }
 
+export interface PortalChatSessionRetry {
+  status: number;
+  contentType: string;
+  body: string;
+}
+
 export class PortalClient {
   private loginLocks = new Map<string, Promise<PortalSession>>();
 
@@ -311,7 +331,12 @@ export class PortalClient {
     return this.ensureSession(refreshed, signal);
   }
 
-  async requestChat(account: ManagedAccount, body: Record<string, unknown>, signal?: AbortSignal): Promise<Response> {
+  async requestChat(
+    account: ManagedAccount,
+    body: Record<string, unknown>,
+    signal?: AbortSignal,
+    onSessionRetry?: (attempt: PortalChatSessionRetry) => void,
+  ): Promise<Response> {
     let session = await this.ensureSession(account, signal);
     if (signal?.aborted) {
       throw clientAbortError();
@@ -321,7 +346,21 @@ export class PortalClient {
       return response;
     }
 
-    await discardPortalResponse(response);
+    if (onSessionRetry) {
+      let responseBody = "";
+      try {
+        responseBody = await readPortalText(response);
+      } catch {
+        // The retry must remain available even when an expired-session page is malformed.
+      }
+      onSessionRetry({
+        status: response.status,
+        contentType: response.headers.get("content-type")?.toLowerCase() ?? "",
+        body: responseBody,
+      });
+    } else {
+      await discardPortalResponse(response);
+    }
     session = await this.refreshSession(account, signal);
     if (signal?.aborted) {
       throw clientAbortError();

@@ -23,15 +23,35 @@ interface Account {
   runtime: RuntimeState;
 }
 
+interface DebugRawBody {
+  contentType: "application/json" | "text/event-stream" | "text/plain";
+  body: string;
+}
+
+interface DebugUpstreamCall {
+  sequence: number;
+  type: "initial" | "repair" | "continuation";
+  round: number;
+  attempt: number;
+  accountId?: string;
+  accountLabel?: string;
+  request: DebugRawBody;
+  response?: DebugRawBody;
+  responseStatus?: number;
+  error?: string;
+}
+
 interface DebugRecord {
   id: string;
   at: string;
   endpoint: string;
   accountId?: string;
   accountLabel?: string;
-  clientRequest: Record<string, unknown>;
+  clientRequest: DebugRawBody | Record<string, unknown>;
+  clientResponse?: DebugRawBody | Record<string, unknown>;
+  upstreamCalls?: DebugUpstreamCall[];
+  // Read records written by previous gateway versions as well.
   upstreamRequest?: Record<string, unknown>;
-  clientResponse?: Record<string, unknown>;
   upstreamResponse?: Record<string, unknown>;
   toolCallAdapter?: {
     toolCallExpected: "auto" | "required" | "forced";
@@ -102,15 +122,22 @@ const newAccount = reactive({ label: "", email: "", password: "", weight: 1 });
 const isLoading = ref(false);
 const isSaving = ref(false);
 const isClearingRecords = ref(false);
-const rawRecordId = ref<string | null>(null);
+const selectedTraceKey = ref<string | null>(null);
+const rawTraceKey = ref<string | null>(null);
 const errorMessage = ref("");
 const notice = ref("");
 
 const enabledCount = computed(() => accounts.value.filter((account) => account.enabled).length);
 const activeSessions = computed(() => accounts.value.filter((account) => account.hasSession).length);
 const cooldownCount = computed(() => accounts.value.filter((account) => account.runtime.cooldownUntil > Date.now()).length);
+function recordRequestObject(record: DebugRecord): JsonRecord | null {
+  return parsedBodyValues(record.clientRequest)
+    .map(asObject)
+    .find((value): value is JsonRecord => Boolean(value)) ?? null;
+}
+
 function forcesTool(record: DebugRecord): boolean {
-  const choice = record.clientRequest.tool_choice;
+  const choice = recordRequestObject(record)?.tool_choice;
   return choice === "required" || (choice && typeof choice === "object" && (choice as { type?: unknown }).type === "function");
 }
 
@@ -202,6 +229,11 @@ async function loadRecords() {
   const payload = await api("/api/admin/records?limit=100");
   records.value = payload.records ?? [];
   Object.assign(settings, payload.settings ?? {});
+  const traces = records.value.flatMap(recordTraces);
+  if (!traces.some((trace) => trace.key === selectedTraceKey.value)) {
+    selectedTraceKey.value = traces[0]?.key ?? null;
+    rawTraceKey.value = null;
+  }
 }
 
 async function selectView(next: "accounts" | "records") {
@@ -302,7 +334,8 @@ async function clearAllRecords() {
   errorMessage.value = "";
   try {
     await api("/api/admin/records", { method: "DELETE" });
-    rawRecordId.value = null;
+    rawTraceKey.value = null;
+    selectedTraceKey.value = null;
     records.value = [];
     notice.value = "已清空全部聊天记录";
   } catch (error) {
@@ -356,12 +389,8 @@ function asObject(value: unknown): JsonRecord | null {
   return value && typeof value === "object" && !Array.isArray(value) ? value as JsonRecord : null;
 }
 
-function displayValue(value: unknown, maxLength = 280): string {
-  const text = typeof value === "string" ? value : pretty(value);
-  if (text.length <= maxLength) {
-    return text;
-  }
-  return `${text.slice(0, maxLength)}…`;
+function displayValue(value: unknown): string {
+  return typeof value === "string" ? value : pretty(value);
 }
 
 function roleName(role: unknown, type?: unknown): string {
@@ -404,6 +433,8 @@ function contentText(value: unknown): string {
       const image = asObject(item.image_url);
       if (image && typeof image.url === "string") return `[图片] ${image.url}`;
       if (typeof item.output === "string") return item.output;
+      if (typeof item.summary === "string") return item.summary;
+      if (Array.isArray(item.summary)) return item.summary.map((entry) => contentText(entry)).filter(Boolean).join("\n");
       return displayValue(item);
     }).filter(Boolean).join("\n");
   }
@@ -431,7 +462,14 @@ function displayMessage(value: unknown): DisplayMessage | null {
   if (!message) return null;
   const type = message.type;
   const role = typeof message.role === "string" ? message.role : type;
-  const output = message.output ?? message.content ?? message.text ?? message.arguments;
+  const output = message.output
+    ?? message.content
+    ?? message.text
+    ?? message.summary
+    ?? message.reasoning
+    ?? message.reasoning_content
+    ?? message.refusal
+    ?? message.arguments;
   const calls = toolCalls(message.tool_calls);
   if (type === "function_call") {
     calls.push({
@@ -441,8 +479,8 @@ function displayMessage(value: unknown): DisplayMessage | null {
     });
   }
   return {
-    role: typeof role === "string" ? role : "message",
-    roleLabel: roleName(role, type),
+    role: typeof role === "string" ? role : "assistant",
+    roleLabel: roleName(typeof role === "string" ? role : "assistant", type),
     content: contentText(output),
     toolCalls: calls,
   };
@@ -487,57 +525,154 @@ function recordFields(value: unknown): DisplayField[] {
   const source = asObject(value);
   if (!source) return [];
   return Object.entries(source)
-    .filter(([key, item]) => !["messages", "input", "output", "choices", "tools", "tool_calls", "content"].includes(key) && item !== undefined)
-    .slice(0, 14)
-    .map(([key, item]) => {
-      if (key === "stream" || key === "parallel_tool_calls") {
-        return { label: fieldNames[key] ?? key, value: item ? "是" : "否" };
-      }
-      if (key === "usage") {
-        const usage = asObject(item);
-        if (usage) {
-          const prompt = usage.prompt_tokens ?? usage.input_tokens;
-          const completion = usage.completion_tokens ?? usage.output_tokens;
-          const total = usage.total_tokens;
-          return {
-            label: fieldNames[key] ?? key,
-            value: [prompt === undefined ? "" : `输入 ${prompt}`, completion === undefined ? "" : `输出 ${completion}`, total === undefined ? "" : `合计 ${total}`].filter(Boolean).join(" · "),
-          };
-        }
-      }
-      if (key === "tool_choice") {
-        const choice = asObject(item);
-        const fn = asObject(choice?.function);
-        if (typeof fn?.name === "string") {
-          return { label: fieldNames[key] ?? key, value: `函数：${fn.name}` };
-        }
-      }
-      if (key === "response_format") {
-        const format = asObject(item);
-        if (typeof format?.type === "string") {
-          return { label: fieldNames[key] ?? key, value: format.type };
-        }
-      }
-      if (key === "error") {
-        const error = asObject(item);
-        if (typeof error?.message === "string") {
-          return { label: fieldNames[key] ?? key, value: error.message };
-        }
-      }
-      return { label: fieldNames[key] ?? key, value: displayValue(item) };
-    });
+    .filter(([key, item]) => !["messages", "input", "output", "choices", "content"].includes(key) && item !== undefined)
+    .map(([key, item]) => ({
+      label: fieldNames[key] ?? key,
+      value: displayValue(item),
+    }));
 }
 
-function recordSections(record: DebugRecord): ParsedSection[] {
-  const sections: Array<[string, string, unknown]> = [
-    ["client-request", "客户端请求", record.clientRequest],
-    ["upstream-request", "上游请求", record.upstreamRequest],
-    ["client-response", "客户端响应", record.clientResponse ?? (record.error ? { error: record.error } : undefined)],
-    ["upstream-response", "上游响应", record.upstreamResponse],
-  ];
-  return sections
-    .filter(([, , value]) => value !== undefined)
-    .map(([key, title, value]) => ({ key, title, fields: recordFields(value), messages: collectMessages(value) }));
+function isDebugRawBody(value: unknown): value is DebugRawBody {
+  const body = asObject(value);
+  return Boolean(body) && typeof body.body === "string" && typeof body.contentType === "string";
+}
+
+function parsedBodyValues(value: DebugRawBody | JsonRecord | undefined): unknown[] {
+  if (!value) return [];
+  if (!isDebugRawBody(value)) return [value];
+  if (value.contentType === "text/event-stream") {
+    return value.body.split(/\r?\n/).flatMap((line) => {
+      if (!line.startsWith("data:")) return [];
+      const data = line.slice(5).trimStart();
+      if (!data || data === "[DONE]") return [];
+      try {
+        return [JSON.parse(data)];
+      } catch {
+        return [];
+      }
+    });
+  }
+  try {
+    return [JSON.parse(value.body)];
+  } catch {
+    return [];
+  }
+}
+
+function rawBodyText(value: DebugRawBody | JsonRecord | undefined): string {
+  if (!value) return "";
+  return isDebugRawBody(value) ? value.body : pretty(value);
+}
+
+function bodyContentType(value: DebugRawBody | JsonRecord | undefined): string {
+  return isDebugRawBody(value) ? value.contentType : "application/json";
+}
+
+interface ConversationTrace {
+  key: string;
+  record: DebugRecord;
+  direction: "client" | "upstream";
+  title: string;
+  subtitle: string;
+  request: DebugRawBody | JsonRecord;
+  response?: DebugRawBody | JsonRecord;
+  status: number;
+  error?: string;
+}
+
+interface BodyPresentation {
+  contentType: string;
+  raw: string;
+  fields: DisplayField[];
+  messages: DisplayMessage[];
+}
+
+function callTitle(call: DebugUpstreamCall): string {
+  const base = call.type === "repair"
+    ? `纠错轮 ${call.round}`
+    : call.type === "continuation"
+      ? `续写轮 ${call.round}`
+      : "首次请求";
+  return call.attempt > 1 ? `${base} · 账号重试 ${call.attempt - 1}` : base;
+}
+
+function recordTraces(record: DebugRecord): ConversationTrace[] {
+  const traces: ConversationTrace[] = [{
+    key: `${record.id}:client`,
+    record,
+    direction: "client",
+    title: "客户端请求",
+    subtitle: record.endpoint,
+    request: record.clientRequest,
+    response: record.clientResponse,
+    status: record.status,
+    error: record.error,
+  }];
+  if (record.upstreamCalls?.length) {
+    traces.push(...record.upstreamCalls.map((call) => ({
+      key: `${record.id}:upstream:${call.sequence}`,
+      record,
+      direction: "upstream" as const,
+      title: callTitle(call),
+      subtitle: call.accountLabel || call.accountId || "上游账号未分配",
+      request: call.request,
+      response: call.response,
+      status: call.responseStatus ?? record.status,
+      error: call.error,
+    })));
+  } else if (record.upstreamRequest || record.upstreamResponse) {
+    traces.push({
+      key: `${record.id}:upstream:legacy`,
+      record,
+      direction: "upstream",
+      title: "上游请求",
+      subtitle: record.accountLabel || record.accountId || "上游账号未分配",
+      request: record.upstreamRequest ?? {},
+      response: record.upstreamResponse,
+      status: record.status,
+      error: record.error,
+    });
+  }
+  return traces;
+}
+
+const allTraces = computed(() => records.value.flatMap(recordTraces));
+const upstreamCallCount = computed(() => allTraces.value.filter((trace) => trace.direction === "upstream").length);
+const selectedTrace = computed(() => allTraces.value.find((trace) => trace.key === selectedTraceKey.value) ?? allTraces.value[0]);
+
+function selectTrace(trace: ConversationTrace): void {
+  selectedTraceKey.value = trace.key;
+  rawTraceKey.value = null;
+}
+
+function presentBody(value: DebugRawBody | JsonRecord | undefined): BodyPresentation {
+  const values = parsedBodyValues(value);
+  const messages = values.flatMap(collectMessages);
+  const raw = rawBodyText(value);
+  return {
+    contentType: bodyContentType(value),
+    raw,
+    fields: values.flatMap(recordFields),
+    messages: messages.length > 0 || !raw
+      ? messages
+      : [{ role: "raw", roleLabel: "原始文本", content: raw, toolCalls: [] }],
+  };
+}
+
+function traceRequest(trace: ConversationTrace): BodyPresentation {
+  return presentBody(trace.request);
+}
+
+function traceResponse(trace: ConversationTrace): BodyPresentation | undefined {
+  return trace.response ? presentBody(trace.response) : undefined;
+}
+
+function traceRawKey(trace: ConversationTrace): string {
+  return `raw:${trace.key}`;
+}
+
+function traceRecordLabel(trace: ConversationTrace): string {
+  return `${formatDate(trace.record.at)} · ${trace.record.endpoint}`;
 }
 
 onMounted(() => {
@@ -681,7 +816,7 @@ onMounted(() => {
           <div class="panel-heading records-heading">
             <div>
               <p class="section-kicker">调试记录</p>
-              <h2>客户端与上游消息</h2>
+              <h2>请求对话</h2>
             </div>
             <div class="record-control">
               <label class="switch-label" for="record-toggle">记录消息</label>
@@ -695,38 +830,94 @@ onMounted(() => {
             </div>
           </div>
           <p class="records-meta">
-            {{ settings.recordMessages ? "消息记录已开启" : "消息记录已关闭" }} · 已加载 {{ records.length }} 条记录
+            {{ settings.recordMessages ? "消息记录已开启" : "消息记录已关闭" }} · {{ records.length }} 个客户端请求 · {{ upstreamCallCount }} 次上游调用
             <template v-if="toolFirstPassRate !== null"> · 工具 JSON 首次解析成功率 {{ toolFirstPassRate }}%（{{ toolAdapterRecords.length }} 轮）</template>
           </p>
           <div v-if="records.length === 0" class="empty-state">暂无聊天记录。</div>
-          <div v-else class="records-list">
-            <details v-for="record in records" :key="record.id" class="record-entry">
-              <summary>
-                <span class="record-endpoint">{{ record.endpoint }}</span>
-                <span class="record-account">{{ record.accountLabel || "未分配账号" }}</span>
-                <span class="record-status" :class="{ success: record.status < 400 }">{{ record.status }}</span>
-                <span v-if="record.toolCallAdapter" class="record-account">
-                  {{ record.toolCallAdapter.finalOutcome === "final" ? "最终 JSON" : record.toolCallAdapter.initialOutcome === "tool_calls" ? "工具 JSON 首次成功" : `工具 JSON 已修复 ×${record.toolCallAdapter.repairAttempts}` }}
-                </span>
-                <time>{{ formatDate(record.at) }}</time>
-              </summary>
-              <div class="record-detail">
-                <div class="record-detail-toolbar">
-                  <span class="record-id">记录 {{ record.id }}</span>
-                  <button class="text-button" type="button" @click.stop="rawRecordId = rawRecordId === record.id ? null : record.id">
-                    {{ rawRecordId === record.id ? "查看解析内容" : "查看原始 JSON" }}
+          <div v-else class="conversation-workbench">
+            <aside class="trace-sidebar" aria-label="请求发送列表">
+              <section v-for="record in records" :key="record.id" class="trace-group">
+                <div class="trace-group-meta">
+                  <span>{{ formatDate(record.at) }}</span>
+                  <span class="trace-group-status" :class="{ success: record.status < 400 }">{{ record.status }}</span>
+                </div>
+                <button
+                  v-for="trace in recordTraces(record).slice(0, 1)"
+                  :key="trace.key"
+                  class="trace-item trace-client"
+                  :class="{ active: selectedTrace?.key === trace.key }"
+                  type="button"
+                  @click="selectTrace(trace)"
+                >
+                  <span class="trace-kind">客户端</span>
+                  <strong>{{ trace.title }}</strong>
+                  <small>{{ trace.subtitle }}</small>
+                </button>
+                <div v-if="recordTraces(record).length > 1" class="trace-children">
+                  <button
+                    v-for="trace in recordTraces(record).slice(1)"
+                    :key="trace.key"
+                    class="trace-item trace-upstream"
+                    :class="{ active: selectedTrace?.key === trace.key, failed: trace.status >= 400 || Boolean(trace.error) }"
+                    type="button"
+                    @click="selectTrace(trace)"
+                  >
+                    <span class="trace-kind">上游</span>
+                    <strong>{{ trace.title }}</strong>
+                    <small>{{ trace.subtitle }}</small>
                   </button>
                 </div>
-                <div v-if="rawRecordId !== record.id" class="record-grid parsed-record">
-                  <section v-for="section in recordSections(record)" :key="section.key" class="parsed-section">
-                    <h3>{{ section.title }}</h3>
-                    <dl v-if="section.fields.length" class="record-fields">
-                      <template v-for="field in section.fields" :key="field.label">
-                        <dt>{{ field.label }}</dt><dd :title="field.value">{{ field.value }}</dd>
-                      </template>
-                    </dl>
-                    <div v-if="section.messages.length" class="message-stack">
-                      <article v-for="(message, index) in section.messages" :key="`${section.key}-${index}`" class="message-item">
+              </section>
+            </aside>
+
+            <section v-if="selectedTrace" class="conversation-detail" :key="selectedTrace.key">
+              <header class="conversation-header">
+                <div>
+                  <p class="section-kicker">{{ selectedTrace.direction === "client" ? "客户端会话" : "上游调用" }}</p>
+                  <h3>{{ selectedTrace.title }}</h3>
+                  <p class="conversation-meta">{{ traceRecordLabel(selectedTrace) }} · {{ selectedTrace.subtitle }} · HTTP {{ selectedTrace.status }}</p>
+                </div>
+                <button class="button button-quiet" type="button" @click="rawTraceKey = rawTraceKey === traceRawKey(selectedTrace) ? null : traceRawKey(selectedTrace)">
+                  {{ rawTraceKey === traceRawKey(selectedTrace) ? "查看对话" : "查看原始数据" }}
+                </button>
+              </header>
+
+              <div v-if="rawTraceKey === traceRawKey(selectedTrace)" class="raw-trace">
+                <section>
+                  <h4>请求正文 · {{ traceRequest(selectedTrace).contentType }}</h4>
+                  <pre>{{ traceRequest(selectedTrace).raw }}</pre>
+                </section>
+                <section v-if="traceResponse(selectedTrace)">
+                  <h4>响应正文 · {{ traceResponse(selectedTrace)?.contentType }}</h4>
+                  <pre>{{ traceResponse(selectedTrace)?.raw }}</pre>
+                </section>
+              </div>
+
+              <div v-else class="conversation-flow">
+                <section class="conversation-turn request-turn">
+                  <div class="turn-label"><span>发送</span><strong>{{ selectedTrace.direction === "client" ? "客户端请求" : "上游请求" }}</strong></div>
+                  <div v-if="traceRequest(selectedTrace).messages.length" class="message-stack">
+                    <article v-for="(message, index) in traceRequest(selectedTrace).messages" :key="`request-${index}`" class="message-item message-sent">
+                      <div class="message-heading"><strong>{{ message.roleLabel }}</strong></div>
+                      <p v-if="message.content" class="message-content">{{ message.content }}</p>
+                      <div v-for="call in message.toolCalls" :key="call.id" class="tool-call-item">
+                        <span class="tool-call-name">工具：{{ call.name }}</span>
+                        <code>{{ call.arguments }}</code>
+                      </div>
+                    </article>
+                  </div>
+                  <dl v-if="traceRequest(selectedTrace).fields.length" class="record-fields trace-fields">
+                    <template v-for="(field, index) in traceRequest(selectedTrace).fields" :key="`request-field-${index}`">
+                      <dt>{{ field.label }}</dt><dd>{{ field.value }}</dd>
+                    </template>
+                  </dl>
+                </section>
+
+                <section class="conversation-turn response-turn">
+                  <div class="turn-label"><span>接收</span><strong>{{ selectedTrace.direction === "client" ? "客户端响应" : "上游响应" }}</strong></div>
+                  <template v-if="traceResponse(selectedTrace)">
+                    <div v-if="traceResponse(selectedTrace)?.messages.length" class="message-stack">
+                      <article v-for="(message, index) in traceResponse(selectedTrace)?.messages" :key="`response-${index}`" class="message-item message-received">
                         <div class="message-heading"><strong>{{ message.roleLabel }}</strong></div>
                         <p v-if="message.content" class="message-content">{{ message.content }}</p>
                         <div v-for="call in message.toolCalls" :key="call.id" class="tool-call-item">
@@ -735,25 +926,31 @@ onMounted(() => {
                         </div>
                       </article>
                     </div>
-                    <p v-if="!section.fields.length && !section.messages.length" class="parsed-empty">无可解析内容</p>
-                  </section>
-                  <section v-if="record.toolCallAdapter" class="parsed-section">
-                    <h3>工具调用转换</h3>
-                    <dl class="record-fields">
-                      <dt>预期模式</dt><dd>{{ toolModeLabel(record.toolCallAdapter.toolCallExpected) }}</dd>
-                      <dt>首次结果</dt><dd>{{ toolOutcomeLabel(record.toolCallAdapter.initialOutcome) }}</dd>
-                      <dt>最终结果</dt><dd>{{ toolOutcomeLabel(record.toolCallAdapter.finalOutcome) }}</dd>
-                      <dt>修复次数</dt><dd>{{ record.toolCallAdapter.repairAttempts }} / {{ record.toolCallAdapter.maxRepairAttempts }}</dd>
-                      <dt>首次解析</dt><dd>{{ record.toolCallAdapter.initialParseSucceeded ? "成功" : "失败" }}</dd>
+                    <dl v-if="traceResponse(selectedTrace)?.fields.length" class="record-fields trace-fields">
+                      <template v-for="(field, index) in traceResponse(selectedTrace)?.fields" :key="`response-field-${index}`">
+                        <dt>{{ field.label }}</dt><dd>{{ field.value }}</dd>
+                      </template>
                     </dl>
-                    <ul v-if="record.toolCallAdapter.errors.length" class="error-list">
-                      <li v-for="error in record.toolCallAdapter.errors" :key="error">{{ error }}</li>
-                    </ul>
-                  </section>
-                </div>
-                <pre v-else class="raw-record-json">{{ pretty(record) }}</pre>
+                  </template>
+                  <p v-else class="parsed-empty">尚未收到响应正文。</p>
+                </section>
+
+                <p v-if="selectedTrace.error" class="trace-error">{{ selectedTrace.error }}</p>
+                <section v-if="selectedTrace.record.toolCallAdapter" class="adapter-trace">
+                  <h4>工具调用转换</h4>
+                  <dl class="record-fields trace-fields">
+                    <dt>预期模式</dt><dd>{{ toolModeLabel(selectedTrace.record.toolCallAdapter.toolCallExpected) }}</dd>
+                    <dt>首次结果</dt><dd>{{ toolOutcomeLabel(selectedTrace.record.toolCallAdapter.initialOutcome) }}</dd>
+                    <dt>最终结果</dt><dd>{{ toolOutcomeLabel(selectedTrace.record.toolCallAdapter.finalOutcome) }}</dd>
+                    <dt>修复次数</dt><dd>{{ selectedTrace.record.toolCallAdapter.repairAttempts }} / {{ selectedTrace.record.toolCallAdapter.maxRepairAttempts }}</dd>
+                    <dt>首次解析</dt><dd>{{ selectedTrace.record.toolCallAdapter.initialParseSucceeded ? "成功" : "失败" }}</dd>
+                  </dl>
+                  <ul v-if="selectedTrace.record.toolCallAdapter.errors.length" class="error-list">
+                    <li v-for="error in selectedTrace.record.toolCallAdapter.errors" :key="error">{{ error }}</li>
+                  </ul>
+                </section>
               </div>
-            </details>
+            </section>
           </div>
         </section>
       </template>

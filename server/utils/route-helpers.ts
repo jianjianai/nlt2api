@@ -1,9 +1,10 @@
 import { randomUUID } from "node:crypto";
-import { HttpError, redact } from "~/server/utils/http.ts";
+import { HttpError } from "~/server/utils/http.ts";
+import { redact } from "~/server/utils/redaction.ts";
 import { PortalError } from "~/server/utils/portal-client.ts";
 import { requestCause } from "~/server/utils/request-errors.ts";
 import { stateStore } from "~/server/utils/state-store.ts";
-import type { DebugRecord, JsonObject } from "~/server/utils/types.ts";
+import type { DebugRawBody, DebugRecord, DebugUpstreamCall, JsonObject } from "~/server/utils/types.ts";
 
 export function upstreamHttpError(error: unknown): HttpError {
   error = requestCause(error);
@@ -36,16 +37,55 @@ export function adminHttpError(error: unknown): HttpError {
   );
 }
 
+function redactJsonBody(body: string): string {
+  try {
+    const parsed = JSON.parse(body);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      return body;
+    }
+    const serialized = JSON.stringify(parsed);
+    const redacted = JSON.stringify(redact(parsed as Record<string, unknown>) ?? {});
+    return serialized === redacted ? body : redacted;
+  } catch {
+    return body;
+  }
+}
+
+function redactSseBody(body: string): string {
+  return body.replace(/^(data:\s*)(.+)$/gm, (line, prefix: string, data: string) => {
+    if (data === "[DONE]") return line;
+    return `${prefix}${redactJsonBody(data)}`;
+  });
+}
+
+function redactRawBody(body: DebugRawBody): DebugRawBody {
+  return {
+    ...body,
+    body: body.contentType === "application/json"
+      ? redactJsonBody(body.body)
+      : body.contentType === "text/event-stream"
+        ? redactSseBody(body.body)
+        : body.body,
+  };
+}
+
+function redactUpstreamCall(call: DebugUpstreamCall): DebugUpstreamCall {
+  return {
+    ...call,
+    request: redactRawBody(call.request),
+    ...(call.response ? { response: redactRawBody(call.response) } : {}),
+  };
+}
+
 export async function recordDebug(input: Omit<DebugRecord, "id" | "at">): Promise<void> {
   try {
     await stateStore.appendDebugRecord({
       id: `dbg_${randomUUID().replaceAll("-", "")}`,
       at: new Date().toISOString(),
       ...input,
-      clientRequest: redact(input.clientRequest) ?? {},
-      ...(input.upstreamRequest ? { upstreamRequest: redact(input.upstreamRequest) ?? {} } : {}),
-      ...(input.clientResponse ? { clientResponse: redact(input.clientResponse) ?? {} } : {}),
-      ...(input.upstreamResponse ? { upstreamResponse: redact(input.upstreamResponse) ?? {} } : {}),
+      clientRequest: redactRawBody(input.clientRequest),
+      ...(input.clientResponse ? { clientResponse: redactRawBody(input.clientResponse) } : {}),
+      ...(input.upstreamCalls ? { upstreamCalls: input.upstreamCalls.map(redactUpstreamCall) } : {}),
     });
   } catch {
     // Diagnostics must never turn a completed model request into an error.

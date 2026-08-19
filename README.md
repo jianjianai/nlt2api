@@ -60,11 +60,11 @@ Responses 的 `text.format: {"type":"json_object"}` 会映射为门户已验证�
 - `POST /api/admin/accounts/:id/verify`：强制重新验证登录
 - `DELETE /api/admin/accounts/:id`
 - `GET/PATCH /api/admin/settings`：开启或关闭消息记录
-- `GET /api/admin/records?limit=100`：读取脱敏的客户端/上游调试记录
+- `GET /api/admin/records?limit=100`：读取按客户端请求分组、包含全部上游调用的脱敏调试记录
 - `DELETE /api/admin/records?account_id=...`：清理指定账号的调试记录
 - `DELETE /api/admin/records`：清空全部调试记录（仅管理员可用）
 
-面板的“聊天记录”页默认将请求、响应、消息角色、文本和工具调用解析成易读视图；点击“查看原始 JSON”才显示完整原始记录。消息记录默认关闭，开启后仍会脱敏并受大小上限约束。
+面板的“聊天记录”页按一个客户端请求分组：左侧先列出客户端请求，再列出首次请求、纠错轮、续写轮、账号重试和会话刷新重发等全部上游调用。右侧从每项原始请求正文和响应正文解析对话、消息、工具调用及全部字段；点击“查看原始数据”可读取完整 JSON 或 SSE 文本。消息记录默认关闭。开启后只会脱敏认证和会话等敏感字段，不会截断已接收的消息正文。
 
 调度使用加权 rendezvous hashing 保持会话粘性，并对无会话键的请求按有效在途负载做均衡。会话依据门户 `/dashboard` 的重定向契约刷新；聊天请求遇到过期会话时会重新登录并重试一次。账号密码和 Cookie 永远不会返回到客户端面板或写入日志。
 
@@ -72,7 +72,7 @@ Responses 的 `text.format: {"type":"json_object"}` 会映射为门户已验证�
 
 网关会在本地校验工具名称和 JSON Schema，并限制工具数量、参数大小、工具结果、请求字节数和输出 token 数。模型没有生成可校验的控制信封时，最多执行五次有界纠错；每次纠错都从原始会话重建，保留第一次完成的思考字段，只替换最近一次无效候选，并携带精确的 JSON、策略或 Schema 错误。只有完整校验通过的候选才能转成 OpenAI 工具调用；达到上限后以 HTTP 502 失败关闭。
 
-调试记录包含首次解析结果、纠错次数和校验错误，面板会按全部工具轮计算首次成功率。模型契约包含每个函数的完整描述和 JSON Schema，放在最新会话/工具结果之后；工具轮默认使用温度 0，内部纠错始终使用温度 0。客户端可发送任意正整数的 `max_tokens`/`max_completion_tokens` 预算，服务端不再设置上限。门户当前实际接受的单次 `max_tokens` 上限是 8,192。客户端预算超过该值且上游以 `finish_reason: "length"` 截断时，网关会在同一账号上自动续接，并合并后续内容，直到达到客户端预算、模型正常结束或达到内部续接轮数上限。未指定预算时仍使用 8,192 的默认单轮生成预算。门户请求有 `NEURALWATT_UPSTREAM_TIMEOUT_MS` 超时，以及上游响应、会话和 Responses 状态的字节上限。Responses 的 `reasoning.effort`、`reasoning.summary` 与旧版 `reasoning.generate_summary` 会接受并校验，常见 SDK 发送的 `null` 默认值也会忽略；门户没有摘要开关，因此只转发有效的 `reasoning.effort`。调试记录默认关闭；开启后每个请求单独写入一个 JSON 调试文件，并受 `NEURALWATT_MAX_RECORD_BYTES` 限制。所有环境变量见 `.env.example`。
+调试记录包含首次解析结果、纠错次数和校验错误，面板会按全部工具轮计算首次成功率。模型契约包含每个函数的完整描述和 JSON Schema，放在最新会话/工具结果之后；工具轮默认使用温度 0，内部纠错始终使用温度 0。客户端可发送任意正整数的 `max_tokens`/`max_completion_tokens` 预算，服务端不再设置上限。门户当前实际接受的单次 `max_tokens` 上限是 8,192。客户端预算超过该值且上游以 `finish_reason: "length"` 截断时，网关会在同一账号上自动续接，并合并后续内容，直到达到客户端预算、模型正常结束或达到内部续接轮数上限。未指定预算时仍使用 8,192 的默认单轮生成预算。门户请求有 `NEURALWATT_UPSTREAM_TIMEOUT_MS` 超时，以及上游响应、会话和 Responses 状态的字节上限。Responses 的 `reasoning.effort`、`reasoning.summary` 与旧版 `reasoning.generate_summary` 会接受并校验，常见 SDK 发送的 `null` 默认值也会忽略；门户没有摘要开关，因此只转发有效的 `reasoning.effort`。调试记录默认关闭；开启后每个客户端请求单独写入一个 JSON 文件，保留全部已接收的原始正文。所有环境变量见 `.env.example`。
 
 运行回归测试、类型检查和构建：
 
