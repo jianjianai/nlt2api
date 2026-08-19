@@ -108,8 +108,12 @@ export function responsesStreamEvents(response: JsonObject): ResponseStreamEvent
       });
     } else {
       const content = Array.isArray(item.content) ? item.content[0] as JsonObject : undefined;
+      const refusal = content?.type === "refusal" && typeof content.refusal === "string" ? content.refusal : "";
       const text = typeof content?.text === "string" ? content.text : "";
-      const part = { type: "output_text", text, annotations: [], logprobs: [] };
+      const isRefusal = Boolean(refusal);
+      const part = isRefusal
+        ? { type: "refusal", refusal }
+        : { type: "output_text", text, annotations: [], logprobs: [] };
       events.push({
         event: "response.content_part.added",
         data: {
@@ -117,33 +121,58 @@ export function responsesStreamEvents(response: JsonObject): ResponseStreamEvent
           output_index: outputIndex,
           item_id: itemId,
           content_index: 0,
-          part: { type: "output_text", text: "", annotations: [], logprobs: [] },
+          part: isRefusal
+            ? { type: "refusal", refusal: "" }
+            : { type: "output_text", text: "", annotations: [], logprobs: [] },
         },
       });
-      if (text) {
+      if (isRefusal) {
         events.push({
-          event: "response.output_text.delta",
+          event: "response.refusal.delta",
           data: {
-            type: "response.output_text.delta",
+            type: "response.refusal.delta",
             output_index: outputIndex,
             item_id: itemId,
             content_index: 0,
-            delta: text,
+            delta: refusal,
+          },
+        });
+        events.push({
+          event: "response.refusal.done",
+          data: {
+            type: "response.refusal.done",
+            output_index: outputIndex,
+            item_id: itemId,
+            content_index: 0,
+            refusal,
+          },
+        });
+      } else {
+        if (text) {
+          events.push({
+            event: "response.output_text.delta",
+            data: {
+              type: "response.output_text.delta",
+              output_index: outputIndex,
+              item_id: itemId,
+              content_index: 0,
+              delta: text,
+              logprobs: [],
+            },
+          });
+        }
+        events.push({
+          event: "response.output_text.done",
+          data: {
+            type: "response.output_text.done",
+            output_index: outputIndex,
+            item_id: itemId,
+            content_index: 0,
+            text,
             logprobs: [],
           },
         });
       }
-      events.push({
-        event: "response.output_text.done",
-        data: {
-          type: "response.output_text.done",
-          output_index: outputIndex,
-          item_id: itemId,
-          content_index: 0,
-          text,
-          logprobs: [],
-        },
-      });
       events.push({
         event: "response.content_part.done",
         data: {

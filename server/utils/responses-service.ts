@@ -1,14 +1,36 @@
 import { createHash, randomUUID } from "node:crypto";
-import { executeChatRequest, parseTools } from "~/server/utils/chat-service.ts";
+import { executeChatRequest, parseTools, validateChatRequest } from "~/server/utils/chat-service.ts";
 import { getProxyConfig } from "~/server/utils/config.ts";
 import { HttpError } from "~/server/utils/http.ts";
 import { responsesStreamEvents } from "~/server/utils/responses-events.ts";
 import { responseEnvelopeFields, responseUsage } from "~/server/utils/responses-compat.ts";
 import { ProxyRequestError } from "~/server/utils/request-errors.ts";
 import { ResponseStateLimitError, stateStore } from "~/server/utils/state-store.ts";
-import type { ChatMessage, JsonObject, JsonValue, ResponseState, ToolCallAdapterTrace, ToolDefinition } from "~/server/utils/types.ts";
+import type {
+  ChatMessage,
+  JsonObject,
+  JsonValue,
+  ResponseState,
+  ToolCallAdapterTrace,
+  ToolDefinition,
+  UpstreamCompletion,
+} from "~/server/utils/types.ts";
 
-interface ResponseExecution {
+export interface ResponsesStreamEntry {
+  event: string;
+  data: JsonObject;
+}
+
+export interface ResponsesExecutionOptions {
+  stream?: boolean;
+  emit?: (entry: ResponsesStreamEntry) => void | Promise<void>;
+  signal?: AbortSignal;
+  prepared?: PreparedResponsesRequest;
+  responseId?: string;
+  createdAt?: number;
+}
+
+export interface ResponseExecution {
   response: JsonObject;
   streamEvents: Array<{ event: string; data: JsonObject }>;
   accountId: string;
@@ -190,9 +212,9 @@ function responseToolChoice(value: unknown): JsonValue | undefined {
 
 const REASONING_SUMMARY_VALUES = new Set(["auto", "concise", "detailed", "none"]);
 
-function responseReasoningEffort(reasoningValue: unknown, directValue: unknown): string | undefined {
+export function responseReasoningEffort(reasoningValue: unknown, directValue: unknown): string | undefined {
   let direct: string | undefined;
-  if (directValue !== undefined) {
+  if (directValue !== undefined && directValue !== null) {
     if (typeof directValue !== "string" || !directValue.trim() || directValue.length > 32) {
       throw new HttpError(400, "`reasoning_effort` must be a non-empty string.", "invalid_request_error", "reasoning_effort");
     }
@@ -220,7 +242,7 @@ function responseReasoningEffort(reasoningValue: unknown, directValue: unknown):
   }
   for (const key of ["summary", "generate_summary"]) {
     const summary = reasoning[key];
-    if (summary !== undefined && (typeof summary !== "string" || !REASONING_SUMMARY_VALUES.has(summary))) {
+    if (summary !== undefined && summary !== null && (typeof summary !== "string" || !REASONING_SUMMARY_VALUES.has(summary))) {
       throw new HttpError(
         400,
         `\`reasoning.${key}\` must be one of auto, concise, detailed, or none.`,
@@ -237,7 +259,7 @@ function responseReasoningEffort(reasoningValue: unknown, directValue: unknown):
       "reasoning",
     );
   }
-  if (reasoning.effort === undefined) {
+  if (reasoning.effort === undefined || reasoning.effort === null) {
     return direct;
   }
   if (typeof reasoning.effort !== "string" || !reasoning.effort.trim() || reasoning.effort.length > 32) {
@@ -345,41 +367,321 @@ function inputItems(value: unknown): ChatMessage[] {
   return messages;
 }
 
-function responseOutput(message: ChatMessage, status: "completed" | "incomplete"): JsonObject[] {
-  const output: JsonObject[] = [];
-  // Only expose an explicit provider summary. `reasoning_content` is commonly
-  // raw chain-of-thought and is retained for internal Chat replay instead.
-  const reasoning = typeof message.reasoning === "string" ? message.reasoning : "";
+interface ResponseOutputIdentity {
+  reasoningId: string;
+  messageId: string;
+  functionCallIds: string[];
+}
+
+type ResponseOutputKind = "reasoning" | "message";
+
+function newResponseOutputIdentity(): ResponseOutputIdentity {
+  const id = () => randomUUID().replaceAll("-", "");
+  return {
+    reasoningId: `rs_${id()}`,
+    messageId: `msg_${id()}`,
+    functionCallIds: [],
+  };
+}
+
+function responseOutput(
+  message: ChatMessage,
+  status: "completed" | "incomplete",
+  identity = newResponseOutputIdentity(),
+  outputOrder: ResponseOutputKind[] = [],
+): JsonObject[] {
+  const reasoningOutput: JsonObject[] = [];
+  const messageOutput: JsonObject[] = [];
+  // The portal may label visible thinking as either `reasoning` or
+  // `reasoning_content`. Responses clients have no Chat-specific channel, so
+  // expose the available text as a standard reasoning summary item.
+  const reasoning = typeof message.reasoning === "string"
+    ? message.reasoning
+    : typeof message.reasoning_content === "string"
+      ? message.reasoning_content
+      : "";
   if (reasoning) {
-    output.push({
-      id: `rs_${randomUUID().replaceAll("-", "")}`,
+    reasoningOutput.push({
+      id: identity.reasoningId,
       type: "reasoning",
       status,
       summary: [{ type: "summary_text", text: reasoning }],
     });
   }
   if (message.tool_calls?.length) {
-    output.push(...message.tool_calls.map((call) => ({
-      id: `fc_${randomUUID().replaceAll("-", "")}`,
+    return [
+      ...reasoningOutput,
+      ...message.tool_calls.map((call, index) => ({
+      id: identity.functionCallIds[index] ?? `fc_${randomUUID().replaceAll("-", "")}`,
       type: "function_call",
       status,
       call_id: call.id,
       name: call.function.name,
       arguments: call.function.arguments,
-    })));
-    return output;
+      })),
+    ];
   }
-  output.push({
-    id: `msg_${randomUUID().replaceAll("-", "")}`,
+  messageOutput.push({
+    id: identity.messageId,
     type: "message",
     status,
     role: "assistant",
-    content: [{ type: "output_text", text: outputToText(message.content), annotations: [], logprobs: [] }],
+    content: typeof message.refusal === "string" && message.refusal
+      ? [{ type: "refusal", refusal: message.refusal }]
+      : [{ type: "output_text", text: outputToText(message.content), annotations: [], logprobs: [] }],
   });
+  const ordered = outputOrder.length > 0 ? outputOrder : ["reasoning", "message"] as ResponseOutputKind[];
+  const output: JsonObject[] = [];
+  for (const kind of ordered) {
+    if (kind === "reasoning" && reasoningOutput.length > 0 && !output.includes(reasoningOutput[0]!)) {
+      output.push(...reasoningOutput);
+    }
+    if (kind === "message" && messageOutput.length > 0 && !output.includes(messageOutput[0]!)) {
+      output.push(...messageOutput);
+    }
+  }
+  if (reasoningOutput.length > 0 && !output.includes(reasoningOutput[0]!)) output.push(...reasoningOutput);
+  if (messageOutput.length > 0 && !output.includes(messageOutput[0]!)) output.push(...messageOutput);
   return output;
 }
 
-export async function executeResponsesRequest(request: JsonObject): Promise<ResponseExecution> {
+interface LiveResponseState {
+  sequenceNumber: number;
+  responseId: string;
+  createdAt: number;
+  model: string;
+  reasoningId: string;
+  messageId: string;
+  nextOutputIndex: number;
+  reasoningOutputIndex?: number;
+  messageOutputIndex?: number;
+  reasoningStarted: boolean;
+  messageStarted: boolean;
+  messageKind?: "output_text" | "refusal";
+  outputOrder: ResponseOutputKind[];
+  startedItemIds: Set<string>;
+}
+
+async function liveEmit(
+  state: LiveResponseState,
+  emit: ((entry: ResponsesStreamEntry) => void | Promise<void>) | undefined,
+  event: string,
+  data: JsonObject,
+): Promise<void> {
+  if (!emit) return;
+  await emit({
+    event,
+    data: { ...data, sequence_number: state.sequenceNumber++ },
+  });
+}
+
+function liveResponseEnvelope(
+  request: JsonObject,
+  tools: ToolDefinition[],
+  previousId: string | undefined,
+  state: LiveResponseState,
+): JsonObject {
+  return {
+    id: state.responseId,
+    object: "response",
+    created_at: state.createdAt,
+    status: "in_progress",
+    model: state.model,
+    output: [],
+    output_text: "",
+    usage: null,
+    ...responseEnvelopeFields(request, tools, previousId, "completed", state.createdAt),
+    completed_at: null,
+    incomplete_details: null,
+  };
+}
+
+async function emitLiveReasoningDelta(
+  state: LiveResponseState,
+  emit: ((entry: ResponsesStreamEntry) => void | Promise<void>) | undefined,
+  delta: string,
+): Promise<void> {
+  if (!delta) return;
+  if (!state.reasoningStarted) {
+    state.reasoningStarted = true;
+    state.reasoningOutputIndex = state.nextOutputIndex++;
+    state.outputOrder.push("reasoning");
+    state.startedItemIds.add(state.reasoningId);
+    await liveEmit(state, emit, "response.output_item.added", {
+      type: "response.output_item.added",
+      output_index: state.reasoningOutputIndex,
+      item: {
+        id: state.reasoningId,
+        type: "reasoning",
+        status: "in_progress",
+        summary: [],
+      },
+    });
+    await liveEmit(state, emit, "response.reasoning_summary_part.added", {
+      type: "response.reasoning_summary_part.added",
+      output_index: state.reasoningOutputIndex,
+      item_id: state.reasoningId,
+      summary_index: 0,
+      part: { type: "summary_text", text: "" },
+    });
+  }
+  await liveEmit(state, emit, "response.reasoning_summary_text.delta", {
+    type: "response.reasoning_summary_text.delta",
+    output_index: state.reasoningOutputIndex ?? 0,
+    item_id: state.reasoningId,
+    summary_index: 0,
+    delta,
+  });
+}
+
+async function emitLiveContentDelta(
+  state: LiveResponseState,
+  emit: ((entry: ResponsesStreamEntry) => void | Promise<void>) | undefined,
+  delta: string,
+): Promise<void> {
+  if (!delta) return;
+  if (!state.messageStarted) {
+    state.messageStarted = true;
+    state.messageKind = "output_text";
+    state.messageOutputIndex = state.nextOutputIndex++;
+    state.outputOrder.push("message");
+    state.startedItemIds.add(state.messageId);
+    await liveEmit(state, emit, "response.output_item.added", {
+      type: "response.output_item.added",
+      output_index: state.messageOutputIndex,
+      item: {
+        id: state.messageId,
+        type: "message",
+        status: "in_progress",
+        role: "assistant",
+        content: [],
+      },
+    });
+    await liveEmit(state, emit, "response.content_part.added", {
+      type: "response.content_part.added",
+      output_index: state.messageOutputIndex,
+      item_id: state.messageId,
+      content_index: 0,
+      part: { type: "output_text", text: "", annotations: [], logprobs: [] },
+    });
+  }
+  await liveEmit(state, emit, "response.output_text.delta", {
+    type: "response.output_text.delta",
+    output_index: state.messageOutputIndex ?? 0,
+    item_id: state.messageId,
+    content_index: 0,
+    delta,
+    logprobs: [],
+  });
+}
+
+async function emitLiveRefusalDelta(
+  state: LiveResponseState,
+  emit: ((entry: ResponsesStreamEntry) => void | Promise<void>) | undefined,
+  delta: string,
+): Promise<void> {
+  if (!delta || (state.messageStarted && state.messageKind !== "refusal")) return;
+  if (!state.messageStarted) {
+    state.messageStarted = true;
+    state.messageKind = "refusal";
+    state.messageOutputIndex = state.nextOutputIndex++;
+    state.outputOrder.push("message");
+    state.startedItemIds.add(state.messageId);
+    await liveEmit(state, emit, "response.output_item.added", {
+      type: "response.output_item.added",
+      output_index: state.messageOutputIndex,
+      item: {
+        id: state.messageId,
+        type: "message",
+        status: "in_progress",
+        role: "assistant",
+        content: [],
+      },
+    });
+    await liveEmit(state, emit, "response.content_part.added", {
+      type: "response.content_part.added",
+      output_index: state.messageOutputIndex,
+      item_id: state.messageId,
+      content_index: 0,
+      part: { type: "refusal", refusal: "" },
+    });
+  }
+  await liveEmit(state, emit, "response.refusal.delta", {
+    type: "response.refusal.delta",
+    output_index: state.messageOutputIndex ?? 0,
+    item_id: state.messageId,
+    content_index: 0,
+    delta,
+  });
+}
+
+async function emitLiveUpstreamFrame(
+  frame: UpstreamCompletion,
+  state: LiveResponseState,
+  emit: ((entry: ResponsesStreamEntry) => void | Promise<void>) | undefined,
+): Promise<boolean> {
+  const sequenceBefore = state.sequenceNumber;
+  const delta = frame.choices?.[0]?.delta;
+  if (!delta) return false;
+  // Prefer the provider's public summary when both channels are present. The
+  // fallback keeps Kimi-style reasoning_content visible to Responses clients.
+  const reasoning = typeof delta.reasoning === "string"
+    ? delta.reasoning
+    : typeof delta.reasoning_content === "string"
+      ? delta.reasoning_content
+      : "";
+  await emitLiveReasoningDelta(state, emit, reasoning);
+  if (typeof delta.refusal === "string" && delta.refusal) {
+    await emitLiveRefusalDelta(state, emit, delta.refusal);
+  } else if (typeof delta.content === "string") {
+    await emitLiveContentDelta(state, emit, delta.content);
+  }
+  return state.sequenceNumber > sequenceBefore;
+}
+
+async function emitLiveTail(
+  response: JsonObject,
+  state: LiveResponseState,
+  emit: ((entry: ResponsesStreamEntry) => void | Promise<void>) | undefined,
+): Promise<void> {
+  const skippedForLive = new Set([
+    "response.output_item.added",
+    "response.reasoning_summary_part.added",
+    "response.reasoning_summary_text.delta",
+    "response.content_part.added",
+    "response.output_text.delta",
+    "response.refusal.delta",
+  ]);
+  for (const entry of responsesStreamEvents(response)) {
+    if (entry.event === "response.created" || entry.event === "response.in_progress") {
+      continue;
+    }
+    const item = asRecord(entry.data.item);
+    const itemId = typeof entry.data.item_id === "string"
+      ? entry.data.item_id
+      : typeof item?.id === "string"
+        ? item.id
+        : undefined;
+    if (skippedForLive.has(entry.event) && itemId && state.startedItemIds.has(itemId)) {
+      continue;
+    }
+    const data = { ...entry.data };
+    delete data.sequence_number;
+    await liveEmit(state, emit, entry.event, data);
+  }
+}
+
+export interface PreparedResponsesRequest {
+  previousId?: string;
+  previous?: ResponseState;
+  conversationMessages: ChatMessage[];
+  tools: ToolDefinition[];
+  model: string;
+  historyLimit: number;
+  chatRequest: JsonObject;
+}
+
+export async function prepareResponsesRequest(request: JsonObject): Promise<PreparedResponsesRequest> {
   if (request.stream !== undefined && typeof request.stream !== "boolean") {
     throw new HttpError(400, "`stream` must be a boolean.", "invalid_request_error", "stream");
   }
@@ -400,23 +702,25 @@ export async function executeResponsesRequest(request: JsonObject): Promise<Resp
   if (previousId && !previous) {
     throw new HttpError(404, "The previous_response_id is unknown or expired.", "invalid_request_error", "previous_response_id");
   }
+  if (previous) {
+    const assignedAccount = await stateStore.getAccount(previous.accountId);
+    if (!assignedAccount || !assignedAccount.enabled) {
+      throw new HttpError(
+        409,
+        "The account assigned to previous_response_id is unavailable.",
+        "invalid_request_error",
+        "previous_response_id",
+      );
+    }
+  }
 
   const newMessages = request.input === undefined ? [] : inputItems(request.input);
   if (!previous && newMessages.length === 0) {
     throw new HttpError(400, "`input` is required unless previous_response_id supplies a conversation.", "invalid_request_error", "input");
   }
   const instructionMessages = responseInstructionMessages(request.instructions);
-  const conversationMessages: ChatMessage[] = [
-    ...(previous?.messages ?? []),
-    ...newMessages,
-  ];
-  const history: ChatMessage[] = [
-    ...instructionMessages,
-    ...(previous?.messages ?? []),
-    ...newMessages,
-  ];
-  // Responses `instructions` and `tools` are request-scoped. Clients must send
-  // them again on a previous_response_id continuation when they are needed.
+  const conversationMessages: ChatMessage[] = [...(previous?.messages ?? []), ...newMessages];
+  const history: ChatMessage[] = [...instructionMessages, ...(previous?.messages ?? []), ...newMessages];
   const tools = request.tools === undefined ? [] : responseTools(request.tools);
   const reasoningEffort = responseReasoningEffort(request.reasoning, request.reasoning_effort);
   const responseFormat = responseFormatFromText(request.text);
@@ -427,10 +731,7 @@ export async function executeResponsesRequest(request: JsonObject): Promise<Resp
   if (!model) {
     throw new HttpError(400, "`model` is required for a new Responses request.", "invalid_request_error", "model");
   }
-  const historyLimit = Math.min(
-    getProxyConfig().maxResponseHistoryBytes,
-    getProxyConfig().maxResponseStateBytes,
-  );
+  const historyLimit = Math.min(getProxyConfig().maxResponseHistoryBytes, getProxyConfig().maxResponseStateBytes);
   const historyBytes = Buffer.byteLength(JSON.stringify({ model, messages: history, tools }), "utf8");
   const stateReserve = responseStateReserve(request, historyLimit);
   if (historyBytes > historyLimit - stateReserve) {
@@ -445,7 +746,7 @@ export async function executeResponsesRequest(request: JsonObject): Promise<Resp
   }
   const chatRequest: JsonObject = {
     ...request,
-    ...(model ? { model } : {}),
+    model,
     messages: history as unknown as JsonValue,
     tools: tools as unknown as JsonValue,
     tool_choice: responseToolChoice(request.tool_choice),
@@ -457,15 +758,60 @@ export async function executeResponsesRequest(request: JsonObject): Promise<Resp
   delete chatRequest.input;
   delete chatRequest.instructions;
   delete chatRequest.previous_response_id;
+  validateChatRequest(chatRequest);
+  return { previousId, previous, conversationMessages, tools, model, historyLimit, chatRequest };
+}
+
+export async function executeResponsesRequest(
+  request: JsonObject,
+  options?: ResponsesExecutionOptions,
+): Promise<ResponseExecution> {
+  const prepared = options?.prepared ?? await prepareResponsesRequest(request);
+  const { previousId, previous, conversationMessages, tools, model, historyLimit } = prepared;
+  const chatRequest: JsonObject = { ...prepared.chatRequest, stream: options?.stream === true };
+
+  const id = options?.responseId ?? `resp_${randomUUID().replaceAll("-", "")}`;
+  const createdAt = options?.createdAt ?? Math.floor(Date.now() / 1_000);
+  const outputIdentity = newResponseOutputIdentity();
+  const liveState: LiveResponseState | undefined = options?.emit
+    ? {
+      sequenceNumber: 0,
+      responseId: id,
+      createdAt,
+      model,
+      reasoningId: outputIdentity.reasoningId,
+      messageId: outputIdentity.messageId,
+      nextOutputIndex: 0,
+      reasoningStarted: false,
+      messageStarted: false,
+      outputOrder: [],
+      startedItemIds: new Set<string>(),
+    }
+    : undefined;
+  if (liveState) {
+    const inProgress = liveResponseEnvelope(request, tools, previousId, liveState);
+    const emit = options?.emit;
+    await liveEmit(liveState, emit, "response.created", {
+      type: "response.created",
+      response: inProgress,
+    });
+    await liveEmit(liveState, emit, "response.in_progress", {
+      type: "response.in_progress",
+      response: inProgress,
+    });
+  }
 
   const execution = await executeChatRequest(chatRequest, {
     stickyKey: previousId ?? responseStickyKey(request.user),
     requiredAccountId: previous?.accountId,
+    stream: options?.stream === true,
+    signal: options?.signal,
+    onUpstreamFrame: liveState && options?.emit
+      ? async (frame) => emitLiveUpstreamFrame(frame, liveState, options.emit)
+      : undefined,
   });
-  const id = `resp_${randomUUID().replaceAll("-", "")}`;
   const responseStatus = execution.finishReason === "length" ? "incomplete" : "completed";
-  const createdAt = Math.floor(Date.now() / 1_000);
-  const output = responseOutput(execution.message, responseStatus);
+  const output = responseOutput(execution.message, responseStatus, outputIdentity, liveState?.outputOrder);
   const text = execution.message.tool_calls?.length ? "" : outputToText(execution.message.content);
   const response: JsonObject = {
     id,
@@ -526,6 +872,10 @@ export async function executeResponsesRequest(request: JsonObject): Promise<Resp
         upstreamResponse: execution.completion as unknown as JsonObject,
       });
     }
+  }
+
+  if (liveState && options?.emit) {
+    await emitLiveTail(response, liveState, options.emit);
   }
 
   return {

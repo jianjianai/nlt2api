@@ -22,7 +22,9 @@ import {
 } from "../server/utils/responses-compat.ts";
 import {
   collectUpstreamStream,
+  openAIStreamingSse,
   openAISse,
+  UpstreamStreamError,
 } from "../server/utils/upstream-stream.ts";
 import { redact } from "../server/utils/redaction.ts";
 
@@ -324,12 +326,70 @@ test("fragmented upstream SSE is assembled without losing deltas", async () => {
       controller.close();
     },
   });
-  const collected = await collectUpstreamStream(new Response(stream));
+  const forwarded: string[] = [];
+  const collected = await collectUpstreamStream(new Response(stream), (frame) => {
+    const content = frame.choices?.[0]?.delta?.content;
+    if (typeof content === "string") forwarded.push(content);
+  });
 
   assert.equal(collected.frames.length, 3);
+  assert.deepEqual(forwarded, ["hel", "lo"]);
   assert.equal(collected.completion.choices?.[0]?.message?.content, "hello");
   assert.equal(collected.completion.choices?.[0]?.finish_reason, "stop");
   assert.equal(collected.completion.usage?.total_tokens, 5);
+});
+
+test("streaming SSE writes its first event before the producer finishes", async () => {
+  let release: () => void = () => {};
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  const response = openAIStreamingSse(async (emit) => {
+    await emit({ data: { delta: "first" } });
+    await gate;
+    await emit({ data: { delta: "second" } });
+  });
+  const reader = response.body?.getReader();
+  assert.ok(reader);
+  const decoder = new TextDecoder();
+  const first = await reader.read();
+  assert.equal(first.done, false);
+  assert.match(decoder.decode(first.value), /"first"/);
+
+  release();
+  let rest = "";
+  while (true) {
+    const next = await reader.read();
+    if (next.done) break;
+    rest += decoder.decode(next.value, { stream: true });
+  }
+  assert.match(rest, /"second"/);
+  assert.match(rest, /data: \[DONE\]/);
+});
+
+test("streaming SSE aborts its producer when the client cancels", async () => {
+  let resolveAbort: () => void = () => {};
+  const aborted = new Promise<void>((resolve) => { resolveAbort = resolve; });
+  const response = openAIStreamingSse(async (emit, signal) => {
+    await emit({ data: { delta: "first" } });
+    await new Promise<void>((resolve) => {
+      if (signal.aborted) {
+        resolveAbort();
+        resolve();
+        return;
+      }
+      signal.addEventListener("abort", () => {
+        resolveAbort();
+        resolve();
+      }, { once: true });
+    });
+  });
+  const reader = response.body?.getReader();
+  assert.ok(reader);
+  await reader.read();
+  await reader.cancel();
+  await Promise.race([
+    aborted,
+    new Promise<never>((_, reject) => setTimeout(() => reject(new Error("abort was not observed")), 100)),
+  ]);
 });
 
 test("upstream reasoning summaries stay distinct from raw reasoning content", async () => {
@@ -352,13 +412,24 @@ test("upstream reasoning summaries stay distinct from raw reasoning content", as
 test("upstream SSE error and empty streams fail closed", async () => {
   await assert.rejects(
     collectUpstreamStream(new Response('data: {"error":{"message":"unknown model"}}\n\n')),
-    /unknown model/,
+    (error: unknown) => error instanceof UpstreamStreamError
+      && error.status === 502
+      && error.message === "unknown model",
+  );
+  await assert.rejects(
+    collectUpstreamStream(new Response('data: {"error":"Gateway returned status 404","status":404}\n\n')),
+    (error: unknown) => error instanceof UpstreamStreamError && error.status === 404,
   );
   await assert.rejects(
     collectUpstreamStream(new Response("data: [DONE]\n\n")),
     /no data frames/,
   );
+  await assert.rejects(
+    collectUpstreamStream(new Response('data: {"choices":]\n\n')),
+    /invalid JSON data/,
+  );
 });
+
 
 test("Chat and Responses SSE use their respective termination contracts", async () => {
   const chat = await openAISse([{ data: { id: "chatcmpl-1" } }]).text();
@@ -424,6 +495,24 @@ test("Responses reasoning summaries have their own lifecycle events", () => {
   assert.equal(byName.get("response.reasoning_summary_text.delta")?.delta, "public summary");
   assert.equal(byName.get("response.reasoning_summary_text.done")?.text, "public summary");
   assert.equal(events.at(-1)?.event, "response.completed");
+});
+
+test("Responses refusals use refusal events instead of output text events", () => {
+  const events = responsesStreamEvents({
+    id: "resp_refusal",
+    object: "response",
+    status: "completed",
+    output: [{
+      id: "msg_refusal",
+      type: "message",
+      status: "completed",
+      role: "assistant",
+      content: [{ type: "refusal", refusal: "cannot comply" }],
+    }],
+  });
+  assert.ok(events.some((event) => event.event === "response.refusal.delta"));
+  assert.ok(events.some((event) => event.event === "response.refusal.done"));
+  assert.ok(!events.some((event) => event.event === "response.output_text.done"));
 });
 
 test("Responses metadata and usage satisfy strict SDK-required fields", () => {

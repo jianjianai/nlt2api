@@ -6,6 +6,7 @@ import { parseAndValidateToolArguments, validateSchemaDefinition } from "~/serve
 import { portalClient, PortalError, readPortalJson, retryAfterSeconds } from "~/server/utils/portal-client.ts";
 import { ProxyRequestError, type RequestDebugContext } from "~/server/utils/request-errors.ts";
 import { stateStore } from "~/server/utils/state-store.ts";
+import { collectUpstreamStream, UpstreamStreamError, type UpstreamFrameHandler } from "~/server/utils/upstream-stream.ts";
 import {
   InvalidStructuredToolCallsError,
   envelopeAllowedForToolChoice,
@@ -29,6 +30,10 @@ const MAX_TOOL_DEFINITION_BYTES = 256 * 1024;
 const MAX_TOOL_ARGUMENT_BYTES = 64 * 1024;
 const MAX_TOOL_RESULT_BYTES = 256 * 1024;
 const DEFAULT_OUTPUT_TOKENS = 16_384;
+// The Playground currently rejects max_tokens above 16,384 even for models
+// whose context window is much larger. Keep the public request budget flexible
+// while never sending a value the browser endpoint will reject.
+const PORTAL_MAX_OUTPUT_TOKENS = 16_384;
 const MAX_TOOL_REPAIR_ATTEMPTS = 5;
 const MAX_TOOL_REPAIR_CANDIDATE_CHARS = 131_072;
 
@@ -41,6 +46,13 @@ export interface ChatExecution {
   tools: ToolDefinition[];
   upstreamRequest: JsonObject;
   toolCallAdapter?: ToolCallAdapterTrace;
+}
+
+export class ClientDisconnectedError extends Error {
+  constructor() {
+    super("The client disconnected before the completion finished.");
+    this.name = "ClientDisconnectedError";
+  }
 }
 
 function asRecord(value: unknown): Record<string, unknown> | undefined {
@@ -173,6 +185,21 @@ function validateSampling(request: JsonObject): void {
   }
 }
 
+export function validateChatRequest(request: JsonObject): void {
+  const model = modelFromRequest(request);
+  if (request.stream !== undefined && typeof request.stream !== "boolean") {
+    throw new HttpError(400, "`stream` must be a boolean.", "invalid_request_error", "stream");
+  }
+  validateSampling(request);
+  const tools = parseTools(request.tools);
+  const messages = parseMessages(request.messages);
+  validateToolChoice(request.tool_choice, tools);
+  if (request.n !== undefined && request.n !== 1) {
+    throw new HttpError(400, "Only n=1 is supported by the portal adapter.", "invalid_request_error", "n");
+  }
+  upstreamBody(request, model, messages, tools, false);
+}
+
 function portalMessages(messages: ChatMessage[]): ChatMessage[] {
   // The Playground currently rejects the OpenAI `developer` role. Preserve
   // message order and content while sending its closest supported role.
@@ -224,7 +251,10 @@ function upstreamBody(
   if (toolTurn && request.temperature === undefined) {
     body.temperature = 0;
   }
-  body.max_tokens = tokenLimit ?? Math.min(DEFAULT_OUTPUT_TOKENS, getProxyConfig().maxOutputTokens);
+  body.max_tokens = Math.min(
+    tokenLimit ?? Math.min(DEFAULT_OUTPUT_TOKENS, getProxyConfig().maxOutputTokens),
+    PORTAL_MAX_OUTPUT_TOKENS,
+  );
   if (toolTurn) {
     // Portal-native tools are textual and model-specific. The OpenAI tool contract
     // is carried exclusively in the controlled system message above.
@@ -273,6 +303,8 @@ async function getCompletion(
   stickyKey?: string,
   requiredAccountId?: string,
   allowEmptyContent = false,
+  onFrame?: UpstreamFrameHandler,
+  signal?: AbortSignal,
 ): Promise<{ account: ManagedAccount; completion: UpstreamCompletion }> {
   const excluded = new Set<string>();
   let lastError: PortalError | undefined;
@@ -307,21 +339,48 @@ async function getCompletion(
       accountLabel: account.label,
       upstreamRequest: body,
     };
+    let streamedOutput = false;
 
     try {
-      const response = await portalClient.requestChat(account, body as Record<string, unknown>);
+      if (signal?.aborted) {
+        throw new ClientDisconnectedError();
+      }
+      const response = await portalClient.requestChat(account, body as Record<string, unknown>, signal);
       if (!response.ok) {
         const parsed = await parsePortalError(response);
         currentContext.upstreamResponse = parsed.payload;
         throw parsed.error;
       }
 
-      const payload = asRecord(await readPortalJson(response));
+      let payload: Record<string, unknown> | undefined;
+      let completion: UpstreamCompletion;
+      const contentType = response.headers.get("content-type")?.toLowerCase() ?? "";
+      if (body.stream === true && contentType.includes("text/event-stream")) {
+        let collected;
+        try {
+          collected = await collectUpstreamStream(response, async (frame) => {
+            if (onFrame) {
+              // The portal often sends an otherwise empty role-only frame
+              // first. The route already emits the OpenAI role chunk, so that
+              // frame creates no client-visible state and must not prevent
+              // account failover if this upstream stream then fails.
+              const emitted = await onFrame(frame);
+              streamedOutput ||= emitted === true;
+            }
+          }, getProxyConfig().maxUpstreamBytes);
+        } finally {
+          portalClient.finishResponse(response);
+        }
+        completion = collected.completion;
+        payload = asRecord(completion);
+      } else {
+        payload = asRecord(await readPortalJson(response));
+        completion = payload as unknown as UpstreamCompletion;
+      }
       currentContext.upstreamResponse = payload as JsonObject | undefined;
       if (!payload) {
         throw new PortalError("The NeuralWatt portal returned a non-object completion.", 502);
       }
-      const completion = payload as unknown as UpstreamCompletion;
       const embeddedError = asRecord(completion.error);
       if (embeddedError || typeof completion.error === "string") {
         const message = typeof completion.error === "string"
@@ -344,6 +403,43 @@ async function getCompletion(
       accountScheduler.markSuccess(account.id);
       return { account, completion };
     } catch (error) {
+      if (signal?.aborted || error instanceof ClientDisconnectedError) {
+        throw new ClientDisconnectedError();
+      }
+      // Once a client has received a delta, retrying another account would
+      // duplicate or reorder its answer. Surface the failure on the current
+      // stream instead of silently starting a second completion.
+      if (streamedOutput) {
+        const failure = error instanceof PortalError
+          ? error
+          : error instanceof UpstreamStreamError
+            ? new PortalError(error.message, error.status, error.retryAfterSeconds)
+            : new PortalError(error instanceof Error ? error.message : "Unknown portal streaming error.", 502);
+        if (countsAgainstAccount(failure.status)) {
+          accountScheduler.markFailure(account.id, failure.message, failure.retryAfterSeconds);
+        }
+        if (error instanceof ProxyRequestError) {
+          throw error;
+        }
+        throw new ProxyRequestError(
+          failure,
+          currentContext,
+        );
+      }
+      if (error instanceof UpstreamStreamError) {
+        const portalError = new PortalError(error.message, error.status, error.retryAfterSeconds);
+        lastError = portalError;
+        lastContext = currentContext;
+        if (!countsAgainstAccount(portalError.status)) {
+          throw new ProxyRequestError(portalError, currentContext);
+        }
+        accountScheduler.markFailure(account.id, portalError.message, portalError.retryAfterSeconds);
+        excluded.add(account.id);
+        if (requiredAccountId) {
+          throw new ProxyRequestError(portalError, currentContext);
+        }
+        continue;
+      }
       if (error instanceof PortalError) {
         lastError = error;
         lastContext = currentContext;
@@ -555,19 +651,18 @@ function evaluateToolCandidate(
 
 export async function executeChatRequest(
   request: JsonObject,
-  options?: { stickyKey?: string; requiredAccountId?: string },
+  options?: {
+    stickyKey?: string;
+    requiredAccountId?: string;
+    stream?: boolean;
+    onUpstreamFrame?: UpstreamFrameHandler;
+    signal?: AbortSignal;
+  },
 ): Promise<ChatExecution> {
+  validateChatRequest(request);
   const model = modelFromRequest(request);
-  if (request.stream !== undefined && typeof request.stream !== "boolean") {
-    throw new HttpError(400, "`stream` must be a boolean.", "invalid_request_error", "stream");
-  }
-  validateSampling(request);
   const messages = parseMessages(request.messages);
   const tools = parseTools(request.tools);
-  validateToolChoice(request.tool_choice, tools);
-  if (request.n !== undefined && request.n !== 1) {
-    throw new HttpError(400, "Only n=1 is supported by the portal adapter.", "invalid_request_error", "n");
-  }
 
   const toolTurn = tools.length > 0 && request.tool_choice !== "none";
   const observedToolCallIds = messages
@@ -576,12 +671,15 @@ export async function executeChatRequest(
   const toolAssignedAccountId = options?.requiredAccountId
     ? undefined
     : accountScheduler.accountForToolCalls(observedToolCallIds);
-  let upstreamRequest = upstreamBody(request, model, messages, tools, false);
+  const streamUpstream = (options?.stream ?? request.stream === true) && !toolTurn;
+  let upstreamRequest = upstreamBody(request, model, messages, tools, streamUpstream);
   let result = await getCompletion(
     upstreamRequest,
     options?.stickyKey,
     options?.requiredAccountId ?? toolAssignedAccountId,
     toolTurn,
+    streamUpstream ? options?.onUpstreamFrame : undefined,
+    options?.signal,
   );
   let message: ChatMessage;
   let toolCallAdapter: ToolCallAdapterTrace | undefined;
@@ -636,8 +734,18 @@ export async function executeChatRequest(
         ) as unknown as JsonValue,
       };
       try {
-        result = await getCompletion(upstreamRequest, options?.stickyKey, result.account.id, true);
+        result = await getCompletion(
+          upstreamRequest,
+          options?.stickyKey,
+          result.account.id,
+          true,
+          undefined,
+          options?.signal,
+        );
       } catch (error) {
+        if (error instanceof ClientDisconnectedError || options?.signal?.aborted) {
+          throw new ClientDisconnectedError();
+        }
         if (error instanceof ProxyRequestError) {
           error.debugContext.toolCallAdapter = toolCallAdapter;
           throw error;
@@ -713,7 +821,13 @@ export function asChatCompletion(execution: ChatExecution): JsonObject {
     message.tool_calls = execution.message.tool_calls as unknown as JsonValue;
   }
   if (typeof execution.message.reasoning === "string") {
-    message.reasoning_content = execution.message.reasoning;
+    message.reasoning = execution.message.reasoning;
+  }
+  if (typeof execution.message.reasoning_content === "string") {
+    message.reasoning_content = execution.message.reasoning_content;
+  }
+  if (typeof execution.message.refusal === "string") {
+    message.refusal = execution.message.refusal;
   }
   return {
     id: completion.id ?? `chatcmpl_${randomUUID().replaceAll("-", "")}`,
@@ -729,13 +843,164 @@ export function asChatCompletion(execution: ChatExecution): JsonObject {
   };
 }
 
+export interface ChatStreamState {
+  id: string;
+  created: number;
+  model: string;
+  roleSent: boolean;
+  sawOutput: boolean;
+  finishSeen: boolean;
+  usageSeen: boolean;
+}
+
+export function createChatStreamState(request: JsonObject): ChatStreamState {
+  return {
+    id: `chatcmpl_${randomUUID().replaceAll("-", "")}`,
+    created: Math.floor(Date.now() / 1_000),
+    model: typeof request.model === "string" && request.model ? request.model : getProxyConfig().defaultModel,
+    roleSent: false,
+    sawOutput: false,
+    finishSeen: false,
+    usageSeen: false,
+  };
+}
+
+function chatStreamBase(state: ChatStreamState): JsonObject {
+  return {
+    id: state.id,
+    object: "chat.completion.chunk",
+    created: state.created,
+    model: state.model,
+  };
+}
+
+export function startChatStream(state: ChatStreamState): JsonObject {
+  state.roleSent = true;
+  return {
+    ...chatStreamBase(state),
+    choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }],
+  };
+}
+
+/** Convert one portal SSE frame into zero or more OpenAI Chat deltas. */
+export function chatChunksFromUpstreamFrame(
+  frame: UpstreamCompletion,
+  state: ChatStreamState,
+  includeUsage = false,
+): JsonObject[] {
+  const chunks: JsonObject[] = [];
+  const choice = frame.choices?.[0];
+  const delta = choice?.delta;
+  const outputDelta: JsonObject = {};
+  if (!state.roleSent && typeof delta?.role === "string") {
+    outputDelta.role = delta.role;
+    state.roleSent = true;
+  }
+  if (typeof delta?.content === "string" && delta.content.length > 0) {
+    outputDelta.content = delta.content;
+    state.sawOutput = true;
+  }
+  if (typeof delta?.reasoning === "string" && delta.reasoning.length > 0) {
+    outputDelta.reasoning = delta.reasoning;
+    state.sawOutput = true;
+  }
+  if (typeof delta?.reasoning_content === "string" && delta.reasoning_content.length > 0) {
+    outputDelta.reasoning_content = delta.reasoning_content;
+    state.sawOutput = true;
+  }
+  if (typeof delta?.refusal === "string" && delta.refusal.length > 0) {
+    outputDelta.refusal = delta.refusal;
+    state.sawOutput = true;
+  }
+  const finishReason = choice?.finish_reason;
+  if (finishReason !== undefined && finishReason !== null) {
+    state.finishSeen = true;
+  }
+  if (Object.keys(outputDelta).length > 0 || (finishReason !== undefined && finishReason !== null)) {
+    chunks.push({
+      ...chatStreamBase(state),
+      choices: [{ index: choice?.index ?? 0, delta: outputDelta, finish_reason: finishReason ?? null }],
+    });
+  }
+
+  if (includeUsage && frame.usage) {
+    state.usageSeen = true;
+    chunks.push({ ...chatStreamBase(state), choices: [], usage: frame.usage as unknown as JsonValue });
+  }
+  return chunks;
+}
+
+function appendFallbackChatDelta(
+  execution: ChatExecution,
+  state: ChatStreamState,
+  chunks: JsonObject[],
+): void {
+  const delta: JsonObject = {};
+  if (!state.roleSent) {
+    delta.role = "assistant";
+    state.roleSent = true;
+  }
+  if (!state.sawOutput) {
+    if (typeof execution.message.reasoning === "string" && execution.message.reasoning) {
+      delta.reasoning = execution.message.reasoning;
+    }
+    if (typeof execution.message.reasoning_content === "string" && execution.message.reasoning_content) {
+      delta.reasoning_content = execution.message.reasoning_content;
+    }
+    if (typeof execution.message.refusal === "string" && execution.message.refusal) {
+      delta.refusal = execution.message.refusal;
+    }
+    if (execution.message.tool_calls?.length) {
+      delta.tool_calls = execution.message.tool_calls.map((call, index) => ({
+        index,
+        id: call.id,
+        type: "function",
+        function: call.function,
+      })) as unknown as JsonValue;
+    } else if (typeof execution.message.content === "string" && execution.message.content) {
+      delta.content = execution.message.content;
+    }
+    if (Object.keys(delta).length > 0) state.sawOutput = true;
+  }
+  if (Object.keys(delta).length > 0) {
+    chunks.push({ ...chatStreamBase(state), choices: [{ index: 0, delta, finish_reason: null }] });
+  }
+}
+
+export function finishChatStream(
+  execution: ChatExecution,
+  state: ChatStreamState,
+  includeUsage = false,
+): JsonObject[] {
+  const chunks: JsonObject[] = [];
+  appendFallbackChatDelta(execution, state, chunks);
+  if (!state.finishSeen) {
+    state.finishSeen = true;
+    chunks.push({
+      ...chatStreamBase(state),
+      choices: [{ index: 0, delta: {}, finish_reason: execution.finishReason }],
+    });
+  }
+  if (includeUsage && !state.usageSeen && execution.completion.usage) {
+    state.usageSeen = true;
+    chunks.push({ ...chatStreamBase(state), choices: [], usage: execution.completion.usage as unknown as JsonValue });
+  }
+  return chunks;
+}
+
 export function asChatCompletionStream(execution: ChatExecution, includeUsage = false): JsonObject[] {
   const id = execution.completion.id ?? `chatcmpl_${randomUUID().replaceAll("-", "")}`;
   const created = execution.completion.created ?? Math.floor(Date.now() / 1_000);
   const base = { id, object: "chat.completion.chunk", created, model: execution.model };
   const chunks: JsonObject[] = [{ ...base, choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }] }];
   if (typeof execution.message.reasoning === "string" && execution.message.reasoning) {
-    chunks.push({ ...base, choices: [{ index: 0, delta: { reasoning_content: execution.message.reasoning }, finish_reason: null }] });
+    chunks.push({ ...base, choices: [{ index: 0, delta: { reasoning: execution.message.reasoning }, finish_reason: null }] });
+  }
+  if (typeof execution.message.reasoning_content === "string" && execution.message.reasoning_content) {
+    chunks.push({ ...base, choices: [{ index: 0, delta: { reasoning_content: execution.message.reasoning_content }, finish_reason: null }] });
+  }
+  if (typeof execution.message.refusal === "string" && execution.message.refusal) {
+    chunks.push({ ...base, choices: [{ index: 0, delta: { refusal: execution.message.refusal }, finish_reason: null }] });
   }
   if (execution.message.tool_calls?.length) {
     chunks.push({

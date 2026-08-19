@@ -12,6 +12,7 @@ const adminToken = process.env.NEURALWATT_PROBE_ADMIN_TOKEN;
 const clientKey = process.env.NEURALWATT_PROBE_CLIENT_KEY;
 const email = process.env.NEURALWATT_PROBE_EMAIL;
 const password = process.env.NEURALWATT_PROBE_PASSWORD;
+const requestedAccountId = process.env.NEURALWATT_PROBE_ACCOUNT_ID;
 const runsPerCli = Number.parseInt(process.env.NEURALWATT_CLI_PROBE_RUNS || "1", 10);
 const taskDelayMs = Number.parseInt(process.env.NEURALWATT_CLI_PROBE_DELAY_MS || "30000", 10);
 
@@ -33,6 +34,7 @@ const openCodeEntrypoint = join(appData, "npm", "node_modules", "opencode-ai", "
 const scratch = await mkdtemp(join(tmpdir(), "neuralwatt-cli-agent-probe-"));
 const codexHome = join(scratch, "codex-home");
 let accountId;
+let ownsAccount = false;
 let previousRecordMessages;
 let cliGatewayProxy;
 const startedAt = new Date().toISOString();
@@ -468,12 +470,21 @@ try {
   cliGatewayProxy = await startCliGatewayProxy();
   const settingsBeforeProbe = await jsonRequest("/api/admin/settings", { headers: adminHeaders });
   previousRecordMessages = Boolean(settingsBeforeProbe?.settings?.recordMessages);
-  const created = await jsonRequest("/api/admin/accounts", {
-    method: "POST",
-    headers: adminHeaders,
-    body: JSON.stringify({ email, password, label: "Codex and OpenCode project probe", weight: 1 }),
-  });
-  accountId = created.account.id;
+  if (requestedAccountId) {
+    const existing = await jsonRequest("/api/admin/accounts", { headers: adminHeaders });
+    if (!existing.accounts?.some((account) => account.id === requestedAccountId)) {
+      throw new Error(`Probe account ${requestedAccountId} was not found.`);
+    }
+    accountId = requestedAccountId;
+  } else {
+    const created = await jsonRequest("/api/admin/accounts", {
+      method: "POST",
+      headers: adminHeaders,
+      body: JSON.stringify({ email, password, label: "Codex and OpenCode project probe", weight: 1 }),
+    });
+    accountId = created.account.id;
+    ownsAccount = true;
+  }
   await jsonRequest("/api/admin/settings", {
     method: "PATCH",
     headers: adminHeaders,
@@ -520,8 +531,17 @@ try {
   }
 
   const debug = await jsonRequest("/api/admin/records?limit=500", { headers: adminHeaders });
-  const records = (debug.records || []).filter((record) =>
+  // A record may be written asynchronously just after the loopback proxy
+  // observes the response. Give the gateway a short bounded drain window so a
+  // correct request is never mistaken for an evicted debug record.
+  let records = (debug.records || []).filter((record) =>
     record.accountId === accountId && record.at >= startedAt);
+  for (let attempt = 0; records.length < cliGatewayProxy.postRequests.length && attempt < 10; attempt += 1) {
+    await sleep(250);
+    const refreshed = await jsonRequest("/api/admin/records?limit=500", { headers: adminHeaders });
+    records = (refreshed.records || []).filter((record) =>
+      record.accountId === accountId && record.at >= startedAt);
+  }
   const adapterRecords = records.filter((record) => record.toolCallAdapter);
   // Count every turn that attempted a controlled tool envelope. A final
   // invalid outcome must remain in the denominator instead of disappearing
@@ -584,7 +604,7 @@ try {
     process.exitCode = 1;
   }
 } finally {
-  if (accountId) {
+  if (accountId && ownsAccount) {
     await fetch(`${baseUrl}/api/admin/records?account_id=${encodeURIComponent(accountId)}`, {
       method: "DELETE",
       headers: adminHeaders,

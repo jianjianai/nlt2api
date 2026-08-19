@@ -1,8 +1,37 @@
 import type { ChatMessage, UpstreamChoice, UpstreamCompletion, UpstreamUsage } from "~/server/utils/types.ts";
 
+/** A structured error reported inside an HTTP-200 upstream SSE stream. */
+export class UpstreamStreamError extends Error {
+  readonly status: number;
+  readonly retryAfterSeconds: number | undefined;
+
+  constructor(
+    message: string,
+    status = 502,
+    retryAfterSeconds?: number,
+  ) {
+    super(message);
+    this.name = "UpstreamStreamError";
+    this.status = status;
+    this.retryAfterSeconds = retryAfterSeconds;
+  }
+}
+
 export interface CollectedUpstreamStream {
   completion: UpstreamCompletion;
   frames: UpstreamCompletion[];
+}
+
+/**
+ * Return true only when the frame produced a client-visible event. This lets
+ * the scheduler retry an upstream stream which failed before it emitted any
+ * meaningful delta (for example, a portal-only empty role frame).
+ */
+export type UpstreamFrameHandler = (frame: UpstreamCompletion) => boolean | void | Promise<boolean | void>;
+
+export interface SseEntry {
+  event?: string;
+  data: unknown;
 }
 
 function asObject(value: unknown): Record<string, unknown> | undefined {
@@ -18,6 +47,9 @@ function mergeDelta(target: ChatMessage, delta: ChatMessage): void {
   }
   if (typeof delta.reasoning_content === "string") {
     target.reasoning_content = `${target.reasoning_content ?? ""}${delta.reasoning_content}`;
+  }
+  if (typeof delta.refusal === "string") {
+    target.refusal = `${typeof target.refusal === "string" ? target.refusal : ""}${delta.refusal}`;
   }
   if (delta.role) {
     target.role = delta.role;
@@ -66,8 +98,9 @@ function parseDataLine(line: string): UpstreamCompletion | undefined {
   }
   try {
     return JSON.parse(data) as UpstreamCompletion;
-  } catch {
-    return undefined;
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : "unknown JSON parse error";
+    throw new Error(`Upstream SSE contained invalid JSON data: ${detail}`);
   }
 }
 
@@ -83,7 +116,19 @@ function assemble(frames: UpstreamCompletion[]): UpstreamCompletion {
       : typeof error?.message === "string"
         ? error.message
         : "Upstream streaming response contained an error frame.";
-    throw new Error(message);
+    const statusValue = typeof errorFrame.status === "number"
+      ? errorFrame.status
+      : typeof error?.status === "number"
+        ? error.status
+        : 502;
+    const status = Number.isInteger(statusValue) && statusValue >= 400 && statusValue <= 599
+      ? statusValue
+      : 502;
+    const retryValue = errorFrame.retry_after ?? error?.retry_after;
+    const retryAfterSeconds = typeof retryValue === "number" && Number.isFinite(retryValue) && retryValue > 0
+      ? Math.min(retryValue, 86_400)
+      : undefined;
+    throw new UpstreamStreamError(message, status, retryAfterSeconds);
   }
   const first = frames.find((frame) => frame.choices?.length) ?? {};
   const message: ChatMessage = { role: "assistant", content: "" };
@@ -115,15 +160,24 @@ function assemble(frames: UpstreamCompletion[]): UpstreamCompletion {
   };
 }
 
-export async function collectUpstreamStream(response: Response): Promise<CollectedUpstreamStream> {
+export async function collectUpstreamStream(
+  response: Response,
+  onFrame?: UpstreamFrameHandler,
+  maxBytes = Number.POSITIVE_INFINITY,
+): Promise<CollectedUpstreamStream> {
   if (!response.body) {
     throw new Error("Upstream returned an empty streaming body.");
   }
 
   const decoder = new TextDecoder();
   let buffer = "";
+  let totalBytes = 0;
   const frames: UpstreamCompletion[] = [];
   for await (const chunk of response.body) {
+    totalBytes += chunk.byteLength;
+    if (totalBytes > maxBytes) {
+      throw new Error("The NeuralWatt portal response exceeded the adapter limit.");
+    }
     buffer += decoder.decode(chunk, { stream: true });
     const lines = buffer.split("\n");
     buffer = lines.pop() ?? "";
@@ -131,6 +185,12 @@ export async function collectUpstreamStream(response: Response): Promise<Collect
       const frame = parseDataLine(line.replace(/\r$/, ""));
       if (frame) {
         frames.push(frame);
+        // Error frames are handled by assemble() so callers never render an
+        // upstream error as model output. Ordinary frames can be forwarded as
+        // soon as they arrive while we continue collecting the final shape.
+        if (!frame.error && onFrame) {
+          await onFrame(frame);
+        }
       }
     }
   }
@@ -138,23 +198,82 @@ export async function collectUpstreamStream(response: Response): Promise<Collect
   const finalFrame = parseDataLine(buffer.replace(/\r$/, ""));
   if (finalFrame) {
     frames.push(finalFrame);
+    if (!finalFrame.error && onFrame) {
+      await onFrame(finalFrame);
+    }
   }
 
   return { completion: assemble(frames), frames };
 }
 
-export function openAISse(events: Array<{ event?: string; data: unknown }>, options?: { doneMarker?: boolean }): Response {
+function encodeSse(encoder: TextEncoder, entry: SseEntry): Uint8Array {
+  const prefix = entry.event ? `event: ${entry.event}\n` : "";
+  return encoder.encode(`${prefix}data: ${JSON.stringify(entry.data)}\n\n`);
+}
+
+export function openAIStreamingSse(
+  producer: (emit: (entry: SseEntry) => Promise<void>, signal: AbortSignal) => Promise<void>,
+  options?: {
+    doneMarker?: boolean;
+    onError?: (error: unknown) => SseEntry | undefined;
+  },
+): Response {
   const encoder = new TextEncoder();
+  let closed = false;
+  const abortController = new AbortController();
+  let wakeCapacity: (() => void) | undefined;
   const stream = new ReadableStream<Uint8Array>({
     start(controller) {
-      for (const entry of events) {
-        const prefix = entry.event ? `event: ${entry.event}\n` : "";
-        controller.enqueue(encoder.encode(`${prefix}data: ${JSON.stringify(entry.data)}\n\n`));
-      }
-      if (options?.doneMarker !== false) {
-        controller.enqueue(encoder.encode("data: [DONE]\n\n"));
-      }
-      controller.close();
+      const waitForCapacity = async (): Promise<void> => {
+        while (!closed && (controller.desiredSize ?? 1) <= 0) {
+          await new Promise<void>((resolve) => {
+            wakeCapacity = resolve;
+          });
+        }
+      };
+
+      const write = async (data: Uint8Array): Promise<void> => {
+        await waitForCapacity();
+        if (closed) return;
+        try {
+          controller.enqueue(data);
+        } catch {
+          closed = true;
+        }
+      };
+
+      const emit = async (entry: SseEntry): Promise<void> => write(encodeSse(encoder, entry));
+      const close = async (): Promise<void> => {
+        if (closed) return;
+        if (options?.doneMarker !== false) {
+          await write(encoder.encode("data: [DONE]\n\n"));
+        }
+        if (closed) return;
+        closed = true;
+        try {
+          controller.close();
+        } catch {
+          // A cancelled stream is already closed.
+        }
+      };
+      void producer(emit, abortController.signal).then(close).catch(async (error) => {
+        if (closed) return;
+        const entry = options?.onError?.(error);
+        if (entry) await emit(entry);
+        await close();
+      });
+    },
+    pull() {
+      const wake = wakeCapacity;
+      wakeCapacity = undefined;
+      wake?.();
+    },
+    cancel() {
+      closed = true;
+      abortController.abort();
+      const wake = wakeCapacity;
+      wakeCapacity = undefined;
+      wake?.();
     },
   });
   return new Response(stream, {
@@ -165,6 +284,14 @@ export function openAISse(events: Array<{ event?: string; data: unknown }>, opti
       "X-Accel-Buffering": "no",
     },
   });
+}
+
+export function openAISse(events: SseEntry[], options?: { doneMarker?: boolean }): Response {
+  return openAIStreamingSse(async (emit) => {
+    for (const entry of events) {
+      await emit(entry);
+    }
+  }, options);
 }
 
 export function choiceFromCompletion(completion: UpstreamCompletion): UpstreamChoice {

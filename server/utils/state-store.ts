@@ -244,6 +244,9 @@ export class StateStore {
         throw new Error("Account not found.");
       }
       state.accounts.splice(index, 1);
+      // A Responses chain is account-affine. Remove it in the same durable
+      // mutation so a deleted account cannot be resurrected by its history.
+      state.responses = (state.responses ?? []).filter((response) => response.accountId !== id);
     });
   }
 
@@ -273,6 +276,12 @@ export class StateStore {
 
   async saveResponseState(response: ResponseState): Promise<void> {
     await this.mutate((state) => {
+      // A completion may finish while its account is being deleted. The
+      // serialized mutation order makes this check atomic with the write:
+      // if deletion wins, discard the stale chain instead of recreating it.
+      if (!state.accounts.some((account) => account.id === response.accountId)) {
+        return;
+      }
       const cutoff = Date.now() - 12 * 60 * 60 * 1_000;
       const retained = (state.responses ?? []).filter((candidate) => candidate.createdAt > cutoff && candidate.id !== response.id);
       retained.push(response);
@@ -287,7 +296,11 @@ export class StateStore {
   async getResponseState(id: string): Promise<ResponseState | undefined> {
     const state = await this.getState();
     const response = (state.responses ?? []).find((candidate) => candidate.id === id);
-    if (!response || response.createdAt < Date.now() - 12 * 60 * 60 * 1_000) {
+    if (
+      !response
+      || response.createdAt < Date.now() - 12 * 60 * 60 * 1_000
+      || !state.accounts.some((account) => account.id === response.accountId)
+    ) {
       return undefined;
     }
     return response;

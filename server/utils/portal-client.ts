@@ -80,26 +80,39 @@ function sessionFromResponse(response: Response): PortalSession | undefined {
   };
 }
 
-async function portalFetch(input: string, init: RequestInit): Promise<Response> {
+async function portalFetch(input: string, init: RequestInit, clientSignal?: AbortSignal): Promise<Response> {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), getProxyConfig().upstreamTimeoutMs);
+  const abortForClient = () => controller.abort();
+  if (clientSignal?.aborted) {
+    controller.abort();
+  } else {
+    clientSignal?.addEventListener("abort", abortForClient, { once: true });
+  }
+  const finish = () => {
+    clearTimeout(timeout);
+    clientSignal?.removeEventListener("abort", abortForClient);
+  };
   try {
     const response = await fetch(input, { ...init, signal: controller.signal });
     if (!response.body) {
-      clearTimeout(timeout);
+      finish();
     } else {
       let finished = false;
       responseFinishes.set(response, () => {
         if (!finished) {
           finished = true;
-          clearTimeout(timeout);
+          finish();
         }
       });
     }
     return response;
   } catch (error) {
-    clearTimeout(timeout);
+    finish();
     if (error instanceof Error && error.name === "AbortError") {
+      if (clientSignal?.aborted) {
+        throw new PortalError("The client disconnected before the portal response completed.", 499);
+      }
       throw new PortalError("The NeuralWatt portal request timed out.", 504);
     }
     throw error;
@@ -184,6 +197,50 @@ function sessionIsFresh(session: PortalSession | undefined): session is PortalSe
     && (session.expiresAt === null || session.expiresAt > Date.now() + 30_000);
 }
 
+function clientAbortError(): PortalError {
+  return new PortalError("The client disconnected before the portal response completed.", 499);
+}
+
+/**
+ * Wait for a shared login without allowing one cancelled request to cancel the
+ * login for other requests using the same account.
+ */
+async function waitWithClientAbort<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
+  if (!signal) {
+    return promise;
+  }
+  if (signal.aborted) {
+    throw clientAbortError();
+  }
+  return new Promise<T>((resolve, reject) => {
+    let settled = false;
+    const cleanup = () => {
+      signal.removeEventListener("abort", onAbort);
+    };
+    const onAbort = () => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      reject(clientAbortError());
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+    promise.then(
+      (value) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        resolve(value);
+      },
+      (error) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        reject(error);
+      },
+    );
+  });
+}
+
 export function retryAfterSeconds(response: Response): number | undefined {
   const value = response.headers.get("retry-after");
   if (!value) {
@@ -226,43 +283,55 @@ async function responseMessage(response: Response): Promise<string> {
 export class PortalClient {
   private loginLocks = new Map<string, Promise<PortalSession>>();
 
-  async ensureSession(account: ManagedAccount): Promise<PortalSession> {
+  async ensureSession(account: ManagedAccount, signal?: AbortSignal): Promise<PortalSession> {
     if (sessionIsFresh(account.session)) {
+      if (signal?.aborted) throw clientAbortError();
       return account.session;
     }
 
     const existing = this.loginLocks.get(account.id);
     if (existing) {
-      return existing;
+      return waitWithClientAbort(existing, signal);
     }
 
     const login = this.login(account).finally(() => {
       this.loginLocks.delete(account.id);
     });
     this.loginLocks.set(account.id, login);
-    return login;
+    return waitWithClientAbort(login, signal);
   }
 
-  async refreshSession(account: ManagedAccount): Promise<PortalSession> {
-    await stateStore.updateSession(account.id, undefined);
-    const refreshed = await stateStore.getAccount(account.id);
+  async refreshSession(account: ManagedAccount, signal?: AbortSignal): Promise<PortalSession> {
+    if (signal?.aborted) throw clientAbortError();
+    await waitWithClientAbort(stateStore.updateSession(account.id, undefined), signal);
+    const refreshed = await waitWithClientAbort(stateStore.getAccount(account.id), signal);
     if (!refreshed) {
       throw new PortalError("The selected account was removed while refreshing its session.", 503);
     }
-    return this.ensureSession(refreshed);
+    return this.ensureSession(refreshed, signal);
   }
 
-  async requestChat(account: ManagedAccount, body: Record<string, unknown>): Promise<Response> {
-    let session = await this.ensureSession(account);
-    let response = await this.sendChat(session, body);
+  async requestChat(account: ManagedAccount, body: Record<string, unknown>, signal?: AbortSignal): Promise<Response> {
+    let session = await this.ensureSession(account, signal);
+    if (signal?.aborted) {
+      throw clientAbortError();
+    }
+    let response = await this.sendChat(session, body, signal);
     if (response.status !== 401 && response.status !== 403 && (response.status < 300 || response.status >= 400)) {
       return response;
     }
 
     await discardPortalResponse(response);
-    session = await this.refreshSession(account);
-    response = await this.sendChat(session, body);
+    session = await this.refreshSession(account, signal);
+    if (signal?.aborted) {
+      throw clientAbortError();
+    }
+    response = await this.sendChat(session, body, signal);
     return response;
+  }
+
+  finishResponse(response: Response): void {
+    finishPortalResponse(response);
   }
 
   async verifyAccount(account: ManagedAccount): Promise<void> {
@@ -328,7 +397,7 @@ export class PortalClient {
     return session;
   }
 
-  private sendChat(session: PortalSession, body: Record<string, unknown>): Promise<Response> {
+  private sendChat(session: PortalSession, body: Record<string, unknown>, signal?: AbortSignal): Promise<Response> {
     return portalFetch(CHAT_URL, {
       method: "POST",
       redirect: "manual",
@@ -337,7 +406,7 @@ export class PortalClient {
         "Content-Type": "application/json",
       },
       body: JSON.stringify(body),
-    });
+    }, signal);
   }
 
   private portalHeaders(session: PortalSession): HeadersInit {

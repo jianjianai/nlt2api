@@ -41,13 +41,13 @@ curl http://localhost:3000/v1/chat/completions \
   -d '{"model":"kimi-k3","messages":[{"role":"user","content":"你好"}]}'
 ```
 
-`GET /v1/models` 和 `GET /v1/models/:id` 返回当前门户公开模型目录。带工具的请求会有意缓冲上游响应，校验服务端控制的 JSON 信封，然后合成为标准 OpenAI `tool_calls` 或 Responses `function_call` 项。网关不会执行客户端提供的工具；客户端应在下一轮发送 `role: "tool"` 或 `function_call_output`。客户端要求流式输出时，网关会在完成校验后重新生成标准 OpenAI SSE，因此事件格式保持兼容，但工具轮不能降低首 token 延迟。
+`GET /v1/models` 和 `GET /v1/models/:id` 返回当前门户公开模型目录。无工具轮在上游每个 SSE 分片到达时立即转换并转发：Chat 会分别发送 `reasoning`、`reasoning_content` 和 `content` delta；Responses 会按 `response.created`、`response.in_progress`、推理摘要和正文 delta、完成事件的顺序发送。流式链路带读取背压；客户端断开会立即取消上游请求并释放账号，损坏的上游 SSE 会失败关闭。上游退回 JSON 时会自动降级为一次性 SSE，不会使客户端等待或中断。带工具的请求会有意缓冲上游响应，校验服务端控制的 JSON 信封，然后合成为标准 OpenAI `tool_calls` 或 Responses `function_call` 项；这是为了避免执行半截或无效的 JSON。网关不会执行客户端提供的工具；客户端应在下一轮发送 `role: "tool"` 或 `function_call_output`。工具轮的 SSE 在校验完成后生成，因此不能降低该轮首 token 延迟。
 
 Codex Responses 的 `namespace` 控制和内置 `web_search` 声明会作为厂商扩展接受，但不会放入门户函数契约；普通 `function` 工具仍会经过完整校验和转换，内置工具不会被网关模拟。
 
 Responses 会话支持 `previous_response_id`，状态默认保存 12 小时；请求设置 `store: false` 时不保存。首个 Responses 请求必须提供非空字符串 `model`；已保存的续接请求可以省略模型并沿用链路模型。选中的门户账号会绑定到响应链。`instructions` 和 `tools` 是请求级字段，符合 OpenAI Responses 语义，续接时需要再次提供才会生效。门户浏览器路由不稳定支持 `developer` 角色，因此请求级 instructions 和 developer 消息会以等价的 `system` 角色发送给上游，客户端可见历史不变。
 
-网关只在上游明确提供 `reasoning` 摘要时将其公开为 Responses 推理摘要，不会把原始 `reasoning_content` 当作公开摘要。原始推理内容保存在加密链路中；没有上游加密推理项时，`store: false` 的手工重放无法完整恢复。请求侧支持 `reasoning: { "effort": "..." }`，并映射为门户的 `reasoning_effort`；冲突的直接 `reasoning_effort` 或不支持的选项会返回错误，而不会静默忽略。
+Chat 会保持上游的 `reasoning` 与 `reasoning_content` 两个字段并在流中分别转发；Responses 将门户提供的可见推理文本映射为标准 `reasoning.summary` 事件和输出项，使 agent 客户端可以实时展示思考过程。原始推理字段仍会保存在加密的 Responses 链路中；没有上游加密推理项时，`store: false` 的手工重放无法完整恢复。请求侧支持 `reasoning: { "effort": "..." }`，并映射为门户的 `reasoning_effort`；冲突的直接 `reasoning_effort` 或不支持的选项会返回错误，而不会静默忽略。
 
 Responses 的 `text.format: {"type":"json_object"}` 会映射为门户已验证的 JSON 模式。普通文本支持；`json_schema` 会被拒绝，不会假装已经由上游强制执行。`function_call_output` 可以包含文本或 `input_image`（包括 `detail`）内容；不支持的内容类型返回 400。
 
@@ -73,7 +73,7 @@ Responses 的 `text.format: {"type":"json_object"}` 会映射为门户已验证�
 
 网关会在本地校验工具名称和 JSON Schema，并限制工具数量、参数大小、工具结果、请求字节数和输出 token 数。模型没有生成可校验的控制信封时，最多执行五次有界纠错；每次纠错都从原始会话重建，保留第一次完成的思考字段，只替换最近一次无效候选，并携带精确的 JSON、策略或 Schema 错误。只有完整校验通过的候选才能转成 OpenAI 工具调用；达到上限后以 HTTP 502 失败关闭。
 
-调试记录包含首次解析结果、纠错次数和校验错误，面板会按全部工具轮计算首次成功率。模型契约包含每个函数的完整描述和 JSON Schema，放在最新会话/工具结果之后；工具轮默认使用温度 0，内部纠错始终使用温度 0。客户端可发送最多 128,000 个输出 token 的预算；如模型上下文更大，可通过 `NEURALWATT_MAX_OUTPUT_TOKENS` 调高，服务端最多允许 1,000,000。未指定预算时仍使用 16,384 的默认生成预算。门户请求有 `NEURALWATT_UPSTREAM_TIMEOUT_MS` 超时，以及上游响应、会话和 Responses 状态的字节上限。Responses 的 `reasoning.summary` 与旧版 `reasoning.generate_summary` 会接受并校验，但门户没有对应开关，因此只转发 `reasoning.effort`。调试记录默认关闭；开启后保存在加密状态文件中，并受 `NEURALWATT_MAX_RECORD_BYTES` 限制。所有环境变量见 `.env.example`。
+调试记录包含首次解析结果、纠错次数和校验错误，面板会按全部工具轮计算首次成功率。模型契约包含每个函数的完整描述和 JSON Schema，放在最新会话/工具结果之后；工具轮默认使用温度 0，内部纠错始终使用温度 0。客户端可发送最多 128,000 个输出 token 的预算；如模型上下文更大，可通过 `NEURALWATT_MAX_OUTPUT_TOKENS` 调高，服务端最多允许 1,000,000。门户当前实际接受的单次 `max_tokens` 上限是 16,384，因此网关会保留客户端预算语义，但在转发前自动限制到 16,384，避免将 128k 这类 Agent 默认值变成 400。未指定预算时仍使用 16,384 的默认生成预算。门户请求有 `NEURALWATT_UPSTREAM_TIMEOUT_MS` 超时，以及上游响应、会话和 Responses 状态的字节上限。Responses 的 `reasoning.effort`、`reasoning.summary` 与旧版 `reasoning.generate_summary` 会接受并校验，常见 SDK 发送的 `null` 默认值也会忽略；门户没有摘要开关，因此只转发有效的 `reasoning.effort`。调试记录默认关闭；开启后保存在加密状态文件中，并受 `NEURALWATT_MAX_RECORD_BYTES` 限制。所有环境变量见 `.env.example`。
 
 运行回归测试、类型检查和构建：
 
@@ -89,8 +89,8 @@ pnpm build
 pnpm probe:cli
 ```
 
-该脚本使用本机安装的 Codex 和 OpenCode，在一次性多文件 JavaScript 项目中进行真实编辑和测试。它要求通过 `NEURALWATT_PROBE_*` 环境变量提供与服务一致的本地管理员/客户端凭据，两个客户端都发送 `stream: true`，验证可见测试与隐藏测试，并在 `finally` 中删除账号、消息记录和临时工作区。只有所有项目通过、首次控制工具调用率高于 90%，且每个纠错候选最终都得到有效工具调用时才通过。OpenCode 在 Codex Windows `:workspace` 受限令牌沙箱内运行，Shell、主目录、配置和临时文件均限制在一次性项目内。独立回环请求追踪必须与调试记录分母一致，避免记录淘汰导致成功率虚高。
+该脚本使用本机安装的 Codex 和 OpenCode，在一次性多文件 JavaScript 项目中进行真实编辑和测试。它要求通过 `NEURALWATT_PROBE_*` 环境变量提供与服务一致的本地管理员/客户端凭据，两个客户端都发送 `stream: true`，验证可见测试与隐藏测试，并在 `finally` 中清理脚本自己创建的账号、消息记录和临时工作区。对已有账号做验收时设置 `NEURALWATT_PROBE_ACCOUNT_ID`；脚本只清理本次临时工作区，不删除该账号或其历史记录。只有所有项目通过、首次控制工具调用率高于 90%，且每个纠错候选最终都得到有效工具调用时才通过。OpenCode 在 Codex Windows `:workspace` 受限令牌沙箱内运行，Shell、主目录、配置和临时文件均限制在一次性项目内。独立回环请求追踪必须与调试记录分母一致，避免记录淘汰导致成功率虚高。
 
-最近一次本地验收（2026-08-19）使用两个 CLI 和两个一次性项目。Codex 与 OpenCode 完成了全部四个项目，包括可见/隐藏测试和多文件编辑；网关观察到 35 个流式轮次、29 个受控工具意图，其中 28 个首次解析成功（96.55%），唯一一次格式错误候选在第一次纠错中成功修复（1/1，100%）。另有一次 Kimi K3 Fast 温度 2 的 20 轮流式压力测试，20 次强制工具选择不匹配全部在一次纠错内修复（100%，最终解析失败为 0）。这些是当前门户部署的验收观测值，不是对未来上游行为的永久承诺。
+最近一次本地验收（2026-08-19）使用两个 CLI 和两个一次性项目。Codex 与 OpenCode 均完成了真实多文件编辑、可见测试和隐藏测试；网关观察到 28 个流式轮次、25 个受控工具意图，25 个首次解析成功（100%），且没有失败工具调用。此前一次包含畸形 JSON 的真实轮次中，纠错 1/1 成功（100%）；另有 Kimi K3 Fast 的 20 轮强制工具选择纠错测试，20/20 在一次纠错内完成（100%）。这些是当前门户部署的验收观测值，不是对未来上游行为的永久承诺。
 
 门户真实路由是浏览器风格的 `/api/chat`，不是另一个 `api.neuralwatt.com/v1` API。门户路由、模型目录或工具行为变更后，应重新运行探测文档中的冒烟用例。
