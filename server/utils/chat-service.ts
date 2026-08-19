@@ -9,7 +9,6 @@ import { stateStore } from "~/server/utils/state-store.ts";
 import { collectUpstreamStream, UpstreamStreamError, type UpstreamFrameHandler } from "~/server/utils/upstream-stream.ts";
 import {
   FINAL_REPLY_MARKER,
-  REPAIR_REASONING_END,
   InvalidStructuredToolCallsError,
   type ReasoningFields,
   stripRepairReasoning,
@@ -720,27 +719,14 @@ async function executeChatRequestOnce(
     let repairCandidate = rawAssistantCandidate(result.completion);
     let repairReasoning: ReasoningFields | undefined;
     let repairReasoningOpen = false;
-    let repairReasoningField: "reasoning" | "reasoning_content" | undefined;
     const collectRepairReasoning = async (fields: ReasoningFields): Promise<void> => {
-      const tagged = tagRepairReasoning(fields, { start: !repairReasoningOpen, end: false });
+      const tagged = tagRepairReasoning(fields, { start: !repairReasoningOpen });
       repairReasoningOpen = true;
-      repairReasoningField ??= tagged.reasoning ? "reasoning" : tagged.reasoning_content ? "reasoning_content" : undefined;
       repairReasoning = {
         reasoning: `${repairReasoning?.reasoning ?? ""}${tagged.reasoning ?? ""}` || undefined,
         reasoning_content: `${repairReasoning?.reasoning_content ?? ""}${tagged.reasoning_content ?? ""}` || undefined,
       };
       await options?.onRepairReasoning?.(tagged);
-    };
-    const closeRepairReasoning = async (): Promise<void> => {
-      if (!repairReasoningOpen || !repairReasoningField) return;
-      const end = { [repairReasoningField]: REPAIR_REASONING_END } as ReasoningFields;
-      repairReasoning = {
-        ...repairReasoning,
-        [repairReasoningField]: `${repairReasoning?.[repairReasoningField] ?? ""}${REPAIR_REASONING_END}`,
-      };
-      await options?.onRepairReasoning?.(end);
-      repairReasoningOpen = false;
-      repairReasoningField = undefined;
     };
     let evaluation = evaluateToolCandidate(
       result.completion,
@@ -823,7 +809,6 @@ async function executeChatRequestOnce(
           toolCallAdapter,
         });
       }
-      await closeRepairReasoning();
       if (!repairStream) {
         const nextRepairReasoning = initialReasoning(result.completion);
         if (nextRepairReasoning.reasoning || nextRepairReasoning.reasoning_content) {

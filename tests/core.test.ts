@@ -2,7 +2,6 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   FINAL_REPLY_MARKER,
-  REPAIR_REASONING_END,
   REPAIR_REASONING_START,
   InvalidStructuredToolCallsError,
   stripRepairReasoning,
@@ -148,14 +147,13 @@ test("Ajv applies nested refs and nontrivial JSON Schema constraints", () => {
 
 test("repair reasoning is tagged for clients and stripped before upstream replay", () => {
   const tagged = tagRepairReasoning({ reasoning: "fix the JSON" });
-  assert.equal(tagged.reasoning, `${REPAIR_REASONING_START}fix the JSON${REPAIR_REASONING_END}`);
+  assert.equal(tagged.reasoning, `${REPAIR_REASONING_START}fix the JSON`);
   const streamed = [
-    tagRepairReasoning({ reasoning: "fix " }, { start: true, end: false }).reasoning,
-    tagRepairReasoning({ reasoning: "the JSON" }, { start: false, end: false }).reasoning,
-    REPAIR_REASONING_END,
+    tagRepairReasoning({ reasoning: "fix " }, { start: true }).reasoning,
+    tagRepairReasoning({ reasoning: "the JSON" }, { start: false }).reasoning,
   ].join("");
-  assert.equal(streamed, `${REPAIR_REASONING_START}fix the JSON${REPAIR_REASONING_END}`);
-  assert.equal(stripRepairReasoning(`first ${tagged.reasoning} second`), "first  second");
+  assert.equal(streamed, `${REPAIR_REASONING_START}fix the JSON`);
+  assert.equal(stripRepairReasoning(`first ${tagged.reasoning} second`), "first ");
   assert.equal(stripRepairReasoning("first @@REPAIR_REASONING@@unfinished"), "first ");
 });
 

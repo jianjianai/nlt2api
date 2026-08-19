@@ -2,7 +2,6 @@ import type { ChatMessage, JsonObject, JsonValue, NormalizedToolCall, ToolDefini
 
 export const FINAL_REPLY_MARKER = "@@FINAL_REPLY@@";
 export const REPAIR_REASONING_START = "@@REPAIR_REASONING@@";
-export const REPAIR_REASONING_END = "@@END_REPAIR_REASONING@@";
 
 export interface ReasoningFields {
   reasoning?: string;
@@ -11,12 +10,11 @@ export interface ReasoningFields {
 
 export function tagRepairReasoning(
   reasoning: ReasoningFields,
-  options?: { start?: boolean; end?: boolean },
+  options?: { start?: boolean },
 ): ReasoningFields {
   const prefix = options?.start === false ? "" : REPAIR_REASONING_START;
-  const suffix = options?.end === false ? "" : REPAIR_REASONING_END;
   const tag = (value: string | undefined): string | undefined => value
-    ? `${prefix}${value}${suffix}`
+    ? `${prefix}${value}`
     : undefined;
   return {
     ...(tag(reasoning.reasoning) ? { reasoning: tag(reasoning.reasoning) } : {}),
@@ -25,16 +23,8 @@ export function tagRepairReasoning(
 }
 
 export function stripRepairReasoning(value: string): string {
-  let result = value;
-  while (true) {
-    const start = result.indexOf(REPAIR_REASONING_START);
-    if (start < 0) break;
-    const end = result.indexOf(REPAIR_REASONING_END, start + REPAIR_REASONING_START.length);
-    result = end < 0
-      ? result.slice(0, start)
-      : result.slice(0, start) + result.slice(end + REPAIR_REASONING_END.length);
-  }
-  return result.replaceAll(REPAIR_REASONING_END, "");
+  const marker = value.indexOf(REPAIR_REASONING_START);
+  return marker < 0 ? value : value.slice(0, marker);
 }
 
 const TOOL_CONTRACT = [
