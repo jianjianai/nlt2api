@@ -271,6 +271,37 @@ export function normaliseAssistantToolCalls(
   };
 }
 
+/**
+ * The portal does not need the client's native tool-call fields in history.
+ * Re-encode them using the same content envelope the model is asked to emit.
+ */
+export function serializeAssistantToolCallsForPortal(messages: ChatMessage[]): ChatMessage[] {
+  return messages.map((message) => {
+    if (message.role !== "assistant" || !message.tool_calls?.length) {
+      return message;
+    }
+
+    const toolCalls = message.tool_calls.map((call) => {
+      const functionValue = objectValue(call.function);
+      const name = stringValue(functionValue?.name);
+      const argumentsValue = toArguments(functionValue?.arguments);
+      if (!name || !argumentsValue) {
+        throw new InvalidStructuredToolCallsError();
+      }
+      return {
+        name,
+        arguments: JSON.parse(argumentsValue) as JsonObject,
+      };
+    });
+    const converted = {
+      ...message,
+      content: JSON.stringify({ type: "tool_calls", tool_calls: toolCalls }),
+    };
+    delete converted.tool_calls;
+    return converted;
+  });
+}
+
 function stripToolContract(content: string): string {
   const marker = content.indexOf(TOOL_CONTRACT_MARKER);
   return marker < 0 ? content : content.slice(0, marker).trimEnd();
@@ -314,7 +345,7 @@ export function withToolCallContract(
     ...(forcedName ? [`You must call only the function named '${forcedName}'.`] : []),
     ...(!parallelToolCalls ? ["Return at most one tool call."] : []),
   ].join(" ");
-  const withoutOldContract = messages.map((message) => {
+  const withoutOldContract = serializeAssistantToolCallsForPortal(messages).map((message) => {
     if (message.role !== "system" && message.role !== "developer") {
       return message;
     }

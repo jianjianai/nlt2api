@@ -18,6 +18,7 @@ import {
   normaliseAssistantToolCalls,
   mergeSystemMessages,
   parseControlledToolEnvelopeDetailed,
+  serializeAssistantToolCallsForPortal,
   withToolCallContract,
 } from "~/server/utils/tool-calls.ts";
 import type {
@@ -272,7 +273,7 @@ function portalMessages(messages: ChatMessage[], markFinalReplies = false): Chat
     }
     return normalized;
   });
-  return mergeSystemMessages(mapped);
+  return mergeSystemMessages(serializeAssistantToolCallsForPortal(mapped));
 }
 
 function upstreamBody(

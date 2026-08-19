@@ -10,6 +10,7 @@ import {
   envelopeAllowedForToolChoice,
   mergeSystemMessages,
   normaliseAssistantToolCalls,
+  serializeAssistantToolCallsForPortal,
   parseControlledToolEnvelope,
   parseControlledToolEnvelopeDetailed,
   withToolCallContract,
@@ -356,6 +357,24 @@ test("system instructions are merged into one message at the front", () => {
   assert.deepEqual(merged.map((message) => message.role), ["system", "user", "tool"]);
   assert.equal(merged.filter((message) => message.role === "system").length, 1);
   assert.equal(merged[0]?.content, "framework\n\nagent instructions");
+});
+
+test("assistant tool calls are re-encoded into portal content", () => {
+  const converted = serializeAssistantToolCallsForPortal([
+    {
+      role: "assistant",
+      content: null,
+      tool_calls: [{
+        id: "call_1",
+        type: "function",
+        function: { name: "calculator", arguments: '{"a":1,"b":2}' },
+      }],
+    },
+    { role: "tool", tool_call_id: "call_1", content: "3" },
+  ]);
+  assert.equal(converted[0]?.tool_calls, undefined);
+  assert.equal(converted[0]?.content, '{"type":"tool_calls","tool_calls":[{"name":"calculator","arguments":{"a":1,"b":2}}]}');
+  assert.equal(converted[1]?.tool_call_id, "call_1");
 });
 
 test("compact tool contracts preserve schema property names and references", () => {

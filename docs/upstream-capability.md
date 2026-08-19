@@ -187,18 +187,13 @@ data: [DONE]
 }
 ```
 
-也接受后续的合成 assistant 调用和工具结果：
+也能理解后续的工具结果。下游客户端提交的标准 assistant `tool_calls` 会由网关转换成与受控契约相同的 JSON `content` 后再发往门户：
 
 ```json
 [
   {
     "role": "assistant",
-    "content": "",
-    "tool_calls": [{
-      "id": "nwcall_1",
-      "type": "function",
-      "function": { "name": "get_weather", "arguments": "{\"city\":\"Shanghai\"}" }
-    }]
+    "content": "{\"type\":\"tool_calls\",\"tool_calls\":[{\"name\":\"get_weather\",\"arguments\":{\"city\":\"Shanghai\"}}]}"
   },
   {
     "role": "tool",
@@ -262,7 +257,7 @@ get_weather(location="Shanghai")
 4. `tool_choice: "none"`、`"required"` 或固定函数由适配器本地执行。
 5. JSON 无效、工具未知、参数无效或选择策略冲突时，最多发起五次有界纠错；每次纠错保留第一次响应的 reasoning 字段，替换上一份错误候选，并把精确的解析/策略/Schema 错误放入提示。纠错轮的 reasoning 可以立即流式发给客户端，但会带内部标记，并在下一轮上游重放前移除；因此上游只看到首次 reasoning 和最终已校验的工具调用。绝不对任意 prose 做“尽力解析”。
 
-受控信封测试结果：六种模型的首轮（不论是否把原生工具字段传给门户）均能解析；DeepSeek Flash、GLM Fast 和 Kimi K3 Fast 的双工具请求返回预期数组；将信封转换为合成 assistant `tool_calls`，再由客户端提交 `role: "tool"` 结果后，六种模型均返回使用 `25 C` 结果的有效 `{"type":"final",...}`。
+受控信封测试结果：六种模型的首轮均能解析；DeepSeek Flash、GLM Fast 和 Kimi K3 Fast 的双工具请求返回预期数组；网关将信封转换为客户端可见的标准 assistant `tool_calls`，客户端再提交 `role: "tool"` 结果。下一次发往门户时，网关会把这份 assistant `tool_calls` 再编码为受控 JSON `content`，六种模型均返回使用 `25 C` 结果的有效 `{"type":"final",...}`。
 
 最稳妥的线路是省略门户原生 `tools` 和 `tool_choice`。一次后续探测显示：Kimi K3 在契约中提供工具定义且省略原生字段时生成了正确的受控信封；同时发送原生 `tools` 时却切换到内部 `thinking` 工具。Kimi K3 Fast 在受控适配路径中返回了预期信封。这是当前部署的观测值，上游变化后应重新验证。
 
@@ -277,7 +272,7 @@ get_weather(location="Shanghai")
 3. 内部向门户请求缓冲的工具轮。工具契约位于唯一的首条 `system` 消息中，要求模型把 JSON 写入普通 assistant `content`；JSON 未完整到达前不能安全判断是最终答案还是工具调用。
 4. 校验信封；工具结果通过后生成标准 OpenAI 工具调用 ID，Chat 返回 `tool_calls`，Responses 返回 `function_call` 项。
 5. 客户端执行自己的工具并在下一轮提交输出；代理不会执行任意客户端工具。
-6. 下一轮重建门户历史，依次加入合成 assistant `tool_calls` 和各个 `role: "tool"`，直到得到合法 `final` 或达到本地轮数上限。
+6. 下一轮重建客户端历史，加入标准 assistant `tool_calls` 和各个 `role: "tool"`；发往门户前将 assistant 工具调用转换为受控 JSON `content`，直到得到合法 `final` 或达到本地轮数上限。
 7. 客户端要求工具轮流式时，只有在内部解析完成后才合成标准 OpenAI SSE；非工具轮可以直接转发门户 SSE，但要过滤门户注释并检查内嵌错误分片。
 
 必须设置本地上限：工具轮数、单轮工具数、全部参数字节数和工具结果字节数。门户没有展示等价的输入校验。
