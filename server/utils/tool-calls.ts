@@ -115,6 +115,14 @@ export class InvalidStructuredToolCallsError extends Error {
   }
 }
 
+export function buildToolRepairHistory(
+  originalHistory: ChatMessage[],
+  candidate: ChatMessage,
+  repair: ChatMessage,
+): ChatMessage[] {
+  return [...originalHistory, candidate, repair];
+}
+
 export function envelopeAllowedForToolChoice(envelope: ControlledToolEnvelope | undefined, toolChoice: unknown): boolean {
   if (!envelope) {
     return false;

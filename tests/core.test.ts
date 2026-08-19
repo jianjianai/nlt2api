@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   InvalidStructuredToolCallsError,
+  buildToolRepairHistory,
   envelopeAllowedForToolChoice,
   normaliseAssistantToolCalls,
   parseControlledToolEnvelope,
@@ -174,6 +175,34 @@ test("controlled envelope leaves embedded or bare call forms to the repair loop"
   );
   assert.equal(bare.envelope, undefined);
   assert.match(bare.error ?? "", /envelope `type`/);
+});
+
+test("repair history replaces the failed candidate and retains initial reasoning", () => {
+  const original = [{ role: "user" as const, content: "read package.json" }];
+  const first = buildToolRepairHistory(
+    original,
+    {
+      role: "assistant",
+      content: '{"type":"tool_calls","tool_calls":[{"name":"read","arguments":{path:"package.json"}}]}',
+      reasoning: "thinking 1",
+    },
+    { role: "user", content: "JSON parse failed: Unexpected token p" },
+  );
+  const second = buildToolRepairHistory(
+    original,
+    {
+      role: "assistant",
+      content: '{"type":"tool_calls","tool_calls":[{"name":"read","arguments":{"path":"package.json"}}]',
+      reasoning: "thinking 1",
+    },
+    { role: "user", content: "JSON parse failed: Unexpected end of JSON input" },
+  );
+
+  assert.deepEqual(first.map((message) => message.role), ["user", "assistant", "user"]);
+  assert.deepEqual(second.map((message) => message.role), ["user", "assistant", "user"]);
+  assert.equal(second[1]?.reasoning, "thinking 1");
+  assert.equal(second[1]?.content, '{"type":"tool_calls","tool_calls":[{"name":"read","arguments":{"path":"package.json"}}]');
+  assert.match(String(second[2]?.content), /Unexpected end of JSON input/);
 });
 
 test("adapter contract follows caller instructions and the latest tool result", () => {

@@ -9,6 +9,7 @@ import { stateStore } from "~/server/utils/state-store.ts";
 import { collectUpstreamStream, UpstreamStreamError, type UpstreamFrameHandler } from "~/server/utils/upstream-stream.ts";
 import {
   InvalidStructuredToolCallsError,
+  buildToolRepairHistory,
   envelopeAllowedForToolChoice,
   normaliseAssistantToolCalls,
   parseControlledToolEnvelopeDetailed,
@@ -531,11 +532,13 @@ function rawAssistantContent(completion: UpstreamCompletion): string {
 
 function rawAssistantCandidate(completion: UpstreamCompletion): string {
   const raw = completion.choices?.[0]?.message;
+  // Content is the controlled, authoritative channel. Only fall back to the
+  // portal's native fields when no textual candidate was produced.
+  if (typeof raw?.content === "string" && raw.content.length > 0) {
+    return raw.content;
+  }
   if (Array.isArray(raw?.tool_calls) && raw.tool_calls.length > 0) {
     return JSON.stringify({ type: "tool_calls", tool_calls: raw.tool_calls });
-  }
-  if (typeof raw?.content === "string") {
-    return raw.content;
   }
   return "";
 }
@@ -694,7 +697,7 @@ async function executeChatRequestOnce(
     // it remains the final instruction in every attempt.
     const originalUpstreamMessages = portalMessages(messages);
     const firstReasoning = initialReasoning(result.completion);
-    let candidate = rawAssistantCandidate(result.completion);
+    let repairCandidate = rawAssistantCandidate(result.completion);
     let evaluation = evaluateToolCandidate(
       result.completion,
       tools,
@@ -716,14 +719,15 @@ async function executeChatRequestOnce(
       const error = evaluation.error ?? "The model output was not a valid controlled tool-call envelope.";
       toolCallAdapter.errors.push(error);
       toolCallAdapter.repairAttempts += 1;
-      const repairHistory = [
-        ...originalUpstreamMessages,
-        withInitialReasoning({
+      const repairHistory = buildToolRepairHistory(
+        originalUpstreamMessages,
+        {
           role: "assistant",
-          content: repairCandidateContent(candidate),
-        }, firstReasoning),
+          content: repairCandidateContent(repairCandidate),
+          ...firstReasoning,
+        },
         repairMessage(error, toolCallAdapter.repairAttempts),
-      ];
+      );
       upstreamRequest = {
         ...upstreamRequest,
         // A repair is internal protocol recovery, not a fresh creative turn.
@@ -761,7 +765,12 @@ async function executeChatRequestOnce(
           toolCallAdapter,
         });
       }
-      candidate = rawAssistantCandidate(result.completion);
+      const nextCandidate = rawAssistantCandidate(result.completion);
+      // A reasoning-only upstream reply is not an error candidate. Retain the
+      // prior malformed call so the next repair has a concrete object to fix.
+      if (nextCandidate.length > 0) {
+        repairCandidate = nextCandidate;
+      }
       evaluation = evaluateToolCandidate(
         result.completion,
         tools,
