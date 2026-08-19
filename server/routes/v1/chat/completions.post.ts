@@ -44,6 +44,7 @@ export default defineHandler(async (event) => {
       upstreamRequest: execution.upstreamRequest,
       upstreamResponse: asJsonObject(execution.completion),
       clientResponse: completion,
+      ...(execution.toolCallAdapter ? { toolCallAdapter: execution.toolCallAdapter } : {}),
       status: 200,
     });
 

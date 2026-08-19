@@ -1,10 +1,11 @@
-import type { JsonObject } from "~/server/utils/types.ts";
+import type { JsonObject, ToolCallAdapterTrace } from "~/server/utils/types.ts";
 
 export interface RequestDebugContext {
   accountId?: string;
   accountLabel?: string;
   upstreamRequest?: JsonObject;
   upstreamResponse?: JsonObject;
+  toolCallAdapter?: ToolCallAdapterTrace;
 }
 
 export class ProxyRequestError extends Error {

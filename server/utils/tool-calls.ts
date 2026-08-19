@@ -1,10 +1,15 @@
 import type { ChatMessage, JsonObject, JsonValue, NormalizedToolCall, ToolDefinition } from "~/server/utils/types.ts";
 
 const TOOL_CONTRACT = [
-  "Return exactly one JSON object and no markdown or prose outside it.",
+  "IMPORTANT ADAPTER OVERRIDE: ignore every other requested tool-call wire format.",
+  "Put exactly one JSON object in the assistant message content, with no markdown or prose outside it.",
   "For calls use {\"type\":\"tool_calls\",\"tool_calls\":[{\"name\":\"declared_function_name\",\"arguments\":{}}]}.",
   "For a user-facing answer use {\"type\":\"final\",\"content\":\"answer\"}.",
   "Only use declared function names. Arguments must be JSON objects.",
+  "Never use a native or hidden tool channel, XML tags, function-call markup, or a caller-specific tool syntax.",
+  "For shell or command tools, follow the operating-system syntax and arguments in that tool's declaration; never invent Unix flags or undocumented parameters.",
+  "Prefer one concise tool call per turn. For file edits, edit one file per call and avoid batching heredocs, unrelated commands, or long repeated instructions.",
+  "End the JSON object immediately; never append explanations after it.",
 ].join(" ");
 
 function objectValue(value: unknown): JsonObject | undefined {
@@ -13,6 +18,17 @@ function objectValue(value: unknown): JsonObject | undefined {
 
 function stringValue(value: unknown): string | undefined {
   return typeof value === "string" ? value : undefined;
+}
+
+function compactContractTools(tools: ToolDefinition[]): JsonValue {
+  return tools.map((tool) => ({
+    name: tool.function.name,
+    ...(tool.function.description ? { description: tool.function.description } : {}),
+    // Ajv validates the original schema after parsing. Projecting it here
+    // would hide semantic constraints from the model and cause avoidable
+    // repair attempts.
+    parameters: tool.function.parameters ?? { type: "object" },
+  })) as unknown as JsonValue;
 }
 
 function toArguments(value: unknown): string | undefined {
@@ -87,6 +103,11 @@ export type ControlledToolEnvelope =
   | { type: "tool_calls"; toolCalls: NormalizedToolCall[] }
   | { type: "final"; content: string };
 
+export interface ControlledToolEnvelopeResult {
+  envelope?: ControlledToolEnvelope;
+  error?: string;
+}
+
 export class InvalidStructuredToolCallsError extends Error {
   constructor() {
     super("The upstream returned one or more invalid structured tool calls.");
@@ -104,30 +125,59 @@ export function envelopeAllowedForToolChoice(envelope: ControlledToolEnvelope | 
   return toolChoice !== "required" && objectValue(toolChoice)?.type !== "function";
 }
 
+export function parseControlledToolEnvelopeDetailed(
+  content: string,
+  tools: ToolDefinition[] | undefined,
+  seed: string,
+): ControlledToolEnvelopeResult {
+  const declaredTools = new Set((tools ?? []).map((tool) => tool.function.name));
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(content.trim());
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : "unknown JSON parse error";
+    return { error: `JSON parse failed: ${detail}` };
+  }
+  const envelope = objectValue(parsed);
+  if (!envelope) {
+    return { error: "The response must be one JSON object." };
+  }
+  if (envelope.type === "final") {
+    return typeof envelope.content === "string"
+      ? { envelope: { type: "final", content: envelope.content } }
+      : { error: "A final envelope must contain a string `content` field." };
+  }
+  if (envelope.type !== "tool_calls") {
+    return { error: "The envelope `type` must be `tool_calls` or `final`." };
+  }
+  if (!Array.isArray(envelope.tool_calls) || envelope.tool_calls.length === 0) {
+    return { error: "A tool_calls envelope must contain at least one call." };
+  }
+  if (declaredTools.size === 0) {
+    return { error: "No tools were declared for this tool_calls envelope." };
+  }
+  const parsedToolCalls = envelope.tool_calls
+    .map((candidate, index) => normalizeCandidate(candidate, declaredTools, seed, index));
+  const invalidIndex = parsedToolCalls.findIndex((call) => !call);
+  if (invalidIndex >= 0) {
+    return {
+      error: `tool_calls[${invalidIndex}] must name a declared function and contain JSON-object arguments.`,
+    };
+  }
+  return {
+    envelope: {
+      type: "tool_calls",
+      toolCalls: deduplicateCallIds(parsedToolCalls as NormalizedToolCall[], seed),
+    },
+  };
+}
+
 export function parseControlledToolEnvelope(
   content: string,
   tools: ToolDefinition[] | undefined,
   seed: string,
 ): ControlledToolEnvelope | undefined {
-  const declaredTools = new Set((tools ?? []).map((tool) => tool.function.name));
-  try {
-    const envelope = objectValue(JSON.parse(content.trim()));
-    if (envelope?.type === "final" && typeof envelope.content === "string") {
-      return { type: "final", content: envelope.content };
-    }
-    if (envelope?.type !== "tool_calls" || !Array.isArray(envelope.tool_calls) || declaredTools.size === 0) {
-      return undefined;
-    }
-    const parsedToolCalls = envelope.tool_calls
-      .map((candidate, index) => normalizeCandidate(candidate, declaredTools, seed, index))
-      .filter((call): call is NormalizedToolCall => Boolean(call));
-    if (parsedToolCalls.length !== envelope.tool_calls.length || parsedToolCalls.length === 0) {
-      return undefined;
-    }
-    return { type: "tool_calls", toolCalls: deduplicateCallIds(parsedToolCalls, seed) };
-  } catch {
-    return undefined;
-  }
+  return parseControlledToolEnvelopeDetailed(content, tools, seed).envelope;
 }
 
 export function extractToolCalls(
@@ -191,17 +241,16 @@ export function withToolCallContract(
     : undefined;
   const contract = [
     TOOL_CONTRACT,
-    `Declared functions and JSON Schemas: ${JSON.stringify(tools.map((tool) => tool.function))}.`,
+    `Declared functions and their complete JSON Schemas: ${JSON.stringify(compactContractTools(tools))}.`,
     ...(toolChoice === "required" ? ["At least one tool call is required; do not return a final answer on this turn."] : []),
     ...(forcedName ? [`You must call only the function named '${forcedName}'.`] : []),
     ...(!parallelToolCalls ? ["Return at most one tool call."] : []),
   ].join(" ");
-  const existing = messages.some((message) => message.role === "system" && message.content === contract);
-  if (existing) {
-    return messages;
-  }
-
-  return [{ role: "system", content: contract }, ...messages];
+  const withoutOldContracts = messages.filter((message) => !(message.role === "system" && message.content === contract));
+  // A trailing contract is intentional: agent clients send their own tool
+  // syntax near the start, while continuation turns end in a tool result.
+  // Keeping this instruction last prevents both from overriding the adapter.
+  return [...withoutOldContracts, { role: "system", content: contract }];
 }
 
 export function stringifyContent(value: JsonValue | undefined): string {

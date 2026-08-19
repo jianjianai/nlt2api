@@ -6,7 +6,7 @@ import { responsesStreamEvents } from "~/server/utils/responses-events.ts";
 import { responseEnvelopeFields, responseUsage } from "~/server/utils/responses-compat.ts";
 import { ProxyRequestError } from "~/server/utils/request-errors.ts";
 import { ResponseStateLimitError, stateStore } from "~/server/utils/state-store.ts";
-import type { ChatMessage, JsonObject, JsonValue, ResponseState, ToolDefinition } from "~/server/utils/types.ts";
+import type { ChatMessage, JsonObject, JsonValue, ResponseState, ToolCallAdapterTrace, ToolDefinition } from "~/server/utils/types.ts";
 
 interface ResponseExecution {
   response: JsonObject;
@@ -15,9 +15,10 @@ interface ResponseExecution {
   accountLabel: string;
   upstreamRequest: JsonObject;
   upstreamResponse: JsonObject;
+  toolCallAdapter?: ToolCallAdapterTrace;
 }
 
-const DEFAULT_MAX_OUTPUT_TOKENS = 8_192;
+const DEFAULT_MAX_OUTPUT_TOKENS = 16_384;
 const RESPONSE_STATE_OVERHEAD_BYTES = 32 * 1_024;
 
 function validCallId(value: unknown): value is string {
@@ -66,13 +67,19 @@ function contentToChat(value: unknown): JsonValue {
       return { type: "text", text: typeof item.text === "string" ? item.text : "" };
     }
     if (type === "input_image") {
-      const imageUrl = typeof item.image_url === "string"
-        ? item.image_url
-        : asRecord(item.image_url)?.url;
+      const image = asRecord(item.image_url);
+      const imageUrl = typeof item.image_url === "string" ? item.image_url : image?.url;
       if (typeof imageUrl !== "string") {
         throw new HttpError(400, "input_image requires an image_url.", "invalid_request_error", "input");
       }
-      return { type: "image_url", image_url: { url: imageUrl } };
+      const detail = image?.detail ?? item.detail;
+      if (detail !== undefined && detail !== "auto" && detail !== "low" && detail !== "high") {
+        throw new HttpError(400, "input_image detail must be auto, low, or high.", "invalid_request_error", "input");
+      }
+      return {
+        type: "image_url",
+        image_url: { url: imageUrl, ...(typeof detail === "string" ? { detail } : {}) },
+      };
     }
     if (type === "image_url") {
       return item as JsonValue;
@@ -98,12 +105,27 @@ function responseTools(value: unknown): ToolDefinition[] {
   if (!Array.isArray(value)) {
     return parseTools(value);
   }
-  const converted = value.map((raw) => {
+  if (value.length > 64) {
+    throw new HttpError(400, "`tools` must contain at most 64 entries.", "invalid_request_error", "tools");
+  }
+  const converted = value.flatMap((raw, index) => {
     const tool = asRecord(raw);
-    if (tool?.type !== "function" || typeof tool.name !== "string") {
-      return raw;
+    // Codex sends its optional multi-agent controls as a vendor `namespace`
+    // group. Those controls are not OpenAI function tools, so keeping them
+    // would let an unsupported extension prevent the ordinary tool loop.
+    if (tool?.type === "namespace") {
+      if (typeof tool.name !== "string" || !Array.isArray(tool.tools)) {
+        throw new HttpError(400, `tools[${index}] is not a valid tool namespace.`, "invalid_request_error", "tools");
+      }
+      return [];
     }
-    return {
+    if (tool?.type === "web_search" || tool?.type === "web_search_preview") {
+      return [];
+    }
+    if (tool?.type !== "function" || typeof tool.name !== "string") {
+      return [raw];
+    }
+    return [{
       type: "function",
       function: {
         name: tool.name,
@@ -111,9 +133,51 @@ function responseTools(value: unknown): ToolDefinition[] {
         parameters: tool.parameters,
         strict: tool.strict,
       },
-    };
+    }];
   });
   return parseTools(converted);
+}
+
+function functionCallOutputToChat(value: unknown): JsonValue {
+  if (typeof value === "string") {
+    return value;
+  }
+  if (Array.isArray(value)) {
+    // Function outputs may carry the same text/image content parts as a
+    // Responses input item. Preserve those parts for Kimi vision follow-ups;
+    // unsupported files fail explicitly in contentToChat instead of vanishing.
+    return contentToChat(value);
+  }
+  return value === undefined || value === null ? "" : JSON.stringify(value);
+}
+
+function responseFormatFromText(value: unknown): JsonObject | undefined {
+  if (value === undefined || value === null) {
+    return undefined;
+  }
+  const text = asRecord(value);
+  if (!text) {
+    throw new HttpError(400, "`text` must be an object.", "invalid_request_error", "text");
+  }
+  if (text.format === undefined || text.format === null) {
+    return undefined;
+  }
+  const format = asRecord(text.format);
+  if (!format || typeof format.type !== "string") {
+    throw new HttpError(400, "`text.format` must be an object with a type.", "invalid_request_error", "text.format");
+  }
+  if (format.type === "text") {
+    return undefined;
+  }
+  if (format.type === "json_object") {
+    return { type: "json_object" };
+  }
+  throw new HttpError(
+    400,
+    "This adapter supports only `text.format` types `text` and `json_object`.",
+    "invalid_request_error",
+    "text.format",
+  );
 }
 
 function responseToolChoice(value: unknown): JsonValue | undefined {
@@ -210,7 +274,7 @@ function inputItems(value: unknown): ChatMessage[] {
       if (!validCallId(callId)) {
         throw new HttpError(400, `input[${index}].call_id must be a valid tool-call ID.`, "invalid_request_error", "input");
       }
-      messages.push({ role: "tool", tool_call_id: callId, content: outputToText(item.output) });
+      messages.push({ role: "tool", tool_call_id: callId, content: functionCallOutputToChat(item.output) });
       pendingCalls = undefined;
       continue;
     }
@@ -330,6 +394,7 @@ export async function executeResponsesRequest(request: JsonObject): Promise<Resp
   // them again on a previous_response_id continuation when they are needed.
   const tools = request.tools === undefined ? [] : responseTools(request.tools);
   const reasoningEffort = responseReasoningEffort(request.reasoning, request.reasoning_effort);
+  const responseFormat = responseFormatFromText(request.text);
   if (request.model !== undefined && (typeof request.model !== "string" || !request.model.trim() || request.model.length > 200)) {
     throw new HttpError(400, "`model` must be a non-empty string.", "invalid_request_error", "model");
   }
@@ -360,6 +425,7 @@ export async function executeResponsesRequest(request: JsonObject): Promise<Resp
     tools: tools as unknown as JsonValue,
     tool_choice: responseToolChoice(request.tool_choice),
     ...(reasoningEffort ? { reasoning_effort: reasoningEffort } : {}),
+    ...(responseFormat ? { response_format: responseFormat } : {}),
     ...(request.max_output_tokens !== undefined ? { max_completion_tokens: request.max_output_tokens } : {}),
     stream: false,
   };
@@ -444,5 +510,6 @@ export async function executeResponsesRequest(request: JsonObject): Promise<Resp
     accountLabel: execution.account.label,
     upstreamRequest: execution.upstreamRequest,
     upstreamResponse: execution.completion as unknown as JsonObject,
+    ...(execution.toolCallAdapter ? { toolCallAdapter: execution.toolCallAdapter } : {}),
   };
 }

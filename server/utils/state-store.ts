@@ -313,6 +313,15 @@ export class StateStore {
       .reverse();
   }
 
+  async deleteDebugRecordsForAccount(accountId: string): Promise<number> {
+    return this.mutate((state) => {
+      const before = state.debugRecords ?? [];
+      const after = before.filter((record) => record.accountId !== accountId);
+      state.debugRecords = after;
+      return before.length - after.length;
+    });
+  }
+
   private async mutate<T>(operation: (state: PersistentState) => T): Promise<T> {
     let result: T | undefined;
     let failure: unknown;

@@ -4,6 +4,8 @@
     "build": "vite build",
     "dev": "vite dev",
     "preview": "vite preview",
+    "probe:cli": "node scripts/probe-cli-agents.mjs",
+    "probe:tools": "node scripts/probe-tool-first-pass.mjs",
     "test": "node --experimental-strip-types --test tests/core.test.ts",
     "typecheck": "tsc --noEmit"
   },

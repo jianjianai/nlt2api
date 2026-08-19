@@ -117,6 +117,17 @@ export interface PublicAccount {
   runtime: AccountRuntimeState;
 }
 
+export interface ToolCallAdapterTrace {
+  toolCallExpected: "auto" | "required" | "forced";
+  initialParseSucceeded: boolean;
+  finalParseSucceeded: boolean;
+  initialOutcome: "tool_calls" | "final" | "invalid";
+  finalOutcome: "tool_calls" | "final" | "invalid";
+  repairAttempts: number;
+  maxRepairAttempts: number;
+  errors: string[];
+}
+
 export interface DebugRecord {
   id: string;
   at: string;
@@ -127,6 +138,7 @@ export interface DebugRecord {
   upstreamRequest?: JsonObject;
   clientResponse?: JsonObject;
   upstreamResponse?: JsonObject;
+  toolCallAdapter?: ToolCallAdapterTrace;
   status: number;
   error?: string;
 }

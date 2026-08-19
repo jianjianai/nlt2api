@@ -1,4 +1,5 @@
 import Ajv, { type ErrorObject, type ValidateFunction } from "ajv";
+import Ajv2020 from "ajv/dist/2020.js";
 import type { JsonObject, JsonValue } from "~/server/utils/types.ts";
 
 export interface SchemaValidationResult {
@@ -6,7 +7,7 @@ export interface SchemaValidationResult {
   errors: string[];
 }
 
-const validator = new Ajv({
+const validatorOptions = {
   allErrors: true,
   allowUnionTypes: true,
   strictSchema: true,
@@ -15,8 +16,15 @@ const validator = new Ajv({
   strictTuples: false,
   strictRequired: false,
   validateFormats: false,
-});
-const compiledSchemas = new Map<string, ValidateFunction | string>();
+} as const;
+const draft7Validator = new Ajv(validatorOptions);
+const draft2020Validator = new Ajv2020(validatorOptions);
+type SchemaValidator = typeof draft7Validator | typeof draft2020Validator;
+interface CompiledSchema {
+  result: ValidateFunction | string;
+  validator: SchemaValidator;
+}
+const compiledSchemas = new Map<string, CompiledSchema>();
 const MAX_COMPILED_SCHEMAS = 500;
 
 function errorText(errors: ErrorObject[] | null | undefined): string[] {
@@ -26,12 +34,20 @@ function errorText(errors: ErrorObject[] | null | undefined): string[] {
   });
 }
 
+function validatorFor(schema: JsonObject): SchemaValidator {
+  const dialect = schema.$schema;
+  return typeof dialect === "string" && dialect.includes("2020-12")
+    ? draft2020Validator
+    : draft7Validator;
+}
+
 function compileSchema(schema: JsonObject): ValidateFunction | string {
   const key = JSON.stringify(schema);
   const cached = compiledSchemas.get(key);
   if (cached) {
-    return cached;
+    return cached.result;
   }
+  const validator = validatorFor(schema);
   let compiled: ValidateFunction | string;
   try {
     compiled = validator.compile(schema);
@@ -39,24 +55,28 @@ function compileSchema(schema: JsonObject): ValidateFunction | string {
     validator.removeSchema(schema);
     compiled = error instanceof Error ? error.message : "Invalid JSON Schema.";
   }
-  compiledSchemas.set(key, compiled);
+  compiledSchemas.set(key, { result: compiled, validator });
   while (compiledSchemas.size > MAX_COMPILED_SCHEMAS) {
     const oldest = compiledSchemas.keys().next().value as string | undefined;
     if (oldest === undefined) break;
     const evicted = compiledSchemas.get(oldest);
     compiledSchemas.delete(oldest);
-    if (typeof evicted !== "string" && evicted?.schema) {
-      validator.removeSchema(evicted.schema);
+    if (evicted && typeof evicted.result !== "string" && evicted.result.schema) {
+      evicted.validator.removeSchema(evicted.result.schema);
     }
   }
   return compiled;
 }
 
 export function jsonSchemaCacheStats(): { compiledSchemas: number; ajvSchemas: number | null } {
-  const internal = validator as unknown as { _cache?: Map<unknown, unknown> };
+  const draft7 = draft7Validator as unknown as { _cache?: Map<unknown, unknown> };
+  const draft2020 = draft2020Validator as unknown as { _cache?: Map<unknown, unknown> };
+  const cacheSizes = [draft7._cache?.size, draft2020._cache?.size];
   return {
     compiledSchemas: compiledSchemas.size,
-    ajvSchemas: internal._cache?.size ?? null,
+    ajvSchemas: cacheSizes.every((size) => typeof size === "number")
+      ? cacheSizes.reduce<number>((sum, size) => sum + (size ?? 0), 0)
+      : null,
   };
 }
 

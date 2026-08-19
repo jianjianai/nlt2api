@@ -33,6 +33,16 @@ interface DebugRecord {
   upstreamRequest?: Record<string, unknown>;
   clientResponse?: Record<string, unknown>;
   upstreamResponse?: Record<string, unknown>;
+  toolCallAdapter?: {
+    toolCallExpected: "auto" | "required" | "forced";
+    initialParseSucceeded: boolean;
+    finalParseSucceeded: boolean;
+    initialOutcome: "tool_calls" | "final" | "invalid";
+    finalOutcome: "tool_calls" | "final" | "invalid";
+    repairAttempts: number;
+    maxRepairAttempts: number;
+    errors: string[];
+  };
   status: number;
   error?: string;
 }
@@ -72,6 +82,27 @@ const notice = ref("");
 const enabledCount = computed(() => accounts.value.filter((account) => account.enabled).length);
 const activeSessions = computed(() => accounts.value.filter((account) => account.hasSession).length);
 const cooldownCount = computed(() => accounts.value.filter((account) => account.runtime.cooldownUntil > Date.now()).length);
+function forcesTool(record: DebugRecord): boolean {
+  const choice = record.clientRequest.tool_choice;
+  return choice === "required" || (choice && typeof choice === "object" && (choice as { type?: unknown }).type === "function");
+}
+
+function isToolIntent(record: DebugRecord): boolean {
+  const trace = record.toolCallAdapter;
+  if (!trace) return false;
+  return forcesTool(record)
+    || trace.initialOutcome === "invalid"
+    || trace.finalOutcome === "tool_calls"
+    || trace.finalOutcome === "invalid";
+}
+
+const toolAdapterRecords = computed(() => records.value.filter((record) =>
+  isToolIntent(record)));
+const toolFirstPassRate = computed(() => {
+  if (toolAdapterRecords.value.length === 0) return null;
+  const successes = toolAdapterRecords.value.filter((record) => record.toolCallAdapter?.initialOutcome === "tool_calls").length;
+  return Math.round((successes / toolAdapterRecords.value.length) * 1_000) / 10;
+});
 
 function headers(): HeadersInit {
   return {
@@ -423,7 +454,10 @@ onMounted(() => {
               <button class="button button-quiet" type="button" @click="loadRecords">Refresh</button>
             </div>
           </div>
-          <p class="records-meta">{{ settings.recordMessages ? "Recording enabled" : "Recording disabled" }} · {{ records.length }} records loaded</p>
+          <p class="records-meta">
+            {{ settings.recordMessages ? "Recording enabled" : "Recording disabled" }} · {{ records.length }} records loaded
+            <template v-if="toolFirstPassRate !== null"> · Tool JSON first-pass {{ toolFirstPassRate }}% ({{ toolAdapterRecords.length }} turns)</template>
+          </p>
           <div v-if="records.length === 0" class="empty-state">No message records.</div>
           <div v-else class="records-list">
             <details v-for="record in records" :key="record.id" class="record-entry">
@@ -431,14 +465,18 @@ onMounted(() => {
                 <span class="record-endpoint">{{ record.endpoint }}</span>
                 <span class="record-account">{{ record.accountLabel || "Unassigned" }}</span>
                 <span class="record-status" :class="{ success: record.status < 400 }">{{ record.status }}</span>
+                <span v-if="record.toolCallAdapter" class="record-account">
+                  {{ record.toolCallAdapter.finalOutcome === "final" ? "Final JSON" : record.toolCallAdapter.initialOutcome === "tool_calls" ? "Tool JSON first-pass" : `Tool JSON repaired ×${record.toolCallAdapter.repairAttempts}` }}
+                </span>
                 <time>{{ formatDate(record.at) }}</time>
               </summary>
               <div class="record-grid">
                 <div><h3>Client request</h3><pre>{{ pretty(record.clientRequest) }}</pre></div>
                 <div><h3>Upstream request</h3><pre>{{ pretty(record.upstreamRequest || {}) }}</pre></div>
-                <div><h3>Client response</h3><pre>{{ pretty(record.clientResponse || { error: record.error }) }}</pre></div>
-                <div><h3>Upstream response</h3><pre>{{ pretty(record.upstreamResponse || {}) }}</pre></div>
-              </div>
+                 <div><h3>Client response</h3><pre>{{ pretty(record.clientResponse || { error: record.error }) }}</pre></div>
+                 <div><h3>Upstream response</h3><pre>{{ pretty(record.upstreamResponse || {}) }}</pre></div>
+                 <div v-if="record.toolCallAdapter"><h3>Tool call adapter</h3><pre>{{ pretty(record.toolCallAdapter) }}</pre></div>
+               </div>
             </details>
           </div>
         </section>

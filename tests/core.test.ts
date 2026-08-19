@@ -5,6 +5,8 @@ import {
   envelopeAllowedForToolChoice,
   normaliseAssistantToolCalls,
   parseControlledToolEnvelope,
+  parseControlledToolEnvelopeDetailed,
+  withToolCallContract,
 } from "../server/utils/tool-calls.ts";
 import {
   parseAndValidateToolArguments,
@@ -22,6 +24,7 @@ import {
   collectUpstreamStream,
   openAISse,
 } from "../server/utils/upstream-stream.ts";
+import { redact } from "../server/utils/redaction.ts";
 
 const tools = [{
   type: "function" as const,
@@ -135,6 +138,165 @@ test("Ajv applies nested refs and nontrivial JSON Schema constraints", () => {
   assert.ok(invalid.errors.some((error) => error.includes("uniqueItems")));
 });
 
+test("controlled envelope reports exact JSON and call-shape errors for repair", () => {
+  const malformed = parseControlledToolEnvelopeDetailed(
+    '{"type":"tool_calls","tool_calls":[{"name":"calculator","arguments":{"a":1,"b":2}}]',
+    tools,
+    "seed",
+  );
+  assert.equal(malformed.envelope, undefined);
+  assert.match(malformed.error ?? "", /^JSON parse failed:/);
+
+  const badArguments = parseControlledToolEnvelopeDetailed(
+    '{"type":"tool_calls","tool_calls":[{"name":"calculator","arguments":[]}]}',
+    tools,
+    "seed",
+  );
+  assert.equal(badArguments.envelope, undefined);
+  assert.match(badArguments.error ?? "", /tool_calls\[0\]/);
+});
+
+test("controlled envelope leaves embedded or bare call forms to the repair loop", () => {
+  const embedded = parseControlledToolEnvelopeDetailed(
+    'Thought complete. <tool_call>{"name":"calculator","arguments":{"a":1,"b":2}}</tool_call>',
+    tools,
+    "seed",
+  );
+  assert.equal(embedded.envelope, undefined);
+  assert.match(embedded.error ?? "", /^JSON parse failed:/);
+
+  const bare = parseControlledToolEnvelopeDetailed(
+    '{"name":"calculator","arguments":{"a":1,"b":2}}',
+    tools,
+    "seed",
+  );
+  assert.equal(bare.envelope, undefined);
+  assert.match(bare.error ?? "", /envelope `type`/);
+});
+
+test("adapter contract follows caller instructions and the latest tool result", () => {
+  const messages = [
+    { role: "system" as const, content: "caller tool syntax" },
+    { role: "developer" as const, content: "more caller instructions" },
+    { role: "user" as const, content: "read package.json" },
+    { role: "assistant" as const, content: null, tool_calls: [{
+      id: "call_1",
+      type: "function" as const,
+      function: { name: "calculator", arguments: '{"a":1,"b":2}' },
+    }] },
+    { role: "tool" as const, tool_call_id: "call_1", content: "3" },
+  ];
+  const contracted = withToolCallContract(messages, tools, "required", false);
+  assert.deepEqual(contracted.map((message) => message.role), [
+    "system", "developer", "user", "assistant", "tool", "system",
+  ]);
+  assert.equal(contracted[0]?.content, "caller tool syntax");
+  assert.match(String(contracted.at(-1)?.content), /IMPORTANT ADAPTER OVERRIDE/);
+  assert.match(String(contracted.at(-1)?.content), /Never use a native or hidden tool channel/);
+  assert.match(String(contracted.at(-1)?.content), /"properties":\{"a"/);
+  assert.doesNotMatch(String(contracted.at(-1)?.content), /caller tool syntax/);
+});
+
+test("adapter contract can be re-applied after a repair candidate", () => {
+  const history = [
+    { role: "user" as const, content: "edit package.json" },
+    { role: "assistant" as const, content: "not-json" },
+    { role: "user" as const, content: "JSON parse failed; retry" },
+  ];
+  const contracted = withToolCallContract(history, tools, "required", true);
+  assert.equal(contracted.at(-1)?.role, "system");
+  assert.match(String(contracted.at(-1)?.content), /IMPORTANT ADAPTER OVERRIDE/);
+  assert.equal(contracted.at(-2)?.content, "JSON parse failed; retry");
+});
+
+test("adapter contract moves an existing copy back to the absolute tail", () => {
+  const first = withToolCallContract([{ role: "user", content: "edit" }], tools, "required");
+  const withLaterHistory = [
+    ...first,
+    { role: "tool" as const, tool_call_id: "call_1", content: "done" },
+  ];
+  const contracted = withToolCallContract(withLaterHistory, tools, "required");
+  assert.equal(contracted.at(-1)?.role, "system");
+  assert.equal(contracted.filter((message) => message.role === "system").length, 1);
+  assert.equal(contracted.at(-2)?.role, "tool");
+});
+
+test("compact tool contracts preserve schema property names and references", () => {
+  const referencedTools = [{
+    type: "function" as const,
+    function: {
+      name: "write_file",
+      parameters: {
+        type: "object",
+        properties: { payload: { $ref: "#/$defs/payload" } },
+        required: ["payload"],
+        additionalProperties: false,
+        $defs: { payload: { type: "string", minLength: 1 } },
+      },
+    },
+  }];
+  const contract = withToolCallContract([{ role: "user", content: "write" }], referencedTools, "required");
+  const text = String(contract.at(-1)?.content);
+  assert.match(text, /"payload"/);
+  assert.match(text, /#\/\$defs\/payload/);
+  assert.match(text, /"\$defs"/);
+});
+
+test("tool contracts preserve descriptions and every JSON Schema constraint", () => {
+  const constrained = [{
+    type: "function" as const,
+    function: {
+      name: "write_file",
+      description: "Write exactly one UTF-8 file.",
+      parameters: {
+        type: "object",
+        properties: {
+          value: { type: "number", multipleOf: 0.25 },
+        },
+        dependentRequired: { value: ["value"] },
+        required: ["value"],
+      },
+    },
+  }];
+  const text = String(withToolCallContract([{ role: "user", content: "write" }], constrained, "required").at(-1)?.content);
+  assert.match(text, /Write exactly one UTF-8 file/);
+  assert.match(text, /"multipleOf":0\.25/);
+  assert.match(text, /"dependentRequired"/);
+});
+
+test("debug redaction covers camelCase credential fields", () => {
+  const redacted = redact({ accessToken: "a", sessionCookie: "b", csrfToken: "c", clientSecret: "d", safeValue: "ok" });
+  assert.deepEqual(redacted, {
+    accessToken: "[redacted]",
+    sessionCookie: "[redacted]",
+    csrfToken: "[redacted]",
+    clientSecret: "[redacted]",
+    safeValue: "ok",
+  });
+});
+
+test("tool schemas support explicit Draft 7 and 2020-12 dialects", () => {
+  const draft7 = {
+    $schema: "http://json-schema.org/draft-07/schema#",
+    type: "object",
+    properties: { value: { type: "integer", minimum: 1 } },
+    required: ["value"],
+    additionalProperties: false,
+  };
+  const draft2020 = {
+    $schema: "https://json-schema.org/draft/2020-12/schema",
+    type: "array",
+    prefixItems: [{ const: "tool" }, { type: "integer" }],
+    items: false,
+  };
+
+  assert.equal(validateSchemaDefinition(draft7).valid, true);
+  assert.equal(validateJsonSchema({ value: 2 }, draft7).valid, true);
+  assert.equal(validateSchemaDefinition(draft2020).valid, true);
+  assert.equal(validateJsonSchema(["tool", 2], draft2020).valid, true);
+  assert.equal(validateJsonSchema(["tool", "bad"], draft2020).valid, false);
+});
+
 test("invalid schemas and malformed argument JSON fail before execution", () => {
   assert.equal(validateSchemaDefinition({ $ref: "#/missing" }).valid, false);
   assert.equal(parseAndValidateToolArguments("not-json", tools[0].function.parameters).validation.valid, false);
@@ -148,7 +310,7 @@ test("compiled JSON Schema caches stay bounded", () => {
   const stats = jsonSchemaCacheStats();
   assert.ok(stats.compiledSchemas <= 500);
   if (stats.ajvSchemas !== null) {
-    assert.ok(stats.ajvSchemas <= 501);
+    assert.ok(stats.ajvSchemas <= stats.compiledSchemas + 32);
   }
 });
 

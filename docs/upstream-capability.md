@@ -263,13 +263,13 @@ or:
 { "type": "final", "content": "The final user-facing answer." }
 ```
 
-Use a server-owned system instruction requiring exactly one of those JSON objects and no markdown/prose. Include the declared function definitions and JSON Schemas in that instruction, but omit the Portal's native `tools` and `tool_choice` fields. Send only `response_format: {"type":"json_object"}` upstream. Parse only the complete, bounded response; then validate:
+Use a server-owned system instruction requiring exactly one of those JSON objects and no markdown/prose. Include the declared function descriptions and complete JSON Schemas in that instruction, but omit the Portal's native `tools` and `tool_choice` fields. Send only `response_format: {"type":"json_object"}` upstream. Parse only the complete, bounded response; then validate:
 
 1. The top-level `type` is exactly `tool_calls` or `final`.
 2. Every requested tool name is in the client's declared tool set.
 3. Every `arguments` object validates against that tool's JSON Schema.
 4. `tool_choice: "none"`, `"required"`, or a fixed function is enforced by this adapter, not delegated to Portal.
-5. Invalid JSON, an unknown tool, invalid arguments, or a violated choice policy triggers one bounded repair request or a deterministic OpenAI-compatible error. Never run a best-effort parser over arbitrary prose.
+5. Invalid JSON, an unknown tool, invalid arguments, or a violated choice policy triggers up to five bounded repair requests or a deterministic OpenAI-compatible error. Each repair keeps the first reasoning fields, replaces the prior bad candidate, includes the precise validation error, and returns to deterministic sampling. Never run a best-effort parser over arbitrary prose.
 
 This controlled envelope was tested successfully:
 

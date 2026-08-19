@@ -10,7 +10,7 @@ import {
   InvalidStructuredToolCallsError,
   envelopeAllowedForToolChoice,
   normaliseAssistantToolCalls,
-  parseControlledToolEnvelope,
+  parseControlledToolEnvelopeDetailed,
   withToolCallContract,
 } from "~/server/utils/tool-calls.ts";
 import type {
@@ -19,6 +19,7 @@ import type {
   JsonValue,
   ManagedAccount,
   NormalizedToolCall,
+  ToolCallAdapterTrace,
   ToolDefinition,
   UpstreamCompletion,
 } from "~/server/utils/types.ts";
@@ -27,7 +28,9 @@ const MAX_TOOLS = 64;
 const MAX_TOOL_DEFINITION_BYTES = 256 * 1024;
 const MAX_TOOL_ARGUMENT_BYTES = 64 * 1024;
 const MAX_TOOL_RESULT_BYTES = 256 * 1024;
-const MAX_OUTPUT_TOKENS = 8_192;
+const MAX_OUTPUT_TOKENS = 16_384;
+const MAX_TOOL_REPAIR_ATTEMPTS = 5;
+const MAX_TOOL_REPAIR_CANDIDATE_CHARS = 131_072;
 
 export interface ChatExecution {
   account: ManagedAccount;
@@ -37,6 +40,7 @@ export interface ChatExecution {
   model: string;
   tools: ToolDefinition[];
   upstreamRequest: JsonObject;
+  toolCallAdapter?: ToolCallAdapterTrace;
 }
 
 function asRecord(value: unknown): Record<string, unknown> | undefined {
@@ -168,6 +172,14 @@ function validateSampling(request: JsonObject): void {
   }
 }
 
+function portalMessages(messages: ChatMessage[]): ChatMessage[] {
+  // The Playground currently rejects the OpenAI `developer` role. Preserve
+  // message order and content while sending its closest supported role.
+  return messages.map((message) => message.role === "developer"
+    ? { ...message, role: "system" }
+    : message);
+}
+
 function upstreamBody(
   request: JsonObject,
   model: string,
@@ -192,15 +204,24 @@ function upstreamBody(
     "chat_template_kwargs",
     "parallel_tool_calls",
   ];
+  const upstreamMessages = portalMessages(messages);
   const body: JsonObject = {
     model,
-    messages: (toolTurn ? withToolCallContract(messages, tools, toolChoice, parallelToolCalls) : messages) as unknown as JsonValue,
+    messages: (toolTurn
+      ? withToolCallContract(upstreamMessages, tools, toolChoice, parallelToolCalls)
+      : upstreamMessages) as unknown as JsonValue,
     stream,
   };
   for (const field of accepted) {
     if (request[field] !== undefined) {
       body[field] = request[field];
     }
+  }
+  // The Playground otherwise applies its conversational sampling default.
+  // Tool turns are protocol work, so use deterministic sampling unless the
+  // OpenAI client explicitly selected a temperature.
+  if (toolTurn && request.temperature === undefined) {
+    body.temperature = 0;
   }
   body.max_tokens = tokenLimit ?? MAX_OUTPUT_TOKENS;
   if (toolTurn) {
@@ -250,6 +271,7 @@ async function getCompletion(
   body: JsonObject,
   stickyKey?: string,
   requiredAccountId?: string,
+  allowEmptyContent = false,
 ): Promise<{ account: ManagedAccount; completion: UpstreamCompletion }> {
   const excluded = new Set<string>();
   let lastError: PortalError | undefined;
@@ -314,7 +336,8 @@ async function getCompletion(
       const message = asRecord(choice?.message);
       const content = message?.content;
       const hasStructuredCalls = Array.isArray(message?.tool_calls) && message.tool_calls.length > 0;
-      if (!choice || !message || (typeof content !== "string" && !hasStructuredCalls)) {
+      const hasRepairableEmptyContent = allowEmptyContent && (content === null || content === undefined);
+      if (!choice || !message || (typeof content !== "string" && !hasStructuredCalls && !hasRepairableEmptyContent)) {
         throw new PortalError("The NeuralWatt portal returned an invalid completion shape.", 502);
       }
       accountScheduler.markSuccess(account.id);
@@ -388,13 +411,14 @@ function outputFinishReason(completion: UpstreamCompletion, message: ChatMessage
   return upstream === "length" ? "length" : "stop";
 }
 
-function repairMessage(rawContent: string): ChatMessage {
+function repairMessage(error: string, attempt: number): ChatMessage {
   return {
     role: "user",
     content: [
-      "Your previous output did not satisfy the required tool envelope, tool_choice, or argument schema.",
-      "Return only one corrected object with type 'tool_calls' or 'final' using the supplied format.",
-      `Previous output: ${rawContent.slice(0, 4_000)}`,
+      `This is tool-call repair attempt ${attempt}. The preceding assistant content is the original candidate; replace it instead of explaining it.`,
+      "The previous tool-call JSON could not be accepted. Return the corrected JSON object only.",
+      `Validation error: ${error.slice(0, 2_000)}`,
+      "Preserve the original intended action when possible. Use the required envelope, a declared function name, and arguments that satisfy its JSON Schema. Emit one concise call for one file or one command, and end immediately after the JSON object.",
     ].join("\n"),
   };
 }
@@ -402,6 +426,130 @@ function repairMessage(rawContent: string): ChatMessage {
 function rawAssistantContent(completion: UpstreamCompletion): string {
   const content = completion.choices?.[0]?.message?.content;
   return typeof content === "string" ? content : "";
+}
+
+function rawAssistantCandidate(completion: UpstreamCompletion): string {
+  const raw = completion.choices?.[0]?.message;
+  if (Array.isArray(raw?.tool_calls) && raw.tool_calls.length > 0) {
+    return JSON.stringify({ type: "tool_calls", tool_calls: raw.tool_calls });
+  }
+  if (typeof raw?.content === "string") {
+    return raw.content;
+  }
+  return "";
+}
+
+function repairCandidateContent(candidate: string): string {
+  if (candidate.length <= MAX_TOOL_REPAIR_CANDIDATE_CHARS) {
+    return candidate;
+  }
+  const half = Math.floor((MAX_TOOL_REPAIR_CANDIDATE_CHARS - 96) / 2);
+  return [
+    candidate.slice(0, half),
+    "[original tool-call candidate truncated; middle omitted for repair context]",
+    candidate.slice(-half),
+  ].join("\n");
+}
+
+function initialReasoning(completion: UpstreamCompletion): Pick<ChatMessage, "reasoning" | "reasoning_content"> {
+  const raw = completion.choices?.[0]?.message;
+  return {
+    ...(typeof raw?.reasoning === "string" ? { reasoning: raw.reasoning } : {}),
+    ...(typeof raw?.reasoning_content === "string" ? { reasoning_content: raw.reasoning_content } : {}),
+  };
+}
+
+function withInitialReasoning(
+  message: ChatMessage,
+  reasoning: Pick<ChatMessage, "reasoning" | "reasoning_content">,
+): ChatMessage {
+  const preserved = { ...message };
+  delete preserved.reasoning;
+  delete preserved.reasoning_content;
+  return { ...preserved, ...reasoning };
+}
+
+function candidateError(error: unknown): string {
+  return error instanceof Error ? error.message : "Unknown tool-call validation error.";
+}
+
+function toolCallExpectation(toolChoice: unknown): ToolCallAdapterTrace["toolCallExpected"] {
+  if (toolChoice === "required") return "required";
+  if (asRecord(toolChoice)?.type === "function") return "forced";
+  return "auto";
+}
+
+function evaluateToolCandidate(
+  completion: UpstreamCompletion,
+  tools: ToolDefinition[],
+  toolChoice: unknown,
+  parallelToolCalls: boolean,
+): { accepted: boolean; outcome: "tool_calls" | "final" | "invalid"; message: ChatMessage; error?: string } {
+  const rawContent = rawAssistantContent(completion);
+  const parsed = parseControlledToolEnvelopeDetailed(
+    rawContent,
+    tools,
+    completion.id ?? randomUUID(),
+  );
+
+  // Prefer an exact controlled envelope when both content and native fields
+  // are present. Some portal responses put an unusable native tool_calls array
+  // beside the valid JSON content; the adapter contract makes the content the
+  // authoritative channel.
+  if (parsed.envelope?.type === "tool_calls") {
+    const message: ChatMessage = {
+      role: "assistant",
+      content: null,
+      tool_calls: parsed.envelope.toolCalls,
+    };
+    try {
+      validateGeneratedCalls(message.tool_calls ?? [], tools, toolChoice, parallelToolCalls);
+      return { accepted: true, outcome: "tool_calls", message };
+    } catch (error) {
+      return { accepted: false, outcome: "invalid", message, error: candidateError(error) };
+    }
+  }
+  if (parsed.envelope?.type === "final") {
+    const message: ChatMessage = { role: "assistant", content: parsed.envelope.content };
+    return envelopeAllowedForToolChoice(parsed.envelope, toolChoice)
+      ? { accepted: true, outcome: "final", message }
+      : {
+        accepted: false,
+        outcome: "invalid",
+        message,
+        error: "The controlled envelope violates the requested tool_choice.",
+      };
+  }
+
+  let message: ChatMessage;
+  try {
+    message = assistantFrom(completion, tools);
+  } catch (error) {
+    if (!(error instanceof InvalidStructuredToolCallsError)) {
+      throw error;
+    }
+    return {
+      accepted: false,
+      outcome: "invalid",
+      message: { role: "assistant", content: rawAssistantCandidate(completion) },
+      error: error.message,
+    };
+  }
+
+  try {
+    validateGeneratedCalls(message.tool_calls ?? [], tools, toolChoice, parallelToolCalls);
+  } catch (error) {
+    return { accepted: false, outcome: "invalid", message, error: candidateError(error) };
+  }
+  if (message.tool_calls?.length) {
+    return { accepted: true, outcome: "tool_calls", message };
+  }
+  return {
+    accepted: false,
+    outcome: "invalid",
+    message,
+    error: parsed.error ?? "The controlled envelope violates the requested tool_choice.",
+  };
 }
 
 export async function executeChatRequest(
@@ -428,80 +576,105 @@ export async function executeChatRequest(
     ? undefined
     : accountScheduler.accountForToolCalls(observedToolCallIds);
   let upstreamRequest = upstreamBody(request, model, messages, tools, false);
-  let result = await getCompletion(upstreamRequest, options?.stickyKey, options?.requiredAccountId ?? toolAssignedAccountId);
+  let result = await getCompletion(
+    upstreamRequest,
+    options?.stickyKey,
+    options?.requiredAccountId ?? toolAssignedAccountId,
+    toolTurn,
+  );
   let message: ChatMessage;
-  let normalizationFailed = false;
-  try {
-    message = assistantFrom(result.completion, tools);
-  } catch (error) {
-    if (!(error instanceof InvalidStructuredToolCallsError)) {
-      throw error;
-    }
-    if (!toolTurn) {
-      throw new ProxyRequestError(new HttpError(502, error.message, "server_error"), {
-        accountId: result.account.id,
-        accountLabel: result.account.label,
-        upstreamRequest,
-        upstreamResponse: result.completion as unknown as JsonObject,
-      });
-    }
-    normalizationFailed = true;
-    message = { role: "assistant", content: rawAssistantContent(result.completion) };
-  }
+  let toolCallAdapter: ToolCallAdapterTrace | undefined;
 
   if (toolTurn) {
-    const rawContent = rawAssistantContent(result.completion);
-    const envelope = normalizationFailed
-      ? undefined
-      : parseControlledToolEnvelope(rawContent, tools, result.completion.id ?? randomUUID());
-    let validationFailed = false;
-    try {
-      validateGeneratedCalls(message.tool_calls ?? [], tools, request.tool_choice, request.parallel_tool_calls !== false);
-    } catch {
-      validationFailed = true;
-    }
-    const accepted = !normalizationFailed
-      && !validationFailed
-      && (Boolean(message.tool_calls?.length) || envelopeAllowedForToolChoice(envelope, request.tool_choice));
-    if (!accepted) {
-      const originalUpstreamMessages = upstreamRequest.messages as unknown as ChatMessage[];
+    // Keep the caller history separate from the adapter contract. Repair turns
+    // append the bad candidate and exact error, then re-apply the contract so
+    // it remains the final instruction in every attempt.
+    const originalUpstreamMessages = portalMessages(messages);
+    const firstReasoning = initialReasoning(result.completion);
+    let candidate = rawAssistantCandidate(result.completion);
+    let evaluation = evaluateToolCandidate(
+      result.completion,
+      tools,
+      request.tool_choice,
+      request.parallel_tool_calls !== false,
+    );
+    toolCallAdapter = {
+      toolCallExpected: toolCallExpectation(request.tool_choice),
+      initialParseSucceeded: evaluation.outcome === "tool_calls",
+      finalParseSucceeded: evaluation.outcome === "tool_calls",
+      initialOutcome: evaluation.outcome,
+      finalOutcome: evaluation.outcome,
+      repairAttempts: 0,
+      maxRepairAttempts: MAX_TOOL_REPAIR_ATTEMPTS,
+      errors: [],
+    };
+
+    while (!evaluation.accepted && toolCallAdapter.repairAttempts < MAX_TOOL_REPAIR_ATTEMPTS) {
+      const error = evaluation.error ?? "The model output was not a valid controlled tool-call envelope.";
+      toolCallAdapter.errors.push(error);
+      toolCallAdapter.repairAttempts += 1;
+      const repairHistory = [
+        ...originalUpstreamMessages,
+        withInitialReasoning({
+          role: "assistant",
+          content: repairCandidateContent(candidate),
+        }, firstReasoning),
+        repairMessage(error, toolCallAdapter.repairAttempts),
+      ];
       upstreamRequest = {
         ...upstreamRequest,
-        messages: [...originalUpstreamMessages, { role: "assistant", content: rawContent }, repairMessage(rawContent)] as unknown as JsonValue,
+        // A repair is internal protocol recovery, not a fresh creative turn.
+        // Deterministic sampling improves JSON/schema correction even when
+        // the caller intentionally used a higher temperature.
+        temperature: 0,
+        messages: withToolCallContract(
+          repairHistory,
+          tools,
+          request.tool_choice,
+          request.parallel_tool_calls !== false,
+        ) as unknown as JsonValue,
       };
-      result = await getCompletion(upstreamRequest, options?.stickyKey, result.account.id);
       try {
-        message = assistantFrom(result.completion, tools);
+        result = await getCompletion(upstreamRequest, options?.stickyKey, result.account.id, true);
       } catch (error) {
-        if (!(error instanceof InvalidStructuredToolCallsError)) {
+        if (error instanceof ProxyRequestError) {
+          error.debugContext.toolCallAdapter = toolCallAdapter;
           throw error;
         }
-        throw new ProxyRequestError(new HttpError(502, error.message, "server_error"), {
+        throw new ProxyRequestError(error, {
+          accountId: result.account.id,
+          accountLabel: result.account.label,
+          upstreamRequest,
+          toolCallAdapter,
+        });
+      }
+      candidate = rawAssistantCandidate(result.completion);
+      evaluation = evaluateToolCandidate(
+        result.completion,
+        tools,
+        request.tool_choice,
+        request.parallel_tool_calls !== false,
+      );
+    }
+
+    toolCallAdapter.finalParseSucceeded = evaluation.outcome === "tool_calls";
+    toolCallAdapter.finalOutcome = evaluation.outcome;
+    if (!evaluation.accepted) {
+      toolCallAdapter.errors.push(evaluation.error ?? "The final repair output was invalid.");
+      throw new ProxyRequestError(
+        new HttpError(502, "Portal did not return a valid tool call after bounded repair.", "server_error"),
+        {
           accountId: result.account.id,
           accountLabel: result.account.label,
           upstreamRequest,
           upstreamResponse: result.completion as unknown as JsonObject,
-        });
-      }
-      if (!message.tool_calls?.length) {
-        const repairedEnvelope = parseControlledToolEnvelope(
-          rawAssistantContent(result.completion),
-          tools,
-          result.completion.id ?? randomUUID(),
-        );
-        if (!envelopeAllowedForToolChoice(repairedEnvelope, request.tool_choice)) {
-          throw new ProxyRequestError(
-            new HttpError(502, "Portal did not return a policy-compliant controlled tool envelope after repair.", "server_error"),
-            {
-              accountId: result.account.id,
-              accountLabel: result.account.label,
-              upstreamRequest,
-              upstreamResponse: result.completion as unknown as JsonObject,
-            },
-          );
-        }
-      }
+          toolCallAdapter,
+        },
+      );
     }
+    message = withInitialReasoning(evaluation.message, firstReasoning);
+  } else {
+    message = assistantFrom(result.completion, tools);
   }
 
   try {
@@ -525,6 +698,7 @@ export async function executeChatRequest(
     model,
     tools,
     upstreamRequest,
+    ...(toolCallAdapter ? { toolCallAdapter } : {}),
   };
 }
 
