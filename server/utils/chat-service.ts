@@ -46,6 +46,7 @@ const PORTAL_MAX_OUTPUT_TOKENS = 8_192;
 const MAX_CONTINUATION_ROUNDS = 16;
 const MAX_TOOL_REPAIR_ATTEMPTS = 5;
 const MAX_TOOL_REPAIR_CANDIDATE_CHARS = 131_072;
+const EMPTY_REPAIR_CANDIDATE = "[The previous assistant turn produced no tool-call JSON. Reconstruct the intended call from the preceding conversation and return only a valid controlled tool-call JSON object.]";
 
 export interface ChatExecution {
   account: ManagedAccount;
@@ -609,11 +610,14 @@ function outputFinishReason(completion: UpstreamCompletion, message: ChatMessage
   return upstream === "length" ? "length" : "stop";
 }
 
-function repairMessage(error: string, attempt: number): ChatMessage {
+function repairMessage(error: string, attempt: number, hasCandidate: boolean): ChatMessage {
+  const context = hasCandidate
+    ? "The preceding assistant message is the failed tool-call candidate; replace it instead of explaining it."
+    : "The preceding assistant turn emitted no tool-call JSON. Continue from the preceding assistant/tool exchanges and produce the missing call; do not treat this repair request as a new user task.";
   return {
     role: "user",
     content: [
-      `This is tool-call repair attempt ${attempt}. The preceding assistant content is the original candidate; replace it instead of explaining it.`,
+      `This is tool-call repair attempt ${attempt}. ${context}`,
       "The previous tool-call JSON could not be accepted. Return the corrected JSON object only.",
       `Validation error: ${error.slice(0, 2_000)}`,
       "Preserve the original intended action when possible. Use the required envelope, a declared function name, and arguments that satisfy its JSON Schema. Emit one concise call for one file or one command, and end immediately after the JSON object.",
@@ -640,6 +644,9 @@ function rawAssistantCandidate(completion: UpstreamCompletion): string {
 }
 
 function repairCandidateContent(candidate: string): string {
+  if (!candidate) {
+    return EMPTY_REPAIR_CANDIDATE;
+  }
   if (candidate.length <= MAX_TOOL_REPAIR_CANDIDATE_CHARS) {
     return candidate;
   }
@@ -649,6 +656,50 @@ function repairCandidateContent(candidate: string): string {
     "[original tool-call candidate truncated; middle omitted for repair context]",
     candidate.slice(-half),
   ].join("\n");
+}
+
+interface RepairCandidate {
+  message: ChatMessage;
+  hasCandidate: boolean;
+}
+
+function repairCandidateFrom(
+  completion: UpstreamCompletion,
+  tools: ToolDefinition[],
+  reasoning: Pick<ChatMessage, "reasoning" | "reasoning_content">,
+): RepairCandidate {
+  const raw = completion.choices?.[0]?.message;
+  const rawToolCalls = Array.isArray(raw?.tool_calls) && raw.tool_calls.length > 0
+    ? raw.tool_calls
+    : undefined;
+  let content = rawAssistantCandidate(completion);
+  let toolCalls: NormalizedToolCall[] | undefined;
+
+  if (rawToolCalls) {
+    try {
+      toolCalls = normaliseAssistantToolCalls(raw, tools, completion.id ?? randomUUID()).tool_calls;
+    } catch {
+      // Invalid native calls cannot be safely attached structurally. Preserve
+      // their exact form in the repair candidate so the model can correct it.
+      if (typeof raw?.content === "string" && raw.content.length > 0) {
+        content = [
+          content,
+          "[native tool_calls from the same response]",
+          JSON.stringify({ tool_calls: rawToolCalls }),
+        ].join("\n");
+      }
+    }
+  }
+
+  return {
+    message: {
+      role: "assistant",
+      content: repairCandidateContent(content),
+      ...reasoning,
+      ...(toolCalls?.length ? { tool_calls: toolCalls } : {}),
+    },
+    hasCandidate: content.length > 0 || Boolean(toolCalls?.length),
+  };
 }
 
 function initialReasoning(completion: UpstreamCompletion): Pick<ChatMessage, "reasoning" | "reasoning_content"> {
@@ -812,7 +863,7 @@ async function executeChatRequestOnce(
         choices: [{ delta: { role: "assistant", ...firstReasoning } }],
       });
     }
-    let repairCandidate = rawAssistantCandidate(result.completion);
+    let repairCandidate = repairCandidateFrom(result.completion, tools, firstReasoning);
     let repairReasoning: ReasoningFields | undefined;
     let repairReasoningOpen = false;
     const collectRepairReasoning = async (fields: ReasoningFields): Promise<void> => {
@@ -847,12 +898,8 @@ async function executeChatRequestOnce(
       toolCallAdapter.repairAttempts += 1;
       const repairHistory = buildToolRepairHistory(
         originalUpstreamMessages,
-        {
-          role: "assistant",
-          content: repairCandidateContent(repairCandidate),
-          ...firstReasoning,
-        },
-        repairMessage(error, toolCallAdapter.repairAttempts),
+        repairCandidate.message,
+        repairMessage(error, toolCallAdapter.repairAttempts, repairCandidate.hasCandidate),
       );
       const repairStream = Boolean(options?.onRepairReasoning);
       upstreamRequest = {
@@ -917,10 +964,10 @@ async function executeChatRequestOnce(
           await collectRepairReasoning(nextRepairReasoning);
         }
       }
-      const nextCandidate = rawAssistantCandidate(result.completion);
+      const nextCandidate = repairCandidateFrom(result.completion, tools, firstReasoning);
       // A reasoning-only upstream reply is not an error candidate. Retain the
       // prior malformed call so the next repair has a concrete object to fix.
-      if (nextCandidate.length > 0) {
+      if (nextCandidate.hasCandidate) {
         repairCandidate = nextCandidate;
       }
       evaluation = evaluateToolCandidate(

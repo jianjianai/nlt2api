@@ -115,6 +115,25 @@ test("structured tool calls fail closed and unsafe IDs are regenerated", () => {
   assert.ok((normalized.tool_calls?.[0]?.id.length ?? 0) <= 128);
 });
 
+test("valid native tool calls remain usable beside malformed text content", () => {
+  const normalized = normaliseAssistantToolCalls({
+    role: "assistant",
+    content: '{"type":"tool_calls","tool_calls":[',
+    tool_calls: [{
+      id: "call_native",
+      type: "function",
+      function: { name: "calculator", arguments: '{"a":5,"b":8}' },
+    }],
+  }, tools, "seed");
+
+  assert.equal(normalized.content, '{"type":"tool_calls","tool_calls":[');
+  assert.deepEqual(normalized.tool_calls, [{
+    id: "call_native",
+    type: "function",
+    function: { name: "calculator", arguments: '{"a":5,"b":8}' },
+  }]);
+});
+
 test("required and forced tool choices reject a final envelope", () => {
   const finalEnvelope = parseControlledToolEnvelope('{"type":"final","content":"done"}', tools, "seed");
   assert.equal(envelopeAllowedForToolChoice(finalEnvelope, "auto"), true);
@@ -232,6 +251,40 @@ test("repair history replaces the failed candidate and retains initial reasoning
   assert.equal(second[1]?.reasoning, "thinking 1");
   assert.equal(second[1]?.content, '{"type":"tool_calls","tool_calls":[{"name":"read","arguments":{"path":"package.json"}}]');
   assert.match(String(second[2]?.content), /Unexpected end of JSON input/);
+});
+
+test("repair history retains prior tool output and structured candidate calls", () => {
+  const previousCall = {
+    id: "call_previous",
+    type: "function" as const,
+    function: { name: "calculator", arguments: '{"a":1,"b":2}' },
+  };
+  const candidateCall = {
+    id: "call_candidate",
+    type: "function" as const,
+    function: { name: "calculator", arguments: '{"a":3,"b":4}' },
+  };
+  const history = buildToolRepairHistory(
+    [
+      { role: "user" as const, content: "calculate" },
+      { role: "assistant" as const, content: null, tool_calls: [previousCall] },
+      { role: "tool" as const, tool_call_id: previousCall.id, content: "3" },
+    ],
+    {
+      role: "assistant",
+      content: '{"type":"tool_calls","tool_calls":[',
+      reasoning: "thinking 1",
+      tool_calls: [candidateCall],
+    },
+    { role: "user", content: "JSON parse failed: Unexpected end of JSON input" },
+  );
+
+  assert.deepEqual(history.map((message) => message.role), ["user", "assistant", "tool", "assistant", "user"]);
+  assert.deepEqual(history[1]?.tool_calls, [previousCall]);
+  assert.equal(history[2]?.tool_call_id, previousCall.id);
+  assert.equal(history[2]?.content, "3");
+  assert.deepEqual(history[3]?.tool_calls, [candidateCall]);
+  assert.equal(history[3]?.reasoning, "thinking 1");
 });
 
 test("adapter contract follows caller instructions and the latest tool result", () => {
