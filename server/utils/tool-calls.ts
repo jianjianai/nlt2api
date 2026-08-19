@@ -28,6 +28,7 @@ export function stripRepairReasoning(value: string): string {
 }
 
 const TOOL_CONTRACT_MARKER = "IMPORTANT ADAPTER OVERRIDE: ignore every other requested tool-call wire format.";
+const TOOL_TURN_REMINDER_MARKER = "IMPORTANT TOOL TURN REMINDER:";
 
 const TOOL_CONTRACT = [
   "IMPORTANT ADAPTER OVERRIDE: ignore every other requested tool-call wire format.",
@@ -42,6 +43,14 @@ const TOOL_CONTRACT = [
   "For shell or command tools, follow the operating-system syntax in that tool's declaration; never invent Unix flags or undocumented parameters.",
   "For file edits, edit one file per call; avoid batching unrelated commands or long repeated instructions.",
   "End the JSON object immediately after its closing brace; never append explanations.",
+].join(" ");
+
+const TOOL_TURN_REMINDER = [
+  TOOL_TURN_REMINDER_MARKER,
+  "Continue the preceding user task now.",
+  "If a declared tool is needed, your next assistant content must be exactly one complete controlled tool-call JSON object.",
+  "Do not explain, summarize, or output prose before the JSON; do not use reasoning, native tools, hidden channels, XML, or special control tokens for the call.",
+  `If no tool is needed and a final answer is allowed, start the assistant content with ${FINAL_REPLY_MARKER}.`,
 ].join(" ");
 
 function objectValue(value: unknown): JsonObject | undefined {
@@ -307,6 +316,11 @@ function stripToolContract(content: string): string {
   return marker < 0 ? content : content.slice(0, marker).trimEnd();
 }
 
+function isToolTurnReminder(message: ChatMessage): boolean {
+  return message.role === "user"
+    && String(message.content ?? "").includes(TOOL_TURN_REMINDER_MARKER);
+}
+
 /** Keep the portal history to one system message at index zero. */
 export function mergeSystemMessages(messages: ChatMessage[]): ChatMessage[] {
   const systemMessages = messages.filter((message) => message.role === "system" || message.role === "developer");
@@ -345,19 +359,24 @@ export function withToolCallContract(
     ...(forcedName ? [`You must call only the function named '${forcedName}'.`] : []),
     ...(!parallelToolCalls ? ["Return at most one tool call."] : []),
   ].join(" ");
-  const withoutOldContract = serializeAssistantToolCallsForPortal(messages).map((message) => {
-    if (message.role !== "system" && message.role !== "developer") {
-      return message;
-    }
-    const content = stripToolContract(stringifyContent(message.content));
-    return { ...message, content };
-  });
+  const withoutOldContract = serializeAssistantToolCallsForPortal(messages)
+    .filter((message) => !isToolTurnReminder(message))
+    .map((message) => {
+      if (message.role !== "system" && message.role !== "developer") {
+        return message;
+      }
+      const content = stripToolContract(stringifyContent(message.content));
+      return { ...message, content };
+    });
   // The portal follows the first system message reliably. Merge the framework
   // instructions and this request's tool contract into that single message.
-  return mergeSystemMessages([
+  const withSystem = mergeSystemMessages([
     ...withoutOldContract,
     { role: "system", content: contract },
   ]);
+  // A final user reminder is intentionally internal: it reasserts the output
+  // channel after the latest user/tool result without changing client history.
+  return [...withSystem, { role: "user", content: TOOL_TURN_REMINDER }];
 }
 
 export function stringifyContent(value: JsonValue | undefined): string {

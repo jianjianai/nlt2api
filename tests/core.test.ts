@@ -309,7 +309,7 @@ test("adapter contract follows caller instructions and the latest tool result", 
   ];
   const contracted = withToolCallContract(messages, tools, "required", false);
   assert.deepEqual(contracted.map((message) => message.role), [
-    "system", "user", "assistant", "tool",
+    "system", "user", "assistant", "tool", "user",
   ]);
   assert.equal(contracted.filter((message) => message.role === "system").length, 1);
   assert.match(String(contracted[0]?.content), /caller tool syntax/);
@@ -319,6 +319,8 @@ test("adapter contract follows caller instructions and the latest tool result", 
   assert.match(String(contracted[0]?.content), /Never use a native or hidden tool channel/);
   assert.match(String(contracted[0]?.content), /Never return null or empty content/);
   assert.match(String(contracted[0]?.content), /"properties":\{"a"/);
+  assert.match(String(contracted.at(-1)?.content), /IMPORTANT TOOL TURN REMINDER/);
+  assert.match(String(contracted.at(-1)?.content), /exactly one complete controlled tool-call JSON object/);
 });
 
 test("adapter contract can be re-applied after a repair candidate", () => {
@@ -332,7 +334,8 @@ test("adapter contract can be re-applied after a repair candidate", () => {
   assert.equal(contracted.at(-1)?.role, "user");
   assert.equal(contracted.filter((message) => message.role === "system").length, 1);
   assert.match(String(contracted[0]?.content), /IMPORTANT ADAPTER OVERRIDE/);
-  assert.equal(contracted.at(-1)?.content, "JSON parse failed; retry");
+  assert.match(String(contracted.at(-2)?.content), /JSON parse failed; retry/);
+  assert.match(String(contracted.at(-1)?.content), /IMPORTANT TOOL TURN REMINDER/);
 });
 
 test("adapter contract stays at the first system message when history continues", () => {
@@ -343,8 +346,16 @@ test("adapter contract stays at the first system message when history continues"
   ];
   const contracted = withToolCallContract(withLaterHistory, tools, "required");
   assert.equal(contracted[0]?.role, "system");
-  assert.equal(contracted.at(-1)?.role, "tool");
+  assert.equal(contracted.at(-2)?.role, "tool");
+  assert.equal(contracted.at(-1)?.role, "user");
   assert.equal(contracted.filter((message) => message.role === "system").length, 1);
+});
+
+test("reapplying the adapter replaces the internal user reminder", () => {
+  const first = withToolCallContract([{ role: "user", content: "read" }], tools, "required");
+  const second = withToolCallContract(first, tools, "required");
+  assert.equal(second.filter((message) => message.role === "user").length, 2);
+  assert.equal(second.filter((message) => String(message.content).startsWith("IMPORTANT TOOL TURN REMINDER:")).length, 1);
 });
 
 test("system instructions are merged into one message at the front", () => {
