@@ -320,7 +320,12 @@ function upstreamBody(
     tokenLimit ?? Math.min(DEFAULT_OUTPUT_TOKENS, getProxyConfig().maxOutputTokens),
     PORTAL_MAX_OUTPUT_TOKENS,
   );
-  if (!toolTurn && request.response_format !== undefined) {
+  if (toolTurn) {
+    // The portal's JSON mode keeps the model's serialized tool intent in the
+    // ordinary assistant content channel instead of its native tool channel.
+    // The local envelope remains authoritative and is still schema-validated.
+    body.response_format = { type: "json_object" };
+  } else if (request.response_format !== undefined) {
     body.response_format = request.response_format;
   }
   return body;

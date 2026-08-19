@@ -311,7 +311,9 @@ test("adapter contract follows caller instructions and the latest tool result", 
   ]);
   assert.equal(contracted[0]?.content, "caller tool syntax");
   assert.match(String(contracted.at(-1)?.content), /IMPORTANT ADAPTER OVERRIDE/);
+  assert.match(String(contracted.at(-1)?.content), /ordinary assistant message content/);
   assert.match(String(contracted.at(-1)?.content), /Never use a native or hidden tool channel/);
+  assert.match(String(contracted.at(-1)?.content), /Never return null or empty content/);
   assert.match(String(contracted.at(-1)?.content), /"properties":\{"a"/);
   assert.doesNotMatch(String(contracted.at(-1)?.content), /caller tool syntax/);
 });
