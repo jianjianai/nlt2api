@@ -1219,7 +1219,7 @@ onMounted(() => {
                   <div v-if="traceRequest(selectedTrace).messages.length" class="message-stack">
                     <article v-for="(message, index) in traceRequest(selectedTrace).messages" :key="`request-${index}`" class="message-item message-sent" :class="{ 'message-thinking': message.roleLabel === '思考', 'message-bubble-right': messageAlign(message.role) === 'right' }">
                       <div class="message-heading"><strong>{{ message.roleLabel }}</strong></div>
-                      <div class="message-collapse" :class="{ expanded: isMessageExpanded(`request-${index}`) }" :ref="(el) => setMessageContentEl(`request-${index}`, el)">
+                      <div class="message-collapse" :class="{ expanded: isMessageExpanded(`request-${index}`), 'has-overflow': overflowMessageKeys.has(`request-${index}`) }" :ref="(el) => setMessageContentEl(`request-${index}`, el)">
                         <p v-if="message.content" class="message-content">{{ message.content }}</p>
                         <div v-for="call in message.toolCalls" :key="call.id" class="tool-call-item">
                           <span class="tool-call-name">工具：{{ call.name }}</span>
@@ -1244,7 +1244,7 @@ onMounted(() => {
                     <div v-if="traceResponse(selectedTrace)?.messages.length" class="message-stack">
                       <article v-for="(message, index) in traceResponse(selectedTrace)?.messages" :key="`response-${index}`" class="message-item message-received" :class="{ 'message-thinking': message.roleLabel === '思考', 'message-bubble-right': messageAlign(message.role) === 'right' }">
                         <div class="message-heading"><strong>{{ message.roleLabel }}</strong></div>
-                        <div class="message-collapse" :class="{ expanded: isMessageExpanded(`response-${index}`) }" :ref="(el) => setMessageContentEl(`response-${index}`, el)">
+                        <div class="message-collapse" :class="{ expanded: isMessageExpanded(`response-${index}`), 'has-overflow': overflowMessageKeys.has(`response-${index}`) }" :ref="(el) => setMessageContentEl(`response-${index}`, el)">
                           <p v-if="message.content" class="message-content">{{ message.content }}</p>
                           <div v-for="call in message.toolCalls" :key="call.id" class="tool-call-item">
                             <span class="tool-call-name">工具：{{ call.name }}</span>

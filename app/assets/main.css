@@ -133,7 +133,7 @@ input:focus { border-color: var(--teal); box-shadow: 0 0 0 3px rgba(20, 125, 120
 .turn-label span { color: var(--muted); font-size: 10px; font-weight: 800; letter-spacing: .07em; }
 .turn-label strong { color: var(--navy); font-size: 12px; }
 .message-stack { display: grid; gap: 8px; }
-.message-item { min-width: 0; width: fit-content; max-width: 92%; border: 1px solid var(--line); border-radius: 6px; padding: 11px 12px; background: #fff; text-align: left; }
+.message-item { min-width: 0; width: 85%; border: 1px solid var(--line); border-radius: 6px; padding: 11px 12px; background: #fff; text-align: left; }
 .message-sent { border-left: 3px solid var(--teal); background: #f8fcfb; }
 .message-received { border-left: 3px solid #4f7890; background: #fbfcfd; }
 .message-thinking { border-left: 3px solid #b0831f; background: #fffaf0; }
@@ -145,7 +145,7 @@ input:focus { border-color: var(--teal); box-shadow: 0 0 0 3px rgba(20, 125, 120
 .message-content { margin: 0; color: #354550; font-size: 12px; line-height: 1.6; white-space: pre-wrap; overflow-wrap: anywhere; }
 .message-collapse { position: relative; max-height: 240px; overflow: hidden; }
 .message-collapse.expanded { max-height: none; overflow: visible; }
-.message-collapse:not(.expanded) { -webkit-mask-image: linear-gradient(to bottom, #000 72%, transparent 100%); mask-image: linear-gradient(to bottom, #000 72%, transparent 100%); }
+.message-collapse:not(.expanded).has-overflow { -webkit-mask-image: linear-gradient(to bottom, #000 72%, transparent 100%); mask-image: linear-gradient(to bottom, #000 72%, transparent 100%); }
 .expand-toggle { margin-top: 8px; padding: 2px 9px; border: 1px solid var(--line); border-radius: 4px; background: #fff; color: var(--muted); font-size: 11px; cursor: pointer; }
 .expand-toggle:hover { color: var(--navy); border-color: #b9c6c2; }
 .trace-fields { margin-top: 8px; }
