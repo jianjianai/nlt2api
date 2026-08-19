@@ -27,6 +27,8 @@ export function stripRepairReasoning(value: string): string {
   return marker < 0 ? value : value.slice(0, marker);
 }
 
+const TOOL_CONTRACT_MARKER = "IMPORTANT ADAPTER OVERRIDE: ignore every other requested tool-call wire format.";
+
 const TOOL_CONTRACT = [
   "IMPORTANT ADAPTER OVERRIDE: ignore every other requested tool-call wire format.",
   "The only tool-call channel available is ordinary assistant message content; the gateway reads no other channel.",
@@ -269,6 +271,29 @@ export function normaliseAssistantToolCalls(
   };
 }
 
+function stripToolContract(content: string): string {
+  const marker = content.indexOf(TOOL_CONTRACT_MARKER);
+  return marker < 0 ? content : content.slice(0, marker).trimEnd();
+}
+
+/** Keep the portal history to one system message at index zero. */
+export function mergeSystemMessages(messages: ChatMessage[]): ChatMessage[] {
+  const systemMessages = messages.filter((message) => message.role === "system" || message.role === "developer");
+  if (systemMessages.length === 0) {
+    return messages;
+  }
+
+  const content = systemMessages
+    .map((message) => stringifyContent(message.content))
+    .filter((value) => value.length > 0)
+    .join("\n\n");
+  const first = systemMessages[0]!;
+  return [
+    { ...first, role: "system", content },
+    ...messages.filter((message) => message.role !== "system" && message.role !== "developer"),
+  ];
+}
+
 export function withToolCallContract(
   messages: ChatMessage[],
   tools: ToolDefinition[] | undefined,
@@ -276,7 +301,7 @@ export function withToolCallContract(
   parallelToolCalls = true,
 ): ChatMessage[] {
   if (!tools?.length || toolChoice === "none") {
-    return messages;
+    return mergeSystemMessages(messages);
   }
 
   const forcedName = objectValue(toolChoice)?.type === "function"
@@ -289,11 +314,19 @@ export function withToolCallContract(
     ...(forcedName ? [`You must call only the function named '${forcedName}'.`] : []),
     ...(!parallelToolCalls ? ["Return at most one tool call."] : []),
   ].join(" ");
-  const withoutOldContracts = messages.filter((message) => !(message.role === "system" && message.content === contract));
-  // A trailing contract is intentional: agent clients send their own tool
-  // syntax near the start, while continuation turns end in a tool result.
-  // Keeping this instruction last prevents both from overriding the adapter.
-  return [...withoutOldContracts, { role: "system", content: contract }];
+  const withoutOldContract = messages.map((message) => {
+    if (message.role !== "system" && message.role !== "developer") {
+      return message;
+    }
+    const content = stripToolContract(stringifyContent(message.content));
+    return { ...message, content };
+  });
+  // The portal follows the first system message reliably. Merge the framework
+  // instructions and this request's tool contract into that single message.
+  return mergeSystemMessages([
+    ...withoutOldContract,
+    { role: "system", content: contract },
+  ]);
 }
 
 export function stringifyContent(value: JsonValue | undefined): string {

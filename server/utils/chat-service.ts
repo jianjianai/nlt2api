@@ -16,6 +16,7 @@ import {
   buildToolRepairHistory,
   envelopeAllowedForToolChoice,
   normaliseAssistantToolCalls,
+  mergeSystemMessages,
   parseControlledToolEnvelopeDetailed,
   withToolCallContract,
 } from "~/server/utils/tool-calls.ts";
@@ -248,29 +249,30 @@ export function validateChatRequest(request: JsonObject): void {
 }
 
 function portalMessages(messages: ChatMessage[], markFinalReplies = false): ChatMessage[] {
-  // The Playground currently rejects the OpenAI `developer` role. Preserve
-  // message order and content while sending its closest supported role.
-  return messages.map((message) => {
-    const mapped = message.role === "developer" ? { ...message, role: "system" as const } : { ...message };
+  // The Playground currently rejects the OpenAI `developer` role. Map it to
+  // system, then normalize all system instructions into one message at index 0.
+  const mapped = messages.map((message) => {
+    const normalized = message.role === "developer" ? { ...message, role: "system" as const } : { ...message };
     for (const field of ["reasoning", "reasoning_content"] as const) {
-      if (typeof mapped[field] === "string") {
-        const cleaned = stripRepairReasoning(mapped[field]);
-        if (cleaned) mapped[field] = cleaned;
-        else delete mapped[field];
+      if (typeof normalized[field] === "string") {
+        const cleaned = stripRepairReasoning(normalized[field]);
+        if (cleaned) normalized[field] = cleaned;
+        else delete normalized[field];
       }
     }
     if (
       markFinalReplies
-      && mapped.role === "assistant"
-      && typeof mapped.content === "string"
-      && mapped.content.length > 0
-      && !mapped.content.startsWith(FINAL_REPLY_MARKER)
-      && !mapped.tool_calls?.length
+      && normalized.role === "assistant"
+      && typeof normalized.content === "string"
+      && normalized.content.length > 0
+      && !normalized.content.startsWith(FINAL_REPLY_MARKER)
+      && !normalized.tool_calls?.length
     ) {
-      return { ...mapped, content: `${FINAL_REPLY_MARKER}${mapped.content}` };
+      return { ...normalized, content: `${FINAL_REPLY_MARKER}${normalized.content}` };
     }
-    return mapped;
+    return normalized;
   });
+  return mergeSystemMessages(mapped);
 }
 
 function upstreamBody(
@@ -320,12 +322,7 @@ function upstreamBody(
     tokenLimit ?? Math.min(DEFAULT_OUTPUT_TOKENS, getProxyConfig().maxOutputTokens),
     PORTAL_MAX_OUTPUT_TOKENS,
   );
-  if (toolTurn) {
-    // The portal's JSON mode keeps the model's serialized tool intent in the
-    // ordinary assistant content channel instead of its native tool channel.
-    // The local envelope remains authoritative and is still schema-validated.
-    body.response_format = { type: "json_object" };
-  } else if (request.response_format !== undefined) {
+  if (!toolTurn && request.response_format !== undefined) {
     body.response_format = request.response_format;
   }
   return body;

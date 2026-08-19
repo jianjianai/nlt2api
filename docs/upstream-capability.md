@@ -104,7 +104,7 @@ Playground 每轮发送以下形状。浏览器把会话历史保存在内存中
 - 标准 `system`、`user`、`assistant` 和 `tool` 角色均可接受；每轮必须重新提交完整消息数组。
 - 输入历史可包含 assistant `tool_calls`、tool `tool_call_id`，以及可选的 `reasoning`/`reasoning_content`。
 - 字符串 content 和 OpenAI 内容片段数组均可接受。`gemma-4-31b` 对 1x1 `data:image/png` 产生了非零图像 token 计数；DeepSeek 接受该形状但没有图像 token 指标，与其不支持视觉的目录声明一致。
-- `response_format: {"type":"json_object"}` 在 DeepSeek 和 GLM Fast 测试中产生有效 JSON，也在六种模型的受控工具测试中成功。
+- Playground 对 `response_format` 的接受不代表它会执行该约束；工具适配不能依赖这个字段，必须使用首条唯一 `system` 消息中的文本契约并在本地校验。
 - `tools` 和 `tool_choice` 在语法上都被接受，甚至畸形工具定义也返回成功；不能把这种接受当作上游校验。
 
 上游校验很弱：`temperature: 9`、`max_tokens: 999999` 和畸形工具 Schema 都曾返回 `200`。因此适配器必须在本地校验 OpenAI 输入、JSON Schema、最大生成预算和工具名。
@@ -252,7 +252,7 @@ get_weather(location="Shanghai")
 { "type": "final", "content": "给用户的最终答案。" }
 ```
 
-服务端系统指令要求上游只能输出上述二选一的完整 JSON，不得输出 Markdown 或 prose；契约中包含工具描述和完整 JSON Schema，但不向门户发送原生 `tools`/`tool_choice`，只发送 `response_format: {"type":"json_object"}`。
+服务端系统指令要求上游只能把上述二选一的完整 JSON 输出到普通 assistant `content`，不得输出 Markdown 或 prose；契约中包含工具描述和完整 JSON Schema，但不向门户发送原生 `tools`/`tool_choice`，也不依赖门户不识别的 `response_format` 字段。
 
 本地必须按以下顺序校验：
 
@@ -272,9 +272,9 @@ get_weather(location="Shanghai")
 
 工具轮流程：
 
-1. 保留调用方 system/developer 上下文，并在最新会话/工具结果后追加服务端 JSON 信封契约、函数名和 Schema。
+1. 将调用方 system/developer 上下文与服务端 JSON 信封契约、函数名和 Schema 合并为唯一的首条 `system` 消息。
 2. 不转发门户原生 `tools` 或 `tool_choice`，由适配器本地执行策略。
-3. 内部向门户请求 `stream: false` 和 `response_format: {"type":"json_object"}`。这是有意缓冲：JSON 未完整到达前不能安全判断是最终答案还是工具调用。
+3. 内部向门户请求缓冲的工具轮。工具契约位于唯一的首条 `system` 消息中，要求模型把 JSON 写入普通 assistant `content`；JSON 未完整到达前不能安全判断是最终答案还是工具调用。
 4. 校验信封；工具结果通过后生成标准 OpenAI 工具调用 ID，Chat 返回 `tool_calls`，Responses 返回 `function_call` 项。
 5. 客户端执行自己的工具并在下一轮提交输出；代理不会执行任意客户端工具。
 6. 下一轮重建门户历史，依次加入合成 assistant `tool_calls` 和各个 `role: "tool"`，直到得到合法 `final` 或达到本地轮数上限。

@@ -8,6 +8,7 @@ import {
   tagRepairReasoning,
   buildToolRepairHistory,
   envelopeAllowedForToolChoice,
+  mergeSystemMessages,
   normaliseAssistantToolCalls,
   parseControlledToolEnvelope,
   parseControlledToolEnvelopeDetailed,
@@ -307,15 +308,16 @@ test("adapter contract follows caller instructions and the latest tool result", 
   ];
   const contracted = withToolCallContract(messages, tools, "required", false);
   assert.deepEqual(contracted.map((message) => message.role), [
-    "system", "developer", "user", "assistant", "tool", "system",
+    "system", "user", "assistant", "tool",
   ]);
-  assert.equal(contracted[0]?.content, "caller tool syntax");
-  assert.match(String(contracted.at(-1)?.content), /IMPORTANT ADAPTER OVERRIDE/);
-  assert.match(String(contracted.at(-1)?.content), /ordinary assistant message content/);
-  assert.match(String(contracted.at(-1)?.content), /Never use a native or hidden tool channel/);
-  assert.match(String(contracted.at(-1)?.content), /Never return null or empty content/);
-  assert.match(String(contracted.at(-1)?.content), /"properties":\{"a"/);
-  assert.doesNotMatch(String(contracted.at(-1)?.content), /caller tool syntax/);
+  assert.equal(contracted.filter((message) => message.role === "system").length, 1);
+  assert.match(String(contracted[0]?.content), /caller tool syntax/);
+  assert.match(String(contracted[0]?.content), /more caller instructions/);
+  assert.match(String(contracted[0]?.content), /IMPORTANT ADAPTER OVERRIDE/);
+  assert.match(String(contracted[0]?.content), /ordinary assistant message content/);
+  assert.match(String(contracted[0]?.content), /Never use a native or hidden tool channel/);
+  assert.match(String(contracted[0]?.content), /Never return null or empty content/);
+  assert.match(String(contracted[0]?.content), /"properties":\{"a"/);
 });
 
 test("adapter contract can be re-applied after a repair candidate", () => {
@@ -325,21 +327,35 @@ test("adapter contract can be re-applied after a repair candidate", () => {
     { role: "user" as const, content: "JSON parse failed; retry" },
   ];
   const contracted = withToolCallContract(history, tools, "required", true);
-  assert.equal(contracted.at(-1)?.role, "system");
-  assert.match(String(contracted.at(-1)?.content), /IMPORTANT ADAPTER OVERRIDE/);
-  assert.equal(contracted.at(-2)?.content, "JSON parse failed; retry");
+  assert.equal(contracted[0]?.role, "system");
+  assert.equal(contracted.at(-1)?.role, "user");
+  assert.equal(contracted.filter((message) => message.role === "system").length, 1);
+  assert.match(String(contracted[0]?.content), /IMPORTANT ADAPTER OVERRIDE/);
+  assert.equal(contracted.at(-1)?.content, "JSON parse failed; retry");
 });
 
-test("adapter contract moves an existing copy back to the absolute tail", () => {
+test("adapter contract stays at the first system message when history continues", () => {
   const first = withToolCallContract([{ role: "user", content: "edit" }], tools, "required");
   const withLaterHistory = [
     ...first,
     { role: "tool" as const, tool_call_id: "call_1", content: "done" },
   ];
   const contracted = withToolCallContract(withLaterHistory, tools, "required");
-  assert.equal(contracted.at(-1)?.role, "system");
+  assert.equal(contracted[0]?.role, "system");
+  assert.equal(contracted.at(-1)?.role, "tool");
   assert.equal(contracted.filter((message) => message.role === "system").length, 1);
-  assert.equal(contracted.at(-2)?.role, "tool");
+});
+
+test("system instructions are merged into one message at the front", () => {
+  const merged = mergeSystemMessages([
+    { role: "user", content: "task" },
+    { role: "system", content: "framework" },
+    { role: "developer", content: "agent instructions" },
+    { role: "tool", tool_call_id: "call_1", content: "result" },
+  ]);
+  assert.deepEqual(merged.map((message) => message.role), ["system", "user", "tool"]);
+  assert.equal(merged.filter((message) => message.role === "system").length, 1);
+  assert.equal(merged[0]?.content, "framework\n\nagent instructions");
 });
 
 test("compact tool contracts preserve schema property names and references", () => {
@@ -357,7 +373,7 @@ test("compact tool contracts preserve schema property names and references", () 
     },
   }];
   const contract = withToolCallContract([{ role: "user", content: "write" }], referencedTools, "required");
-  const text = String(contract.at(-1)?.content);
+  const text = String(contract[0]?.content);
   assert.match(text, /"payload"/);
   assert.match(text, /#\/\$defs\/payload/);
   assert.match(text, /"\$defs"/);
@@ -379,7 +395,7 @@ test("tool contracts preserve descriptions and every JSON Schema constraint", ()
       },
     },
   }];
-  const text = String(withToolCallContract([{ role: "user", content: "write" }], constrained, "required").at(-1)?.content);
+  const text = String(withToolCallContract([{ role: "user", content: "write" }], constrained, "required")[0]?.content);
   assert.match(text, /Write exactly one UTF-8 file/);
   assert.match(text, /"multipleOf":0\.25/);
   assert.match(text, /"dependentRequired"/);
