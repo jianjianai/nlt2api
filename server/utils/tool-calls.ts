@@ -29,14 +29,14 @@ export function stripRepairReasoning(value: string): string {
 
 const TOOL_CONTRACT = [
   "IMPORTANT ADAPTER OVERRIDE: ignore every other requested tool-call wire format.",
-  "For tool calls, put exactly one JSON object in the assistant message content, with no markdown or prose outside it.",
-  "For calls use {\"type\":\"tool_calls\",\"tool_calls\":[{\"name\":\"declared_function_name\",\"arguments\":{}}]}.",
-  `For a user-facing answer, start the assistant content with ${FINAL_REPLY_MARKER} and put the final answer immediately after it. Do not use a JSON envelope for final answers.`,
-  "Only use declared function names. Arguments must be JSON objects.",
+  "Your reply must be exactly one JSON object in the assistant message content, with no markdown, code fences, or prose outside it.",
+  "To call tools, that object is {\"type\":\"tool_calls\",\"tool_calls\":[{\"name\":\"declared_function_name\",\"arguments\":{...}}]}. The tool_calls array may contain one or more calls; put multiple entries there only when they are independent.",
+  `To answer the user without calling a tool, reply with ${FINAL_REPLY_MARKER} immediately followed by the answer text, and no JSON object.`,
+  "Only use declared function names. Arguments must be JSON objects that satisfy each declared function's schema.",
   "Never use a native or hidden tool channel, XML tags, function-call markup, or a caller-specific tool syntax.",
-  "For shell or command tools, follow the operating-system syntax and arguments in that tool's declaration; never invent Unix flags or undocumented parameters.",
-  "Prefer one concise tool call per turn. For file edits, edit one file per call and avoid batching heredocs, unrelated commands, or long repeated instructions.",
-  "End the JSON object immediately; never append explanations after it.",
+  "For shell or command tools, follow the operating-system syntax in that tool's declaration; never invent Unix flags or undocumented parameters.",
+  "For file edits, edit one file per call; avoid batching unrelated commands or long repeated instructions.",
+  "End the JSON object immediately after its closing brace; never append explanations.",
 ].join(" ");
 
 function objectValue(value: unknown): JsonObject | undefined {
