@@ -133,14 +133,21 @@ input:focus { border-color: var(--teal); box-shadow: 0 0 0 3px rgba(20, 125, 120
 .turn-label span { color: var(--muted); font-size: 10px; font-weight: 800; letter-spacing: .07em; }
 .turn-label strong { color: var(--navy); font-size: 12px; }
 .message-stack { display: grid; gap: 8px; }
-.message-item { min-width: 0; border: 1px solid var(--line); border-radius: 4px; padding: 11px 12px; background: #fff; }
+.message-item { min-width: 0; width: fit-content; max-width: 92%; border: 1px solid var(--line); border-radius: 6px; padding: 11px 12px; background: #fff; text-align: left; }
 .message-sent { border-left: 3px solid var(--teal); background: #f8fcfb; }
 .message-received { border-left: 3px solid #4f7890; background: #fbfcfd; }
 .message-thinking { border-left: 3px solid #b0831f; background: #fffaf0; }
 .message-thinking .message-heading strong { color: #8a6417; }
+.message-bubble-left { justify-self: start; }
+.message-bubble-right { justify-self: end; }
 .message-heading { display: flex; align-items: baseline; gap: 7px; margin-bottom: 5px; }
 .message-heading strong { color: var(--navy); font-size: 12px; }
 .message-content { margin: 0; color: #354550; font-size: 12px; line-height: 1.6; white-space: pre-wrap; overflow-wrap: anywhere; }
+.message-collapse { position: relative; max-height: 240px; overflow: hidden; }
+.message-collapse.expanded { max-height: none; overflow: visible; }
+.message-collapse:not(.expanded) { -webkit-mask-image: linear-gradient(to bottom, #000 72%, transparent 100%); mask-image: linear-gradient(to bottom, #000 72%, transparent 100%); }
+.expand-toggle { margin-top: 8px; padding: 2px 9px; border: 1px solid var(--line); border-radius: 4px; background: #fff; color: var(--muted); font-size: 11px; cursor: pointer; }
+.expand-toggle:hover { color: var(--navy); border-color: #b9c6c2; }
 .trace-fields { margin-top: 8px; }
 .record-fields { display: grid; grid-template-columns: minmax(104px, .25fr) minmax(0, 1fr); gap: 6px 12px; margin: 0; padding: 11px 12px; border: 1px solid var(--line); border-radius: 4px; background: #fff; font-size: 11px; }
 .record-fields dt { color: var(--muted); font-weight: 700; overflow-wrap: anywhere; }

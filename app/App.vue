@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, reactive, ref } from "vue";
+import { computed, onMounted, reactive, ref, watch } from "vue";
 
 interface RuntimeState {
   inFlight: number;
@@ -126,6 +126,13 @@ const selectedTraceKey = ref<string | null>(null);
 const rawTraceKey = ref<string | null>(null);
 const errorMessage = ref("");
 const notice = ref("");
+
+// Long message collapse state. Keys are `request-${index}` / `response-${index}`
+// and are reset whenever the selected trace changes.
+const COLLAPSE_MAX_HEIGHT = 240;
+const expandedMessageKeys = ref(new Set<string>());
+const overflowMessageKeys = ref(new Set<string>());
+const messageContentEls = new Map<string, HTMLElement>();
 
 const enabledCount = computed(() => accounts.value.filter((account) => account.enabled).length);
 const activeSessions = computed(() => accounts.value.filter((account) => account.hasSession).length);
@@ -926,6 +933,41 @@ function dedupeFields(fields: DisplayField[]): DisplayField[] {
   return result;
 }
 
+/** Bubble alignment: model/system/tool calls on the left, user input on the right. */
+function messageAlign(role: string): "left" | "right" {
+  return ["user", "tool", "function_call_output", "input_text"].includes(role) ? "right" : "left";
+}
+
+function setMessageContentEl(key: string, el: unknown): void {
+  if (el instanceof HTMLElement) {
+    messageContentEls.set(key, el);
+    requestAnimationFrame(() => measureMessageContent(key));
+  } else {
+    messageContentEls.delete(key);
+  }
+}
+
+function measureMessageContent(key: string): void {
+  const el = messageContentEls.get(key);
+  if (!el) return;
+  if (el.scrollHeight > COLLAPSE_MAX_HEIGHT + 2) {
+    overflowMessageKeys.value.add(key);
+  } else {
+    overflowMessageKeys.value.delete(key);
+  }
+}
+
+function toggleMessageExpanded(key: string): void {
+  const next = new Set(expandedMessageKeys.value);
+  if (next.has(key)) next.delete(key);
+  else next.add(key);
+  expandedMessageKeys.value = next;
+}
+
+function isMessageExpanded(key: string): boolean {
+  return expandedMessageKeys.value.has(key);
+}
+
 function traceRequest(trace: ConversationTrace): BodyPresentation {
   return presentBody(trace.request);
 }
@@ -942,10 +984,21 @@ function traceRecordLabel(trace: ConversationTrace): string {
   return `${formatDate(trace.record.at)} · ${trace.record.endpoint}`;
 }
 
+watch(selectedTraceKey, () => {
+  expandedMessageKeys.value = new Set();
+  overflowMessageKeys.value = new Set();
+  messageContentEls.clear();
+});
+
 onMounted(() => {
   if (token.value) {
     void loadDashboard();
   }
+  window.addEventListener("resize", () => {
+    for (const key of [...messageContentEls.keys()]) {
+      measureMessageContent(key);
+    }
+  });
 });
 </script>
 
@@ -1164,13 +1217,18 @@ onMounted(() => {
                 <section class="conversation-turn request-turn">
                   <div class="turn-label"><span>发送</span><strong>{{ selectedTrace.direction === "client" ? "客户端请求" : "上游请求" }}</strong></div>
                   <div v-if="traceRequest(selectedTrace).messages.length" class="message-stack">
-                    <article v-for="(message, index) in traceRequest(selectedTrace).messages" :key="`request-${index}`" class="message-item message-sent">
+                    <article v-for="(message, index) in traceRequest(selectedTrace).messages" :key="`request-${index}`" class="message-item message-sent" :class="{ 'message-thinking': message.roleLabel === '思考', 'message-bubble-right': messageAlign(message.role) === 'right' }">
                       <div class="message-heading"><strong>{{ message.roleLabel }}</strong></div>
-                      <p v-if="message.content" class="message-content">{{ message.content }}</p>
-                      <div v-for="call in message.toolCalls" :key="call.id" class="tool-call-item">
-                        <span class="tool-call-name">工具：{{ call.name }}</span>
-                        <code>{{ call.arguments }}</code>
+                      <div class="message-collapse" :class="{ expanded: isMessageExpanded(`request-${index}`) }" :ref="(el) => setMessageContentEl(`request-${index}`, el)">
+                        <p v-if="message.content" class="message-content">{{ message.content }}</p>
+                        <div v-for="call in message.toolCalls" :key="call.id" class="tool-call-item">
+                          <span class="tool-call-name">工具：{{ call.name }}</span>
+                          <code>{{ call.arguments }}</code>
+                        </div>
                       </div>
+                      <button v-if="overflowMessageKeys.has(`request-${index}`)" class="expand-toggle" type="button" @click="toggleMessageExpanded(`request-${index}`)">
+                        {{ isMessageExpanded(`request-${index}`) ? "收起" : "展开全部" }}
+                      </button>
                     </article>
                   </div>
                   <dl v-if="traceRequest(selectedTrace).fields.length" class="record-fields trace-fields">
@@ -1184,13 +1242,18 @@ onMounted(() => {
                   <div class="turn-label"><span>接收</span><strong>{{ selectedTrace.direction === "client" ? "客户端响应" : "上游响应" }}</strong></div>
                   <template v-if="traceResponse(selectedTrace)">
                     <div v-if="traceResponse(selectedTrace)?.messages.length" class="message-stack">
-                      <article v-for="(message, index) in traceResponse(selectedTrace)?.messages" :key="`response-${index}`" class="message-item message-received">
+                      <article v-for="(message, index) in traceResponse(selectedTrace)?.messages" :key="`response-${index}`" class="message-item message-received" :class="{ 'message-thinking': message.roleLabel === '思考', 'message-bubble-right': messageAlign(message.role) === 'right' }">
                         <div class="message-heading"><strong>{{ message.roleLabel }}</strong></div>
-                        <p v-if="message.content" class="message-content">{{ message.content }}</p>
-                        <div v-for="call in message.toolCalls" :key="call.id" class="tool-call-item">
-                          <span class="tool-call-name">工具：{{ call.name }}</span>
-                          <code>{{ call.arguments }}</code>
+                        <div class="message-collapse" :class="{ expanded: isMessageExpanded(`response-${index}`) }" :ref="(el) => setMessageContentEl(`response-${index}`, el)">
+                          <p v-if="message.content" class="message-content">{{ message.content }}</p>
+                          <div v-for="call in message.toolCalls" :key="call.id" class="tool-call-item">
+                            <span class="tool-call-name">工具：{{ call.name }}</span>
+                            <code>{{ call.arguments }}</code>
+                          </div>
                         </div>
+                        <button v-if="overflowMessageKeys.has(`response-${index}`)" class="expand-toggle" type="button" @click="toggleMessageExpanded(`response-${index}`)">
+                          {{ isMessageExpanded(`response-${index}`) ? "收起" : "展开全部" }}
+                        </button>
                       </article>
                     </div>
                     <dl v-if="traceResponse(selectedTrace)?.fields.length" class="record-fields trace-fields">
