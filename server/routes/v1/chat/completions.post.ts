@@ -71,6 +71,14 @@ export default defineHandler(async (event) => {
               }
               return chunks.length > 0;
             },
+            onRepairReasoning: async (reasoning) => {
+              const chunks = chatChunksFromUpstreamFrame({
+                choices: [{ delta: { role: "assistant", ...reasoning } }],
+              }, state, false);
+              for (const chunk of chunks) {
+                await emit({ data: chunk });
+              }
+            },
           });
 
           // Tool turns are deliberately buffered for JSON/schema validation;

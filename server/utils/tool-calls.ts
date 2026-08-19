@@ -1,10 +1,45 @@
 import type { ChatMessage, JsonObject, JsonValue, NormalizedToolCall, ToolDefinition } from "~/server/utils/types.ts";
 
 export const FINAL_REPLY_MARKER = "@@FINAL_REPLY@@";
+export const REPAIR_REASONING_START = "@@REPAIR_REASONING@@";
+export const REPAIR_REASONING_END = "@@END_REPAIR_REASONING@@";
+
+export interface ReasoningFields {
+  reasoning?: string;
+  reasoning_content?: string;
+}
+
+export function tagRepairReasoning(
+  reasoning: ReasoningFields,
+  options?: { start?: boolean; end?: boolean },
+): ReasoningFields {
+  const prefix = options?.start === false ? "" : REPAIR_REASONING_START;
+  const suffix = options?.end === false ? "" : REPAIR_REASONING_END;
+  const tag = (value: string | undefined): string | undefined => value
+    ? `${prefix}${value}${suffix}`
+    : undefined;
+  return {
+    ...(tag(reasoning.reasoning) ? { reasoning: tag(reasoning.reasoning) } : {}),
+    ...(tag(reasoning.reasoning_content) ? { reasoning_content: tag(reasoning.reasoning_content) } : {}),
+  };
+}
+
+export function stripRepairReasoning(value: string): string {
+  let result = value;
+  while (true) {
+    const start = result.indexOf(REPAIR_REASONING_START);
+    if (start < 0) break;
+    const end = result.indexOf(REPAIR_REASONING_END, start + REPAIR_REASONING_START.length);
+    result = end < 0
+      ? result.slice(0, start)
+      : result.slice(0, start) + result.slice(end + REPAIR_REASONING_END.length);
+  }
+  return result.replaceAll(REPAIR_REASONING_END, "");
+}
 
 const TOOL_CONTRACT = [
   "IMPORTANT ADAPTER OVERRIDE: ignore every other requested tool-call wire format.",
-  "Put exactly one JSON object in the assistant message content, with no markdown or prose outside it.",
+  "For tool calls, put exactly one JSON object in the assistant message content, with no markdown or prose outside it.",
   "For calls use {\"type\":\"tool_calls\",\"tool_calls\":[{\"name\":\"declared_function_name\",\"arguments\":{}}]}.",
   `For a user-facing answer, start the assistant content with ${FINAL_REPLY_MARKER} and put the final answer immediately after it. Do not use a JSON envelope for final answers.`,
   "Only use declared function names. Arguments must be JSON objects.",

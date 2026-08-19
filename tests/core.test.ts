@@ -2,7 +2,11 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   FINAL_REPLY_MARKER,
+  REPAIR_REASONING_END,
+  REPAIR_REASONING_START,
   InvalidStructuredToolCallsError,
+  stripRepairReasoning,
+  tagRepairReasoning,
   buildToolRepairHistory,
   envelopeAllowedForToolChoice,
   normaliseAssistantToolCalls,
@@ -140,6 +144,19 @@ test("Ajv applies nested refs and nontrivial JSON Schema constraints", () => {
   assert.equal(invalid.valid, false);
   assert.ok(invalid.errors.some((error) => error.includes("exclusiveMinimum")));
   assert.ok(invalid.errors.some((error) => error.includes("uniqueItems")));
+});
+
+test("repair reasoning is tagged for clients and stripped before upstream replay", () => {
+  const tagged = tagRepairReasoning({ reasoning: "fix the JSON" });
+  assert.equal(tagged.reasoning, `${REPAIR_REASONING_START}fix the JSON${REPAIR_REASONING_END}`);
+  const streamed = [
+    tagRepairReasoning({ reasoning: "fix " }, { start: true, end: false }).reasoning,
+    tagRepairReasoning({ reasoning: "the JSON" }, { start: false, end: false }).reasoning,
+    REPAIR_REASONING_END,
+  ].join("");
+  assert.equal(streamed, `${REPAIR_REASONING_START}fix the JSON${REPAIR_REASONING_END}`);
+  assert.equal(stripRepairReasoning(`first ${tagged.reasoning} second`), "first  second");
+  assert.equal(stripRepairReasoning("first @@REPAIR_REASONING@@unfinished"), "first ");
 });
 
 test("marked final replies are accepted and the marker is removed", () => {

@@ -9,7 +9,11 @@ import { stateStore } from "~/server/utils/state-store.ts";
 import { collectUpstreamStream, UpstreamStreamError, type UpstreamFrameHandler } from "~/server/utils/upstream-stream.ts";
 import {
   FINAL_REPLY_MARKER,
+  REPAIR_REASONING_END,
   InvalidStructuredToolCallsError,
+  type ReasoningFields,
+  stripRepairReasoning,
+  tagRepairReasoning,
   buildToolRepairHistory,
   envelopeAllowedForToolChoice,
   normaliseAssistantToolCalls,
@@ -210,7 +214,14 @@ function portalMessages(messages: ChatMessage[], markFinalReplies = false): Chat
   // The Playground currently rejects the OpenAI `developer` role. Preserve
   // message order and content while sending its closest supported role.
   return messages.map((message) => {
-    const mapped = message.role === "developer" ? { ...message, role: "system" as const } : message;
+    const mapped = message.role === "developer" ? { ...message, role: "system" as const } : { ...message };
+    for (const field of ["reasoning", "reasoning_content"] as const) {
+      if (typeof mapped[field] === "string") {
+        const cleaned = stripRepairReasoning(mapped[field]);
+        if (cleaned) mapped[field] = cleaned;
+        else delete mapped[field];
+      }
+    }
     if (
       markFinalReplies
       && mapped.role === "assistant"
@@ -671,6 +682,7 @@ async function executeChatRequestOnce(
     requiredAccountId?: string;
     stream?: boolean;
     onUpstreamFrame?: UpstreamFrameHandler;
+    onRepairReasoning?: (reasoning: ReasoningFields) => void | Promise<void>;
     signal?: AbortSignal;
   },
 ): Promise<ChatExecution> {
@@ -706,6 +718,30 @@ async function executeChatRequestOnce(
     const originalUpstreamMessages = portalMessages(messages, true);
     const firstReasoning = initialReasoning(result.completion);
     let repairCandidate = rawAssistantCandidate(result.completion);
+    let repairReasoning: ReasoningFields | undefined;
+    let repairReasoningOpen = false;
+    let repairReasoningField: "reasoning" | "reasoning_content" | undefined;
+    const collectRepairReasoning = async (fields: ReasoningFields): Promise<void> => {
+      const tagged = tagRepairReasoning(fields, { start: !repairReasoningOpen, end: false });
+      repairReasoningOpen = true;
+      repairReasoningField ??= tagged.reasoning ? "reasoning" : tagged.reasoning_content ? "reasoning_content" : undefined;
+      repairReasoning = {
+        reasoning: `${repairReasoning?.reasoning ?? ""}${tagged.reasoning ?? ""}` || undefined,
+        reasoning_content: `${repairReasoning?.reasoning_content ?? ""}${tagged.reasoning_content ?? ""}` || undefined,
+      };
+      await options?.onRepairReasoning?.(tagged);
+    };
+    const closeRepairReasoning = async (): Promise<void> => {
+      if (!repairReasoningOpen || !repairReasoningField) return;
+      const end = { [repairReasoningField]: REPAIR_REASONING_END } as ReasoningFields;
+      repairReasoning = {
+        ...repairReasoning,
+        [repairReasoningField]: `${repairReasoning?.[repairReasoningField] ?? ""}${REPAIR_REASONING_END}`,
+      };
+      await options?.onRepairReasoning?.(end);
+      repairReasoningOpen = false;
+      repairReasoningField = undefined;
+    };
     let evaluation = evaluateToolCandidate(
       result.completion,
       tools,
@@ -736,11 +772,13 @@ async function executeChatRequestOnce(
         },
         repairMessage(error, toolCallAdapter.repairAttempts),
       );
+      const repairStream = Boolean(options?.onRepairReasoning);
       upstreamRequest = {
         ...upstreamRequest,
-        // Repair turns are never streamed to the client. Their reasoning is
-        // internal protocol work and must not be emitted or replayed as output.
-        stream: false,
+        // Repair content remains internal. When a client stream is active, the
+        // upstream repair request may stream only its reasoning through the
+        // filtered callback below.
+        stream: repairStream,
         // A repair is internal protocol recovery, not a fresh creative turn.
         // Deterministic sampling improves JSON/schema correction even when
         // the caller intentionally used a higher temperature.
@@ -758,7 +796,16 @@ async function executeChatRequestOnce(
           options?.stickyKey,
           result.account.id,
           true,
-          undefined,
+          repairStream
+            ? async (frame) => {
+              const fields = initialReasoning({ choices: [{ message: frame.choices?.[0]?.delta }] });
+              if (fields.reasoning || fields.reasoning_content) {
+                await collectRepairReasoning(fields);
+                return true;
+              }
+              return false;
+            }
+            : undefined,
           options?.signal,
         );
       } catch (error) {
@@ -775,6 +822,13 @@ async function executeChatRequestOnce(
           upstreamRequest,
           toolCallAdapter,
         });
+      }
+      await closeRepairReasoning();
+      if (!repairStream) {
+        const nextRepairReasoning = initialReasoning(result.completion);
+        if (nextRepairReasoning.reasoning || nextRepairReasoning.reasoning_content) {
+          await collectRepairReasoning(nextRepairReasoning);
+        }
       }
       const nextCandidate = rawAssistantCandidate(result.completion);
       // A reasoning-only upstream reply is not an error candidate. Retain the
@@ -806,6 +860,15 @@ async function executeChatRequestOnce(
       );
     }
     message = withInitialReasoning(evaluation.message, firstReasoning);
+    if (repairReasoning) {
+      message = {
+        ...message,
+        ...(repairReasoning.reasoning ? { reasoning: `${message.reasoning ?? ""}${repairReasoning.reasoning}` } : {}),
+        ...(repairReasoning.reasoning_content
+          ? { reasoning_content: `${message.reasoning_content ?? ""}${repairReasoning.reasoning_content}` }
+          : {}),
+      };
+    }
   } else {
     message = assistantFrom(result.completion, tools);
   }
@@ -902,6 +965,7 @@ export async function executeChatRequest(
     requiredAccountId?: string;
     stream?: boolean;
     onUpstreamFrame?: UpstreamFrameHandler;
+    onRepairReasoning?: (reasoning: ReasoningFields) => void | Promise<void>;
     signal?: AbortSignal;
   },
 ): Promise<ChatExecution> {
@@ -937,6 +1001,7 @@ export async function executeChatRequest(
       ...options,
       requiredAccountId: execution?.account.id ?? options?.requiredAccountId,
       onUpstreamFrame: relayFrame,
+      onRepairReasoning: options?.onRepairReasoning,
     });
     execution = current;
     accumulatedMessage = accumulatedMessage

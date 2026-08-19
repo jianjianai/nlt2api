@@ -838,6 +838,12 @@ export async function executeResponsesRequest(
     onUpstreamFrame: liveState && options?.emit
       ? async (frame) => emitLiveUpstreamFrame(frame, liveState, options.emit)
       : undefined,
+    onRepairReasoning: liveState && options?.emit
+      ? async (reasoning) => {
+        const text = reasoning.reasoning ?? reasoning.reasoning_content ?? "";
+        await emitLiveReasoningDelta(liveState, options.emit, text);
+      }
+      : undefined,
   });
   const responseStatus = execution.finishReason === "length" ? "incomplete" : "completed";
   const output = responseOutput(execution.message, responseStatus, outputIdentity, liveState?.outputOrder);
