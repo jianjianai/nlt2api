@@ -23,17 +23,19 @@ import type {
   ToolCallAdapterTrace,
   ToolDefinition,
   UpstreamCompletion,
+  UpstreamUsage,
 } from "~/server/utils/types.ts";
 
 const MAX_TOOLS = 64;
 const MAX_TOOL_DEFINITION_BYTES = 256 * 1024;
 const MAX_TOOL_ARGUMENT_BYTES = 64 * 1024;
 const MAX_TOOL_RESULT_BYTES = 256 * 1024;
-const DEFAULT_OUTPUT_TOKENS = 16_384;
-// The Playground currently rejects max_tokens above 16,384 even for models
-// whose context window is much larger. Keep the public request budget flexible
-// while never sending a value the browser endpoint will reject.
-const PORTAL_MAX_OUTPUT_TOKENS = 16_384;
+const DEFAULT_OUTPUT_TOKENS = 8_192;
+// The Playground currently rejects max_tokens above 8,192 even for models
+// whose context window is much larger. Larger client budgets are fulfilled by
+// bounded continuation rounds below.
+const PORTAL_MAX_OUTPUT_TOKENS = 8_192;
+const MAX_CONTINUATION_ROUNDS = 16;
 const MAX_TOOL_REPAIR_ATTEMPTS = 5;
 const MAX_TOOL_REPAIR_CANDIDATE_CHARS = 131_072;
 
@@ -651,7 +653,7 @@ function evaluateToolCandidate(
   };
 }
 
-export async function executeChatRequest(
+async function executeChatRequestOnce(
   request: JsonObject,
   options?: {
     stickyKey?: string;
@@ -810,6 +812,178 @@ export async function executeChatRequest(
     tools,
     upstreamRequest,
     ...(toolCallAdapter ? { toolCallAdapter } : {}),
+  };
+}
+
+function requestedOutputBudget(request: JsonObject): number | undefined {
+  const value = request.max_completion_tokens ?? request.max_tokens;
+  return typeof value === "number" && Number.isInteger(value) && value >= 1 ? value : undefined;
+}
+
+function requestWithOutputBudget(request: JsonObject, budget: number): JsonObject {
+  if (request.max_completion_tokens !== undefined) {
+    return { ...request, max_completion_tokens: budget };
+  }
+  return { ...request, max_tokens: budget };
+}
+
+function continuationMessage(message: ChatMessage): ChatMessage | undefined {
+  const content = typeof message.content === "string" ? message.content : "";
+  const reasoning = typeof message.reasoning === "string" ? message.reasoning : undefined;
+  const reasoningContent = typeof message.reasoning_content === "string" ? message.reasoning_content : undefined;
+  if (!content && !reasoning && !reasoningContent) {
+    return undefined;
+  }
+  return {
+    role: "assistant",
+    content,
+    ...(reasoning ? { reasoning } : {}),
+    ...(reasoningContent ? { reasoning_content: reasoningContent } : {}),
+  };
+}
+
+function appendContinuationMessage(
+  accumulated: ChatMessage,
+  next: ChatMessage,
+): ChatMessage {
+  const append = (left: unknown, right: unknown): string | undefined => {
+    const a = typeof left === "string" ? left : "";
+    const b = typeof right === "string" ? right : "";
+    return a || b ? `${a}${b}` : undefined;
+  };
+  return {
+    role: "assistant",
+    content: append(accumulated.content, next.content) ?? "",
+    ...(append(accumulated.reasoning, next.reasoning) ? { reasoning: append(accumulated.reasoning, next.reasoning) } : {}),
+    ...(append(accumulated.reasoning_content, next.reasoning_content)
+      ? { reasoning_content: append(accumulated.reasoning_content, next.reasoning_content) }
+      : {}),
+  };
+}
+
+function addUsageTotals(
+  total: UpstreamUsage | undefined,
+  usage: UpstreamUsage | undefined,
+): UpstreamUsage | undefined {
+  if (!total && !usage) return undefined;
+  const merged: UpstreamUsage = { ...(total ?? {}), ...(usage ?? {}) };
+  for (const key of ["prompt_tokens", "completion_tokens", "total_tokens"] as const) {
+    const left = typeof total?.[key] === "number" ? total[key] : 0;
+    const right = typeof usage?.[key] === "number" ? usage[key] : 0;
+    if (left || right) merged[key] = left + right;
+  }
+  return merged;
+}
+
+export async function executeChatRequest(
+  request: JsonObject,
+  options?: {
+    stickyKey?: string;
+    requiredAccountId?: string;
+    stream?: boolean;
+    onUpstreamFrame?: UpstreamFrameHandler;
+    signal?: AbortSignal;
+  },
+): Promise<ChatExecution> {
+  const budget = requestedOutputBudget(request);
+  // Tool-call turns use a controlled JSON envelope and must remain atomic.
+  const toolTurn = Array.isArray(request.tools) && request.tools.length > 0 && request.tool_choice !== "none";
+  const canContinue = !toolTurn && budget !== undefined && budget > PORTAL_MAX_OUTPUT_TOKENS;
+  const maxRounds = canContinue ? MAX_CONTINUATION_ROUNDS : 1;
+  let remaining = budget;
+  let currentRequest = canContinue ? requestWithOutputBudget(request, Math.min(budget, PORTAL_MAX_OUTPUT_TOKENS)) : request;
+  let execution: ChatExecution | undefined;
+  let accumulatedMessage: ChatMessage | undefined;
+  let accumulatedUsage: UpstreamUsage | undefined;
+  let didContinue = false;
+
+  for (let round = 0; round < maxRounds; round += 1) {
+    const relayFrame: UpstreamFrameHandler | undefined = options?.onUpstreamFrame
+      ? async (frame) => {
+        const choice = frame.choices?.[0];
+        // Each upstream round is an internal segment. Hold its terminal frame
+        // and usage until all continuation rounds have been combined.
+        if (choice?.finish_reason !== undefined && choice.finish_reason !== null) {
+          return false;
+        }
+        if (frame.usage) {
+          return false;
+        }
+        return options.onUpstreamFrame!(frame);
+      }
+      : undefined;
+
+    const current = await executeChatRequestOnce(currentRequest, {
+      ...options,
+      requiredAccountId: execution?.account.id ?? options?.requiredAccountId,
+      onUpstreamFrame: relayFrame,
+    });
+    execution = current;
+    accumulatedMessage = accumulatedMessage
+      ? appendContinuationMessage(accumulatedMessage, current.message)
+      : continuationMessage(current.message);
+    accumulatedUsage = addUsageTotals(accumulatedUsage, current.completion.usage);
+
+    const consumed = typeof current.completion.usage?.completion_tokens === "number"
+      ? current.completion.usage.completion_tokens
+      : PORTAL_MAX_OUTPUT_TOKENS;
+    if (remaining !== undefined) {
+      remaining = Math.max(0, remaining - consumed);
+    }
+    const shouldContinue = canContinue
+      && current.finishReason === "length"
+      && (remaining ?? 0) > 0
+      && accumulatedMessage !== undefined
+      && !current.message.tool_calls?.length
+      && round + 1 < maxRounds;
+
+    if (!shouldContinue) {
+      break;
+    }
+
+    didContinue = true;
+    if (!accumulatedMessage) {
+      break;
+    }
+    currentRequest = requestWithOutputBudget(
+      requestWithBudgetMessages(request, accumulatedMessage),
+      Math.min(remaining!, PORTAL_MAX_OUTPUT_TOKENS),
+    );
+  }
+
+  if (!execution) {
+    throw new HttpError(502, "The portal returned no completion.", "server_error");
+  }
+  if (didContinue && accumulatedMessage) {
+    execution = {
+      ...execution,
+      message: accumulatedMessage,
+      completion: {
+        ...execution.completion,
+        choices: [{
+          index: 0,
+          message: accumulatedMessage,
+          finish_reason: execution.finishReason,
+        }],
+        ...(accumulatedUsage ? { usage: accumulatedUsage } : {}),
+      },
+    };
+  }
+  return execution;
+}
+
+function requestWithBudgetMessages(request: JsonObject, assistant: ChatMessage): JsonObject {
+  const messages = Array.isArray(request.messages) ? request.messages : [];
+  return {
+    ...request,
+    messages: [
+      ...messages,
+      assistant as unknown as JsonValue,
+      {
+        role: "user",
+        content: "Continue the previous response from exactly where it ended. Do not repeat any text. Finish the answer if possible.",
+      },
+    ] as unknown as JsonValue,
   };
 }
 
