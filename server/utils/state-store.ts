@@ -322,6 +322,14 @@ export class StateStore {
     });
   }
 
+  async deleteAllDebugRecords(): Promise<number> {
+    return this.mutate((state) => {
+      const deleted = state.debugRecords?.length ?? 0;
+      state.debugRecords = [];
+      return deleted;
+    });
+  }
+
   private async mutate<T>(operation: (state: PersistentState) => T): Promise<T> {
     let result: T | undefined;
     let failure: unknown;

@@ -7,10 +7,12 @@ export default defineHandler(async (event) => {
   try {
     requireAdminAuth(event.req);
     const accountId = new URL(event.req.url).searchParams.get("account_id")?.trim();
-    if (!accountId || accountId.length > 128) {
-      throw new HttpError(400, "`account_id` is required.", "invalid_request_error", "account_id");
+    if (accountId && accountId.length > 128) {
+      throw new HttpError(400, "`account_id` 长度不能超过 128 个字符。", "invalid_request_error", "account_id");
     }
-    const deleted = await stateStore.deleteDebugRecordsForAccount(accountId);
+    const deleted = accountId
+      ? await stateStore.deleteDebugRecordsForAccount(accountId)
+      : await stateStore.deleteAllDebugRecords();
     return jsonResponse({ deleted });
   } catch (error) {
     return openAIErrorResponse(adminHttpError(error));

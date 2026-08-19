@@ -1,46 +1,46 @@
-# Neuralwatt Portal Playground Upstream Capability Probe
+# NeuralWatt 门户 Playground 上游能力探测
 
-**Test window:** 2026-08-18 20:58-21:22 +08:00 (12:58-13:22 UTC)
-**Target:** `https://portal.neuralwatt.com/playground` and its same-origin browser APIs
-**Method:** real browser-session requests, isolated anonymous HTTP checks, and deterministic low-output prompts.
-**Secret handling:** credentials, session values, API keys, and cookie values were not recorded. Cookie attributes below are redacted metadata only.
+**测试时间：** 2026-08-18 20:58-21:22（北京时间，UTC 12:58-13:22）
+**目标：** `https://portal.neuralwatt.com/playground` 及其同源浏览器 API
+**方法：** 真实浏览器会话请求、隔离的匿名 HTTP 检查，以及确定性低输出提示。
+**机密处理：** 未记录凭据、会话值、API 密钥或 Cookie 值；下文的 Cookie 属性仅保留脱敏元数据。
 
-## Executive Result
+## 结论摘要
 
-The Playground is backed by a browser-oriented, cookie-authenticated endpoint:
+Playground 使用浏览器风格、Cookie 鉴权的接口：
 
 ```text
 POST https://portal.neuralwatt.com/api/chat
 ```
 
-Its normal request body and normal SSE chunks are close to OpenAI Chat Completions, but it is **not** a native OpenAI `/v1` surface:
+其普通请求体和 SSE 分片接近 OpenAI Chat Completions，但它不是原生 OpenAI `/v1` 接口：
 
-- `POST /api/responses`, `POST /v1/responses`, `POST /v1/chat/completions`, and `POST /api/v1/chat/completions` each returned `404 {"detail":"Not Found"}` in this test.
-- The browser route accepts `tools` and later `role: "tool"` messages, but did not emit structured `message.tool_calls` or `delta.tool_calls` in any tool-generation test. It emitted model-specific text instead.
-- A deterministic JSON tool-call envelope, coupled with local JSON Schema validation and synthetic standard `tool_calls`, was successful across all six tested model variants. This is the recommended adapter strategy.
+- 本次测试中，`POST /api/responses`、`POST /v1/responses`、`POST /v1/chat/completions` 和 `POST /api/v1/chat/completions` 均返回 `404 {"detail":"Not Found"}`。
+- 浏览器路由接受 `tools` 和后续的 `role: "tool"` 消息，但工具生成测试没有返回结构化的 `message.tool_calls` 或 `delta.tool_calls`，而是返回模型特有的文本。
+- 服务端控制的确定性 JSON 工具信封，配合本地 JSON Schema 校验和合成的标准 `tool_calls`，在六种测试模型上均成功。这是当前适配器采用的稳定方案。
 
-The portal documentation also describes `https://api.neuralwatt.com/v1/...`, including enrolled-account `/v1/responses`. That is a separate API host and must not be conflated with the tested Portal browser surface.
+门户文档还描述了 `https://api.neuralwatt.com/v1/...`，包括已入驻账号的 `/v1/responses`。那是独立的 API 主机，不能和本次测试的浏览器 Playground 路由混用。
 
-## Route Matrix
+## 路由矩阵
 
-| Route | Observed behavior | Authentication state tested |
+| 路由 | 观测行为 | 测试的鉴权状态 |
 | --- | --- | --- |
-| `POST /api/chat` | Chat Completions-like JSON or SSE. Browser's actual upstream route. | Anonymous and signed-in |
-| `GET /api/models` | `200 application/json`, `{"models":[...]}`; 12 public models at test time. | Anonymous and signed-in |
-| `GET /api/usage` | `200 application/json`. Anonymous response exposed a low trial quota; signed-in Basic response was `{"rate_limited":false}`. | Anonymous and signed-in |
-| `GET /auth/login` | HTML login form. | No state required |
-| `POST /auth/login` | Form login; valid test account returned `303` to `/dashboard` and refreshed the session cookie. | Login flow |
-| `GET /dashboard` without session | `303 See Other`, `Location: /auth/login?next=/dashboard`. | Anonymous |
-| `POST /api/responses` | `404 {"detail":"Not Found"}`. | Signed-in |
-| `POST /v1/responses` | `404 {"detail":"Not Found"}`. | Signed-in |
-| `POST /v1/chat/completions` | `404 {"detail":"Not Found"}`. | Signed-in |
-| `POST /api/v1/chat/completions` | `404 {"detail":"Not Found"}`. | Signed-in |
+| `POST /api/chat` | 类 Chat Completions 的 JSON 或 SSE；浏览器实际使用的上游路由。 | 匿名、已登录 |
+| `GET /api/models` | `200 application/json`，返回 `{"models":[...]}`；测试时有 12 个公开模型。 | 匿名、已登录 |
+| `GET /api/usage` | `200 application/json`。匿名响应暴露低额度试用配额；已登录 Basic 响应为 `{"rate_limited":false}`。 | 匿名、已登录 |
+| `GET /auth/login` | HTML 登录表单。 | 无需状态 |
+| `POST /auth/login` | 表单登录；测试账号成功后返回 `303` 到 `/dashboard` 并刷新会话 Cookie。 | 登录流程 |
+| `GET /dashboard`（无会话） | `303 See Other`，`Location: /auth/login?next=/dashboard`。 | 匿名 |
+| `POST /api/responses` | `404 {"detail":"Not Found"}`。 | 已登录 |
+| `POST /v1/responses` | `404 {"detail":"Not Found"}`。 | 已登录 |
+| `POST /v1/chat/completions` | `404 {"detail":"Not Found"}`。 | 已登录 |
+| `POST /api/v1/chat/completions` | `404 {"detail":"Not Found"}`。 | 已登录 |
 
-No WebSocket was observed in the tested Playground flows. The browser used ordinary `fetch` plus an HTTP SSE response.
+测试的 Playground 流程没有观察到 WebSocket；浏览器使用普通 `fetch` 加 HTTP SSE。
 
-## Login and Session Contract
+## 登录与会话契约
 
-The Portal login page contains this ordinary HTML form contract:
+门户登录页是普通 HTML 表单：
 
 ```text
 POST /auth/login
@@ -50,45 +50,45 @@ email=<email>
 password=<password>
 ```
 
-- Field names are `email` and `password`; the form exposes no visible hidden CSRF field.
-- A successful test login returned `303 See Other` and navigated to `/dashboard`.
-- Its response set `nw_session=[redacted]; HttpOnly; Max-Age=604800; Path=/; SameSite=Lax; Secure`.
-- `Max-Age=604800` is seven days. Treat it as an observed current value, not a permanence guarantee.
-- The logged-out `GET /dashboard` redirect is the reliable session-health probe. Do **not** use `POST /api/chat` as the health probe: it also succeeds anonymously and would silently spend anonymous quota after an account session expires.
+- 字段名是 `email` 和 `password`；表单没有可见的隐藏 CSRF 字段。
+- 成功登录返回 `303 See Other` 并跳转到 `/dashboard`。
+- 测试响应设置 `nw_session=[已脱敏]; HttpOnly; Max-Age=604800; Path=/; SameSite=Lax; Secure`。
+- `Max-Age=604800` 是七天，只是本次观测值，不应视为永久保证。
+- 未登录时 `GET /dashboard` 的重定向是可靠的会话健康检查。不要用 `POST /api/chat` 检查登录，因为匿名聊天也能成功；会话过期时这样做会悄悄消耗匿名配额。
 
-The browser sends the `nw_session` cookie using `credentials: "include"`. No Authorization bearer header or CSRF header was present in the Playground chat request. The browser also sent `X-Original-Referrer`, `X-UTM-Data`, and `X-PostHog-ID`; equivalent direct same-origin tests without those analytics headers succeeded, so they are not part of the minimum upstream contract.
+浏览器以 `credentials: "include"` 发送 `nw_session` Cookie。测试中没有 Authorization Bearer 或 CSRF 请求头。浏览器还发送 `X-Original-Referrer`、`X-UTM-Data` 和 `X-PostHog-ID`；不带这些分析头的同源直连测试也成功，因此它们不是最小契约的一部分。
 
-## Model Catalog
+## 模型目录
 
-`GET /api/models` returned `{"models":[...]}` and was usable without a session. Each object includes model identity, provider, context length, per-1K pricing, `supports_tools`, `supports_json_mode`, `supports_vision`, `supports_reasoning`, preview/flex flags, and, where relevant, a `reasoning` capability block.
+`GET /api/models` 无需会话即可返回 `{"models":[...]}`。每个模型对象包含身份、提供商、上下文长度、每 1K token 价格、`supports_tools`、`supports_json_mode`、`supports_vision`、`supports_reasoning`、预览/弹性标志和（适用时）reasoning 能力块。
 
-| ID | Context | Tools | JSON mode | Vision | Reasoning |
+| ID | 上下文 | 工具 | JSON 模式 | 视觉 | 推理 |
 | --- | ---: | :---: | :---: | :---: | :---: |
-| `deepseek-v4-flash` | 1,048,576 | yes | yes | no | yes |
-| `glm-5.2` | 1,048,576 | yes | no | no | yes |
-| `glm-5.2-fast` | 1,048,576 | yes | no | no | yes |
-| `glm-5.2-short` | 200,000 | yes | no | no | yes |
-| `glm-5.2-short-fast` | 200,000 | yes | no | no | yes |
-| `gemma-4-31b` | 262,144 | yes | yes | yes | yes |
-| `kimi-k2.7-code` | 262,144 | yes | yes | yes | yes |
-| `kimi-k2.7-code-fast` | 262,144 | yes | yes | yes | yes |
-| `kimi-k3` | 1,048,576 | yes | yes | yes | yes |
-| `kimi-k3-fast` | 1,048,576 | yes | yes | yes | no |
-| `qwen3.6-35b` | 131,072 | yes | yes | yes | yes |
-| `qwen3.6-35b-fast` | 131,072 | yes | yes | yes | no |
+| `deepseek-v4-flash` | 1,048,576 | 是 | 是 | 否 | 是 |
+| `glm-5.2` | 1,048,576 | 是 | 否 | 否 | 是 |
+| `glm-5.2-fast` | 1,048,576 | 是 | 否 | 否 | 是 |
+| `glm-5.2-short` | 200,000 | 是 | 否 | 否 | 是 |
+| `glm-5.2-short-fast` | 200,000 | 是 | 否 | 否 | 是 |
+| `gemma-4-31b` | 262,144 | 是 | 是 | 是 | 是 |
+| `kimi-k2.7-code` | 262,144 | 是 | 是 | 是 | 是 |
+| `kimi-k2.7-code-fast` | 262,144 | 是 | 是 | 是 | 是 |
+| `kimi-k3` | 1,048,576 | 是 | 是 | 是 | 是 |
+| `kimi-k3-fast` | 1,048,576 | 是 | 是 | 是 | 否 |
+| `qwen3.6-35b` | 131,072 | 是 | 是 | 是 | 是 |
+| `qwen3.6-35b-fast` | 131,072 | 是 | 是 | 是 | 否 |
 
-The published capability is useful for model selection, but the portal's actual tool-call wire behavior is described separately below and takes precedence for this adapter.
+目录中的能力声明只用于选型；工具调用的实际线路行为以下文实测结果为准。
 
-## `/api/chat` Request Contract
+## `/api/chat` 请求契约
 
-The Playground itself posts this shape for each turn. Conversation history lives in browser memory; there is no observed server-side conversation or previous-response ID.
+Playground 每轮发送以下形状。浏览器把会话历史保存在内存中，每轮都重新发送完整消息数组；没有观察到服务端会话或 previous-response ID。
 
 ```json
 {
   "model": "deepseek-v4-flash",
   "messages": [
-    { "role": "system", "content": "optional system prompt" },
-    { "role": "user", "content": "message" }
+    { "role": "system", "content": "可选系统提示" },
+    { "role": "user", "content": "消息" }
   ],
   "stream": true,
   "temperature": 0.7,
@@ -97,24 +97,23 @@ The Playground itself posts this shape for each turn. Conversation history lives
 }
 ```
 
-Verified accepted fields and forms:
+已确认接受的字段和形式：
 
-- `model` and `messages` are required. Missing values returned `400` with `{"detail":"Model is required"}` or `{"detail":"Messages are required"}`.
-- `stream: false` returned a non-streaming Chat Completions-like JSON object.
-- `stream: true` returned `text/event-stream; charset=utf-8`.
-- Standard `system`, `user`, `assistant`, and `tool` roles were accepted. The complete message array must be supplied again for every turn.
-- Assistant `tool_calls`, tool `tool_call_id`, and optional `reasoning`/`reasoning_content` messages were accepted as incoming history.
-- String content and OpenAI-style content-part arrays were accepted. A 1x1 `data:image/png` with `gemma-4-31b` produced nonzero image token accounting; DeepSeek accepted the shape but showed no image-token metric, consistent with its advertised non-vision capability.
-- `response_format: {"type":"json_object"}` produced valid JSON in DeepSeek and GLM Fast tests. It also worked in the controlled tool tests below on all six tested variants.
-- `tools` and `tool_choice` are accepted syntactically, including malformed tool definitions. Do not treat acceptance as upstream validation.
+- `model` 和 `messages` 必填；缺失时分别返回 `400 {"detail":"Model is required"}` 或 `400 {"detail":"Messages are required"}`。
+- `stream: false` 返回非流式、类 Chat Completions JSON；`stream: true` 返回 `text/event-stream; charset=utf-8`。
+- 标准 `system`、`user`、`assistant` 和 `tool` 角色均可接受；每轮必须重新提交完整消息数组。
+- 输入历史可包含 assistant `tool_calls`、tool `tool_call_id`，以及可选的 `reasoning`/`reasoning_content`。
+- 字符串 content 和 OpenAI 内容片段数组均可接受。`gemma-4-31b` 对 1x1 `data:image/png` 产生了非零图像 token 计数；DeepSeek 接受该形状但没有图像 token 指标，与其不支持视觉的目录声明一致。
+- `response_format: {"type":"json_object"}` 在 DeepSeek 和 GLM Fast 测试中产生有效 JSON，也在六种模型的受控工具测试中成功。
+- `tools` 和 `tool_choice` 在语法上都被接受，甚至畸形工具定义也返回成功；不能把这种接受当作上游校验。
 
-Observed weak validation matters for the adapter: `temperature: 9`, `max_tokens: 999999`, and a malformed tool schema all returned `200` in the Portal test. Validate OpenAI-compatible inputs, JSON Schemas, maximum generation budget, and tool names locally before forwarding them.
+上游校验很弱：`temperature: 9`、`max_tokens: 999999` 和畸形工具 Schema 都曾返回 `200`。因此适配器必须在本地校验 OpenAI 输入、JSON Schema、最大生成预算和工具名。
 
-## Normal Response Shapes
+## 普通响应形状
 
-### Non-streaming
+### 非流式
 
-`stream: false` returned `200 application/json` with a Chat Completions-like body. A reduced real example is:
+`stream: false` 返回类 Chat Completions 的 JSON（以下为删减后的真实形状）：
 
 ```json
 {
@@ -125,11 +124,7 @@ Observed weak validation matters for the adapter: `temperature: 9`, `max_tokens:
   "choices": [
     {
       "index": 0,
-      "message": {
-        "role": "assistant",
-        "content": "NW_NONSTREAM_OK",
-        "function_call": null
-      },
+      "message": { "role": "assistant", "content": "NW_NONSTREAM_OK", "function_call": null },
       "finish_reason": "stop"
     }
   ],
@@ -144,11 +139,11 @@ Observed weak validation matters for the adapter: `temperature: 9`, `max_tokens:
 }
 ```
 
-Provider additions encountered include `_latency`, `energy`, `cost`, `service_tier`, `system_fingerprint`, `stop_reason`, `token_ids`, and model-specific fields. Preserve only deliberately supported additions in any public adapter response; do not accidentally expose raw upstream diagnostics.
+实际还遇到 `_latency`、`energy`、`cost`、`service_tier`、`system_fingerprint`、`stop_reason`、`token_ids` 等提供商字段。公开适配器只应有意保留支持的扩展，不要把上游诊断信息意外透传给客户端。
 
-### Streaming
+### 流式
 
-The ordinary success stream has OpenAI-like `data:` chunks plus Portal-specific SSE comments:
+普通成功流包含 OpenAI 风格的 `data:` 分片和门户专用 SSE 注释：
 
 ```text
 : pricing {"prompt_per_1k":0.00014,"completion_per_1k":0.00028}
@@ -159,36 +154,31 @@ data: {"object":"chat.completion.chunk","choices":[{"delta":{"content":"NW"},"fi
 
 data: {"object":"chat.completion.chunk","choices":[],"usage":{"prompt_tokens":12,"completion_tokens":5,"total_tokens":17}}
 
-: energy {"energy_joules":3.01,"energy_kwh":8.37e-7,"duration_seconds":2.81,...}
+: energy {"energy_joules":3.01,"energy_kwh":8.37e-7,"duration_seconds":2.81}
 
 data: [DONE]
 ```
 
-Details confirmed in multiple streams:
+多次流式测试确认：首个注释通常是 `: pricing`，末尾遥测注释是 `: energy`；最后一个 usage 分片的 `choices` 为空，usage 不保证附在 finish 分片上；最后内容后是 `finish_reason: "stop"`，随后 usage、energy 和 `[DONE]`。Playground 客户端会处理 `: routing`，但本次没有实际观察到。
 
-- The first comment is `: pricing {...}` and the terminal telemetry comment is `: energy {...}`.
-- The final usage chunk has `choices: []`; usage is not guaranteed to be attached to the `finish_reason` chunk.
-- The last content chunk is followed by `finish_reason: "stop"`, then usage, energy, and `[DONE]`.
-- `: routing {...}` is handled by the Playground client code but was not observed in these tests.
+### 错误形状
 
-### Error Shapes
+流式请求不能只看 HTTP 状态：
 
-The HTTP status alone is not sufficient for streaming calls.
-
-| Case | Observed result |
+| 情况 | 观测结果 |
 | --- | --- |
-| Missing `messages` | `400 application/json`, `{"detail":"Messages are required"}` |
-| `GET /api/chat` | `405 application/json`, `{"detail":"Method Not Allowed"}` |
-| Unknown model, non-streaming | `404 application/json`; wrapper body contains `error` plus textual upstream `details` |
-| Unknown model, `stream: true` | **HTTP 200** with `text/event-stream`, then `data: {"error":"Gateway returned status 404","status":404}`; no normal completion sequence observed |
+| 缺少 `messages` | `400 application/json`，`{"detail":"Messages are required"}` |
+| `GET /api/chat` | `405 application/json`，`{"detail":"Method Not Allowed"}` |
+| 非流式未知模型 | `404 application/json`；包装体包含 `error` 和文本上游 `details` |
+| 流式未知模型 | HTTP 仍为 `200 text/event-stream`，随后 `data: {"error":"Gateway returned status 404","status":404}`；没有正常完成序列 |
 
-Always parse each SSE JSON record for `error` before treating a `200` transport status as a successful completion.
+因此必须逐条解析 SSE JSON；看到 `error` 之前，不能把传输层 `200` 当作成功。
 
-## Tool Calling: Actual Portal Behavior
+## 工具调用：门户实际行为
 
-### What Works
+### 可以工作的部分
 
-The route accepts the conventional incoming fields:
+路由接受常见的输入字段：
 
 ```json
 {
@@ -197,7 +187,7 @@ The route accepts the conventional incoming fields:
 }
 ```
 
-It also accepts a later synthetic assistant call and tool result:
+也接受后续的合成 assistant 调用和工具结果：
 
 ```json
 [
@@ -218,15 +208,14 @@ It also accepts a later synthetic assistant call and tool result:
 ]
 ```
 
-All six tested variants correctly used that supplied tool result in their next response when the synthetic assistant call was included.
+六种测试模型在下一轮都正确使用了提供的工具结果。
 
-### What Does Not Work Reliably
+### 不可靠的部分
 
-Across tool-generation tests for `deepseek-v4-flash`, `glm-5.2-fast`, `gemma-4-31b`, `kimi-k2.7-code-fast`, `kimi-k3-fast`, and `qwen3.6-35b-fast`:
+对 `deepseek-v4-flash`、`glm-5.2-fast`、`gemma-4-31b`、`kimi-k2.7-code-fast`、`kimi-k3-fast` 和 `qwen3.6-35b-fast` 的工具生成测试显示：
 
-- The response always had `message.function_call: null`.
-- No native `message.tool_calls` and no streaming `delta.tool_calls` were observed.
-- The requested tool call appeared only as model text. Formats varied between calls and models, for example:
+- `message.function_call` 始终是 `null`；没有观察到原生 `message.tool_calls` 或流式 `delta.tool_calls`。
+- 工具意图只出现在模型文本中，格式随模型和轮次变化，例如：
 
 ```text
 tool_call(get_weather, city="Shanghai")
@@ -237,16 +226,16 @@ get_weather(location="Shanghai")
 {"tool_calls":[{"id":"call_1","type":"function",...}]}
 ```
 
-- One Kimi stream emitted an XML-like `<function_calls>` block token by token. Other runs from the same model emitted a JSON literal or even a fabricated weather object instead.
-- `tool_choice: "none"`, `"auto"`, `"required"`, and a forced-function object all still produced textual tool markup in the DeepSeek comparison. Upstream `tool_choice` must therefore not be relied on for policy enforcement.
+- Kimi 某次流式输出逐 token 生成 XML 风格的 `<function_calls>`；同一模型其他轮次可能输出 JSON 字面量，甚至输出伪造的天气对象。
+- `tool_choice: "none"`、`"auto"`、`"required"` 和固定函数对象都曾继续产生文本标记；不能依赖上游实现策略约束。
 
-The Portal documentation's generic statement that tool calls are returned in a `tool_calls` array applies to its documented `api.neuralwatt.com/v1` API, not to the observed browser route behavior.
+门户文档中“工具调用通过 `tool_calls` 数组返回”的说明对应的是文档化的 `api.neuralwatt.com/v1`，不适用于这里实测的浏览器路由。
 
-## Recommended Stable Tool-Call Adapter
+## 稳定的工具调用适配策略
 
-Do not execute a tool because a model's free-form prose happens to resemble a function invocation. Textual format parsing would be model-specific, vulnerable to ambiguous prose, and impossible to make equivalent to the OpenAI contract.
+不要因为任意 prose 看起来像函数调用就执行工具。模型特有的文本解析容易误把示例或普通描述当作调用，无法等价实现 OpenAI 契约。
 
-Instead, for every request that exposes tools, use an internal controlled envelope:
+对每个带工具的请求，使用服务端控制的内部信封：
 
 ```json
 {
@@ -257,67 +246,65 @@ Instead, for every request that exposes tools, use an internal controlled envelo
 }
 ```
 
-or:
+或：
 
 ```json
-{ "type": "final", "content": "The final user-facing answer." }
+{ "type": "final", "content": "给用户的最终答案。" }
 ```
 
-Use a server-owned system instruction requiring exactly one of those JSON objects and no markdown/prose. Include the declared function descriptions and complete JSON Schemas in that instruction, but omit the Portal's native `tools` and `tool_choice` fields. Send only `response_format: {"type":"json_object"}` upstream. Parse only the complete, bounded response; then validate:
+服务端系统指令要求上游只能输出上述二选一的完整 JSON，不得输出 Markdown 或 prose；契约中包含工具描述和完整 JSON Schema，但不向门户发送原生 `tools`/`tool_choice`，只发送 `response_format: {"type":"json_object"}`。
 
-1. The top-level `type` is exactly `tool_calls` or `final`.
-2. Every requested tool name is in the client's declared tool set.
-3. Every `arguments` object validates against that tool's JSON Schema.
-4. `tool_choice: "none"`, `"required"`, or a fixed function is enforced by this adapter, not delegated to Portal.
-5. Invalid JSON, an unknown tool, invalid arguments, or a violated choice policy triggers up to five bounded repair requests or a deterministic OpenAI-compatible error. Each repair keeps the first reasoning fields, replaces the prior bad candidate, includes the precise validation error, and returns to deterministic sampling. Never run a best-effort parser over arbitrary prose.
+本地必须按以下顺序校验：
 
-This controlled envelope was tested successfully:
+1. 顶层 `type` 必须严格是 `tool_calls` 或 `final`。
+2. 每个工具名必须存在于客户端声明的工具集合。
+3. 每个 `arguments` 对象必须通过对应工具的 JSON Schema。
+4. `tool_choice: "none"`、`"required"` 或固定函数由适配器本地执行。
+5. JSON 无效、工具未知、参数无效或选择策略冲突时，最多发起五次有界纠错；每次纠错保留第一次响应的 reasoning 字段，替换上一份错误候选，并把精确的解析/策略/Schema 错误放入提示。绝不对任意 prose 做“尽力解析”。
 
-- First-turn `tool_calls` JSON parsed successfully for all six variants listed above, both with and without passing `tools` to Portal.
-- A two-tool request produced `get_weather` and `get_time` calls in the expected array for DeepSeek Flash, GLM Fast, and Kimi K3 Fast.
-- After the adapter converted a validated envelope into a synthetic OpenAI assistant `tool_calls` message and the client returned a `role: "tool"` result, all six variants returned a valid `{"type":"final",...}` JSON answer using the supplied `25 C` result exactly.
+受控信封测试结果：六种模型的首轮（不论是否把原生工具字段传给门户）均能解析；DeepSeek Flash、GLM Fast 和 Kimi K3 Fast 的双工具请求返回预期数组；将信封转换为合成 assistant `tool_calls`，再由客户端提交 `role: "tool"` 结果后，六种模型均返回使用 `25 C` 结果的有效 `{"type":"final",...}`。
 
-The safest wire form is to **omit the Portal's native `tools` and `tool_choice` fields** on a tool-bearing upstream request. A later live probe showed why: `kimi-k3` generated a valid controlled envelope when the definitions were in the contract and native fields were omitted, but when native `tools` were also sent it switched to an internal `thinking` tool and never emitted the requested calculator call. `kimi-k3-fast` returned the expected envelope in the controlled adapter path. This is an observed deployment detail, not a provider guarantee, so it should be re-probed after upstream changes.
+最稳妥的线路是省略门户原生 `tools` 和 `tool_choice`。一次后续探测显示：Kimi K3 在契约中提供工具定义且省略原生字段时生成了正确的受控信封；同时发送原生 `tools` 时却切换到内部 `thinking` 工具。Kimi K3 Fast 在受控适配路径中返回了预期信封。这是当前部署的观测值，上游变化后应重新验证。
 
-### Call Loop
+## 调用循环
 
-For `/v1/chat/completions`, map the client's ordinary message history to Portal's `messages` array. For `/v1/responses`, normalize `input`, function-call output items, and any prior response state to the same internal message representation.
+对 `/v1/chat/completions`，把客户端消息历史映射为门户 `messages`。对 `/v1/responses`，把 `input`、函数调用输出项和之前的响应状态归一化为同一内部消息格式。
 
-For a tool-bearing turn:
+工具轮流程：
 
-1. Preserve caller system/developer context and append the server-owned JSON-envelope contract, including the declared function names and schemas.
-2. Do not forward native Portal `tools` or `tool_choice`; enforce those policies locally.
-3. Internally request `stream: false` from Portal and include `response_format: {"type":"json_object"}`. Buffering is intentional: a stream cannot be safely classified as a final answer or a complete tool call until all JSON has arrived.
-4. Validate the envelope. For a tool result, synthesize standard OpenAI tool-call IDs and return normal `tool_calls` (Chat Completions) or `function_call` output items (Responses) to the client.
-5. The client executes its own tools and sends outputs back. Do not execute arbitrary client-defined tools inside this proxy.
-6. On the next request, reconstruct the Portal history with the synthetic assistant `tool_calls` message followed by each `role: "tool"` message. Continue until a validated `final` object or a local max-round limit is reached.
-7. For client-requested streaming on tool turns, synthesize standard OpenAI SSE only after the internal response has been parsed. For non-tool turns, direct SSE proxying is viable after filtering Portal comments and checking embedded error frames.
+1. 保留调用方 system/developer 上下文，并在最新会话/工具结果后追加服务端 JSON 信封契约、函数名和 Schema。
+2. 不转发门户原生 `tools` 或 `tool_choice`，由适配器本地执行策略。
+3. 内部向门户请求 `stream: false` 和 `response_format: {"type":"json_object"}`。这是有意缓冲：JSON 未完整到达前不能安全判断是最终答案还是工具调用。
+4. 校验信封；工具结果通过后生成标准 OpenAI 工具调用 ID，Chat 返回 `tool_calls`，Responses 返回 `function_call` 项。
+5. 客户端执行自己的工具并在下一轮提交输出；代理不会执行任意客户端工具。
+6. 下一轮重建门户历史，依次加入合成 assistant `tool_calls` 和各个 `role: "tool"`，直到得到合法 `final` 或达到本地轮数上限。
+7. 客户端要求工具轮流式时，只有在内部解析完成后才合成标准 OpenAI SSE；非工具轮可以直接转发门户 SSE，但要过滤门户注释并检查内嵌错误分片。
 
-Use an explicit local maximum for tool rounds, tool count, total tool arguments bytes, and returned tool-result bytes. These are adapter policy limits; the Portal route did not demonstrate equivalent validation.
+必须设置本地上限：工具轮数、单轮工具数、全部参数字节数和工具结果字节数。门户没有展示等价的输入校验。
 
-## Account Pooling Implications
+## 账号池注意事项
 
-Each configured Portal account needs its own server-side cookie jar. The practical health / re-login loop is:
+每个门户账号必须拥有独立的服务端 Cookie 罐：
 
 ```text
-select account using sticky conversation key
-  -> GET /dashboard with that account's cookie jar
-  -> 200: use account
-  -> 303 to /auth/login: POST /auth/login, persist refreshed cookie jar, retry health check once
-  -> failure: mark account unavailable with bounded backoff
+按粘性会话键选择账号
+  -> 用该账号 Cookie 访问 GET /dashboard
+  -> 200：继续使用
+  -> 303 到 /auth/login：POST /auth/login，保存刷新后的 Cookie，再检查一次
+  -> 失败：使用有界退避标记账号不可用
 ```
 
-Do not use a successful `/api/chat` response as proof that a pooled account is signed in, because anonymous chat also worked at test time. Store cookies encrypted at rest, never expose them through the admin API or message records, and keep sticky assignment per logical OpenAI conversation/response chain so that all tool turns retain the same upstream account context.
+不要用成功的 `/api/chat` 响应证明账号已登录，因为匿名聊天也可能成功。粘性分配应按逻辑 OpenAI 会话/响应链保持，使所有工具轮使用同一上游账号上下文。Cookie 应加密保存，绝不能通过管理 API 或消息记录暴露。
 
-## Debug Record Boundaries
+## 调试记录边界
 
-An administrator-facing debug view can safely correlate a client request, the normalized Portal request, the selected account ID, upstream status, and the normalized response/SSE terminal state. It should make conversion failures auditable, especially the controlled tool envelope and synthetic tool-call IDs.
+管理员调试视图可以关联客户端请求、归一化门户请求、账号 ID、上游状态和归一化响应/SSE 终态，也应能审计受控工具信封及合成工具调用 ID。
 
-It must redact or omit all authentication material before persistence or display: account passwords, `nw_session` values, any `Set-Cookie` value, Authorization headers, CSRF values if the provider adds them later, and analytics identifiers. Cap stored message and tool-result bytes, record truncation, and keep the raw upstream textual tool markup only behind the explicit message-recording switch.
+持久化或展示前必须脱敏/删除所有鉴权材料：账号密码、`nw_session` 值、任何 `Set-Cookie` 值、Authorization 头、未来可能新增的 CSRF 值和分析标识符。限制消息及工具结果字节数，记录截断信息；原始上游文本工具标记只在显式开启消息记录后保存，并仅允许管理员通过“查看原始 JSON”查看。
 
-## Limits of This Probe
+## 探测边界
 
-- Results are an observed Portal deployment snapshot, not a provider stability promise. Re-run smoke probes before a release that changes routing or parser behavior.
-- The test did not use an `api.neuralwatt.com` API key and therefore makes no claim about the native `/v1/responses` service beyond the portal documentation's distinction.
-- No rate-limit exhaustion, account ban, or browser challenge behavior was intentionally induced.
-- The exact user prompt/completion records were intentionally not copied into this document beyond small deterministic protocol examples.
+- 结果是当前门户部署的快照，不是提供商的稳定性承诺；路由或模型目录变更前应重新运行冒烟探测。
+- 本次没有使用 `api.neuralwatt.com` API Key，因此不对原生 `/v1/responses` 做额外结论，只确认它与门户路由分离。
+- 没有故意耗尽速率限制、触发封号或浏览器挑战。
+- 为保护隐私，本文只保留少量确定性协议示例，没有复制完整用户提示或模型回复。
