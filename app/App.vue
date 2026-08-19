@@ -579,7 +579,7 @@ function buildAggregatedMessages(options: {
 }
 
 /** Merge chat.completion.chunk deltas into 思考 / 最终回复 / 工具调用 boxes. */
-function aggregateChatCompletionChunks(chunks: unknown[]): DisplayMessage[] {
+function aggregateChatCompletionChunks(chunks: unknown[], stripMarkers = true): DisplayMessage[] {
   let content = "";
   let reasoning = "";
   let reasoningContent = "";
@@ -615,14 +615,14 @@ function aggregateChatCompletionChunks(chunks: unknown[]): DisplayMessage[] {
     }
   }
   return buildAggregatedMessages({
-    reasoning: cleanMarkers(reasoning || reasoningContent),
-    content: cleanMarkers(content || refusal),
+    reasoning: stripMarkers ? cleanMarkers(reasoning || reasoningContent) : (reasoning || reasoningContent).trim(),
+    content: stripMarkers ? cleanMarkers(content || refusal) : (content || refusal).trim(),
     toolCalls: [...toolCalls.values()],
   });
 }
 
 /** Merge Responses API stream events into 思考 / 最终回复 / 工具调用 boxes. */
-function aggregateResponseEvents(chunks: unknown[]): DisplayMessage[] {
+function aggregateResponseEvents(chunks: unknown[], stripMarkers = true): DisplayMessage[] {
   const reasoningByItem = new Map<string, string>();
   const textByItem = new Map<string, string>();
   const toolByItem = new Map<string, DisplayToolCall>();
@@ -723,25 +723,25 @@ function aggregateResponseEvents(chunks: unknown[]): DisplayMessage[] {
     }
   }
   return buildAggregatedMessages({
-    reasoning: cleanMarkers([...reasoningByItem.values()].join("\n")),
-    content: cleanMarkers([...textByItem.values()].join("\n")),
+    reasoning: stripMarkers ? cleanMarkers([...reasoningByItem.values()].join("\n")) : [...reasoningByItem.values()].join("\n").trim(),
+    content: stripMarkers ? cleanMarkers([...textByItem.values()].join("\n")) : [...textByItem.values()].join("\n").trim(),
     toolCalls: [...toolByItem.values()],
     errors,
   });
 }
 
-function aggregateStreamingMessages(values: unknown[]): DisplayMessage[] {
+function aggregateStreamingMessages(values: unknown[], stripMarkers: boolean): DisplayMessage[] {
   const chunks = values.filter(isStreamingChunk);
   if (chunks.length === 0) return [];
   const chatChunks = chunks.some((value) => asObject(value)?.object === "chat.completion.chunk");
-  return chatChunks ? aggregateChatCompletionChunks(chunks) : aggregateResponseEvents(chunks);
+  return chatChunks ? aggregateChatCompletionChunks(chunks, stripMarkers) : aggregateResponseEvents(chunks, stripMarkers);
 }
 
 /** Collect messages from a body, concatenating streaming chunks into one box per kind. */
-function collectBodyMessages(value: DebugRawBody | JsonRecord | undefined): DisplayMessage[] {
+function collectBodyMessages(value: DebugRawBody | JsonRecord | undefined, stripMarkers: boolean): DisplayMessage[] {
   const values = parsedBodyValues(value);
   if (values.some(isStreamingChunk)) {
-    const aggregated = aggregateStreamingMessages(values);
+    const aggregated = aggregateStreamingMessages(values, stripMarkers);
     if (aggregated.length > 0) return aggregated;
   }
   return values.flatMap(collectMessages);
@@ -906,10 +906,10 @@ function selectTrace(trace: ConversationTrace): void {
   rawTraceKey.value = null;
 }
 
-function presentBody(value: DebugRawBody | JsonRecord | undefined): BodyPresentation {
+function presentBody(value: DebugRawBody | JsonRecord | undefined, options?: { stripMarkers?: boolean }): BodyPresentation {
   const values = parsedBodyValues(value);
   const streaming = values.some(isStreamingChunk);
-  const messages = collectBodyMessages(value);
+  const messages = collectBodyMessages(value, options?.stripMarkers ?? true);
   const raw = rawBodyText(value);
   const fields = values.flatMap(recordFields);
   return {
@@ -969,11 +969,11 @@ function isMessageExpanded(key: string): boolean {
 }
 
 function traceRequest(trace: ConversationTrace): BodyPresentation {
-  return presentBody(trace.request);
+  return presentBody(trace.request, { stripMarkers: trace.direction === "client" });
 }
 
 function traceResponse(trace: ConversationTrace): BodyPresentation | undefined {
-  return trace.response ? presentBody(trace.response) : undefined;
+  return trace.response ? presentBody(trace.response, { stripMarkers: trace.direction === "client" }) : undefined;
 }
 
 function traceRawKey(trace: ConversationTrace): string {
