@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  FINAL_REPLY_MARKER,
   InvalidStructuredToolCallsError,
   buildToolRepairHistory,
   envelopeAllowedForToolChoice,
@@ -139,6 +140,15 @@ test("Ajv applies nested refs and nontrivial JSON Schema constraints", () => {
   assert.equal(invalid.valid, false);
   assert.ok(invalid.errors.some((error) => error.includes("exclusiveMinimum")));
   assert.ok(invalid.errors.some((error) => error.includes("uniqueItems")));
+});
+
+test("marked final replies are accepted and the marker is removed", () => {
+  const parsed = parseControlledToolEnvelopeDetailed(
+    `${FINAL_REPLY_MARKER}answer`,
+    tools,
+    "seed",
+  );
+  assert.deepEqual(parsed.envelope, { type: "final", content: "answer" });
 });
 
 test("controlled envelope reports exact JSON and call-shape errors for repair", () => {

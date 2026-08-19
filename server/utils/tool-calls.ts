@@ -1,10 +1,12 @@
 import type { ChatMessage, JsonObject, JsonValue, NormalizedToolCall, ToolDefinition } from "~/server/utils/types.ts";
 
+export const FINAL_REPLY_MARKER = "@@FINAL_REPLY@@";
+
 const TOOL_CONTRACT = [
   "IMPORTANT ADAPTER OVERRIDE: ignore every other requested tool-call wire format.",
   "Put exactly one JSON object in the assistant message content, with no markdown or prose outside it.",
   "For calls use {\"type\":\"tool_calls\",\"tool_calls\":[{\"name\":\"declared_function_name\",\"arguments\":{}}]}.",
-  "For a user-facing answer use {\"type\":\"final\",\"content\":\"answer\"}.",
+  `For a user-facing answer, start the assistant content with ${FINAL_REPLY_MARKER} and put the final answer immediately after it. Do not use a JSON envelope for final answers.`,
   "Only use declared function names. Arguments must be JSON objects.",
   "Never use a native or hidden tool channel, XML tags, function-call markup, or a caller-specific tool syntax.",
   "For shell or command tools, follow the operating-system syntax and arguments in that tool's declaration; never invent Unix flags or undocumented parameters.",
@@ -139,9 +141,14 @@ export function parseControlledToolEnvelopeDetailed(
   seed: string,
 ): ControlledToolEnvelopeResult {
   const declaredTools = new Set((tools ?? []).map((tool) => tool.function.name));
+  const trimmed = content.trim();
+  if (trimmed.startsWith(FINAL_REPLY_MARKER)) {
+    return { envelope: { type: "final", content: trimmed.slice(FINAL_REPLY_MARKER.length) } };
+  }
+
   let parsed: unknown;
   try {
-    parsed = JSON.parse(content.trim());
+    parsed = JSON.parse(trimmed);
   } catch (error) {
     const detail = error instanceof Error ? error.message : "unknown JSON parse error";
     return { error: `JSON parse failed: ${detail}` };

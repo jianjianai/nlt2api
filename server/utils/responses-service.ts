@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { executeChatRequest, parseTools, validateChatRequest } from "~/server/utils/chat-service.ts";
+import { FINAL_REPLY_MARKER } from "~/server/utils/tool-calls.ts";
 import { getProxyConfig } from "~/server/utils/config.ts";
 import { HttpError } from "~/server/utils/http.ts";
 import { responsesStreamEvents } from "~/server/utils/responses-events.ts";
@@ -452,6 +453,9 @@ interface LiveResponseState {
   model: string;
   reasoningId: string;
   messageId: string;
+  toolTurn: boolean;
+  toolContentMode: "unknown" | "final" | "tool";
+  toolContentBuffer: string;
   nextOutputIndex: number;
   reasoningOutputIndex?: number;
   messageOutputIndex?: number;
@@ -634,7 +638,29 @@ async function emitLiveUpstreamFrame(
   if (typeof delta.refusal === "string" && delta.refusal) {
     await emitLiveRefusalDelta(state, emit, delta.refusal);
   } else if (typeof delta.content === "string") {
-    await emitLiveContentDelta(state, emit, delta.content);
+    let content = delta.content;
+    if (state.toolTurn && state.toolContentMode !== "tool") {
+      state.toolContentBuffer += content;
+      content = "";
+      if (state.toolContentMode === "unknown") {
+        if (state.toolContentBuffer === FINAL_REPLY_MARKER) {
+          state.toolContentMode = "final";
+          state.toolContentBuffer = "";
+        } else if (state.toolContentBuffer.startsWith(FINAL_REPLY_MARKER)) {
+          state.toolContentMode = "final";
+          content = state.toolContentBuffer.slice(FINAL_REPLY_MARKER.length);
+          state.toolContentBuffer = "";
+        } else if (!FINAL_REPLY_MARKER.startsWith(state.toolContentBuffer)) {
+          state.toolContentMode = "tool";
+          state.toolContentBuffer = "";
+        }
+      }
+      if (state.toolContentMode === "final" && state.toolContentBuffer.length > 0) {
+        content = state.toolContentBuffer;
+        state.toolContentBuffer = "";
+      }
+    }
+    await emitLiveContentDelta(state, emit, content);
   }
   return state.sequenceNumber > sequenceBefore;
 }
@@ -782,6 +808,9 @@ export async function executeResponsesRequest(
       reasoningId: outputIdentity.reasoningId,
       messageId: outputIdentity.messageId,
       nextOutputIndex: 0,
+      toolTurn: tools.length > 0 && request.tool_choice !== "none",
+      toolContentMode: tools.length > 0 && request.tool_choice !== "none" ? "unknown" : "final",
+      toolContentBuffer: "",
       reasoningStarted: false,
       messageStarted: false,
       outputOrder: [],

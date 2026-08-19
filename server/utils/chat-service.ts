@@ -8,6 +8,7 @@ import { ProxyRequestError, type RequestDebugContext } from "~/server/utils/requ
 import { stateStore } from "~/server/utils/state-store.ts";
 import { collectUpstreamStream, UpstreamStreamError, type UpstreamFrameHandler } from "~/server/utils/upstream-stream.ts";
 import {
+  FINAL_REPLY_MARKER,
   InvalidStructuredToolCallsError,
   buildToolRepairHistory,
   envelopeAllowedForToolChoice,
@@ -205,12 +206,23 @@ export function validateChatRequest(request: JsonObject): void {
   upstreamBody(request, model, messages, tools, false);
 }
 
-function portalMessages(messages: ChatMessage[]): ChatMessage[] {
+function portalMessages(messages: ChatMessage[], markFinalReplies = false): ChatMessage[] {
   // The Playground currently rejects the OpenAI `developer` role. Preserve
   // message order and content while sending its closest supported role.
-  return messages.map((message) => message.role === "developer"
-    ? { ...message, role: "system" }
-    : message);
+  return messages.map((message) => {
+    const mapped = message.role === "developer" ? { ...message, role: "system" as const } : message;
+    if (
+      markFinalReplies
+      && mapped.role === "assistant"
+      && typeof mapped.content === "string"
+      && mapped.content.length > 0
+      && !mapped.content.startsWith(FINAL_REPLY_MARKER)
+      && !mapped.tool_calls?.length
+    ) {
+      return { ...mapped, content: `${FINAL_REPLY_MARKER}${mapped.content}` };
+    }
+    return mapped;
+  });
 }
 
 function upstreamBody(
@@ -237,7 +249,7 @@ function upstreamBody(
     "chat_template_kwargs",
     "parallel_tool_calls",
   ];
-  const upstreamMessages = portalMessages(messages);
+  const upstreamMessages = portalMessages(messages, toolTurn);
   const body: JsonObject = {
     model,
     messages: (toolTurn
@@ -260,11 +272,7 @@ function upstreamBody(
     tokenLimit ?? Math.min(DEFAULT_OUTPUT_TOKENS, getProxyConfig().maxOutputTokens),
     PORTAL_MAX_OUTPUT_TOKENS,
   );
-  if (toolTurn) {
-    // Portal-native tools are textual and model-specific. The OpenAI tool contract
-    // is carried exclusively in the controlled system message above.
-    body.response_format = { type: "json_object" };
-  } else if (request.response_format !== undefined) {
+  if (!toolTurn && request.response_format !== undefined) {
     body.response_format = request.response_format;
   }
   return body;
@@ -678,7 +686,7 @@ async function executeChatRequestOnce(
   const toolAssignedAccountId = options?.requiredAccountId
     ? undefined
     : accountScheduler.accountForToolCalls(observedToolCallIds);
-  const streamUpstream = (options?.stream ?? request.stream === true) && !toolTurn;
+  const streamUpstream = options?.stream ?? request.stream === true;
   let upstreamRequest = upstreamBody(request, model, messages, tools, streamUpstream);
   let result = await getCompletion(
     upstreamRequest,
@@ -695,7 +703,7 @@ async function executeChatRequestOnce(
     // Keep the caller history separate from the adapter contract. Repair turns
     // append the bad candidate and exact error, then re-apply the contract so
     // it remains the final instruction in every attempt.
-    const originalUpstreamMessages = portalMessages(messages);
+    const originalUpstreamMessages = portalMessages(messages, true);
     const firstReasoning = initialReasoning(result.completion);
     let repairCandidate = rawAssistantCandidate(result.completion);
     let evaluation = evaluateToolCandidate(
@@ -730,6 +738,9 @@ async function executeChatRequestOnce(
       );
       upstreamRequest = {
         ...upstreamRequest,
+        // Repair turns are never streamed to the client. Their reasoning is
+        // internal protocol work and must not be emitted or replayed as output.
+        stream: false,
         // A repair is internal protocol recovery, not a fresh creative turn.
         // Deterministic sampling improves JSON/schema correction even when
         // the caller intentionally used a higher temperature.
@@ -1032,6 +1043,9 @@ export interface ChatStreamState {
   id: string;
   created: number;
   model: string;
+  toolTurn: boolean;
+  toolContentMode: "unknown" | "final" | "tool";
+  toolContentBuffer: string;
   roleSent: boolean;
   sawOutput: boolean;
   finishSeen: boolean;
@@ -1039,10 +1053,15 @@ export interface ChatStreamState {
 }
 
 export function createChatStreamState(request: JsonObject): ChatStreamState {
+  const tools = Array.isArray(request.tools) ? request.tools : [];
+  const toolTurn = tools.length > 0 && request.tool_choice !== "none";
   return {
     id: `chatcmpl_${randomUUID().replaceAll("-", "")}`,
     created: Math.floor(Date.now() / 1_000),
     model: typeof request.model === "string" && request.model ? request.model : getProxyConfig().defaultModel,
+    toolTurn,
+    toolContentMode: toolTurn ? "unknown" : "final",
+    toolContentBuffer: "",
     roleSent: false,
     sawOutput: false,
     finishSeen: false,
@@ -1082,8 +1101,29 @@ export function chatChunksFromUpstreamFrame(
     state.roleSent = true;
   }
   if (typeof delta?.content === "string" && delta.content.length > 0) {
-    outputDelta.content = delta.content;
-    state.sawOutput = true;
+    if (!state.toolTurn) {
+      outputDelta.content = delta.content;
+      state.sawOutput = true;
+    } else if (state.toolContentMode !== "tool") {
+      state.toolContentBuffer += delta.content;
+      if (state.toolContentMode === "unknown") {
+        if (state.toolContentBuffer === FINAL_REPLY_MARKER) {
+          state.toolContentMode = "final";
+          state.toolContentBuffer = "";
+        } else if (state.toolContentBuffer.startsWith(FINAL_REPLY_MARKER)) {
+          state.toolContentMode = "final";
+          state.toolContentBuffer = state.toolContentBuffer.slice(FINAL_REPLY_MARKER.length);
+        } else if (!FINAL_REPLY_MARKER.startsWith(state.toolContentBuffer)) {
+          state.toolContentMode = "tool";
+          state.toolContentBuffer = "";
+        }
+      }
+      if (state.toolContentMode === "final" && state.toolContentBuffer.length > 0) {
+        outputDelta.content = state.toolContentBuffer;
+        state.toolContentBuffer = "";
+        state.sawOutput = true;
+      }
+    }
   }
   if (typeof delta?.reasoning === "string" && delta.reasoning.length > 0) {
     outputDelta.reasoning = delta.reasoning;
@@ -1125,18 +1165,23 @@ function appendFallbackChatDelta(
     delta.role = "assistant";
     state.roleSent = true;
   }
-  if (!state.sawOutput) {
-    if (typeof execution.message.reasoning === "string" && execution.message.reasoning) {
+  const hasToolCalls = Boolean(execution.message.tool_calls?.length);
+  if (hasToolCalls || !state.sawOutput) {
+    if (state.toolTurn && state.toolContentMode === "unknown") {
+      state.toolContentMode = "tool";
+      state.toolContentBuffer = "";
+    }
+    if (!hasToolCalls && typeof execution.message.reasoning === "string" && execution.message.reasoning) {
       delta.reasoning = execution.message.reasoning;
     }
-    if (typeof execution.message.reasoning_content === "string" && execution.message.reasoning_content) {
+    if (!hasToolCalls && typeof execution.message.reasoning_content === "string" && execution.message.reasoning_content) {
       delta.reasoning_content = execution.message.reasoning_content;
     }
-    if (typeof execution.message.refusal === "string" && execution.message.refusal) {
+    if (!hasToolCalls && typeof execution.message.refusal === "string" && execution.message.refusal) {
       delta.refusal = execution.message.refusal;
     }
-    if (execution.message.tool_calls?.length) {
-      delta.tool_calls = execution.message.tool_calls.map((call, index) => ({
+    if (hasToolCalls) {
+      delta.tool_calls = execution.message.tool_calls!.map((call, index) => ({
         index,
         id: call.id,
         type: "function",
