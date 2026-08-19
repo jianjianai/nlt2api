@@ -32,7 +32,7 @@ function responseStateReserve(request: JsonObject, maxBytes: number): number {
   const requested = typeof request.max_output_tokens === "number"
     && Number.isInteger(request.max_output_tokens)
     && request.max_output_tokens > 0
-    && request.max_output_tokens <= DEFAULT_MAX_OUTPUT_TOKENS
+    && request.max_output_tokens <= getProxyConfig().maxOutputTokens
     ? request.max_output_tokens
     : DEFAULT_MAX_OUTPUT_TOKENS;
   const projected = RESPONSE_STATE_OVERHEAD_BYTES + requested * 16;
@@ -188,6 +188,8 @@ function responseToolChoice(value: unknown): JsonValue | undefined {
   return value as JsonValue | undefined;
 }
 
+const REASONING_SUMMARY_VALUES = new Set(["auto", "concise", "detailed", "none"]);
+
 function responseReasoningEffort(reasoningValue: unknown, directValue: unknown): string | undefined {
   let direct: string | undefined;
   if (directValue !== undefined) {
@@ -203,11 +205,34 @@ function responseReasoningEffort(reasoningValue: unknown, directValue: unknown):
   if (!reasoning) {
     throw new HttpError(400, "`reasoning` must be an object.", "invalid_request_error", "reasoning");
   }
-  const unsupported = Object.keys(reasoning).filter((key) => key !== "effort");
+  // OpenAI clients commonly send summary controls alongside effort. The
+  // Portal exposes no equivalent summary switch, so validate these known
+  // compatibility fields and intentionally omit them from the upstream body.
+  // `generate_summary` is the deprecated spelling still emitted by some SDKs.
+  const unsupported = Object.keys(reasoning).filter((key) => !["effort", "summary", "generate_summary"].includes(key));
   if (unsupported.length > 0) {
     throw new HttpError(
       400,
-      "This adapter currently supports only `reasoning.effort`.",
+      "This adapter supports `reasoning.effort` and the compatible summary controls.",
+      "invalid_request_error",
+      "reasoning",
+    );
+  }
+  for (const key of ["summary", "generate_summary"]) {
+    const summary = reasoning[key];
+    if (summary !== undefined && (typeof summary !== "string" || !REASONING_SUMMARY_VALUES.has(summary))) {
+      throw new HttpError(
+        400,
+        `\`reasoning.${key}\` must be one of auto, concise, detailed, or none.`,
+        "invalid_request_error",
+        `reasoning.${key}`,
+      );
+    }
+  }
+  if (reasoning.summary !== undefined && reasoning.generate_summary !== undefined && reasoning.summary !== reasoning.generate_summary) {
+    throw new HttpError(
+      400,
+      "`reasoning.summary` conflicts with `reasoning.generate_summary`.",
       "invalid_request_error",
       "reasoning",
     );

@@ -28,7 +28,7 @@ const MAX_TOOLS = 64;
 const MAX_TOOL_DEFINITION_BYTES = 256 * 1024;
 const MAX_TOOL_ARGUMENT_BYTES = 64 * 1024;
 const MAX_TOOL_RESULT_BYTES = 256 * 1024;
-const MAX_OUTPUT_TOKENS = 16_384;
+const DEFAULT_OUTPUT_TOKENS = 16_384;
 const MAX_TOOL_REPAIR_ATTEMPTS = 5;
 const MAX_TOOL_REPAIR_CANDIDATE_CHARS = 131_072;
 
@@ -151,8 +151,9 @@ function validateTokenLimit(request: JsonObject): number | undefined {
   if (raw === undefined || raw === null) {
     return undefined;
   }
-  if (typeof raw !== "number" || !Number.isInteger(raw) || raw < 1 || raw > MAX_OUTPUT_TOKENS) {
-    throw new HttpError(400, `\`max_tokens\` must be an integer between 1 and ${MAX_OUTPUT_TOKENS}.`, "invalid_request_error", "max_tokens");
+  const maxOutputTokens = getProxyConfig().maxOutputTokens;
+  if (typeof raw !== "number" || !Number.isInteger(raw) || raw < 1 || raw > maxOutputTokens) {
+    throw new HttpError(400, `\`max_tokens\` must be an integer between 1 and ${maxOutputTokens}.`, "invalid_request_error", "max_tokens");
   }
   return raw;
 }
@@ -223,7 +224,7 @@ function upstreamBody(
   if (toolTurn && request.temperature === undefined) {
     body.temperature = 0;
   }
-  body.max_tokens = tokenLimit ?? MAX_OUTPUT_TOKENS;
+  body.max_tokens = tokenLimit ?? Math.min(DEFAULT_OUTPUT_TOKENS, getProxyConfig().maxOutputTokens);
   if (toolTurn) {
     // Portal-native tools are textual and model-specific. The OpenAI tool contract
     // is carried exclusively in the controlled system message above.

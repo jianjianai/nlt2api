@@ -8,6 +8,7 @@ export interface ProxyConfig {
   defaultModel: string;
   maxRecordBytes: number;
   maxRequestBytes: number;
+  maxOutputTokens: number;
   maxResponseHistoryBytes: number;
   maxResponseStateBytes: number;
   maxUpstreamBytes: number;
@@ -24,6 +25,7 @@ export function getProxyConfig(): ProxyConfig {
 
   const rawMaxRecordBytes = Number(process.env.NEURALWATT_MAX_RECORD_BYTES ?? "5242880");
   const rawMaxRequestBytes = Number(process.env.NEURALWATT_MAX_REQUEST_BYTES ?? "8388608");
+  const rawMaxOutputTokens = Number(process.env.NEURALWATT_MAX_OUTPUT_TOKENS ?? "128000");
   const rawMaxResponseHistoryBytes = Number(process.env.NEURALWATT_MAX_RESPONSE_HISTORY_BYTES ?? "2097152");
   const rawMaxResponseStateBytes = Number(process.env.NEURALWATT_MAX_RESPONSE_STATE_BYTES ?? "16777216");
   const rawMaxUpstreamBytes = Number(process.env.NEURALWATT_MAX_UPSTREAM_BYTES ?? "16777216");
@@ -40,6 +42,9 @@ export function getProxyConfig(): ProxyConfig {
     maxRequestBytes: Number.isFinite(rawMaxRequestBytes) && rawMaxRequestBytes > 0
       ? Math.floor(rawMaxRequestBytes)
       : 8_388_608,
+    maxOutputTokens: Number.isFinite(rawMaxOutputTokens) && rawMaxOutputTokens > 0
+      ? Math.max(1, Math.min(1_000_000, Math.floor(rawMaxOutputTokens)))
+      : 128_000,
     maxResponseHistoryBytes: Number.isFinite(rawMaxResponseHistoryBytes) && rawMaxResponseHistoryBytes > 0
       ? Math.floor(rawMaxResponseHistoryBytes)
       : 2_097_152,
