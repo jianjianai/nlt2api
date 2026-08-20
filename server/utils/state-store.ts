@@ -15,6 +15,12 @@ const STORE_FILE = "accounts.json";
 const RECORDS_DIR = "records";
 const MAX_DEBUG_RECORDS = 500;
 
+interface RecordIndexEntry {
+  id: string;
+  at: string;
+  file: string;
+}
+
 export class ResponseStateLimitError extends Error {
   constructor() {
     super("The Responses state exceeds the configured storage budget.");
@@ -67,6 +73,7 @@ function compareAt(a: string, b: string): number {
 export class StateStore {
   private state: PersistentState | undefined;
   private mutationQueue: Promise<void> = Promise.resolve();
+  private recordIndexInit: Promise<RecordIndexEntry[]> | undefined;
 
   private get storePath(): string {
     return join(getProxyConfig().dataDir, STORE_FILE);
@@ -243,32 +250,54 @@ export class StateStore {
     if (!(await this.getSettings()).recordMessages) {
       return;
     }
+    // Resolve the index before writing so a concurrent first-time build can
+    // never observe this file on disk and then have it pushed a second time.
+    const index = await this.getRecordIndex();
     const target = this.recordPath(record.id);
     await mkdir(this.recordsDir, { recursive: true });
     const temporary = `${target}.${process.pid}.${randomBytes(6).toString("hex")}.tmp`;
     await writeFile(temporary, JSON.stringify(record), { encoding: "utf8", mode: 0o600 });
     await rename(temporary, target);
-    await this.pruneDebugRecords();
+    index.push({ id: record.id, at: record.at, file: target });
+    await this.pruneDebugRecords(index);
   }
 
   async listDebugRecords(limit = 100): Promise<DebugRecord[]> {
-    const records = await this.readAllDebugRecords();
-    return records
-      .slice(-Math.max(1, Math.min(limit, MAX_DEBUG_RECORDS)))
-      .reverse()
-      .map((entry) => entry.record);
+    const index = await this.getRecordIndex();
+    const bounded = Math.max(1, Math.min(limit, MAX_DEBUG_RECORDS));
+    const records = (await Promise.all(index.slice(-bounded).map((entry) => this.readRecordFile(entry.file))))
+      .filter((record): record is DebugRecord => record !== undefined);
+    records.sort((a, b) => compareAt(a.at, b.at));
+    return records.reverse();
   }
 
   async deleteDebugRecordsForAccount(accountId: string): Promise<number> {
-    const records = await this.readAllDebugRecords();
-    const matches = records.filter((entry) => entry.record.accountId === accountId);
-    await Promise.all(matches.map((entry) => unlink(entry.file).catch(() => undefined)));
-    return matches.length;
+    const index = await this.getRecordIndex();
+    const matches = new Set<string>();
+    await Promise.all(index.map(async (entry) => {
+      const record = await this.readRecordFile(entry.file);
+      if (record?.accountId === accountId) {
+        matches.add(entry.file);
+      }
+    }));
+    if (matches.size === 0) {
+      return 0;
+    }
+    await Promise.all([...matches].map((file) => unlink(file).catch(() => undefined)));
+    for (let position = index.length - 1; position >= 0; position -= 1) {
+      const entry = index[position];
+      if (entry && matches.has(entry.file)) {
+        index.splice(position, 1);
+      }
+    }
+    return matches.size;
   }
 
   async deleteAllDebugRecords(): Promise<number> {
+    const index = await this.getRecordIndex();
     const files = await this.listRecordFiles();
     await Promise.all(files.map((file) => unlink(file).catch(() => undefined)));
+    index.length = 0;
     return files.length;
   }
 
@@ -296,22 +325,36 @@ export class StateStore {
     }
   }
 
-  private async readAllDebugRecords(): Promise<Array<{ file: string; record: DebugRecord }>> {
+  /**
+   * Record metadata is cached in insertion order so appends and pruning stay
+   * O(1). The index is built from one directory scan on first use; records
+   * added by other processes appear only after a restart.
+   */
+  private getRecordIndex(): Promise<RecordIndexEntry[]> {
+    if (!this.recordIndexInit) {
+      this.recordIndexInit = this.buildRecordIndex().catch((error) => {
+        this.recordIndexInit = undefined;
+        throw error;
+      });
+    }
+    return this.recordIndexInit;
+  }
+
+  private async buildRecordIndex(): Promise<RecordIndexEntry[]> {
     const files = await this.listRecordFiles();
-    const records: Array<{ file: string; record: DebugRecord }> = [];
+    const entries: RecordIndexEntry[] = [];
     for (const file of files) {
       const record = await this.readRecordFile(file);
       if (record) {
-        records.push({ file, record });
+        entries.push({ id: record.id, at: record.at, file });
       }
     }
-    records.sort((a, b) => compareAt(a.record.at, b.record.at));
-    return records;
+    entries.sort((a, b) => compareAt(a.at, b.at));
+    return entries;
   }
 
-  private async pruneDebugRecords(): Promise<void> {
-    const records = await this.readAllDebugRecords();
-    const excess = records.slice(0, Math.max(0, records.length - MAX_DEBUG_RECORDS));
+  private async pruneDebugRecords(index: RecordIndexEntry[]): Promise<void> {
+    const excess = index.splice(0, Math.max(0, index.length - MAX_DEBUG_RECORDS));
     await Promise.all(excess.map((entry) => unlink(entry.file).catch(() => undefined)));
   }
 
