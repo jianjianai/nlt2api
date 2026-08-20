@@ -12,7 +12,4 @@ services:
       NEURALWATT_DEFAULT_MODEL: ${NEURALWATT_DEFAULT_MODEL:-kimi-k3-fast}
     volumes:
       # A named volume preserves the non-root ownership from the image.
-      - neuralwatt-data:/app/.data
-
-volumes:
-  neuralwatt-data:
+      - ./data:/app/.data
