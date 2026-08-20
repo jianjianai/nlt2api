@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, reactive, ref, watch } from "vue";
+import { computed, onMounted, onUnmounted, reactive, ref, watch } from "vue";
 
 interface RuntimeState {
   inFlight: number;
@@ -100,13 +100,6 @@ interface DisplayField {
   value: string;
 }
 
-interface ParsedSection {
-  key: string;
-  title: string;
-  fields: DisplayField[];
-  messages: DisplayMessage[];
-}
-
 const tokenStorageKey = "neuralwatt-admin-token";
 const token = ref(typeof window === "undefined" ? "" : sessionStorage.getItem(tokenStorageKey) ?? "");
 const tokenDraft = ref(token.value);
@@ -125,8 +118,53 @@ const isSaving = ref(false);
 const isClearingRecords = ref(false);
 const selectedTraceKey = ref<string | null>(null);
 const rawTraceKey = ref<string | null>(null);
-const errorMessage = ref("");
-const notice = ref("");
+const loginError = ref("");
+
+// ---- Toast notifications (replace the old one-line notice / error banner) ----
+interface ToastItem {
+  id: number;
+  kind: "success" | "error";
+  text: string;
+}
+const toasts = ref<ToastItem[]>([]);
+let toastSeq = 0;
+function pushToast(kind: "success" | "error", text: string): void {
+  const id = ++toastSeq;
+  toasts.value = [...toasts.value, { id, kind, text }];
+  window.setTimeout(() => dismissToast(id), kind === "error" ? 6000 : 3500);
+}
+function dismissToast(id: number): void {
+  toasts.value = toasts.value.filter((toast) => toast.id !== id);
+}
+function errorText(error: unknown, fallback: string): string {
+  return error instanceof Error ? error.message : fallback;
+}
+
+// ---- Modals & per-account busy state ----
+const showAddAccount = ref(false);
+const proxyEditor = ref<{ account: Account; value: string } | null>(null);
+const pendingRemoval = ref<Account | null>(null);
+const showClearConfirm = ref(false);
+const busyAccountIds = ref(new Set<string>());
+
+function setAccountBusy(id: string, busy: boolean): void {
+  const next = new Set(busyAccountIds.value);
+  if (busy) next.add(id);
+  else next.delete(id);
+  busyAccountIds.value = next;
+}
+function isAccountBusy(id: string): boolean {
+  return busyAccountIds.value.has(id);
+}
+
+// ---- Filters ----
+const accountQuery = ref("");
+const recordQuery = ref("");
+const recordFilter = ref<"all" | "success" | "failed">("all");
+
+// ---- Auto refresh ----
+const autoRefresh = ref(false);
+let autoRefreshTimer: number | undefined;
 
 // Long message collapse state. Keys are `request-${index}` / `response-${index}`
 // and are reset whenever the selected trace changes.
@@ -138,6 +176,33 @@ const messageContentEls = new Map<string, HTMLElement>();
 const enabledCount = computed(() => accounts.value.filter((account) => account.enabled).length);
 const activeSessions = computed(() => accounts.value.filter((account) => account.hasSession).length);
 const cooldownCount = computed(() => accounts.value.filter((account) => account.runtime.cooldownUntil > Date.now()).length);
+
+const filteredAccounts = computed(() => {
+  const query = accountQuery.value.trim().toLowerCase();
+  if (!query) return accounts.value;
+  return accounts.value.filter((account) =>
+    account.label.toLowerCase().includes(query)
+    || account.emailHint.toLowerCase().includes(query)
+    || (account.proxyHint ?? "").toLowerCase().includes(query));
+});
+
+function recordFailed(record: DebugRecord): boolean {
+  return record.status >= 400 || Boolean(record.error);
+}
+const failedRecordCount = computed(() => records.value.filter(recordFailed).length);
+const filteredRecords = computed(() => {
+  let list = records.value;
+  if (recordFilter.value === "success") list = list.filter((record) => !recordFailed(record));
+  else if (recordFilter.value === "failed") list = list.filter(recordFailed);
+  const query = recordQuery.value.trim().toLowerCase();
+  if (query) {
+    list = list.filter((record) =>
+      record.endpoint.toLowerCase().includes(query)
+      || (record.accountLabel ?? "").toLowerCase().includes(query));
+  }
+  return list;
+});
+
 function recordRequestObject(record: DebugRecord): JsonRecord | null {
   return parsedBodyValues(record.clientRequest)
     .map(asObject)
@@ -189,9 +254,10 @@ async function api(path: string, init: RequestInit = {}): Promise<ApiPayload> {
 function useToken() {
   const value = tokenDraft.value.trim();
   if (!value) {
-    errorMessage.value = "请输入管理员令牌。";
+    loginError.value = "请输入管理员令牌。";
     return;
   }
+  loginError.value = "";
   token.value = value;
   sessionStorage.setItem(tokenStorageKey, value);
   void loadDashboard();
@@ -203,15 +269,20 @@ function signOut() {
   sessionStorage.removeItem(tokenStorageKey);
   accounts.value = [];
   records.value = [];
-  errorMessage.value = "";
+  loginError.value = "";
+  toasts.value = [];
+  showAddAccount.value = false;
+  proxyEditor.value = null;
+  pendingRemoval.value = null;
+  showClearConfirm.value = false;
+  autoRefresh.value = false;
 }
 
-async function loadDashboard() {
+async function loadDashboard(options?: { silent?: boolean }) {
   if (!token.value) {
     return;
   }
-  isLoading.value = true;
-  errorMessage.value = "";
+  if (!options?.silent) isLoading.value = true;
   try {
     const payload = await api("/api/admin/status");
     accounts.value = payload.accounts ?? [];
@@ -220,16 +291,18 @@ async function loadDashboard() {
     if (view.value === "records") {
       await loadRecords();
     }
-    notice.value = "刚刚更新";
   } catch (error) {
-    errorMessage.value = error instanceof Error ? error.message : "无法加载控制台。";
-    if (errorMessage.value.includes("Invalid admin token") || errorMessage.value.includes("管理员令牌无效")) {
+    const message = errorText(error, "无法加载控制台。");
+    if (message.includes("Invalid admin token") || message.includes("管理员令牌无效")) {
       token.value = "";
       tokenDraft.value = "";
       sessionStorage.removeItem(tokenStorageKey);
+      loginError.value = "管理员令牌无效或已过期，请重新输入。";
+    } else if (!options?.silent) {
+      pushToast("error", message);
     }
   } finally {
-    isLoading.value = false;
+    if (!options?.silent) isLoading.value = false;
   }
 }
 
@@ -246,20 +319,18 @@ async function loadRecords() {
 
 async function selectView(next: "accounts" | "records") {
   view.value = next;
-  errorMessage.value = "";
   if (next === "records") {
     try {
       await loadRecords();
     } catch (error) {
-      errorMessage.value = error instanceof Error ? error.message : "无法加载聊天记录。";
+      pushToast("error", errorText(error, "无法加载聊天记录。"));
     }
   }
 }
 
 async function addAccount() {
+  if (isSaving.value) return;
   isSaving.value = true;
-  errorMessage.value = "";
-  notice.value = "";
   try {
     await api("/api/admin/accounts", {
       method: "POST",
@@ -270,57 +341,61 @@ async function addAccount() {
     newAccount.password = "";
     newAccount.weight = 1;
     newAccount.proxy = "";
-    notice.value = "账号验证成功并已添加";
-    await loadDashboard();
+    showAddAccount.value = false;
+    pushToast("success", "账号验证成功并已添加");
+    await loadDashboard({ silent: true });
   } catch (error) {
-    errorMessage.value = error instanceof Error ? error.message : "无法添加账号。";
+    pushToast("error", errorText(error, "无法添加账号。"));
   } finally {
     isSaving.value = false;
   }
 }
 
 async function verifyAccount(account: Account) {
-  account.runtime.lastError = undefined;
+  if (isAccountBusy(account.id)) return;
+  setAccountBusy(account.id, true);
   try {
     const payload = await api(`/api/admin/accounts/${encodeURIComponent(account.id)}/verify`, { method: "POST" });
     if (payload.account) {
       replaceAccount(payload.account);
     }
-    notice.value = `${account.label} 验证成功`;
+    pushToast("success", `${account.label} 验证成功`);
   } catch (error) {
-    errorMessage.value = error instanceof Error ? error.message : "账号验证失败。";
+    pushToast("error", errorText(error, "账号验证失败。"));
+  } finally {
+    setAccountBusy(account.id, false);
   }
 }
 
-async function editProxy(account: Account) {
-  const current = account.proxyHint ?? "";
-  const input = window.prompt(
-    `设置账号“${account.label}”的出口代理，支持 http/https/socks4/socks5，可带认证（如 socks5://user:pass@host:1080）。留空并确定可清除代理。`,
-    current,
-  );
-  if (input === null) {
-    return;
-  }
-  const value = input.trim();
-  if (value === current) {
-    return;
-  }
-  errorMessage.value = "";
+function openProxyEditor(account: Account) {
+  proxyEditor.value = { account, value: "" };
+}
+
+async function saveProxy() {
+  const editor = proxyEditor.value;
+  if (!editor || isAccountBusy(editor.account.id)) return;
+  const value = editor.value.trim();
+  setAccountBusy(editor.account.id, true);
   try {
-    const payload = await api(`/api/admin/accounts/${encodeURIComponent(account.id)}`, {
+    const payload = await api(`/api/admin/accounts/${encodeURIComponent(editor.account.id)}`, {
       method: "PATCH",
       body: JSON.stringify({ proxy: value === "" ? null : value }),
     });
     if (payload.account) {
       replaceAccount(payload.account);
     }
-    notice.value = value === "" ? `${account.label} 的代理已清除` : `${account.label} 的代理已更新，会话将重新登录`;
+    pushToast("success", value === "" ? `${editor.account.label} 的代理已清除` : `${editor.account.label} 的代理已更新，会话将重新登录`);
+    proxyEditor.value = null;
   } catch (error) {
-    errorMessage.value = error instanceof Error ? error.message : "无法更新代理。";
+    pushToast("error", errorText(error, "无法更新代理。"));
+  } finally {
+    setAccountBusy(editor.account.id, false);
   }
 }
 
 async function toggleAccount(account: Account) {
+  if (isAccountBusy(account.id)) return;
+  setAccountBusy(account.id, true);
   try {
     const payload = await api(`/api/admin/accounts/${encodeURIComponent(account.id)}`, {
       method: "PATCH",
@@ -329,21 +404,31 @@ async function toggleAccount(account: Account) {
     if (payload.account) {
       replaceAccount(payload.account);
     }
+    pushToast("success", account.enabled ? `${account.label} 已禁用` : `${account.label} 已启用`);
   } catch (error) {
-    errorMessage.value = error instanceof Error ? error.message : "无法更新账号。";
+    pushToast("error", errorText(error, "无法更新账号。"));
+  } finally {
+    setAccountBusy(account.id, false);
   }
 }
 
-async function removeAccount(account: Account) {
-  if (!window.confirm(`确定移除账号“${account.label}”吗？`)) {
-    return;
-  }
+function askRemoveAccount(account: Account) {
+  pendingRemoval.value = account;
+}
+
+async function confirmRemoveAccount() {
+  const account = pendingRemoval.value;
+  if (!account || isAccountBusy(account.id)) return;
+  setAccountBusy(account.id, true);
   try {
     await api(`/api/admin/accounts/${encodeURIComponent(account.id)}`, { method: "DELETE" });
     accounts.value = accounts.value.filter((item) => item.id !== account.id);
-    notice.value = "账号已移除";
+    pendingRemoval.value = null;
+    pushToast("success", `账号「${account.label}」已移除`);
   } catch (error) {
-    errorMessage.value = error instanceof Error ? error.message : "无法移除账号。";
+    pushToast("error", errorText(error, "无法移除账号。"));
+  } finally {
+    setAccountBusy(account.id, false);
   }
 }
 
@@ -354,29 +439,29 @@ async function setRecording(value: boolean) {
       body: JSON.stringify({ recordMessages: value }),
     });
     settings.recordMessages = payload.settings?.recordMessages ?? value;
-    notice.value = value ? "已开启消息记录" : "已关闭消息记录";
+    pushToast("success", value ? "已开启消息记录" : "已关闭消息记录");
   } catch (error) {
-    errorMessage.value = error instanceof Error ? error.message : "无法更新消息记录设置。";
+    pushToast("error", errorText(error, "无法更新消息记录设置。"));
   }
 }
 
-async function clearAllRecords() {
-  if (records.value.length === 0 || isClearingRecords.value) {
-    return;
-  }
-  if (!window.confirm("确定清空全部聊天记录吗？此操作不可撤销。")) {
-    return;
-  }
+function askClearRecords() {
+  if (records.value.length === 0 || isClearingRecords.value) return;
+  showClearConfirm.value = true;
+}
+
+async function confirmClearRecords() {
+  if (isClearingRecords.value) return;
   isClearingRecords.value = true;
-  errorMessage.value = "";
   try {
     await api("/api/admin/records", { method: "DELETE" });
     rawTraceKey.value = null;
     selectedTraceKey.value = null;
     records.value = [];
-    notice.value = "已清空全部聊天记录";
+    showClearConfirm.value = false;
+    pushToast("success", "已清空全部聊天记录");
   } catch (error) {
-    errorMessage.value = error instanceof Error ? error.message : "无法清空聊天记录。";
+    pushToast("error", errorText(error, "无法清空聊天记录。"));
   } finally {
     isClearingRecords.value = false;
   }
@@ -398,24 +483,29 @@ function formatDate(value: string | number | null | undefined): string {
   return new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "short" }).format(new Date(value));
 }
 
-function sessionLabel(account: Account): string {
+type BadgeTone = "good" | "warn" | "bad" | "muted";
+
+function sessionBadge(account: Account): { text: string; tone: BadgeTone } {
   if (!account.hasSession) {
-    return "未登录";
+    return { text: "未登录", tone: "muted" };
   }
   if (account.sessionExpiresAt && account.sessionExpiresAt < Date.now()) {
-    return "已过期";
+    return { text: "已过期", tone: "bad" };
   }
-  return account.sessionExpiresAt ? `有效至 ${formatDate(account.sessionExpiresAt)}` : "有效";
+  return { text: "会话有效", tone: "good" };
 }
 
-function runtimeLabel(account: Account): string {
+function runtimeBadge(account: Account): { text: string; tone: BadgeTone } {
   if (account.runtime.cooldownUntil > Date.now()) {
-    return "冷却中";
+    return { text: "冷却中", tone: "warn" };
+  }
+  if (!account.enabled) {
+    return { text: "已禁用", tone: "muted" };
   }
   if (account.runtime.inFlight > 0) {
-    return `${account.runtime.inFlight} 个请求处理中`;
+    return { text: `${account.runtime.inFlight} 个请求处理中`, tone: "good" };
   }
-  return account.enabled ? "就绪" : "已禁用";
+  return { text: "就绪", tone: "good" };
 }
 
 function pretty(value: unknown): string {
@@ -878,18 +968,44 @@ watch(selectedTraceKey, () => {
   messageContentEls.clear();
 });
 
+watch(autoRefresh, (enabled) => {
+  window.clearInterval(autoRefreshTimer);
+  autoRefreshTimer = undefined;
+  if (enabled) {
+    autoRefreshTimer = window.setInterval(() => {
+      void loadDashboard({ silent: true });
+    }, 30_000);
+  }
+});
+
+function onKeydown(event: KeyboardEvent): void {
+  if (event.key !== "Escape") return;
+  if (proxyEditor.value) proxyEditor.value = null;
+  else if (pendingRemoval.value) pendingRemoval.value = null;
+  else if (showClearConfirm.value) showClearConfirm.value = false;
+  else if (showAddAccount.value) showAddAccount.value = false;
+}
+
+function onWindowResize(): void {
+  for (const key of [...messageContentEls.keys()]) {
+    measureMessageContent(key);
+  }
+}
+
 onMounted(() => {
   if (token.value) {
     void loadDashboard();
   }
-  window.addEventListener("resize", () => {
-    for (const key of [...messageContentEls.keys()]) {
-      measureMessageContent(key);
-    }
-  });
+  window.addEventListener("keydown", onKeydown);
+  window.addEventListener("resize", onWindowResize);
+});
+
+onUnmounted(() => {
+  window.clearInterval(autoRefreshTimer);
+  window.removeEventListener("keydown", onKeydown);
+  window.removeEventListener("resize", onWindowResize);
 });
 </script>
-
 <template>
   <div class="app-shell">
     <header class="topbar">
@@ -900,7 +1016,7 @@ onMounted(() => {
       <div v-if="token" class="topbar-actions">
         <span class="connection-dot" :class="{ busy: isLoading }"></span>
         <span class="topbar-status">{{ isLoading ? "刷新中" : "已连接" }}</span>
-        <button class="button button-quiet" type="button" :disabled="isLoading" @click="loadDashboard">刷新</button>
+        <button class="button button-quiet" type="button" :disabled="isLoading" @click="loadDashboard()">刷新</button>
         <button class="button button-quiet" type="button" @click="signOut">退出登录</button>
       </div>
     </header>
@@ -915,7 +1031,7 @@ onMounted(() => {
           <input id="admin-token" v-model="tokenDraft" type="password" autocomplete="off" spellcheck="false" />
           <button class="button button-primary" type="submit">进入控制台</button>
         </form>
-        <p v-if="errorMessage" class="error-line" role="alert">{{ errorMessage }}</p>
+        <p v-if="loginError" class="error-line" role="alert">{{ loginError }}</p>
       </section>
     </main>
 
@@ -925,10 +1041,13 @@ onMounted(() => {
           <p class="section-kicker">运行概览</p>
           <h1>网关控制台</h1>
         </div>
-        <p class="last-update">{{ notice || "就绪" }}</p>
+        <label class="auto-refresh" for="auto-refresh-toggle">
+          <button id="auto-refresh-toggle" class="switch" :class="{ on: autoRefresh }" type="button" :aria-pressed="autoRefresh" @click="autoRefresh = !autoRefresh">
+            <span></span>
+          </button>
+          自动刷新（30 秒）
+        </label>
       </section>
-
-      <p v-if="errorMessage" class="banner banner-error" role="alert">{{ errorMessage }}</p>
 
       <section class="metric-grid" aria-label="网关状态">
         <article class="metric">
@@ -955,73 +1074,68 @@ onMounted(() => {
       </nav>
 
       <template v-if="view === 'accounts'">
-        <section class="workspace-grid">
-          <form class="panel account-form" @submit.prevent="addAccount">
-            <div class="panel-heading">
-              <div>
-                <p class="section-kicker">连接池</p>
-                <h2>添加账号</h2>
-              </div>
-              <span class="panel-note">保存时验证登录</span>
+        <section class="panel accounts-panel">
+          <div class="panel-heading">
+            <div>
+              <p class="section-kicker">连接池</p>
+              <h2>账号管理</h2>
+              <p class="panel-sub">粘性会话 · 加权负载 · {{ enabledCount }}/{{ accounts.length }} 已启用</p>
             </div>
-            <label for="account-label">账号名称</label>
-            <input id="account-label" v-model="newAccount.label" type="text" maxlength="120" placeholder="主账号 Kimi" />
-            <label for="account-email">门户邮箱</label>
-            <input id="account-email" v-model="newAccount.email" type="email" maxlength="320" autocomplete="off" required />
-            <label for="account-password">门户密码</label>
-            <input id="account-password" v-model="newAccount.password" type="password" maxlength="4096" autocomplete="new-password" required />
-            <label for="account-weight">权重</label>
-            <input id="account-weight" v-model.number="newAccount.weight" type="number" min="1" max="100" step="1" required />
-            <label for="account-proxy">出口代理（可选）</label>
-            <input id="account-proxy" v-model="newAccount.proxy" type="text" maxlength="2048" autocomplete="off" spellcheck="false" placeholder="http://host:8080 或 socks5://user:pass@host:1080" />
-            <button class="button button-primary form-submit" type="submit" :disabled="isSaving">
-              {{ isSaving ? "验证中…" : "添加账号" }}
-            </button>
-          </form>
+            <div class="panel-actions">
+              <input v-model="accountQuery" class="search-input" type="search" placeholder="搜索账号、邮箱或代理…" aria-label="搜索账号" />
+              <button class="button button-primary" type="button" @click="showAddAccount = true">+ 添加账号</button>
+            </div>
+          </div>
 
-          <section class="panel account-list" aria-labelledby="accounts-title">
-            <div class="panel-heading">
-              <div>
-                <p class="section-kicker">调度器</p>
-                <h2 id="accounts-title">账号列表</h2>
-              </div>
-              <span class="panel-note">粘性会话 · 加权负载</span>
-            </div>
-            <div v-if="accounts.length === 0" class="empty-state">尚未配置账号。</div>
-            <div v-else class="account-table-wrap">
-              <table class="account-table">
-                <thead>
-                  <tr><th>账号</th><th>会话</th><th>运行状态</th><th>权重</th><th>操作</th></tr>
-                </thead>
-                <tbody>
-                  <tr v-for="account in accounts" :key="account.id">
-                    <td>
-                      <strong>{{ account.label }}</strong>
-                      <span class="muted">{{ account.emailHint }}</span>
-                      <span v-if="account.proxyHint" class="muted">代理 {{ account.proxyHint }}</span>
-                    </td>
-                    <td>
-                      <span class="state-text" :class="{ good: account.hasSession && !(account.sessionExpiresAt && account.sessionExpiresAt < Date.now()) }">{{ sessionLabel(account) }}</span>
-                      <span class="muted">{{ formatDate(account.updatedAt) }}</span>
-                    </td>
-                    <td>
-                      <span class="state-text" :class="{ good: account.enabled && account.runtime.cooldownUntil <= Date.now() }">{{ runtimeLabel(account) }}</span>
-                      <span v-if="account.runtime.lastError" class="muted error-detail">{{ account.runtime.lastError }}</span>
-                    </td>
-                    <td>{{ account.weight }}</td>
-                    <td class="action-cell">
-                      <button class="text-button" type="button" @click="verifyAccount(account)">验证</button>
-                      <button class="text-button" type="button" @click="editProxy(account)">代理</button>
-                      <button class="text-button" type="button" @click="toggleAccount(account)">{{ account.enabled ? "禁用" : "启用" }}</button>
-                      <button class="text-button danger" type="button" @click="removeAccount(account)">移除</button>
-                    </td>
-                  </tr>
-                </tbody>
-              </table>
-            </div>
-          </section>
+          <div v-if="accounts.length === 0" class="empty-state">
+            <p>尚未配置账号。</p>
+            <button class="button button-primary" type="button" @click="showAddAccount = true">添加第一个账号</button>
+          </div>
+          <div v-else-if="filteredAccounts.length === 0" class="empty-state">
+            <p>没有匹配「{{ accountQuery }}」的账号。</p>
+          </div>
+          <div v-else class="account-cards">
+            <article v-for="account in filteredAccounts" :key="account.id" class="account-card" :class="{ 'card-disabled': !account.enabled }">
+              <header class="account-card-head">
+                <div class="account-identity">
+                  <strong>{{ account.label }}</strong>
+                  <span class="muted">{{ account.emailHint }}</span>
+                </div>
+                <span class="badge" :class="runtimeBadge(account).tone">{{ runtimeBadge(account).text }}</span>
+              </header>
+              <dl class="account-facts">
+                <div>
+                  <dt>会话</dt>
+                  <dd>
+                    <span class="badge" :class="sessionBadge(account).tone">{{ sessionBadge(account).text }}</span>
+                    <span v-if="account.hasSession && account.sessionExpiresAt" class="muted">至 {{ formatDate(account.sessionExpiresAt) }}</span>
+                  </dd>
+                </div>
+                <div>
+                  <dt>权重</dt>
+                  <dd>{{ account.weight }}</dd>
+                </div>
+                <div>
+                  <dt>代理</dt>
+                  <dd class="mono">{{ account.proxyHint ?? "直连" }}</dd>
+                </div>
+                <div>
+                  <dt>更新</dt>
+                  <dd>{{ formatDate(account.updatedAt) }}</dd>
+                </div>
+              </dl>
+              <p v-if="account.runtime.lastError" class="account-error" :title="account.runtime.lastError">{{ account.runtime.lastError }}</p>
+              <footer class="account-actions">
+                <button class="text-button" type="button" :disabled="isAccountBusy(account.id)" @click="verifyAccount(account)">验证</button>
+                <button class="text-button" type="button" :disabled="isAccountBusy(account.id)" @click="openProxyEditor(account)">代理</button>
+                <button class="text-button" type="button" :disabled="isAccountBusy(account.id)" @click="toggleAccount(account)">{{ account.enabled ? "禁用" : "启用" }}</button>
+                <button class="text-button danger" type="button" :disabled="isAccountBusy(account.id)" @click="askRemoveAccount(account)">移除</button>
+              </footer>
+            </article>
+          </div>
         </section>
       </template>
+
 
       <template v-else>
         <section class="panel records-panel">
@@ -1036,19 +1150,27 @@ onMounted(() => {
                 <span></span>
               </button>
               <button class="button button-quiet" type="button" @click="loadRecords">刷新</button>
-              <button class="button button-danger" type="button" :disabled="records.length === 0 || isClearingRecords" @click="clearAllRecords">
-                {{ isClearingRecords ? "清空中…" : "清空全部" }}
-              </button>
+              <button class="button button-danger" type="button" :disabled="records.length === 0 || isClearingRecords" @click="askClearRecords">清空全部</button>
+            </div>
+          </div>
+          <div class="records-toolbar">
+            <input v-model="recordQuery" class="search-input" type="search" placeholder="按端点或账号搜索…" aria-label="搜索记录" />
+            <div class="filter-chips" role="group" aria-label="按状态过滤">
+              <button type="button" :class="{ active: recordFilter === 'all' }" @click="recordFilter = 'all'">全部 {{ records.length }}</button>
+              <button type="button" :class="{ active: recordFilter === 'success' }" @click="recordFilter = 'success'">成功 {{ records.length - failedRecordCount }}</button>
+              <button type="button" :class="{ active: recordFilter === 'failed' }" @click="recordFilter = 'failed'">失败 {{ failedRecordCount }}</button>
             </div>
           </div>
           <p class="records-meta">
             {{ settings.recordMessages ? "消息记录已开启" : "消息记录已关闭" }} · {{ records.length }} 个客户端请求 · {{ upstreamCallCount }} 次上游调用
             <template v-if="toolFirstPassRate !== null"> · 工具 JSON 首次解析成功率 {{ toolFirstPassRate }}%（{{ toolAdapterRecords.length }} 轮）</template>
           </p>
-          <div v-if="records.length === 0" class="empty-state">暂无聊天记录。</div>
+          <div v-if="filteredRecords.length === 0" class="empty-state">
+            <p>{{ records.length === 0 ? "暂无聊天记录。" : "没有匹配当前过滤条件的记录。" }}</p>
+          </div>
           <div v-else class="conversation-workbench">
             <aside class="trace-sidebar" aria-label="请求发送列表">
-              <section v-for="record in records" :key="record.id" class="trace-group">
+              <section v-for="record in filteredRecords" :key="record.id" class="trace-group">
                 <div class="trace-group-meta">
                   <span>{{ formatDate(record.at) }}</span>
                   <span class="trace-group-status" :class="{ success: record.status < 400 }">{{ record.status }}</span>
@@ -1177,5 +1299,89 @@ onMounted(() => {
         </section>
       </template>
     </main>
+
+    <div v-if="showAddAccount" class="modal-backdrop" @click.self="showAddAccount = false">
+      <form class="modal" @submit.prevent="addAccount">
+        <header class="modal-head">
+          <h2>添加账号</h2>
+          <button class="modal-close" type="button" aria-label="关闭" @click="showAddAccount = false">×</button>
+        </header>
+        <p class="modal-note">保存时将验证门户登录，验证成功后加入连接池。</p>
+        <div class="modal-body">
+          <label for="account-label">账号名称</label>
+          <input id="account-label" v-model="newAccount.label" type="text" maxlength="120" placeholder="主账号 Kimi" />
+          <label for="account-email">门户邮箱</label>
+          <input id="account-email" v-model="newAccount.email" type="email" maxlength="320" autocomplete="off" required />
+          <label for="account-password">门户密码</label>
+          <input id="account-password" v-model="newAccount.password" type="password" maxlength="4096" autocomplete="new-password" required />
+          <div class="field-row">
+            <div>
+              <label for="account-weight">权重</label>
+              <input id="account-weight" v-model.number="newAccount.weight" type="number" min="1" max="100" step="1" required />
+            </div>
+            <div>
+              <label for="account-proxy">出口代理（可选）</label>
+              <input id="account-proxy" v-model="newAccount.proxy" type="text" maxlength="2048" autocomplete="off" spellcheck="false" placeholder="socks5://user:pass@host:1080" />
+            </div>
+          </div>
+        </div>
+        <footer class="modal-foot">
+          <button class="button button-quiet" type="button" @click="showAddAccount = false">取消</button>
+          <button class="button button-primary" type="submit" :disabled="isSaving">{{ isSaving ? "验证中…" : "验证并添加" }}</button>
+        </footer>
+      </form>
+    </div>
+
+    <div v-if="proxyEditor" class="modal-backdrop" @click.self="proxyEditor = null">
+      <form class="modal" @submit.prevent="saveProxy">
+        <header class="modal-head">
+          <h2>设置出口代理</h2>
+          <button class="modal-close" type="button" aria-label="关闭" @click="proxyEditor = null">×</button>
+        </header>
+        <p class="modal-note">账号「{{ proxyEditor.account.label }}」 · 当前：{{ proxyEditor.account.proxyHint ?? "直连" }}</p>
+        <div class="modal-body">
+          <label for="proxy-input">代理地址</label>
+          <input id="proxy-input" v-model="proxyEditor.value" type="text" maxlength="2048" autocomplete="off" spellcheck="false" placeholder="http://host:8080 或 socks5://user:pass@host:1080" />
+          <p class="field-hint">支持 http / https / socks4 / socks5，可带认证。留空并保存将清除代理；修改后会话将重新登录。</p>
+        </div>
+        <footer class="modal-foot">
+          <button class="button button-quiet" type="button" @click="proxyEditor = null">取消</button>
+          <button class="button button-primary" type="submit" :disabled="isAccountBusy(proxyEditor.account.id)">保存</button>
+        </footer>
+      </form>
+    </div>
+
+    <div v-if="pendingRemoval" class="modal-backdrop" @click.self="pendingRemoval = null">
+      <div class="modal modal-confirm" role="alertdialog" aria-labelledby="remove-title">
+        <header class="modal-head">
+          <h2 id="remove-title">移除账号</h2>
+        </header>
+        <p class="confirm-text">确定移除账号「{{ pendingRemoval.label }}」吗？该账号的会话将被删除，此操作不可撤销。</p>
+        <footer class="modal-foot">
+          <button class="button button-quiet" type="button" @click="pendingRemoval = null">取消</button>
+          <button class="button button-danger-solid" type="button" :disabled="isAccountBusy(pendingRemoval.id)" @click="confirmRemoveAccount">移除</button>
+        </footer>
+      </div>
+    </div>
+
+    <div v-if="showClearConfirm" class="modal-backdrop" @click.self="showClearConfirm = false">
+      <div class="modal modal-confirm" role="alertdialog" aria-labelledby="clear-title">
+        <header class="modal-head">
+          <h2 id="clear-title">清空聊天记录</h2>
+        </header>
+        <p class="confirm-text">确定清空全部 {{ records.length }} 条聊天记录吗？此操作不可撤销。</p>
+        <footer class="modal-foot">
+          <button class="button button-quiet" type="button" @click="showClearConfirm = false">取消</button>
+          <button class="button button-danger-solid" type="button" :disabled="isClearingRecords" @click="confirmClearRecords">{{ isClearingRecords ? "清空中…" : "清空全部" }}</button>
+        </footer>
+      </div>
+    </div>
+
+    <div class="toast-stack" aria-live="polite">
+      <div v-for="toast in toasts" :key="toast.id" class="toast" :class="toast.kind">
+        <span class="toast-text">{{ toast.text }}</span>
+        <button class="toast-close" type="button" aria-label="关闭通知" @click="dismissToast(toast.id)">×</button>
+      </div>
+    </div>
   </div>
 </template>
