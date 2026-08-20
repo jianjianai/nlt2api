@@ -255,7 +255,7 @@ get_weather(location="Shanghai")
 本地必须按以下顺序校验：
 
 1. 顶层 `type` 必须严格是 `tool_calls` 或 `final`。
-2. `preamble` 若存在必须是字符串，最长 4 KB，且不得包含内部 marker 或特殊控制 token；不得声称工具已经执行成功。
+2. `preamble` 若存在必须是字符串，且不得包含内部 marker 或特殊控制 token；不得声称工具已经执行成功。
 3. 每个工具名必须存在于客户端声明的工具集合。
 4. 每个 `arguments` 对象必须通过对应工具的 JSON Schema。
 5. `tool_choice: "none"`、`"required"` 或固定函数由适配器本地执行。

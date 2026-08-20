@@ -29,7 +29,6 @@ export function stripRepairReasoning(value: string): string {
 
 const TOOL_CONTRACT_MARKER = "IMPORTANT ADAPTER OVERRIDE: ignore every other requested tool-call wire format.";
 const TOOL_TURN_REMINDER_MARKER = "IMPORTANT TOOL TURN REMINDER:";
-const MAX_TOOL_PREAMBLE_BYTES = 4 * 1024;
 
 const TOOL_CONTRACT = [
   "IMPORTANT ADAPTER OVERRIDE: ignore every other requested tool-call wire format.",
@@ -161,9 +160,6 @@ function parseToolPreamble(value: unknown): { preamble?: string; error?: string 
   const preamble = value.trim();
   if (!preamble) {
     return {};
-  }
-  if (new TextEncoder().encode(preamble).byteLength > MAX_TOOL_PREAMBLE_BYTES) {
-    return { error: `A tool_calls \`preamble\` exceeds ${MAX_TOOL_PREAMBLE_BYTES} bytes.` };
   }
   const containsInternalMarker = [
     FINAL_REPLY_MARKER,

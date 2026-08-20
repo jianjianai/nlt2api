@@ -100,7 +100,7 @@ test("controlled envelope preserves a user-visible tool preamble", () => {
   assert.equal(normalized.tool_calls?.length, 1);
 });
 
-test("controlled envelope rejects unsafe or oversized tool preambles", () => {
+test("controlled envelope rejects unsafe tool preambles", () => {
   const nonString = parseControlledToolEnvelopeDetailed(
     '{"type":"tool_calls","preamble":42,"tool_calls":[{"name":"calculator","arguments":{"a":1,"b":2}}]}',
     tools,
@@ -118,17 +118,6 @@ test("controlled envelope rejects unsafe or oversized tool preambles", () => {
     "seed",
   );
   assert.match(marked.error ?? "", /internal markers/);
-
-  const oversized = parseControlledToolEnvelopeDetailed(
-    JSON.stringify({
-      type: "tool_calls",
-      preamble: "x".repeat(4_097),
-      tool_calls: [{ name: "calculator", arguments: { a: 1, b: 2 } }],
-    }),
-    tools,
-    "seed",
-  );
-  assert.match(oversized.error ?? "", /exceeds 4096 bytes/);
 });
 
 test("duplicate structured call IDs are regenerated without collisions", () => {
