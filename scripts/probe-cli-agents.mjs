@@ -70,7 +70,7 @@ async function startCliGatewayProxy() {
       const incomingUrl = new URL(incoming.url || "/", "http://127.0.0.1");
       const method = incoming.method || "GET";
       const isModelRoute = incomingUrl.pathname === "/v1/models" || incomingUrl.pathname.startsWith("/v1/models/");
-      const isCompletionRoute = incomingUrl.pathname === "/v1/chat/completions" || incomingUrl.pathname === "/v1/responses";
+      const isCompletionRoute = incomingUrl.pathname === "/v1/chat/completions";
       if (incoming.headers.authorization !== `Bearer ${token}` || !((method === "GET" && isModelRoute) || (method === "POST" && isCompletionRoute))) {
         outgoing.writeHead(403, { "content-type": "application/json" });
         outgoing.end(JSON.stringify({ error: { message: "Probe gateway route denied." } }));
@@ -362,7 +362,7 @@ async function runCodex(workspace, seed, gateway) {
     "-c", 'model_providers.neuralwatt.name="NeuralWatt local gateway"',
     "-c", `model_providers.neuralwatt.base_url="${gateway.baseUrl}/v1"`,
     "-c", 'model_providers.neuralwatt.env_key="NEURALWATT_CLI_TEST_KEY"',
-    "-c", 'model_providers.neuralwatt.wire_api="responses"',
+    "-c", 'model_providers.neuralwatt.wire_api="chat"',
     "-c", "model_providers.neuralwatt.requires_openai_auth=false",
     taskPrompt(seed),
   ];

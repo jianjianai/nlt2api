@@ -388,7 +388,7 @@ async function getCompletion(
       if (requiredAccountId) {
         const stored = await stateStore.getAccount(requiredAccountId);
         if (!stored || !stored.enabled) {
-          throw new HttpError(409, "The response chain's assigned account is unavailable.", "invalid_request_error", "previous_response_id");
+          throw new HttpError(409, "The assigned account is unavailable.", "invalid_request_error", "account");
         }
         account = await accountScheduler.acquire(stickyKey, new Set((await stateStore.listAccounts()).filter((item) => item.id !== requiredAccountId).map((item) => item.id)));
       } else {

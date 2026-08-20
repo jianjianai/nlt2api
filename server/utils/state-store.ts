@@ -8,7 +8,6 @@ import type {
   PersistentState,
   PortalSession,
   ProxySettings,
-  ResponseState,
 } from "~/server/utils/types.ts";
 
 const STORE_FILE = "accounts.json";
@@ -21,19 +20,11 @@ interface RecordIndexEntry {
   file: string;
 }
 
-export class ResponseStateLimitError extends Error {
-  constructor() {
-    super("The Responses state exceeds the configured storage budget.");
-    this.name = "ResponseStateLimitError";
-  }
-}
-
 function emptyState(): PersistentState {
   return {
     version: 1,
     settings: { recordMessages: false },
     accounts: [],
-    responses: [],
   };
 }
 
@@ -45,23 +36,6 @@ function normaliseAccount(account: ManagedAccount): ManagedAccount {
     weight: Math.max(1, Math.min(100, Math.floor(account.weight || 1))),
     enabled: account.enabled !== false,
   };
-}
-
-function boundResponseStates(responses: ResponseState[]): ResponseState[] {
-  const maxBytes = getProxyConfig().maxResponseStateBytes;
-  const retained: ResponseState[] = [];
-  let totalBytes = 2;
-  for (let index = responses.length - 1; index >= 0 && retained.length < 500; index -= 1) {
-    const response = responses[index];
-    if (!response) continue;
-    const bytes = Buffer.byteLength(JSON.stringify(response), "utf8") + (retained.length > 0 ? 1 : 0);
-    if (totalBytes + bytes > maxBytes) {
-      break;
-    }
-    retained.unshift(response);
-    totalBytes += bytes;
-  }
-  return retained;
 }
 
 function compareAt(a: string, b: string): number {
@@ -103,7 +77,6 @@ export class StateStore {
         version: 1,
         settings: { recordMessages: Boolean(parsed.settings?.recordMessages) },
         accounts: parsed.accounts.map(normaliseAccount),
-        responses: boundResponseStates((parsed.responses ?? []).filter((response) => response.createdAt > Date.now() - 12 * 60 * 60 * 1_000)),
       };
     } catch (error) {
       const code = error instanceof Error && "code" in error ? (error as NodeJS.ErrnoException).code : undefined;
@@ -184,9 +157,6 @@ export class StateStore {
         throw new Error("Account not found.");
       }
       state.accounts.splice(index, 1);
-      // A Responses chain is account-affine. Remove it in the same durable
-      // mutation so a deleted account cannot be resurrected by its history.
-      state.responses = (state.responses ?? []).filter((response) => response.accountId !== id);
     });
   }
 
@@ -212,38 +182,6 @@ export class StateStore {
       }
       return { ...state.settings };
     });
-  }
-
-  async saveResponseState(response: ResponseState): Promise<void> {
-    await this.mutate((state) => {
-      // A completion may finish while its account is being deleted. The
-      // serialized mutation order makes this check atomic with the write:
-      // if deletion wins, discard the stale chain instead of recreating it.
-      if (!state.accounts.some((account) => account.id === response.accountId)) {
-        return;
-      }
-      const cutoff = Date.now() - 12 * 60 * 60 * 1_000;
-      const retained = (state.responses ?? []).filter((candidate) => candidate.createdAt > cutoff && candidate.id !== response.id);
-      retained.push(response);
-      const bounded = boundResponseStates(retained);
-      if (!bounded.some((candidate) => candidate.id === response.id)) {
-        throw new ResponseStateLimitError();
-      }
-      state.responses = bounded;
-    });
-  }
-
-  async getResponseState(id: string): Promise<ResponseState | undefined> {
-    const state = await this.getState();
-    const response = (state.responses ?? []).find((candidate) => candidate.id === id);
-    if (
-      !response
-      || response.createdAt < Date.now() - 12 * 60 * 60 * 1_000
-      || !state.accounts.some((account) => account.id === response.accountId)
-    ) {
-      return undefined;
-    }
-    return response;
   }
 
   async appendDebugRecord(record: DebugRecord): Promise<void> {

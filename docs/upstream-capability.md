@@ -267,7 +267,7 @@ get_weather(location="Shanghai")
 
 ## 调用循环
 
-对 `/v1/chat/completions`，把客户端消息历史映射为门户 `messages`。对 `/v1/responses`，把 `input`、函数调用输出项和之前的响应状态归一化为同一内部消息格式。
+对 `/v1/chat/completions`，把客户端消息历史映射为门户 `messages`。
 
 工具轮流程：
 
@@ -275,7 +275,7 @@ get_weather(location="Shanghai")
 2. 不转发门户原生 `tools` 或 `tool_choice`，由适配器本地执行策略。
 3. 在最新用户/工具结果之后追加一条仅发往门户的固定 `user` 协议提醒，重复强调本轮必须把工具调用写入 assistant `content`；该提醒不会回传给客户端，且重复构建时会去重。
 4. 内部向门户请求缓冲的工具轮。工具契约位于唯一的首条 `system` 消息中，要求模型把 JSON 写入普通 assistant `content`；JSON 未完整到达前不能安全判断是最终答案还是工具调用。
-5. 校验信封；工具结果通过后生成标准 OpenAI 工具调用 ID，Chat 返回带可选用户可见 `content` 的 `tool_calls`，Responses 返回可选 `message` 项加 `function_call` 项；`preamble` 始终在工具调用之前释放。
+5. 校验信封；工具结果通过后生成标准 OpenAI 工具调用 ID，Chat 返回带可选用户可见 `content`/`preamble` 的 `tool_calls`；`preamble` 始终在工具调用之前释放。
 6. 客户端执行自己的工具并在下一轮提交输出；代理不会执行任意客户端工具。
 7. 下一轮重建客户端历史，加入标准 assistant `tool_calls` 和各个 `role: "tool"`；发往门户前将 assistant 工具调用及 `preamble` 转换为受控 JSON `content`，并在末尾追加协议提醒，直到得到合法 `final` 或达到本地轮数上限。
 8. 客户端要求工具轮流式时，只有在内部解析完成后才合成标准 OpenAI SSE；非工具轮可以直接转发门户 SSE，但要过滤门户注释并检查内嵌错误分片。

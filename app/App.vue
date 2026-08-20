@@ -408,11 +408,6 @@ function roleName(role: unknown, type?: unknown): string {
     assistant: "助手",
     tool: "工具",
     function: "函数",
-    input_text: "输入文本",
-    output_text: "输出文本",
-    function_call: "工具调用",
-    function_call_output: "工具结果",
-    reasoning: "推理",
   };
   const key = typeof role === "string" ? role : typeof type === "string" ? type : "message";
   return names[key] ?? key;
@@ -439,9 +434,6 @@ function contentText(value: unknown): string {
       if (typeof item.image_url === "string") return `[图片] ${item.image_url}`;
       const image = asObject(item.image_url);
       if (image && typeof image.url === "string") return `[图片] ${image.url}`;
-      if (typeof item.output === "string") return item.output;
-      if (typeof item.summary === "string") return item.summary;
-      if (Array.isArray(item.summary)) return item.summary.map((entry) => contentText(entry)).filter(Boolean).join("\n");
       return displayValue(item);
     }).filter(Boolean).join("\n");
   }
@@ -467,27 +459,17 @@ function toolCalls(value: unknown): DisplayToolCall[] {
 function displayMessage(value: unknown): DisplayMessage | null {
   const message = asObject(value);
   if (!message) return null;
-  const type = message.type;
-  const role = typeof message.role === "string" ? message.role : type;
-  const output = message.output
-    ?? message.content
+  const role = typeof message.role === "string" ? message.role : "assistant";
+  const output = message.content
     ?? message.text
-    ?? message.summary
     ?? message.reasoning
     ?? message.reasoning_content
     ?? message.refusal
     ?? message.arguments;
   const calls = toolCalls(message.tool_calls);
-  if (type === "function_call") {
-    calls.push({
-      id: typeof message.call_id === "string" ? message.call_id : typeof message.id === "string" ? message.id : "tool_call",
-      name: typeof message.name === "string" ? message.name : "未命名工具",
-      arguments: contentText(message.arguments ?? {}),
-    });
-  }
   return {
-    role: typeof role === "string" ? role : "assistant",
-    roleLabel: roleName(typeof role === "string" ? role : "assistant", type),
+    role,
+    roleLabel: roleName(role),
     content: contentText(output),
     toolCalls: calls,
   };
@@ -499,16 +481,6 @@ function messageReasoningText(message: JsonRecord): string {
   if (typeof reasoning === "string") return reasoning;
   const reasoningContent = message.reasoning_content;
   if (typeof reasoningContent === "string") return reasoningContent;
-  const summary = message.summary;
-  if (typeof summary === "string") return summary;
-  if (Array.isArray(summary)) {
-    return summary.map((entry) => {
-      const part = asObject(entry);
-      if (!part) return displayValue(entry);
-      if (typeof part.text === "string") return part.text;
-      return displayValue(part);
-    }).filter(Boolean).join("");
-  }
   return "";
 }
 
@@ -522,7 +494,7 @@ function splitMessage(value: unknown): DisplayMessage[] {
   const message = asObject(value);
   if (!message || rendered.role !== "assistant") return [rendered];
   const reasoning = messageReasoningText(message);
-  const body = contentText(message.output ?? message.content ?? message.text ?? message.refusal ?? message.arguments);
+  const body = contentText(message.content ?? message.text ?? message.refusal ?? message.arguments);
   const calls = rendered.toolCalls;
   if (reasoning && body) {
     return [
@@ -539,13 +511,11 @@ function splitMessage(value: unknown): DisplayMessage[] {
   return [rendered];
 }
 
-/** True when a parsed SSE datum belongs to a stream (chat chunks or Responses events). */
+/** True when a parsed SSE datum belongs to a chat stream. */
 function isStreamingChunk(value: unknown): boolean {
   const source = asObject(value);
   if (!source) return false;
   if (source.object === "chat.completion.chunk") return true;
-  const type = String(source.type ?? "");
-  if (type.startsWith("response.") || type === "error") return true;
   const choice = asObject(Array.isArray(source.choices) ? source.choices[0] : undefined);
   return choice?.delta !== undefined;
 }
@@ -621,120 +591,10 @@ function aggregateChatCompletionChunks(chunks: unknown[], stripMarkers = true): 
   });
 }
 
-/** Merge Responses API stream events into 思考 / 最终回复 / 工具调用 boxes. */
-function aggregateResponseEvents(chunks: unknown[], stripMarkers = true): DisplayMessage[] {
-  const reasoningByItem = new Map<string, string>();
-  const textByItem = new Map<string, string>();
-  const toolByItem = new Map<string, DisplayToolCall>();
-  const errors: string[] = [];
-  for (const raw of chunks) {
-    const source = asObject(raw);
-    if (!source) continue;
-    const type = String(source.type ?? "");
-    const itemId = typeof source.item_id === "string" ? source.item_id : "";
-    if (type === "response.reasoning_text.delta" || type === "response.reasoning_summary_text.delta") {
-      const delta = typeof source.delta === "string" ? source.delta : "";
-      if (delta) {
-        const key = itemId || "__fallback";
-        reasoningByItem.set(key, `${reasoningByItem.get(key) ?? ""}${delta}`);
-      }
-    } else if (type === "response.reasoning_text.done" || type === "response.reasoning_summary_text.done") {
-      const text = typeof source.text === "string" ? source.text : "";
-      if (text) reasoningByItem.set(itemId || "__fallback", text);
-    } else if (type === "response.output_text.delta" || type === "response.refusal.delta") {
-      const delta = typeof source.delta === "string" ? source.delta : "";
-      if (delta) {
-        const key = itemId || "__fallback";
-        textByItem.set(key, `${textByItem.get(key) ?? ""}${delta}`);
-      }
-    } else if (type === "response.output_text.done" || type === "response.refusal.done") {
-      const text = typeof source.text === "string" ? source.text : typeof source.refusal === "string" ? source.refusal : "";
-      if (text) textByItem.set(itemId || "__fallback", text);
-    } else if (type === "response.function_call_arguments.delta") {
-      const delta = typeof source.delta === "string" ? source.delta : "";
-      const key = itemId || "__fallback";
-      const known = toolByItem.get(key) ?? { id: itemId || "tool_call", name: "未命名工具", arguments: "" };
-      known.arguments += delta;
-      toolByItem.set(key, known);
-    } else if (type === "response.function_call_arguments.done") {
-      const key = itemId || "__fallback";
-      const name = typeof source.name === "string" ? source.name : "";
-      const argumentsText = typeof source.arguments === "string" ? source.arguments : "";
-      const known = toolByItem.get(key) ?? { id: itemId || "tool_call", name, arguments: argumentsText };
-      if (name) known.name = name;
-      if (argumentsText) known.arguments = argumentsText;
-      toolByItem.set(key, known);
-    } else if (type === "response.output_item.added" || type === "response.output_item.done") {
-      const item = asObject(source.item);
-      if (!item) continue;
-      const itemType = String(item.type ?? "");
-      const resolvedId = typeof item.id === "string" ? item.id : itemId;
-      if (itemType === "reasoning") {
-        const summary = Array.isArray(item.summary)
-          ? item.summary.map((entry) => {
-              const part = asObject(entry);
-              return part && typeof part.text === "string" ? part.text : displayValue(entry);
-            }).filter(Boolean).join("")
-          : typeof item.summary === "string"
-            ? item.summary
-            : "";
-        if (summary) reasoningByItem.set(resolvedId || "__fallback", summary);
-      } else if (itemType === "function_call") {
-        const fn = asObject(item.function) ?? {};
-        const key = resolvedId || "__fallback";
-        const known = toolByItem.get(key) ?? {
-          id: resolvedId || "tool_call",
-          name: typeof fn.name === "string" ? fn.name : "未命名工具",
-          arguments: "",
-        };
-        if (typeof fn.name === "string" && fn.name) known.name = fn.name;
-        if (typeof fn.arguments === "string" && fn.arguments) known.arguments = fn.arguments;
-        toolByItem.set(key, known);
-      } else if (itemType === "message") {
-        const text = contentText(item.content ?? "");
-        if (text) textByItem.set(resolvedId || "__fallback", text);
-      }
-    } else if (type === "response.completed" || type === "response.incomplete" || type === "response.failed") {
-      const response = asObject(source.response);
-      if (response && reasoningByItem.size === 0 && textByItem.size === 0 && toolByItem.size === 0) {
-        // Terminal events may carry complete output when delta events are missing.
-        for (const item of Array.isArray(response.output) ? response.output : []) {
-          const itemObject = asObject(item);
-          if (!itemObject) continue;
-          const itemType = String(itemObject.type ?? "");
-          const resolvedId = typeof itemObject.id === "string" ? itemObject.id : "";
-          if (itemType === "reasoning") {
-            reasoningByItem.set(resolvedId || "__fallback", contentText(itemObject.summary ?? ""));
-          } else if (itemType === "function_call") {
-            const fn = asObject(itemObject.function) ?? {};
-            toolByItem.set(resolvedId || "tool_call", {
-              id: resolvedId || "tool_call",
-              name: typeof fn.name === "string" ? fn.name : "未命名工具",
-              arguments: contentText(itemObject.arguments ?? fn.arguments ?? ""),
-            });
-          } else if (itemType === "message") {
-            textByItem.set(resolvedId || "__fallback", contentText(itemObject.content ?? ""));
-          }
-        }
-      }
-    } else if (type === "error") {
-      const messageText = typeof source.message === "string" ? source.message : "";
-      if (messageText) errors.push(messageText);
-    }
-  }
-  return buildAggregatedMessages({
-    reasoning: stripMarkers ? cleanMarkers([...reasoningByItem.values()].join("\n")) : [...reasoningByItem.values()].join("\n").trim(),
-    content: stripMarkers ? cleanMarkers([...textByItem.values()].join("\n")) : [...textByItem.values()].join("\n").trim(),
-    toolCalls: [...toolByItem.values()],
-    errors,
-  });
-}
-
 function aggregateStreamingMessages(values: unknown[], stripMarkers: boolean): DisplayMessage[] {
   const chunks = values.filter(isStreamingChunk);
   if (chunks.length === 0) return [];
-  const chatChunks = chunks.some((value) => asObject(value)?.object === "chat.completion.chunk");
-  return chatChunks ? aggregateChatCompletionChunks(chunks, stripMarkers) : aggregateResponseEvents(chunks, stripMarkers);
+  return aggregateChatCompletionChunks(chunks, stripMarkers);
 }
 
 /** Collect messages from a body, concatenating streaming chunks into one box per kind. */
@@ -751,8 +611,6 @@ function collectMessages(value: unknown): DisplayMessage[] {
   const source = asObject(value);
   const candidates: unknown[] = [];
   if (Array.isArray(source?.messages)) candidates.push(...source.messages);
-  if (Array.isArray(source?.input)) candidates.push(...source.input);
-  if (Array.isArray(source?.output)) candidates.push(...source.output);
   if (Array.isArray(source?.choices)) {
     for (const choice of source.choices) {
       const item = asObject(choice);
@@ -760,7 +618,7 @@ function collectMessages(value: unknown): DisplayMessage[] {
       else if (item?.delta) candidates.push(item.delta);
     }
   }
-  if (source?.role || ["message", "function_call", "function_call_output", "reasoning", "input_text", "output_text"].includes(String(source?.type))) {
+  if (source?.role) {
     candidates.push(source);
   }
   return candidates.flatMap(splitMessage);
@@ -935,7 +793,7 @@ function dedupeFields(fields: DisplayField[]): DisplayField[] {
 
 /** Bubble alignment: model/system/tool calls on the left, user input on the right. */
 function messageAlign(role: string): "left" | "right" {
-  return ["user", "tool", "function_call_output", "input_text"].includes(role) ? "right" : "left";
+  return ["user", "tool"].includes(role) ? "right" : "left";
 }
 
 function setMessageContentEl(key: string, el: unknown): void {

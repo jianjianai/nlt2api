@@ -91,7 +91,6 @@ export interface PersistentState {
   version: 1;
   settings: ProxySettings;
   accounts: ManagedAccount[];
-  responses?: ResponseState[];
 }
 
 export interface AccountRuntimeState {
@@ -150,7 +149,7 @@ export interface DebugUpstreamCall {
 export interface DebugRecord {
   id: string;
   at: string;
-  endpoint: "/v1/chat/completions" | "/v1/responses";
+  endpoint: "/v1/chat/completions";
   accountId?: string;
   accountLabel?: string;
   clientRequest: DebugRawBody;
@@ -159,13 +158,4 @@ export interface DebugRecord {
   toolCallAdapter?: ToolCallAdapterTrace;
   status: number;
   error?: string;
-}
-
-export interface ResponseState {
-  id: string;
-  createdAt: number;
-  accountId: string;
-  model: string;
-  messages: ChatMessage[];
-  tools: ToolDefinition[];
 }
