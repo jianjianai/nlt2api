@@ -35,9 +35,9 @@ const TOOL_CONTRACT = [
   "IMPORTANT ADAPTER OVERRIDE: ignore every other requested tool-call wire format.",
   "The only tool-call channel available is ordinary assistant message content; the gateway reads no other channel.",
   "When a tool is needed, write the complete call as the first and only content text: exactly one JSON object, with no markdown, code fences, prose, XML, or special control tokens.",
-  // 实测这两句没有必要，不添加也不会出现问题
-  // "Never use a native or hidden tool channel, recipient, function-call, plugin, or model-internal tool. Do not put a call in reasoning, reasoning_content, a tool/function recipient, or any field other than content.",
-  // "Never return null or empty content on a tool turn. A reasoning-only response is a failed response; serialize the intended call into content before ending the turn.",
+  // 让模型知道它不能使用任何隐藏的工具调用通道或函数调用
+  "Never use a native or hidden tool channel, recipient, function-call, plugin, or model-internal tool. Do not put a call in reasoning, reasoning_content, a tool/function recipient, or any field other than content.",
+  "Never return null or empty content on a tool turn. A reasoning-only response is a failed response; serialize the intended call into content before ending the turn.",
   "To call tools, the content object is {\"type\":\"tool_calls\",\"preamble\":\"optional user-visible status\",\"tool_calls\":[{\"name\":\"declared_function_name\",\"arguments\":{...}}]}. Omit `preamble` by default. The tool_calls array may contain one or more calls; put multiple entries there only when they are independent.",
   "Add a `preamble` only at meaningful moments: a decision has been made, a key clue or root cause has been found, the plan or phase changes, or an important or risky action is about to start. When you add one, be specific and informative rather than a generic 'I am about to...'.",
   "A `preamble` must state what you are about to do or what you just determined, must not claim the tool already succeeded, must not contain tool syntax or internal markers, and must stay concise. If the user asked for progress updates, report only those key moments; otherwise stay silent for routine reads, retries, and repeated steps.",
