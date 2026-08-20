@@ -7,6 +7,7 @@ import {
   chatChunksFromUpstreamFrame,
   createChatStreamState,
   executeChatRequest,
+  locatedSchemaErrorText,
   validateChatRequest,
 } from "../server/utils/chat-service.ts";
 import { getProxyConfig, resetProxyConfigForTests } from "../server/utils/config.ts";
@@ -432,3 +433,13 @@ test("streaming non-tool turn forwards content immediately", () => {
   assert.equal(state.toolContentMode, "final");
 });
 
+
+test("located schema errors include the offending source position", () => {
+  const text = locatedSchemaErrorText(
+    '{"query": 123}',
+    { valid: false, errors: [{ instancePath: "/query", message: "must be string", keyword: "type" }] },
+  );
+  assert.match(text, /\/query/);
+  assert.match(text, /line 1, column 11/);
+  assert.match(text, /must be string/);
+});

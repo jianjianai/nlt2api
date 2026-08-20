@@ -13,6 +13,7 @@ import {
   serializeAssistantToolCallsForPortal,
   parseControlledToolEnvelope,
   parseControlledToolEnvelopeDetailed,
+  parseRepairJson,
   withToolCallContract,
 } from "../server/utils/tool-calls.ts";
 import {
@@ -237,14 +238,16 @@ test("marked final replies are accepted and the marker is removed", () => {
   assert.deepEqual(parsed.envelope, { type: "final", content: "answer" });
 });
 
-test("controlled envelope reports exact JSON and call-shape errors for repair", () => {
-  const malformed = parseControlledToolEnvelopeDetailed(
+test("controlled envelope repairs recoverable JSON and reports call-shape errors", () => {
+  const repaired = parseControlledToolEnvelopeDetailed(
     '{"type":"tool_calls","tool_calls":[{"name":"calculator","arguments":{"a":1,"b":2}}]',
     tools,
     "seed",
   );
-  assert.equal(malformed.envelope, undefined);
-  assert.match(malformed.error ?? "", /^JSON parse failed:/);
+  assert.equal(repaired.envelope?.type, "tool_calls");
+  if (repaired.envelope?.type !== "tool_calls") return;
+  assert.equal(repaired.envelope.toolCalls.length, 1);
+  assert.deepEqual(JSON.parse(repaired.envelope.toolCalls[0]!.function.arguments), { a: 1, b: 2 });
 
   const badArguments = parseControlledToolEnvelopeDetailed(
     '{"type":"tool_calls","tool_calls":[{"name":"calculator","arguments":[]}]}',
@@ -255,6 +258,26 @@ test("controlled envelope reports exact JSON and call-shape errors for repair", 
   assert.match(badArguments.error ?? "", /tool_calls\[0\]/);
 });
 
+test("jsonrepair recovers truncated tool-call JSON before reporting an error", () => {
+  const result = parseRepairJson('{"type":"tool_calls","tool_calls":[{"name":"calculator","arguments":{"a":1,"b":2}}]');
+  assert.ok("value" in result);
+  if (!("value" in result)) return;
+  assert.equal(result.repaired, true);
+  assert.deepEqual(result.value, {
+    type: "tool_calls",
+    tool_calls: [{ name: "calculator", arguments: { a: 1, b: 2 } }],
+  });
+});
+
+test("unrepairable JSON produces a located, friendly diagnostic", () => {
+  const result = parseRepairJson('{"type":"tool_calls","tool_calls":[{"name":"calculator","arguments":{"a":1,"b":2}}]} <|trailing|>');
+  assert.ok(!("value" in result));
+  if ("value" in result) return;
+  assert.match(result.error, /could not be parsed/);
+  assert.match(result.error, /line 1, column \d+/);
+  assert.match(result.error, />>>/);
+});
+
 test("controlled envelope leaves embedded or bare call forms to the repair loop", () => {
   const embedded = parseControlledToolEnvelopeDetailed(
     'Thought complete. <tool_call>{"name":"calculator","arguments":{"a":1,"b":2}}</tool_call>',
@@ -262,7 +285,7 @@ test("controlled envelope leaves embedded or bare call forms to the repair loop"
     "seed",
   );
   assert.equal(embedded.envelope, undefined);
-  assert.match(embedded.error ?? "", /^JSON parse failed:/);
+  assert.match(embedded.error ?? "", /could not be parsed/);
 
   const bare = parseControlledToolEnvelopeDetailed(
     '{"name":"calculator","arguments":{"a":1,"b":2}}',

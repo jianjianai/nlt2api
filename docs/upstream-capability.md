@@ -259,7 +259,7 @@ get_weather(location="Shanghai")
 3. 每个工具名必须存在于客户端声明的工具集合。
 4. 每个 `arguments` 对象必须通过对应工具的 JSON Schema。
 5. `tool_choice: "none"`、`"required"` 或固定函数由适配器本地执行。
-6. JSON 无效、工具未知、参数无效或选择策略冲突时，最多发起五次有界纠错；每次纠错保留第一次响应的 reasoning 字段，替换上一份错误候选，并把精确的解析/策略/Schema 错误放入提示。纠错轮的 reasoning 可以立即流式发给客户端，但会带内部标记，并在下一轮上游重放前移除；因此上游只看到首次 reasoning 和最终已校验的工具调用。绝不对任意 prose 做“尽力解析”。
+6. JSON 先直接解析；解析失败时用 `jsonrepair` 尝试修复，修复成功直接采用；仍失败时用 `json-source-map`/原生错误位置生成带行、列和上下文片段的友好诊断。工具未知、参数或策略/Schema 失败时同样生成带 `instancePath` 与源位置的友好错误。最多发起五次有界纠错；每次纠错保留第一次响应的 reasoning 字段，替换上一份错误候选。纠错轮的 reasoning 可以立即流式发给客户端，但会带内部标记，并在下一轮上游重放前移除；因此上游只看到首次 reasoning 和最终已校验的工具调用。绝不对任意 prose 做“尽力解析”。
 
 受控信封测试结果：六种模型的首轮均能解析；DeepSeek Flash、GLM Fast 和 Kimi K3 Fast 的双工具请求返回预期数组；网关将信封转换为客户端可见的标准 assistant `tool_calls`，客户端再提交 `role: "tool"` 结果。下一次发往门户时，网关会把这份 assistant `tool_calls` 再编码为受控 JSON `content`，六种模型均返回使用 `25 C` 结果的有效 `{"type":"final",...}`。
 

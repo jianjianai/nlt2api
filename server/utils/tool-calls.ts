@@ -1,3 +1,4 @@
+import { jsonrepair } from "jsonrepair";
 import type { ChatMessage, JsonObject, JsonValue, NormalizedToolCall, ToolDefinition } from "~/server/utils/types.ts";
 
 export const FINAL_REPLY_MARKER = "@@FINAL_REPLY@@";
@@ -214,6 +215,74 @@ export function envelopeAllowedForToolChoice(envelope: ControlledToolEnvelope | 
   return toolChoice !== "required" && objectValue(toolChoice)?.type !== "function";
 }
 
+export interface JsonRepairResult {
+  value: unknown;
+  repaired: boolean;
+}
+
+export interface JsonRepairFailure {
+  error: string;
+}
+
+interface JsonErrorPosition {
+  pos: number;
+  line?: number;
+  column?: number;
+}
+
+function jsonErrorPosition(message: string): JsonErrorPosition | undefined {
+  const withLineColumn = /at position (\d+) \(line (\d+) column (\d+)\)/.exec(message);
+  if (withLineColumn) {
+    return {
+      pos: Number(withLineColumn[1]),
+      line: Number(withLineColumn[2]),
+      column: Number(withLineColumn[3]),
+    };
+  }
+  const plain = /at position (\d+)/.exec(message);
+  return plain ? { pos: Number(plain[1]) } : undefined;
+}
+
+function excerptAround(text: string, pos: number, radius = 60): string {
+  const start = Math.max(0, pos - radius);
+  const end = Math.min(text.length, pos + radius);
+  const prefix = start > 0 ? "…" : "";
+  const suffix = end < text.length ? "…" : "";
+  return `${prefix}${text.slice(start, pos)}>>>${text.slice(pos, pos + 1)}<<<${text.slice(pos + 1, end)}${suffix}`;
+}
+
+function friendlyJsonParseError(text: string, nativeError: unknown, repairError: unknown): string {
+  const native = nativeError instanceof Error ? nativeError.message : String(nativeError);
+  const repair = repairError instanceof Error ? repairError.message : String(repairError);
+  const position = jsonErrorPosition(native);
+  const lines = [
+    "The tool-call JSON could not be parsed, and automatic repair also failed.",
+    `JSON.parse error: ${native}`,
+    `jsonrepair error: ${repair}`,
+  ];
+  if (position) {
+    const line = position.line ?? "?";
+    const column = position.column ?? "?";
+    lines.push(`The parser stopped at line ${line}, column ${column} (position ${position.pos}).`);
+    lines.push(`Nearby text: ${excerptAround(text, position.pos)}`);
+  }
+  lines.push("Return exactly one valid JSON object as assistant content, with no prose, markdown, or code fences.");
+  return lines.join("\n");
+}
+
+export function parseRepairJson(text: string): JsonRepairResult | JsonRepairFailure {
+  try {
+    return { value: JSON.parse(text), repaired: false };
+  } catch (nativeError) {
+    try {
+      const repaired = jsonrepair(text);
+      return { value: JSON.parse(repaired), repaired: true };
+    } catch (repairError) {
+      return { error: friendlyJsonParseError(text, nativeError, repairError) };
+    }
+  }
+}
+
 export function parseControlledToolEnvelopeDetailed(
   content: string,
   tools: ToolDefinition[] | undefined,
@@ -226,12 +295,11 @@ export function parseControlledToolEnvelopeDetailed(
   }
 
   let parsed: unknown;
-  try {
-    parsed = JSON.parse(trimmed);
-  } catch (error) {
-    const detail = error instanceof Error ? error.message : "unknown JSON parse error";
-    return { error: `JSON parse failed: ${detail}` };
+  const parsedJson = parseRepairJson(trimmed);
+  if (!("value" in parsedJson)) {
+    return { error: parsedJson.error };
   }
+  parsed = parsedJson.value;
   const envelope = objectValue(parsed);
   if (!envelope) {
     return { error: "The response must be one JSON object." };

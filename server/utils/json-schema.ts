@@ -116,3 +116,51 @@ export function parseAndValidateToolArguments(
   }
   return { value, validation: validateJsonSchema(value, schema) };
 }
+
+export interface LocatedSchemaError {
+  instancePath: string;
+  message: string;
+  keyword: string;
+}
+
+export interface LocatedSchemaValidationResult {
+  valid: boolean;
+  errors: LocatedSchemaError[];
+}
+
+export function validateJsonSchemaLocated(value: unknown, schema: JsonObject | undefined): LocatedSchemaValidationResult {
+  if (!schema || Object.keys(schema).length === 0) {
+    return { valid: true, errors: [] };
+  }
+  const compiled = compileSchema(schema);
+  if (typeof compiled === "string") {
+    return { valid: false, errors: [{ instancePath: "$", message: `schema is invalid: ${compiled}`, keyword: "schema" }] };
+  }
+  const valid = compiled(value);
+  return valid
+    ? { valid: true, errors: [] }
+    : {
+      valid: false,
+      errors: (compiled.errors ?? []).map((error) => ({
+        instancePath: error.instancePath || "$",
+        message: error.message ?? error.keyword,
+        keyword: error.keyword,
+      })),
+    };
+}
+
+export function parseAndValidateToolArgumentsLocated(
+  argumentsValue: string,
+  schema: JsonObject | undefined,
+): { value: JsonValue; validation: LocatedSchemaValidationResult } {
+  let value: JsonValue;
+  try {
+    value = JSON.parse(argumentsValue) as JsonValue;
+  } catch {
+    return { value: null, validation: { valid: false, errors: [{ instancePath: "$", message: "arguments are not valid JSON", keyword: "parse" }] } };
+  }
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return { value, validation: { valid: false, errors: [{ instancePath: "$", message: "arguments must be a JSON object", keyword: "type" }] } };
+  }
+  return { value, validation: validateJsonSchemaLocated(value, schema) };
+}

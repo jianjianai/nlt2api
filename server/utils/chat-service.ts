@@ -1,8 +1,13 @@
 import { createHash, randomUUID } from "node:crypto";
+import { parse as parseJsonSourceMap } from "json-source-map";
 import { accountScheduler } from "~/server/utils/account-scheduler.ts";
 import { getProxyConfig } from "~/server/utils/config.ts";
 import { HttpError } from "~/server/utils/http.ts";
-import { parseAndValidateToolArguments, validateSchemaDefinition } from "~/server/utils/json-schema.ts";
+import {
+  parseAndValidateToolArgumentsLocated,
+  validateSchemaDefinition,
+  type LocatedSchemaValidationResult,
+} from "~/server/utils/json-schema.ts";
 import { portalClient, PortalError, readPortalJsonBody, retryAfterSeconds } from "~/server/utils/portal-client.ts";
 import { ProxyRequestError, type RequestDebugContext } from "~/server/utils/request-errors.ts";
 import { stateStore } from "~/server/utils/state-store.ts";
@@ -589,6 +594,21 @@ async function getCompletion(
   );
 }
 
+export function locatedSchemaErrorText(argumentsValue: string, validation: LocatedSchemaValidationResult): string {
+  let pointers: Record<string, { value?: { line: number; column: number } }> = {};
+  try {
+    const sourceMap = parseJsonSourceMap(argumentsValue);
+    pointers = sourceMap.pointers as unknown as typeof pointers;
+  } catch {
+    // Fall back to plain Ajv messages when the source map cannot be built.
+  }
+  return validation.errors.map((error) => {
+    const position = pointers[error.instancePath]?.value;
+    const location = position ? ` (line ${position.line + 1}, column ${position.column + 1})` : "";
+    return `- ${error.instancePath}${location}: ${error.message}`;
+  }).join("\n");
+}
+
 function validateGeneratedCalls(calls: NormalizedToolCall[], tools: ToolDefinition[], toolChoice: unknown, parallelToolCalls: boolean): void {
   if (toolChoice === "none" && calls.length > 0) {
     throw new HttpError(502, "Portal attempted a tool call despite tool_choice='none'.", "server_error");
@@ -608,9 +628,10 @@ function validateGeneratedCalls(calls: NormalizedToolCall[], tools: ToolDefiniti
       throw new HttpError(502, "Portal returned tool arguments that exceed the adapter limit.", "server_error");
     }
     const tool = tools.find((candidate) => candidate.function.name === call.function.name);
-    const { validation } = parseAndValidateToolArguments(call.function.arguments, tool?.function.parameters);
+    const { validation } = parseAndValidateToolArgumentsLocated(call.function.arguments, tool?.function.parameters);
     if (!validation.valid) {
-      throw new HttpError(502, `Portal returned invalid arguments for \`${call.function.name}\`: ${validation.errors.join("; ")}`, "server_error");
+      const detail = locatedSchemaErrorText(call.function.arguments, validation);
+      throw new HttpError(502, `Tool \`${call.function.name}\` arguments failed schema validation:\n${detail}`, "server_error");
     }
   }
 }
@@ -648,10 +669,19 @@ function repairMessage(error: string, attempt: number, candidate: ChatMessage, p
     role: "tool",
     tool_call_id: candidateToolCallId ?? `call_repair_${attempt}`,
     content: [
-      `This is tool-call repair attempt ${attempt}. ${context}`,
-      "The previous tool-call JSON could not be accepted. Return the corrected JSON object only.",
-      `Validation error: ${error.slice(0, 2_000)}`,
-      `Preserve the original intended action when possible. Use the required envelope, a declared function name, and arguments that satisfy its JSON Schema. ${callRule} End immediately after the JSON object.`,
+      `Tool-call repair attempt ${attempt}.`,
+      context,
+      "",
+      "The previous tool-call JSON was rejected. Return only the corrected JSON object.",
+      "",
+      "Rejection details:",
+      error.slice(0, 2_000),
+      "",
+      "Rules:",
+      "- Use the required envelope and a declared function name.",
+      "- Make arguments satisfy the declared JSON Schema.",
+      `- ${callRule}`,
+      "- Output exactly one JSON object with no prose, markdown, or code fences.",
     ].join("\n"),
   };
 }
