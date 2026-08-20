@@ -235,11 +235,14 @@ get_weather(location="Shanghai")
 ```json
 {
   "type": "tool_calls",
+  "preamble": "我先检查当前天气数据源。",
   "tool_calls": [
     { "name": "get_weather", "arguments": { "city": "Shanghai" } }
   ]
 }
 ```
+
+`preamble` 可选；它是在工具执行前展示给用户的简短行动说明，由适配器在校验完整信封后释放。
 
 或：
 
@@ -252,10 +255,11 @@ get_weather(location="Shanghai")
 本地必须按以下顺序校验：
 
 1. 顶层 `type` 必须严格是 `tool_calls` 或 `final`。
-2. 每个工具名必须存在于客户端声明的工具集合。
-3. 每个 `arguments` 对象必须通过对应工具的 JSON Schema。
-4. `tool_choice: "none"`、`"required"` 或固定函数由适配器本地执行。
-5. JSON 无效、工具未知、参数无效或选择策略冲突时，最多发起五次有界纠错；每次纠错保留第一次响应的 reasoning 字段，替换上一份错误候选，并把精确的解析/策略/Schema 错误放入提示。纠错轮的 reasoning 可以立即流式发给客户端，但会带内部标记，并在下一轮上游重放前移除；因此上游只看到首次 reasoning 和最终已校验的工具调用。绝不对任意 prose 做“尽力解析”。
+2. `preamble` 若存在必须是字符串，最长 4 KB，且不得包含内部 marker 或特殊控制 token；不得声称工具已经执行成功。
+3. 每个工具名必须存在于客户端声明的工具集合。
+4. 每个 `arguments` 对象必须通过对应工具的 JSON Schema。
+5. `tool_choice: "none"`、`"required"` 或固定函数由适配器本地执行。
+6. JSON 无效、工具未知、参数无效或选择策略冲突时，最多发起五次有界纠错；每次纠错保留第一次响应的 reasoning 字段，替换上一份错误候选，并把精确的解析/策略/Schema 错误放入提示。纠错轮的 reasoning 可以立即流式发给客户端，但会带内部标记，并在下一轮上游重放前移除；因此上游只看到首次 reasoning 和最终已校验的工具调用。绝不对任意 prose 做“尽力解析”。
 
 受控信封测试结果：六种模型的首轮均能解析；DeepSeek Flash、GLM Fast 和 Kimi K3 Fast 的双工具请求返回预期数组；网关将信封转换为客户端可见的标准 assistant `tool_calls`，客户端再提交 `role: "tool"` 结果。下一次发往门户时，网关会把这份 assistant `tool_calls` 再编码为受控 JSON `content`，六种模型均返回使用 `25 C` 结果的有效 `{"type":"final",...}`。
 
@@ -271,9 +275,9 @@ get_weather(location="Shanghai")
 2. 不转发门户原生 `tools` 或 `tool_choice`，由适配器本地执行策略。
 3. 在最新用户/工具结果之后追加一条仅发往门户的固定 `user` 协议提醒，重复强调本轮必须把工具调用写入 assistant `content`；该提醒不会回传给客户端，且重复构建时会去重。
 4. 内部向门户请求缓冲的工具轮。工具契约位于唯一的首条 `system` 消息中，要求模型把 JSON 写入普通 assistant `content`；JSON 未完整到达前不能安全判断是最终答案还是工具调用。
-5. 校验信封；工具结果通过后生成标准 OpenAI 工具调用 ID，Chat 返回 `tool_calls`，Responses 返回 `function_call` 项。
+5. 校验信封；工具结果通过后生成标准 OpenAI 工具调用 ID，Chat 返回带可选用户可见 `content` 的 `tool_calls`，Responses 返回可选 `message` 项加 `function_call` 项；`preamble` 始终在工具调用之前释放。
 6. 客户端执行自己的工具并在下一轮提交输出；代理不会执行任意客户端工具。
-7. 下一轮重建客户端历史，加入标准 assistant `tool_calls` 和各个 `role: "tool"`；发往门户前将 assistant 工具调用转换为受控 JSON `content`，并在末尾追加协议提醒，直到得到合法 `final` 或达到本地轮数上限。
+7. 下一轮重建客户端历史，加入标准 assistant `tool_calls` 和各个 `role: "tool"`；发往门户前将 assistant 工具调用及 `preamble` 转换为受控 JSON `content`，并在末尾追加协议提醒，直到得到合法 `final` 或达到本地轮数上限。
 8. 客户端要求工具轮流式时，只有在内部解析完成后才合成标准 OpenAI SSE；非工具轮可以直接转发门户 SSE，但要过滤门户注释并检查内嵌错误分片。
 
 必须设置本地上限：工具轮数、单轮工具数、全部参数字节数和工具结果字节数。门户没有展示等价的输入校验。

@@ -387,7 +387,7 @@ function newResponseOutputIdentity(): ResponseOutputIdentity {
   };
 }
 
-function responseOutput(
+export function responseOutput(
   message: ChatMessage,
   status: "completed" | "incomplete",
   identity = newResponseOutputIdentity(),
@@ -411,28 +411,27 @@ function responseOutput(
       summary: [{ type: "summary_text", text: reasoning }],
     });
   }
-  if (message.tool_calls?.length) {
-    return [
-      ...reasoningOutput,
-      ...message.tool_calls.map((call, index) => ({
-      id: identity.functionCallIds[index] ?? `fc_${randomUUID().replaceAll("-", "")}`,
-      type: "function_call",
-      status,
-      call_id: call.id,
-      name: call.function.name,
-      arguments: call.function.arguments,
-      })),
-    ];
-  }
-  messageOutput.push({
-    id: identity.messageId,
-    type: "message",
+  const functionCallOutput: JsonObject[] = (message.tool_calls ?? []).map((call, index) => ({
+    id: identity.functionCallIds[index] ?? `fc_${randomUUID().replaceAll("-", "")}`,
+    type: "function_call",
     status,
-    role: "assistant",
-    content: typeof message.refusal === "string" && message.refusal
-      ? [{ type: "refusal", refusal: message.refusal }]
-      : [{ type: "output_text", text: outputToText(message.content), annotations: [], logprobs: [] }],
-  });
+    call_id: call.id,
+    name: call.function.name,
+    arguments: call.function.arguments,
+  }));
+  const messageText = outputToText(message.content);
+  const hasRefusal = typeof message.refusal === "string" && Boolean(message.refusal);
+  if (hasRefusal || messageText || functionCallOutput.length === 0) {
+    messageOutput.push({
+      id: identity.messageId,
+      type: "message",
+      status,
+      role: "assistant",
+      content: hasRefusal
+        ? [{ type: "refusal", refusal: message.refusal }]
+        : [{ type: "output_text", text: messageText, annotations: [], logprobs: [] }],
+    });
+  }
   const ordered = outputOrder.length > 0 ? outputOrder : ["reasoning", "message"] as ResponseOutputKind[];
   const output: JsonObject[] = [];
   for (const kind of ordered) {
@@ -445,6 +444,7 @@ function responseOutput(
   }
   if (reasoningOutput.length > 0 && !output.includes(reasoningOutput[0]!)) output.push(...reasoningOutput);
   if (messageOutput.length > 0 && !output.includes(messageOutput[0]!)) output.push(...messageOutput);
+  output.push(...functionCallOutput);
   return output;
 }
 
@@ -849,7 +849,7 @@ export async function executeResponsesRequest(
   });
   const responseStatus = execution.finishReason === "length" ? "incomplete" : "completed";
   const output = responseOutput(execution.message, responseStatus, outputIdentity, liveState?.outputOrder);
-  const text = execution.message.tool_calls?.length ? "" : outputToText(execution.message.content);
+  const text = outputToText(execution.message.content);
   const response: JsonObject = {
     id,
     object: "response",

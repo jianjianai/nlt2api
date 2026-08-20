@@ -74,6 +74,63 @@ test("controlled envelope produces stable OpenAI tool calls", () => {
   assert.deepEqual(JSON.parse(envelope.toolCalls[0]!.function.arguments), { a: 29, b: 13 });
 });
 
+test("controlled envelope preserves a user-visible tool preamble", () => {
+  const envelope = parseControlledToolEnvelope(
+    JSON.stringify({
+      type: "tool_calls",
+      preamble: "I will inspect the calculation inputs first.",
+      tool_calls: [{ name: "calculator", arguments: { a: 29, b: 13 } }],
+    }),
+    tools,
+    "chatcmpl-preamble",
+  );
+
+  assert.equal(envelope?.type, "tool_calls");
+  if (envelope?.type !== "tool_calls") return;
+  assert.equal(envelope.preamble, "I will inspect the calculation inputs first.");
+  const normalized = normaliseAssistantToolCalls({
+    role: "assistant",
+    content: JSON.stringify({
+      type: "tool_calls",
+      preamble: "I will inspect the calculation inputs first.",
+      tool_calls: [{ name: "calculator", arguments: { a: 29, b: 13 } }],
+    }),
+  }, tools, "chatcmpl-preamble");
+  assert.equal(normalized.content, "I will inspect the calculation inputs first.");
+  assert.equal(normalized.tool_calls?.length, 1);
+});
+
+test("controlled envelope rejects unsafe or oversized tool preambles", () => {
+  const nonString = parseControlledToolEnvelopeDetailed(
+    '{"type":"tool_calls","preamble":42,"tool_calls":[{"name":"calculator","arguments":{"a":1,"b":2}}]}',
+    tools,
+    "seed",
+  );
+  assert.match(nonString.error ?? "", /preamble.*string/);
+
+  const marked = parseControlledToolEnvelopeDetailed(
+    JSON.stringify({
+      type: "tool_calls",
+      preamble: `starting ${FINAL_REPLY_MARKER}`,
+      tool_calls: [{ name: "calculator", arguments: { a: 1, b: 2 } }],
+    }),
+    tools,
+    "seed",
+  );
+  assert.match(marked.error ?? "", /internal markers/);
+
+  const oversized = parseControlledToolEnvelopeDetailed(
+    JSON.stringify({
+      type: "tool_calls",
+      preamble: "x".repeat(4_097),
+      tool_calls: [{ name: "calculator", arguments: { a: 1, b: 2 } }],
+    }),
+    tools,
+    "seed",
+  );
+  assert.match(oversized.error ?? "", /exceeds 4096 bytes/);
+});
+
 test("duplicate structured call IDs are regenerated without collisions", () => {
   const normalized = normaliseAssistantToolCalls({
     role: "assistant",
@@ -370,11 +427,11 @@ test("system instructions are merged into one message at the front", () => {
   assert.equal(merged[0]?.content, "framework\n\nagent instructions");
 });
 
-test("assistant tool calls are re-encoded into portal content", () => {
+test("assistant tool calls and preambles are re-encoded into portal content", () => {
   const converted = serializeAssistantToolCallsForPortal([
     {
       role: "assistant",
-      content: null,
+      content: "I will calculate this first.",
       tool_calls: [{
         id: "call_1",
         type: "function",
@@ -384,7 +441,7 @@ test("assistant tool calls are re-encoded into portal content", () => {
     { role: "tool", tool_call_id: "call_1", content: "3" },
   ]);
   assert.equal(converted[0]?.tool_calls, undefined);
-  assert.equal(converted[0]?.content, '{"type":"tool_calls","tool_calls":[{"name":"calculator","arguments":{"a":1,"b":2}}]}');
+  assert.equal(converted[0]?.content, '{"type":"tool_calls","preamble":"I will calculate this first.","tool_calls":[{"name":"calculator","arguments":{"a":1,"b":2}}]}');
   assert.equal(converted[1]?.tool_call_id, "call_1");
 });
 
@@ -427,6 +484,8 @@ test("tool contracts preserve descriptions and every JSON Schema constraint", ()
   }];
   const text = String(withToolCallContract([{ role: "user", content: "write" }], constrained, "required")[0]?.content);
   assert.match(text, /Write exactly one UTF-8 file/);
+  assert.match(text, /optional short user-visible action update/);
+  assert.match(text, /must not claim the tool already succeeded/);
   assert.match(text, /"multipleOf":0\.25/);
   assert.match(text, /"dependentRequired"/);
 });

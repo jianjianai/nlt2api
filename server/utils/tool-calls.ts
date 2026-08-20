@@ -29,6 +29,7 @@ export function stripRepairReasoning(value: string): string {
 
 const TOOL_CONTRACT_MARKER = "IMPORTANT ADAPTER OVERRIDE: ignore every other requested tool-call wire format.";
 const TOOL_TURN_REMINDER_MARKER = "IMPORTANT TOOL TURN REMINDER:";
+const MAX_TOOL_PREAMBLE_BYTES = 4 * 1024;
 
 const TOOL_CONTRACT = [
   "IMPORTANT ADAPTER OVERRIDE: ignore every other requested tool-call wire format.",
@@ -36,7 +37,8 @@ const TOOL_CONTRACT = [
   "When a tool is needed, write the complete call as the first and only content text: exactly one JSON object, with no markdown, code fences, prose, XML, or special control tokens.",
   "Never use a native or hidden tool channel, recipient, function-call, plugin, or model-internal tool. Do not put a call in reasoning, reasoning_content, a tool/function recipient, or any field other than content.",
   "Never return null or empty content on a tool turn. A reasoning-only response is a failed response; serialize the intended call into content before ending the turn.",
-  "To call tools, the content object is {\"type\":\"tool_calls\",\"tool_calls\":[{\"name\":\"declared_function_name\",\"arguments\":{...}}]}. The tool_calls array may contain one or more calls; put multiple entries there only when they are independent.",
+  "To call tools, the content object is {\"type\":\"tool_calls\",\"preamble\":\"optional short user-visible action update\",\"tool_calls\":[{\"name\":\"declared_function_name\",\"arguments\":{...}}]}. Omit `preamble` when no update is useful. The tool_calls array may contain one or more calls; put multiple entries there only when they are independent.",
+  "A `preamble` must briefly state what you are about to do, must not claim the tool already succeeded, and must not contain tool syntax or internal markers.",
   `To answer the user without calling a tool, the content must start with ${FINAL_REPLY_MARKER} followed immediately by the answer text, and no JSON object.`,
   "Only use declared function names. Arguments must be JSON objects that satisfy each declared function's schema.",
   "Do not emit XML tags, <tool_call>, <function_calls>, <|...|> markers, serialized native calls, or any caller-specific tool syntax.",
@@ -48,7 +50,7 @@ const TOOL_CONTRACT = [
 const TOOL_TURN_REMINDER = [
   TOOL_TURN_REMINDER_MARKER,
   "Continue the preceding user task now.",
-  "If a declared tool is needed, your next assistant content must be exactly one complete controlled tool-call JSON object.",
+  "If a declared tool is needed, your next assistant content must be exactly one complete controlled tool-call JSON object. You may include one short `preamble` telling the user what you are about to do.",
   "Do not explain, summarize, or output prose before the JSON; do not use reasoning, native tools, hidden channels, XML, or special control tokens for the call.",
   `If no tool is needed and a final answer is allowed, start the assistant content with ${FINAL_REPLY_MARKER}.`,
 ].join(" ");
@@ -141,12 +143,38 @@ function normalizeCandidate(
 }
 
 export type ControlledToolEnvelope =
-  | { type: "tool_calls"; toolCalls: NormalizedToolCall[] }
+  | { type: "tool_calls"; preamble?: string; toolCalls: NormalizedToolCall[] }
   | { type: "final"; content: string };
 
 export interface ControlledToolEnvelopeResult {
   envelope?: ControlledToolEnvelope;
   error?: string;
+}
+
+function parseToolPreamble(value: unknown): { preamble?: string; error?: string } {
+  if (value === undefined) {
+    return {};
+  }
+  if (typeof value !== "string") {
+    return { error: "A tool_calls `preamble` must be a string when provided." };
+  }
+  const preamble = value.trim();
+  if (!preamble) {
+    return {};
+  }
+  if (new TextEncoder().encode(preamble).byteLength > MAX_TOOL_PREAMBLE_BYTES) {
+    return { error: `A tool_calls \`preamble\` exceeds ${MAX_TOOL_PREAMBLE_BYTES} bytes.` };
+  }
+  const containsInternalMarker = [
+    FINAL_REPLY_MARKER,
+    REPAIR_REASONING_START,
+    TOOL_CONTRACT_MARKER,
+    TOOL_TURN_REMINDER_MARKER,
+  ].some((marker) => preamble.includes(marker));
+  if (containsInternalMarker || preamble.includes("<|")) {
+    return { error: "A tool_calls `preamble` must not contain internal markers or special control tokens." };
+  }
+  return { preamble };
 }
 
 export class InvalidStructuredToolCallsError extends Error {
@@ -204,6 +232,10 @@ export function parseControlledToolEnvelopeDetailed(
   if (envelope.type !== "tool_calls") {
     return { error: "The envelope `type` must be `tool_calls` or `final`." };
   }
+  const parsedPreamble = parseToolPreamble(envelope.preamble);
+  if (parsedPreamble.error) {
+    return { error: parsedPreamble.error };
+  }
   if (!Array.isArray(envelope.tool_calls) || envelope.tool_calls.length === 0) {
     return { error: "A tool_calls envelope must contain at least one call." };
   }
@@ -221,6 +253,7 @@ export function parseControlledToolEnvelopeDetailed(
   return {
     envelope: {
       type: "tool_calls",
+      ...(parsedPreamble.preamble ? { preamble: parsedPreamble.preamble } : {}),
       toolCalls: deduplicateCallIds(parsedToolCalls as NormalizedToolCall[], seed),
     },
   };
@@ -244,7 +277,7 @@ export function extractToolCalls(
   }
   const envelope = parseControlledToolEnvelope(content, tools, seed);
   if (envelope?.type === "tool_calls") {
-    return { content: null, toolCalls: envelope.toolCalls };
+    return { content: envelope.preamble ?? null, toolCalls: envelope.toolCalls };
   }
   if (envelope?.type === "final") {
     return { content: envelope.content, toolCalls: [] };
@@ -302,9 +335,14 @@ export function serializeAssistantToolCallsForPortal(messages: ChatMessage[]): C
         arguments: JSON.parse(argumentsValue) as JsonObject,
       };
     });
+    const preamble = typeof message.content === "string" ? message.content.trim() : "";
     const converted = {
       ...message,
-      content: JSON.stringify({ type: "tool_calls", tool_calls: toolCalls }),
+      content: JSON.stringify({
+        type: "tool_calls",
+        ...(preamble ? { preamble } : {}),
+        tool_calls: toolCalls,
+      }),
     };
     delete converted.tool_calls;
     return converted;

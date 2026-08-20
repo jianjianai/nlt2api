@@ -756,7 +756,7 @@ function evaluateToolCandidate(
   if (parsed.envelope?.type === "tool_calls") {
     const message: ChatMessage = {
       role: "assistant",
-      content: null,
+      content: parsed.envelope.preamble ?? null,
       tool_calls: parsed.envelope.toolCalls,
     };
     try {
@@ -1394,9 +1394,9 @@ function appendFallbackChatDelta(
   state: ChatStreamState,
   chunks: JsonObject[],
 ): void {
-  const delta: JsonObject = {};
+  const leadingDelta: JsonObject = {};
   if (!state.roleSent) {
-    delta.role = "assistant";
+    leadingDelta.role = "assistant";
     state.roleSent = true;
   }
   const hasToolCalls = Boolean(execution.message.tool_calls?.length);
@@ -1405,31 +1405,35 @@ function appendFallbackChatDelta(
     state.toolContentBuffer = "";
   }
   if (!state.reasoningSent && typeof execution.message.reasoning === "string" && execution.message.reasoning) {
-    delta.reasoning = execution.message.reasoning;
+    leadingDelta.reasoning = execution.message.reasoning;
     state.reasoningSent = true;
   }
   if (!state.reasoningContentSent && typeof execution.message.reasoning_content === "string" && execution.message.reasoning_content) {
-    delta.reasoning_content = execution.message.reasoning_content;
+    leadingDelta.reasoning_content = execution.message.reasoning_content;
     state.reasoningContentSent = true;
   }
   if (!state.refusalSent && typeof execution.message.refusal === "string" && execution.message.refusal) {
-    delta.refusal = execution.message.refusal;
+    leadingDelta.refusal = execution.message.refusal;
     state.refusalSent = true;
   }
-  if (hasToolCalls && !state.toolCallsSent) {
-    delta.tool_calls = execution.message.tool_calls!.map((call, index) => ({
-      index,
-      id: call.id,
-      type: "function",
-      function: call.function,
-    })) as unknown as JsonValue;
-    state.toolCallsSent = true;
-  } else if (!hasToolCalls && !state.contentSent && typeof execution.message.content === "string" && execution.message.content) {
-    delta.content = execution.message.content;
+  if (!state.contentSent && typeof execution.message.content === "string" && execution.message.content) {
+    leadingDelta.content = execution.message.content;
     state.contentSent = true;
   }
-  if (Object.keys(delta).length > 0) {
-    chunks.push({ ...chatStreamBase(state), choices: [{ index: 0, delta, finish_reason: null }] });
+  if (Object.keys(leadingDelta).length > 0) {
+    chunks.push({ ...chatStreamBase(state), choices: [{ index: 0, delta: leadingDelta, finish_reason: null }] });
+  }
+  if (hasToolCalls && !state.toolCallsSent) {
+    const toolDelta: JsonObject = {
+      tool_calls: execution.message.tool_calls!.map((call, index) => ({
+        index,
+        id: call.id,
+        type: "function",
+        function: call.function,
+      })) as unknown as JsonValue,
+    };
+    state.toolCallsSent = true;
+    chunks.push({ ...chatStreamBase(state), choices: [{ index: 0, delta: toolDelta, finish_reason: null }] });
   }
 }
 
@@ -1468,6 +1472,9 @@ export function asChatCompletionStream(execution: ChatExecution, includeUsage = 
   if (typeof execution.message.refusal === "string" && execution.message.refusal) {
     chunks.push({ ...base, choices: [{ index: 0, delta: { refusal: execution.message.refusal }, finish_reason: null }] });
   }
+  if (typeof execution.message.content === "string" && execution.message.content) {
+    chunks.push({ ...base, choices: [{ index: 0, delta: { content: execution.message.content }, finish_reason: null }] });
+  }
   if (execution.message.tool_calls?.length) {
     chunks.push({
       ...base,
@@ -1484,8 +1491,6 @@ export function asChatCompletionStream(execution: ChatExecution, includeUsage = 
         finish_reason: null,
       }],
     });
-  } else if (typeof execution.message.content === "string" && execution.message.content) {
-    chunks.push({ ...base, choices: [{ index: 0, delta: { content: execution.message.content }, finish_reason: null }] });
   }
   chunks.push({ ...base, choices: [{ index: 0, delta: {}, finish_reason: execution.finishReason }] });
   if (includeUsage && execution.completion.usage) {
