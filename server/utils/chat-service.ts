@@ -1233,8 +1233,6 @@ export async function executeChatRequest(
   }
 }
 
-const CONTINUATION_USER_PROMPT = "Continue the previous response from exactly where it ended. Do not repeat any text. Finish the answer if possible.";
-
 interface ThinkingContinuationOptions {
   stickyKey?: string;
   allowEmptyContent: boolean;
@@ -1245,12 +1243,12 @@ interface ThinkingContinuationOptions {
 
 /**
  * Continue a thinking-interrupted completion with the remaining output
- * budget. Each round appends the accumulated reasoning as an assistant turn
- * plus a fixed continuation prompt to the already-built upstream messages
- * (for tool turns these are the contracted messages, so the tool contract
- * stays intact), pinned to the account that produced the partial thinking.
- * Continuation reasoning is appended verbatim, without the repair marker
- * used for tool-call repair rounds.
+ * budget. Each round appends the accumulated reasoning as a trailing
+ * assistant turn (prefill, no extra user prompt) to the already-built
+ * upstream messages (for tool turns these are the contracted messages, so
+ * the tool contract stays intact), pinned to the account that produced the
+ * partial thinking. Continuation reasoning is appended verbatim, without
+ * the repair marker used for tool-call repair rounds.
  */
 async function continueThinking(
   body: JsonObject,
@@ -1287,10 +1285,14 @@ async function continueThinking(
     const continuationBody: JsonObject = {
       ...body,
       max_tokens: Math.min(remaining, PORTAL_MAX_OUTPUT_TOKENS),
+      // Prefill-style continuation: the request ends with the assistant
+      // message carrying the accumulated thinking. Probes showed a trailing
+      // "Continue" user prompt makes reasoning models burn tokens on
+      // instruction meta-reasoning and suppresses the answer body, while
+      // the bare prefill just continues the thought.
       messages: [
         ...(Array.isArray(body.messages) ? body.messages : []),
         assistant as unknown as JsonValue,
-        { role: "user", content: CONTINUATION_USER_PROMPT } as unknown as JsonValue,
       ],
     };
     const next = await getCompletion(
