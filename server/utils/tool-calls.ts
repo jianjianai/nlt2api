@@ -187,7 +187,21 @@ export function buildToolRepairHistory(
   candidate: ChatMessage,
   repair: ChatMessage,
 ): ChatMessage[] {
-  return [...originalHistory, candidate, repair];
+  // The failed candidate must model the same content-envelope format the
+  // contract demands: native tool_calls fields never reach the portal, even
+  // in repair history. Otherwise the model sees its own previous turn use a
+  // channel the contract forbids and may imitate it instead of correcting the
+  // call.
+  let serialized = candidate;
+  if (candidate.tool_calls?.length) {
+    try {
+      serialized = serializeAssistantToolCallsForPortal([candidate])[0] ?? candidate;
+    } catch {
+      // Unserializable calls stay textual: repairCandidateFrom already folded
+      // their raw form into the candidate content.
+    }
+  }
+  return [...originalHistory, serialized, repair];
 }
 
 export function envelopeAllowedForToolChoice(envelope: ControlledToolEnvelope | undefined, toolChoice: unknown): boolean {

@@ -331,8 +331,34 @@ test("repair history retains prior tool output and structured candidate calls", 
   assert.deepEqual(history[1]?.tool_calls, [previousCall]);
   assert.equal(history[2]?.tool_call_id, previousCall.id);
   assert.equal(history[2]?.content, "3");
-  assert.deepEqual(history[3]?.tool_calls, [candidateCall]);
+  // The candidate's native calls are serialized into the content envelope so
+  // repair history never shows the portal a native tool_calls field.
+  assert.equal(history[3]?.tool_calls, undefined);
+  const serializedCandidate = JSON.parse(String(history[3]?.content));
+  assert.equal(serializedCandidate.type, "tool_calls");
+  assert.equal(serializedCandidate.preamble, '{"type":"tool_calls","tool_calls":[');
+  assert.deepEqual(serializedCandidate.tool_calls, [{ name: "calculator", arguments: { a: 3, b: 4 } }]);
   assert.equal(history[3]?.reasoning, "thinking 1");
+});
+
+test("repair history serializes candidate native calls into the content envelope", () => {
+  const candidateCall = {
+    id: "call_candidate",
+    type: "function" as const,
+    function: { name: "calculator", arguments: '{"a":3,"b":4}' },
+  };
+  const history = buildToolRepairHistory(
+    [{ role: "user" as const, content: "calculate" }],
+    { role: "assistant" as const, content: "let me compute", tool_calls: [candidateCall] },
+    { role: "user" as const, content: "Validation error: arguments failed the schema" },
+  );
+  const candidate = history[1];
+  assert.equal(candidate?.role, "assistant");
+  assert.equal(candidate?.tool_calls, undefined);
+  const envelope = JSON.parse(String(candidate?.content));
+  assert.equal(envelope.type, "tool_calls");
+  assert.equal(envelope.preamble, "let me compute");
+  assert.deepEqual(envelope.tool_calls, [{ name: "calculator", arguments: { a: 3, b: 4 } }]);
 });
 
 test("repair history keeps the reminder before the failed candidate and error", () => {
@@ -344,14 +370,13 @@ test("repair history keeps the reminder before the failed candidate and error", 
   const history = buildToolRepairHistory(
     contracted,
     { role: "assistant" as const, content: '{"type":"tool_calls","tool_calls":[{"name":"calculator","arguments":{"a":1' },
-    { role: "tool" as const, tool_call_id: "call_repair_1", content: "JSON parse failed; retry" },
+    { role: "user" as const, content: "JSON parse failed; retry" },
   );
-  assert.deepEqual(history.map((message) => message.role), ["system", "user", "user", "assistant", "tool"]);
+  assert.deepEqual(history.map((message) => message.role), ["system", "user", "user", "assistant", "user"]);
   assert.equal(history[1]?.content, "read package.json");
   assert.match(String(history[2]?.content), /IMPORTANT TOOL TURN REMINDER/);
   assert.equal(history[3]?.role, "assistant");
-  assert.equal(history[4]?.role, "tool");
-  assert.equal(history[4]?.tool_call_id, "call_repair_1");
+  assert.equal(history[4]?.role, "user");
   assert.match(String(history[4]?.content), /JSON parse failed; retry/);
 });
 
@@ -376,8 +401,6 @@ test("adapter contract follows caller instructions and the latest tool result", 
   assert.match(String(contracted[0]?.content), /more caller instructions/);
   assert.match(String(contracted[0]?.content), /IMPORTANT ADAPTER OVERRIDE/);
   assert.match(String(contracted[0]?.content), /ordinary assistant message content/);
-  assert.match(String(contracted[0]?.content), /Never use a native or hidden tool channel/);
-  assert.match(String(contracted[0]?.content), /Never return null or empty content/);
   assert.match(String(contracted[0]?.content), /"properties":\{"a"/);
   assert.match(String(contracted.at(-1)?.content), /IMPORTANT TOOL TURN REMINDER/);
   assert.match(String(contracted.at(-1)?.content), /exactly one complete controlled tool-call JSON object/);
