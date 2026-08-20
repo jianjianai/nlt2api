@@ -150,14 +150,14 @@ export function requireAdminAuth(request: Request): void {
   }
 }
 
-export function asString(value: unknown, field: string, options?: { optional?: boolean; maxLength?: number }): string | undefined {
+export function asString(value: unknown, field: string, options?: { optional?: boolean; maxLength?: number; allowEmpty?: boolean }): string | undefined {
   if (value === undefined || value === null) {
     if (options?.optional) {
       return undefined;
     }
     throw new HttpError(400, `\`${field}\` is required.`, "invalid_request_error", field);
   }
-  if (typeof value !== "string" || !value.trim()) {
+  if (typeof value !== "string" || (!options?.allowEmpty && !value.trim())) {
     throw new HttpError(400, `\`${field}\` must be a non-empty string.`, "invalid_request_error", field);
   }
   if (options?.maxLength && value.length > options.maxLength) {

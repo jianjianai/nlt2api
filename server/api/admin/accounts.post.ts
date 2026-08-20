@@ -18,8 +18,10 @@ export default defineHandler(async (event) => {
     if (weight !== undefined && !Number.isInteger(weight)) {
       throw new HttpError(400, "`weight` must be an integer.", "invalid_request_error", "weight");
     }
-    const proxyInput = asString(body.proxy, "proxy", { optional: true, maxLength: 2_048 });
-    const proxy = proxyInput ? normalizeProxyUrl(proxyInput) : undefined;
+    // The add-account form always submits a proxy field; an empty or
+    // whitespace-only value means a direct connection.
+    const proxyInput = asString(body.proxy, "proxy", { optional: true, allowEmpty: true, maxLength: 2_048 });
+    const proxy = proxyInput?.trim() ? normalizeProxyUrl(proxyInput) : undefined;
 
     const account = await stateStore.addAccount({ email, password, label, weight, ...(proxy ? { proxy } : {}) });
     accountId = account.id;

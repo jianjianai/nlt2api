@@ -28,11 +28,11 @@ export default defineHandler(async (event) => {
       input.weight = weight;
     }
     if (body.proxy !== undefined) {
-      if (body.proxy === null || body.proxy === "") {
-        input.proxy = null;
-      } else {
-        input.proxy = normalizeProxyUrl(asString(body.proxy, "proxy", { maxLength: 2_048 })!);
-      }
+      // null, empty and whitespace-only values all clear the proxy.
+      const proxyInput = body.proxy === null
+        ? null
+        : asString(body.proxy, "proxy", { allowEmpty: true, maxLength: 2_048 });
+      input.proxy = proxyInput?.trim() ? normalizeProxyUrl(proxyInput) : null;
     }
     if (Object.keys(input).length === 0) {
       throw new HttpError(400, "At least one account field must be supplied.", "invalid_request_error");
