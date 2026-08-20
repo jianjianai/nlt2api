@@ -467,7 +467,8 @@ test("tool contracts preserve descriptions and every JSON Schema constraint", ()
   }];
   const text = String(withToolCallContract([{ role: "user", content: "write" }], constrained, "required")[0]?.content);
   assert.match(text, /Write exactly one UTF-8 file/);
-  assert.match(text, /optional short user-visible action update/);
+  assert.match(text, /optional user-visible status/);
+  assert.match(text, /meaningful moments/);
   assert.match(text, /must not claim the tool already succeeded/);
   assert.match(text, /"multipleOf":0\.25/);
   assert.match(text, /"dependentRequired"/);
