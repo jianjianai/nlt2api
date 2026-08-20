@@ -134,7 +134,7 @@ export interface DebugRawBody {
   body: string;
 }
 
-export type DebugUpstreamCallType = "initial" | "repair";
+export type DebugUpstreamCallType = "initial" | "repair" | "continuation";
 
 export interface DebugUpstreamCall {
   sequence: number;
