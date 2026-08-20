@@ -288,7 +288,7 @@ function upstreamBody(
   messages: ChatMessage[],
   tools: ToolDefinition[],
   stream: boolean,
-): JsonObject {
+): { body: JsonObject; messages: ChatMessage[] } {
   const tokenLimit = validateTokenLimit(request);
   const toolChoice = request.tool_choice;
   const toolTurn = tools.length > 0 && toolChoice !== "none";
@@ -306,12 +306,12 @@ function upstreamBody(
     "chat_template_kwargs",
     "parallel_tool_calls",
   ];
-  const upstreamMessages = portalMessages(messages, toolTurn);
+  const upstreamMessages = toolTurn
+    ? withToolCallContract(portalMessages(messages, true), tools, toolChoice, parallelToolCalls)
+    : portalMessages(messages, false);
   const body: JsonObject = {
     model,
-    messages: (toolTurn
-      ? withToolCallContract(upstreamMessages, tools, toolChoice, parallelToolCalls)
-      : upstreamMessages) as unknown as JsonValue,
+    messages: upstreamMessages as unknown as JsonValue,
     stream,
   };
   for (const field of accepted) {
@@ -332,7 +332,7 @@ function upstreamBody(
   if (!toolTurn && request.response_format !== undefined) {
     body.response_format = request.response_format;
   }
-  return body;
+  return { body, messages: upstreamMessages };
 }
 
 async function parsePortalError(response: Response): Promise<{ error: PortalError; payload?: JsonObject; raw: string }> {
@@ -857,7 +857,8 @@ async function executeChatRequestOnce(
     ? undefined
     : accountScheduler.accountForToolCalls(observedToolCallIds);
   const streamUpstream = options?.stream ?? request.stream === true;
-  let upstreamRequest = upstreamBody(request, model, messages, tools, streamUpstream);
+  const builtUpstream = upstreamBody(request, model, messages, tools, streamUpstream);
+  let upstreamRequest = builtUpstream.body;
   let result = await getCompletion(
     upstreamRequest,
     options?.stickyKey,
@@ -873,18 +874,13 @@ async function executeChatRequestOnce(
   let toolCallAdapter: ToolCallAdapterTrace | undefined;
 
   if (toolTurn) {
-    // Keep the caller history separate from the adapter contract. The adapter
-    // contract and the internal reminder are applied once to the original
-    // history; repair turns then append the failed candidate and the exact
-    // error after the reminder so the reminder always stays right after the
-    // user instruction instead of after the error message.
-    const originalUpstreamMessages = portalMessages(messages, true);
-    const contractedOriginalMessages = withToolCallContract(
-      originalUpstreamMessages,
-      tools,
-      request.tool_choice,
-      request.parallel_tool_calls !== false,
-    );
+    // upstreamBody already applied the adapter contract and the internal
+    // reminder to the original history exactly once; reuse that list so the
+    // repair history cannot drift from what was actually sent. Repair turns
+    // append the failed candidate and the exact error after the reminder, so
+    // the reminder always stays right after the user instruction instead of
+    // after the error message.
+    const contractedOriginalMessages = builtUpstream.messages;
     const firstReasoning = initialReasoning(result.completion);
     // The portal occasionally returns a JSON completion even after accepting
     // a streaming request. Forward the original reasoning before a repair so
