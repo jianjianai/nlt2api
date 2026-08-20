@@ -10,7 +10,10 @@ export interface SchemaValidationResult {
 const validatorOptions = {
   allErrors: true,
   allowUnionTypes: true,
-  strictSchema: true,
+  // Clients annotate tool schemas with custom keywords (e.g. "encrypted").
+  // This proxy only forwards the schema upstream, so unknown keywords must be
+  // ignored instead of rejected as strict-mode compile errors.
+  strictSchema: false,
   strictNumbers: true,
   strictTypes: false,
   strictTuples: false,
