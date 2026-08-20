@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, reactive, ref, watch } from "vue";
+import { computed, nextTick, onMounted, onUnmounted, reactive, ref, watch } from "vue";
 
 interface RuntimeState {
   inFlight: number;
@@ -962,6 +962,45 @@ function traceRecordLabel(trace: ConversationTrace): string {
   return `${formatDate(trace.record.at)} · ${trace.record.endpoint}`;
 }
 
+/** Compact timestamp for the sidebar: HH:MM:SS today, MM-DD HH:MM otherwise. */
+function compactTime(value: string): string {
+  const date = new Date(value);
+  const pad = (n: number) => String(n).padStart(2, "0");
+  const time = `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
+  return date.toDateString() === new Date().toDateString()
+    ? time
+    : `${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${time}`;
+}
+
+/** Short content preview shown in the sidebar: the last user message, else any last message. */
+function recordPreview(record: DebugRecord): string {
+  const messages = collectBodyMessages(record.clientRequest, true);
+  const lastUser = [...messages].reverse().find((message) => message.role === "user" && message.content);
+  const source = lastUser ?? [...messages].reverse().find((message) => message.content);
+  if (!source) return "（无消息内容）";
+  const text = source.content.replace(/\s+/g, " ").trim();
+  return text.length > 60 ? `${text.slice(0, 60)}…` : text;
+}
+
+// ---- Prev / next record navigation ----
+const detailEl = ref<HTMLElement | null>(null);
+const selectedRecordIndex = computed(() => {
+  if (!selectedTrace.value) return -1;
+  return filteredRecords.value.findIndex((record) => record.id === selectedTrace.value!.record.id);
+});
+
+function gotoRecord(offset: number): void {
+  const next = filteredRecords.value[selectedRecordIndex.value + offset] ?? (selectedRecordIndex.value === -1 ? filteredRecords.value[0] : undefined);
+  if (!next) return;
+  const traces = recordTraces(next);
+  if (!traces.length) return;
+  selectTrace(traces[0]);
+  void nextTick(() => {
+    detailEl.value?.scrollIntoView({ block: "start" });
+    document.querySelector(".trace-group.active")?.scrollIntoView({ block: "nearest" });
+  });
+}
+
 watch(selectedTraceKey, () => {
   expandedMessageKeys.value = new Set();
   overflowMessageKeys.value = new Set();
@@ -979,11 +1018,20 @@ watch(autoRefresh, (enabled) => {
 });
 
 function onKeydown(event: KeyboardEvent): void {
-  if (event.key !== "Escape") return;
-  if (proxyEditor.value) proxyEditor.value = null;
-  else if (pendingRemoval.value) pendingRemoval.value = null;
-  else if (showClearConfirm.value) showClearConfirm.value = false;
-  else if (showAddAccount.value) showAddAccount.value = false;
+  if (event.key === "Escape") {
+    if (proxyEditor.value) proxyEditor.value = null;
+    else if (pendingRemoval.value) pendingRemoval.value = null;
+    else if (showClearConfirm.value) showClearConfirm.value = false;
+    else if (showAddAccount.value) showAddAccount.value = false;
+    return;
+  }
+  if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
+  if (view.value !== "records" || !token.value) return;
+  if (showAddAccount.value || proxyEditor.value || pendingRemoval.value || showClearConfirm.value) return;
+  const target = event.target as HTMLElement | null;
+  if (target && ["INPUT", "TEXTAREA", "SELECT"].includes(target.tagName)) return;
+  event.preventDefault();
+  gotoRecord(event.key === "ArrowLeft" ? -1 : 1);
 }
 
 function onWindowResize(): void {
@@ -1170,50 +1218,53 @@ onUnmounted(() => {
           </div>
           <div v-else class="conversation-workbench">
             <aside class="trace-sidebar" aria-label="请求发送列表">
-              <section v-for="record in filteredRecords" :key="record.id" class="trace-group">
-                <div class="trace-group-meta">
-                  <span>{{ formatDate(record.at) }}</span>
-                  <span class="trace-group-status" :class="{ success: record.status < 400 }">{{ record.status }}</span>
-                </div>
-                <button
-                  v-for="trace in recordTraces(record).slice(0, 1)"
-                  :key="trace.key"
-                  class="trace-item trace-client"
-                  :class="{ active: selectedTrace?.key === trace.key }"
-                  type="button"
-                  @click="selectTrace(trace)"
-                >
-                  <span class="trace-kind">客户端</span>
-                  <strong>{{ trace.title }}</strong>
-                  <small>{{ trace.subtitle }}</small>
+              <section v-for="record in filteredRecords" :key="record.id" class="trace-group" :class="{ active: selectedTrace?.record.id === record.id }">
+                <button class="trace-record" type="button" @click="selectTrace(recordTraces(record)[0])">
+                  <span class="trace-record-top">
+                    <span class="status-chip" :class="record.status < 400 ? 'ok' : 'err'">{{ record.status }}</span>
+                    <span class="trace-endpoint">{{ record.endpoint }}</span>
+                    <time class="trace-time">{{ compactTime(record.at) }}</time>
+                  </span>
+                  <span class="trace-preview">{{ recordPreview(record) }}</span>
+                  <span class="trace-record-sub">
+                    {{ record.accountLabel || "未分配账号" }}<template v-if="recordTraces(record).length > 1"> · {{ recordTraces(record).length - 1 }} 次上游调用</template>
+                  </span>
                 </button>
                 <div v-if="recordTraces(record).length > 1" class="trace-children">
                   <button
                     v-for="trace in recordTraces(record).slice(1)"
                     :key="trace.key"
-                    class="trace-item trace-upstream"
+                    class="trace-child"
                     :class="{ active: selectedTrace?.key === trace.key, failed: trace.status >= 400 || Boolean(trace.error) }"
                     type="button"
                     @click="selectTrace(trace)"
                   >
-                    <span class="trace-kind">上游</span>
-                    <strong>{{ trace.title }}</strong>
-                    <small>{{ trace.subtitle }}</small>
+                    <span class="trace-child-title">{{ trace.title }}</span>
+                    <span class="trace-child-sub">{{ trace.subtitle }} · HTTP {{ trace.status }}</span>
                   </button>
                 </div>
               </section>
             </aside>
 
-            <section v-if="selectedTrace" class="conversation-detail" :key="selectedTrace.key">
+            <section v-if="selectedTrace" ref="detailEl" class="conversation-detail" :key="selectedTrace.key">
               <header class="conversation-header">
-                <div>
-                  <p class="section-kicker">{{ selectedTrace.direction === "client" ? "客户端会话" : "上游调用" }}</p>
-                  <h3>{{ selectedTrace.title }}</h3>
-                  <p class="conversation-meta">{{ traceRecordLabel(selectedTrace) }} · {{ selectedTrace.subtitle }} · HTTP {{ selectedTrace.status }}</p>
+                <div class="conversation-heading">
+                  <div class="conversation-title-row">
+                    <span class="status-chip" :class="selectedTrace.status < 400 ? 'ok' : 'err'">{{ selectedTrace.status }}</span>
+                    <h3>{{ selectedTrace.title }}</h3>
+                    <span class="conversation-dir">{{ selectedTrace.direction === "client" ? "客户端会话" : "上游调用" }}</span>
+                  </div>
+                  <p class="conversation-meta">{{ traceRecordLabel(selectedTrace) }} · {{ selectedTrace.subtitle }}</p>
                 </div>
-                <button class="button button-quiet" type="button" @click="rawTraceKey = rawTraceKey === traceRawKey(selectedTrace) ? null : traceRawKey(selectedTrace)">
-                  {{ rawTraceKey === traceRawKey(selectedTrace) ? "查看对话" : "查看原始数据" }}
-                </button>
+                <div class="conversation-actions">
+                  <div class="record-nav">
+                    <button type="button" aria-label="上一条记录" :disabled="selectedRecordIndex <= 0" @click="gotoRecord(-1)">←</button>
+                    <button type="button" aria-label="下一条记录" :disabled="selectedRecordIndex === -1 || selectedRecordIndex >= filteredRecords.length - 1" @click="gotoRecord(1)">→</button>
+                  </div>
+                  <button class="button button-quiet" type="button" @click="rawTraceKey = rawTraceKey === traceRawKey(selectedTrace) ? null : traceRawKey(selectedTrace)">
+                    {{ rawTraceKey === traceRawKey(selectedTrace) ? "查看对话" : "原始数据" }}
+                  </button>
+                </div>
               </header>
 
               <div v-if="rawTraceKey === traceRawKey(selectedTrace)" class="raw-trace">
@@ -1227,62 +1278,82 @@ onUnmounted(() => {
                 </section>
               </div>
 
-              <div v-else class="conversation-flow">
-                <section class="conversation-turn request-turn">
-                  <div class="turn-label"><span>发送</span><strong>{{ selectedTrace.direction === "client" ? "客户端请求" : "上游请求" }}</strong></div>
-                  <div v-if="traceRequest(selectedTrace).messages.length" class="message-stack">
-                    <article v-for="(message, index) in traceRequest(selectedTrace).messages" :key="`request-${index}`" class="message-item message-sent" :class="{ 'message-thinking': message.roleLabel === '思考', 'message-bubble-right': messageAlign(message.role) === 'right' }">
-                      <div class="message-heading"><strong>{{ message.roleLabel }}</strong></div>
-                      <div class="message-collapse" :class="{ expanded: isMessageExpanded(`request-${index}`), 'has-overflow': overflowMessageKeys.has(`request-${index}`) }" :ref="(el) => setMessageContentEl(`request-${index}`, el)">
+              <div v-else class="chat-flow">
+                <article
+                  v-for="(message, index) in traceRequest(selectedTrace).messages"
+                  :key="`request-${index}`"
+                  class="chat-msg"
+                  :class="[messageAlign(message.role) === 'right' ? 'right' : 'left', { thinking: message.roleLabel === '思考' }]"
+                >
+                  <div class="chat-role">{{ message.roleLabel }}</div>
+                  <div class="chat-bubble">
+                    <div class="message-collapse" :class="{ expanded: isMessageExpanded(`request-${index}`), 'has-overflow': overflowMessageKeys.has(`request-${index}`) }" :ref="(el) => setMessageContentEl(`request-${index}`, el)">
+                      <p v-if="message.content" class="message-content">{{ message.content }}</p>
+                      <div v-for="call in message.toolCalls" :key="call.id" class="tool-call-item">
+                        <span class="tool-call-name">工具：{{ call.name }}</span>
+                        <code>{{ call.arguments }}</code>
+                      </div>
+                    </div>
+                    <button v-if="overflowMessageKeys.has(`request-${index}`)" class="expand-toggle" type="button" @click="toggleMessageExpanded(`request-${index}`)">
+                      {{ isMessageExpanded(`request-${index}`) ? "收起" : "展开全部" }}
+                    </button>
+                  </div>
+                </article>
+
+                <div class="chat-divider"><span>{{ selectedTrace.direction === "client" ? "客户端响应" : "上游响应" }} · HTTP {{ selectedTrace.status }}</span></div>
+
+                <template v-if="traceResponse(selectedTrace)">
+                  <article
+                    v-for="(message, index) in traceResponse(selectedTrace)?.messages"
+                    :key="`response-${index}`"
+                    class="chat-msg"
+                    :class="[messageAlign(message.role) === 'right' ? 'right' : 'left', { thinking: message.roleLabel === '思考' }]"
+                  >
+                    <div class="chat-role">{{ message.roleLabel }}</div>
+                    <div class="chat-bubble">
+                      <div class="message-collapse" :class="{ expanded: isMessageExpanded(`response-${index}`), 'has-overflow': overflowMessageKeys.has(`response-${index}`) }" :ref="(el) => setMessageContentEl(`response-${index}`, el)">
                         <p v-if="message.content" class="message-content">{{ message.content }}</p>
                         <div v-for="call in message.toolCalls" :key="call.id" class="tool-call-item">
                           <span class="tool-call-name">工具：{{ call.name }}</span>
                           <code>{{ call.arguments }}</code>
                         </div>
                       </div>
-                      <button v-if="overflowMessageKeys.has(`request-${index}`)" class="expand-toggle" type="button" @click="toggleMessageExpanded(`request-${index}`)">
-                        {{ isMessageExpanded(`request-${index}`) ? "收起" : "展开全部" }}
+                      <button v-if="overflowMessageKeys.has(`response-${index}`)" class="expand-toggle" type="button" @click="toggleMessageExpanded(`response-${index}`)">
+                        {{ isMessageExpanded(`response-${index}`) ? "收起" : "展开全部" }}
                       </button>
-                    </article>
-                  </div>
-                  <dl v-if="traceRequest(selectedTrace).fields.length" class="record-fields trace-fields">
+                    </div>
+                  </article>
+                  <p v-if="!traceResponse(selectedTrace)?.messages.length" class="parsed-empty">响应无消息内容。</p>
+                </template>
+                <p v-else class="parsed-empty">尚未收到响应正文。</p>
+
+                <p v-if="selectedTrace.error" class="trace-error">{{ selectedTrace.error }}</p>
+
+                <details v-if="traceRequest(selectedTrace).fields.length" class="fold-section">
+                  <summary>请求参数 <span class="fold-count">{{ traceRequest(selectedTrace).fields.length }}</span></summary>
+                  <dl class="record-fields">
                     <template v-for="(field, index) in traceRequest(selectedTrace).fields" :key="`request-field-${index}`">
                       <dt>{{ field.label }}</dt><dd>{{ field.value }}</dd>
                     </template>
                   </dl>
-                </section>
+                </details>
 
-                <section class="conversation-turn response-turn">
-                  <div class="turn-label"><span>接收</span><strong>{{ selectedTrace.direction === "client" ? "客户端响应" : "上游响应" }}</strong></div>
-                  <template v-if="traceResponse(selectedTrace)">
-                    <div v-if="traceResponse(selectedTrace)?.messages.length" class="message-stack">
-                      <article v-for="(message, index) in traceResponse(selectedTrace)?.messages" :key="`response-${index}`" class="message-item message-received" :class="{ 'message-thinking': message.roleLabel === '思考', 'message-bubble-right': messageAlign(message.role) === 'right' }">
-                        <div class="message-heading"><strong>{{ message.roleLabel }}</strong></div>
-                        <div class="message-collapse" :class="{ expanded: isMessageExpanded(`response-${index}`), 'has-overflow': overflowMessageKeys.has(`response-${index}`) }" :ref="(el) => setMessageContentEl(`response-${index}`, el)">
-                          <p v-if="message.content" class="message-content">{{ message.content }}</p>
-                          <div v-for="call in message.toolCalls" :key="call.id" class="tool-call-item">
-                            <span class="tool-call-name">工具：{{ call.name }}</span>
-                            <code>{{ call.arguments }}</code>
-                          </div>
-                        </div>
-                        <button v-if="overflowMessageKeys.has(`response-${index}`)" class="expand-toggle" type="button" @click="toggleMessageExpanded(`response-${index}`)">
-                          {{ isMessageExpanded(`response-${index}`) ? "收起" : "展开全部" }}
-                        </button>
-                      </article>
-                    </div>
-                    <dl v-if="traceResponse(selectedTrace)?.fields.length" class="record-fields trace-fields">
-                      <template v-for="(field, index) in traceResponse(selectedTrace)?.fields" :key="`response-field-${index}`">
-                        <dt>{{ field.label }}</dt><dd>{{ field.value }}</dd>
-                      </template>
-                    </dl>
-                  </template>
-                  <p v-else class="parsed-empty">尚未收到响应正文。</p>
-                </section>
+                <details v-if="traceResponse(selectedTrace)?.fields.length" class="fold-section">
+                  <summary>响应元数据 <span class="fold-count">{{ traceResponse(selectedTrace)?.fields.length }}</span></summary>
+                  <dl class="record-fields">
+                    <template v-for="(field, index) in traceResponse(selectedTrace)?.fields" :key="`response-field-${index}`">
+                      <dt>{{ field.label }}</dt><dd>{{ field.value }}</dd>
+                    </template>
+                  </dl>
+                </details>
 
-                <p v-if="selectedTrace.error" class="trace-error">{{ selectedTrace.error }}</p>
-                <section v-if="selectedTrace.record.toolCallAdapter" class="adapter-trace">
-                  <h4>工具调用转换</h4>
-                  <dl class="record-fields trace-fields">
+                <details v-if="selectedTrace.record.toolCallAdapter" class="fold-section">
+                  <summary>
+                    工具调用转换
+                    <span class="fold-count">{{ toolOutcomeLabel(selectedTrace.record.toolCallAdapter.finalOutcome) }}</span>
+                    <span v-if="selectedTrace.record.toolCallAdapter.errors.length" class="fold-count fold-count-err">{{ selectedTrace.record.toolCallAdapter.errors.length }} 个错误</span>
+                  </summary>
+                  <dl class="record-fields">
                     <dt>预期模式</dt><dd>{{ toolModeLabel(selectedTrace.record.toolCallAdapter.toolCallExpected) }}</dd>
                     <dt>首次结果</dt><dd>{{ toolOutcomeLabel(selectedTrace.record.toolCallAdapter.initialOutcome) }}</dd>
                     <dt>最终结果</dt><dd>{{ toolOutcomeLabel(selectedTrace.record.toolCallAdapter.finalOutcome) }}</dd>
@@ -1292,7 +1363,7 @@ onUnmounted(() => {
                   <ul v-if="selectedTrace.record.toolCallAdapter.errors.length" class="error-list">
                     <li v-for="error in selectedTrace.record.toolCallAdapter.errors" :key="error">{{ error }}</li>
                   </ul>
-                </section>
+                </details>
               </div>
             </section>
           </div>
