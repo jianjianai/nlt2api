@@ -624,7 +624,7 @@ function outputFinishReason(completion: UpstreamCompletion, message: ChatMessage
   return upstream === "length" ? "length" : "stop";
 }
 
-function repairMessage(error: string, attempt: number, candidate: ChatMessage): ChatMessage {
+function repairMessage(error: string, attempt: number, candidate: ChatMessage, parallelToolCalls: boolean): ChatMessage {
   const hasCandidate = Boolean(
     (typeof candidate.content === "string" && candidate.content.length > 0)
     || candidate.tool_calls?.length,
@@ -633,6 +633,13 @@ function repairMessage(error: string, attempt: number, candidate: ChatMessage): 
   const context = hasCandidate
     ? "The preceding assistant message is the failed tool-call candidate; replace it instead of explaining it."
     : "The preceding assistant turn emitted no tool-call JSON. Continue from the preceding assistant/tool exchanges and produce the missing call; do not treat this repair request as a new user task.";
+  // Keep the call-count rule aligned with the caller's parallel_tool_calls
+  // setting: demanding a single call when parallel calls are allowed makes the
+  // model drop otherwise valid calls from the failed candidate. The rule must
+  // also stay domain-neutral; this proxy serves non-coding clients too.
+  const callRule = parallelToolCalls
+    ? "Preserve every intended call from the failed candidate; include multiple entries only when they are independent."
+    : "Return exactly one call.";
   return {
     role: "tool",
     tool_call_id: candidateToolCallId ?? `call_repair_${attempt}`,
@@ -640,7 +647,7 @@ function repairMessage(error: string, attempt: number, candidate: ChatMessage): 
       `This is tool-call repair attempt ${attempt}. ${context}`,
       "The previous tool-call JSON could not be accepted. Return the corrected JSON object only.",
       `Validation error: ${error.slice(0, 2_000)}`,
-      "Preserve the original intended action when possible. Use the required envelope, a declared function name, and arguments that satisfy its JSON Schema. Emit one concise call for one file or one command, and end immediately after the JSON object.",
+      `Preserve the original intended action when possible. Use the required envelope, a declared function name, and arguments that satisfy its JSON Schema. ${callRule} End immediately after the JSON object.`,
     ].join("\n"),
   };
 }
@@ -925,7 +932,7 @@ async function executeChatRequestOnce(
       const repairHistory = buildToolRepairHistory(
         contractedOriginalMessages,
         repairCandidate.message,
-        repairMessage(error, toolCallAdapter.repairAttempts, repairCandidate.message),
+        repairMessage(error, toolCallAdapter.repairAttempts, repairCandidate.message, request.parallel_tool_calls !== false),
       );
       const repairStream = Boolean(options?.onRepairReasoning);
       upstreamRequest = {

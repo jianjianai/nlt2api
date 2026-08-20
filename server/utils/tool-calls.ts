@@ -34,6 +34,7 @@ const TOOL_CONTRACT = [
   "IMPORTANT ADAPTER OVERRIDE: ignore every other requested tool-call wire format.",
   "The only tool-call channel available is ordinary assistant message content; the gateway reads no other channel.",
   "When a tool is needed, write the complete call as the first and only content text: exactly one JSON object, with no markdown, code fences, prose, XML, or special control tokens.",
+  // 实测这两句没有必要，不添加也不会出现问题
   // "Never use a native or hidden tool channel, recipient, function-call, plugin, or model-internal tool. Do not put a call in reasoning, reasoning_content, a tool/function recipient, or any field other than content.",
   // "Never return null or empty content on a tool turn. A reasoning-only response is a failed response; serialize the intended call into content before ending the turn.",
   "To call tools, the content object is {\"type\":\"tool_calls\",\"preamble\":\"optional user-visible status\",\"tool_calls\":[{\"name\":\"declared_function_name\",\"arguments\":{...}}]}. Omit `preamble` by default. The tool_calls array may contain one or more calls; put multiple entries there only when they are independent.",
