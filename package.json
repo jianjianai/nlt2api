@@ -6,7 +6,7 @@
     "preview": "vite preview",
     "probe:cli": "node scripts/probe-cli-agents.mjs",
     "probe:tools": "node scripts/probe-tool-first-pass.mjs",
-    "test": "node --experimental-strip-types --import ./tests/register-alias.mjs --test tests/core.test.ts tests/state-store.test.ts",
+    "test": "node --experimental-transform-types --import ./tests/register-alias.mjs --test tests/core.test.ts tests/state-store.test.ts tests/chat-validation.test.ts",
     "typecheck": "tsc --noEmit"
   },
   "devDependencies": {

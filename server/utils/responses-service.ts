@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { executeChatRequest, parseTools, validateChatRequest } from "~/server/utils/chat-service.ts";
+import { executeChatRequest, parseTools, validateChatRequest, type ValidatedChatRequest } from "~/server/utils/chat-service.ts";
 import { FINAL_REPLY_MARKER } from "~/server/utils/tool-calls.ts";
 import { getProxyConfig } from "~/server/utils/config.ts";
 import { HttpError } from "~/server/utils/http.ts";
@@ -707,6 +707,7 @@ export interface PreparedResponsesRequest {
   model: string;
   historyLimit: number;
   chatRequest: JsonObject;
+  validated: ValidatedChatRequest;
 }
 
 export async function prepareResponsesRequest(request: JsonObject): Promise<PreparedResponsesRequest> {
@@ -786,8 +787,8 @@ export async function prepareResponsesRequest(request: JsonObject): Promise<Prep
   delete chatRequest.input;
   delete chatRequest.instructions;
   delete chatRequest.previous_response_id;
-  validateChatRequest(chatRequest);
-  return { previousId, previous, conversationMessages, tools, model, historyLimit, chatRequest };
+  const validated = validateChatRequest(chatRequest);
+  return { previousId, previous, conversationMessages, tools, model, historyLimit, chatRequest, validated };
 }
 
 export async function executeResponsesRequest(
@@ -836,6 +837,7 @@ export async function executeResponsesRequest(
     stickyKey: previousId ?? responseStickyKey(request.user),
     requiredAccountId: previous?.accountId,
     stream: options?.stream === true,
+    validated: prepared.validated,
     signal: options?.signal,
     onUpstreamFrame: liveState && options?.emit
       ? async (frame) => emitLiveUpstreamFrame(frame, liveState, options.emit)

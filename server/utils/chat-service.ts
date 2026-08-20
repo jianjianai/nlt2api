@@ -37,6 +37,7 @@ import type {
 } from "~/server/utils/types.ts";
 
 const MAX_TOOLS = 64;
+const MAX_MESSAGES = 1_000;
 const MAX_TOOL_DEFINITION_BYTES = 256 * 1024;
 const MAX_TOOL_ARGUMENT_BYTES = 64 * 1024;
 const MAX_TOOL_RESULT_BYTES = 256 * 1024;
@@ -110,7 +111,7 @@ function parseMessages(value: unknown): ChatMessage[] {
   if (!Array.isArray(value) || value.length === 0) {
     throw new HttpError(400, "`messages` must be a non-empty array.", "invalid_request_error", "messages");
   }
-  if (value.length > 1_000) {
+  if (value.length > MAX_MESSAGES) {
     throw new HttpError(400, "`messages` exceeds the supported history limit.", "invalid_request_error", "messages");
   }
 
@@ -234,7 +235,13 @@ function validateSampling(request: JsonObject): void {
   }
 }
 
-export function validateChatRequest(request: JsonObject): void {
+export interface ValidatedChatRequest {
+  model: string;
+  messages: ChatMessage[];
+  tools: ToolDefinition[];
+}
+
+export function validateChatRequest(request: JsonObject): ValidatedChatRequest {
   const model = modelFromRequest(request);
   if (request.stream !== undefined && typeof request.stream !== "boolean") {
     throw new HttpError(400, "`stream` must be a boolean.", "invalid_request_error", "stream");
@@ -247,6 +254,7 @@ export function validateChatRequest(request: JsonObject): void {
     throw new HttpError(400, "Only n=1 is supported by the portal adapter.", "invalid_request_error", "n");
   }
   upstreamBody(request, model, messages, tools, false);
+  return { model, messages, tools };
 }
 
 function portalMessages(messages: ChatMessage[], markFinalReplies = false): ChatMessage[] {
@@ -821,12 +829,10 @@ async function executeChatRequestOnce(
     upstreamCalls?: DebugUpstreamCall[];
     upstreamType?: DebugUpstreamCallType;
     upstreamRound?: number;
+    validated?: ValidatedChatRequest;
   },
 ): Promise<ChatExecution> {
-  validateChatRequest(request);
-  const model = modelFromRequest(request);
-  const messages = parseMessages(request.messages);
-  const tools = parseTools(request.tools);
+  const { model, messages, tools } = options?.validated ?? validateChatRequest(request);
 
   const toolTurn = tools.length > 0 && request.tool_choice !== "none";
   const observedToolCallIds = messages
@@ -1108,8 +1114,14 @@ export async function executeChatRequest(
     onUpstreamFrame?: UpstreamFrameHandler;
     onRepairReasoning?: (reasoning: ReasoningFields) => void | Promise<void>;
     signal?: AbortSignal;
+    validated?: ValidatedChatRequest;
   },
 ): Promise<ChatExecution> {
+  const { validated: prevalidated, ...forwardedOptions } = options ?? {};
+  // Validate once per client request. Continuation rounds below only append
+  // internally constructed messages and shrink the token budget, so they reuse
+  // this result instead of re-running the full validation pipeline.
+  const validated = prevalidated ?? validateChatRequest(request);
   const budget = requestedOutputBudget(request);
   // Tool-call turns use a controlled JSON envelope and must remain atomic.
   const toolTurn = Array.isArray(request.tools) && request.tools.length > 0 && request.tool_choice !== "none";
@@ -1117,6 +1129,7 @@ export async function executeChatRequest(
   const maxRounds = canContinue ? MAX_CONTINUATION_ROUNDS : 1;
   let remaining = budget;
   let currentRequest = canContinue ? requestWithOutputBudget(request, Math.min(budget, PORTAL_MAX_OUTPUT_TOKENS)) : request;
+  let currentValidated = validated;
   let execution: ChatExecution | undefined;
   let accumulatedMessage: ChatMessage | undefined;
   let accumulatedUsage: UpstreamUsage | undefined;
@@ -1124,7 +1137,7 @@ export async function executeChatRequest(
   const upstreamCalls: DebugUpstreamCall[] = [];
 
   for (let round = 0; round < maxRounds; round += 1) {
-    const relayFrame: UpstreamFrameHandler | undefined = options?.onUpstreamFrame
+    const relayFrame: UpstreamFrameHandler | undefined = forwardedOptions.onUpstreamFrame
       ? async (frame) => {
         const choice = frame.choices?.[0];
         // Each upstream round is an internal segment. Hold its terminal frame
@@ -1135,20 +1148,31 @@ export async function executeChatRequest(
         if (frame.usage) {
           return false;
         }
-        return options.onUpstreamFrame!(frame);
+        return forwardedOptions.onUpstreamFrame!(frame);
       }
       : undefined;
 
     let current: ChatExecution;
     try {
+      if (round > 0) {
+        const continuation = buildContinuationRequest(
+          request,
+          validated,
+          accumulatedMessage!,
+          Math.min(remaining!, PORTAL_MAX_OUTPUT_TOKENS),
+        );
+        currentRequest = continuation.request;
+        currentValidated = continuation.validated;
+      }
       current = await executeChatRequestOnce(currentRequest, {
-        ...options,
-        requiredAccountId: execution?.account.id ?? options?.requiredAccountId,
+        ...forwardedOptions,
+        requiredAccountId: execution?.account.id ?? forwardedOptions.requiredAccountId,
         onUpstreamFrame: relayFrame,
-        onRepairReasoning: options?.onRepairReasoning,
+        onRepairReasoning: forwardedOptions.onRepairReasoning,
         upstreamCalls,
         upstreamType: round === 0 ? "initial" : "continuation",
         upstreamRound: round === 0 ? 1 : round,
+        validated: currentValidated,
       });
     } catch (error) {
       if (error instanceof ProxyRequestError) {
@@ -1187,10 +1211,6 @@ export async function executeChatRequest(
     if (!accumulatedMessage) {
       break;
     }
-    currentRequest = requestWithOutputBudget(
-      requestWithBudgetMessages(request, accumulatedMessage),
-      Math.min(remaining!, PORTAL_MAX_OUTPUT_TOKENS),
-    );
   }
 
   if (!execution) {
@@ -1214,18 +1234,33 @@ export async function executeChatRequest(
   return execution;
 }
 
-function requestWithBudgetMessages(request: JsonObject, assistant: ChatMessage): JsonObject {
-  const messages = Array.isArray(request.messages) ? request.messages : [];
+const CONTINUATION_USER_PROMPT = "Continue the previous response from exactly where it ended. Do not repeat any text. Finish the answer if possible.";
+
+/**
+ * Build the next continuation request together with its validated form. The
+ * two appended messages are constructed here and always satisfy parseMessages,
+ * so the validated message list reuses the base validation instead of
+ * re-checking the entire history. The history cap is still enforced exactly
+ * the way parseMessages would enforce it for the rebuilt request.
+ */
+export function buildContinuationRequest(
+  request: JsonObject,
+  base: ValidatedChatRequest,
+  assistant: ChatMessage,
+  budget: number,
+): { request: JsonObject; validated: ValidatedChatRequest } {
+  const userMessage: ChatMessage = { role: "user", content: CONTINUATION_USER_PROMPT };
+  const rawMessages = [
+    ...(Array.isArray(request.messages) ? request.messages : []),
+    assistant as unknown as JsonValue,
+    userMessage as unknown as JsonValue,
+  ];
+  if (rawMessages.length > MAX_MESSAGES) {
+    throw new HttpError(400, "`messages` exceeds the supported history limit.", "invalid_request_error", "messages");
+  }
   return {
-    ...request,
-    messages: [
-      ...messages,
-      assistant as unknown as JsonValue,
-      {
-        role: "user",
-        content: "Continue the previous response from exactly where it ended. Do not repeat any text. Finish the answer if possible.",
-      },
-    ] as unknown as JsonValue,
+    request: requestWithOutputBudget({ ...request, messages: rawMessages as unknown as JsonValue }, budget),
+    validated: { ...base, messages: [...base.messages, assistant, userMessage] },
   };
 }
 

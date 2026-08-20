@@ -67,7 +67,8 @@ export default defineHandler(async (event) => {
     const requestBody = body;
     // Keep client-shape errors as ordinary HTTP 4xx responses. Once the SSE
     // headers are committed, only runtime/upstream failures can use SSE errors.
-    validateChatRequest(requestBody);
+    // The validated artifacts are forwarded so execution does not re-validate.
+    const validated = validateChatRequest(requestBody);
     if (body.stream === true) {
       const includeUsage = streamOptions?.include_usage === true;
       const state = createChatStreamState(requestBody);
@@ -85,6 +86,7 @@ export default defineHandler(async (event) => {
             stickyKey: stickyKeyFrom(event.req, requestBody),
             stream: true,
             signal,
+            validated,
             onUpstreamFrame: async (frame) => {
               const chunks = chatChunksFromUpstreamFrame(frame, state, includeUsage);
               for (const chunk of chunks) {
@@ -146,6 +148,7 @@ export default defineHandler(async (event) => {
     }
     const execution = await executeChatRequest(body, {
       stickyKey: stickyKeyFrom(event.req, body),
+      validated,
     });
     const completion = asChatCompletion(execution);
 
