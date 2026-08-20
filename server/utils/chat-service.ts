@@ -377,24 +377,36 @@ async function getCompletion(
     upstreamRequest: body,
     ...(trace ? { upstreamCalls: trace.calls } : {}),
   };
-  const attempts = requiredAccountId
-    ? 1
-    : Math.max(1, (await stateStore.listAccounts()).filter((account) => account.enabled).length);
+  // A required account is an affinity preference (repair pinning, tool-call
+  // binding), never a hard requirement: the full conversation state travels in
+  // the request messages, so when the preferred account is cooling down,
+  // disabled, or fails, fall back to normal scheduling over the remaining
+  // healthy accounts instead of failing the request.
+  const attempts = Math.max(1, (await stateStore.listAccounts()).filter((account) => account.enabled).length);
   for (let attempt = 0; attempt < attempts; attempt += 1) {
     let account: ManagedAccount;
+    let pinnedAttempt = false;
     try {
-      if (requiredAccountId) {
+      if (requiredAccountId && attempt === 0) {
         const stored = await stateStore.getAccount(requiredAccountId);
-        if (!stored || !stored.enabled) {
-          throw new HttpError(409, "The assigned account is unavailable.", "invalid_request_error", "account");
+        if (stored?.enabled) {
+          pinnedAttempt = true;
+          account = await accountScheduler.acquire(stickyKey, new Set((await stateStore.listAccounts()).filter((item) => item.id !== requiredAccountId).map((item) => item.id)));
+        } else {
+          account = await accountScheduler.acquire(stickyKey, excluded);
         }
-        account = await accountScheduler.acquire(stickyKey, new Set((await stateStore.listAccounts()).filter((item) => item.id !== requiredAccountId).map((item) => item.id)));
       } else {
         account = await accountScheduler.acquire(stickyKey, excluded);
       }
     } catch (error) {
       if (error instanceof HttpError) {
         throw error;
+      }
+      if (pinnedAttempt && requiredAccountId) {
+        // The preferred account is cooling down or otherwise not acquirable;
+        // exclude it and fall back to normal scheduling on the next attempt.
+        excluded.add(requiredAccountId);
+        continue;
       }
       if (lastError) {
         throw new ProxyRequestError(lastError, lastContext);
@@ -549,9 +561,6 @@ async function getCompletion(
         }
         accountScheduler.markFailure(account.id, portalError.message, portalError.retryAfterSeconds);
         excluded.add(account.id);
-        if (requiredAccountId) {
-          throw new ProxyRequestError(portalError, currentContext);
-        }
         continue;
       }
       if (error instanceof PortalError) {
@@ -562,9 +571,6 @@ async function getCompletion(
         }
         accountScheduler.markFailure(account.id, error.message, error.retryAfterSeconds);
         excluded.add(account.id);
-        if (requiredAccountId) {
-          throw new ProxyRequestError(error, currentContext);
-        }
       } else {
         const message = error instanceof Error ? error.message : "Unknown portal transport error.";
         accountScheduler.markFailure(account.id, message);
