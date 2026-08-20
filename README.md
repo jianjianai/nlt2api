@@ -1,4 +1,4 @@
-# NeuralWatt OpenAI 网关
+# nlt2 OpenAI 网关
 
 本服务将 OpenAI 兼容的 `POST /v1/chat/completions` 转换为带 Cookie 登录态的
 `https://portal.neuralwatt.com/api/chat` Playground 请求。上游真实能力、Kimi K3
