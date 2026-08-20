@@ -1,6 +1,7 @@
 import { defineHandler } from "nitro";
 import { accountScheduler } from "~/server/utils/account-scheduler.ts";
 import { asBoolean, asNumber, asString, HttpError, jsonResponse, openAIErrorResponse, readJsonObject, requireAdminAuth } from "~/server/utils/http.ts";
+import { normalizeProxyUrl } from "~/server/utils/proxy.ts";
 import { adminHttpError } from "~/server/utils/route-helpers.ts";
 import { stateStore } from "~/server/utils/state-store.ts";
 
@@ -12,7 +13,7 @@ export default defineHandler(async (event) => {
       throw new HttpError(400, "Account id is required.", "invalid_request_error", "id");
     }
     const body = await readJsonObject(event.req);
-    const input: { label?: string; enabled?: boolean; weight?: number } = {};
+    const input: { label?: string; enabled?: boolean; weight?: number; proxy?: string | null } = {};
     if (body.label !== undefined) {
       input.label = asString(body.label, "label", { maxLength: 120 });
     }
@@ -26,13 +27,26 @@ export default defineHandler(async (event) => {
       }
       input.weight = weight;
     }
+    if (body.proxy !== undefined) {
+      if (body.proxy === null || body.proxy === "") {
+        input.proxy = null;
+      } else {
+        input.proxy = normalizeProxyUrl(asString(body.proxy, "proxy", { maxLength: 2_048 })!);
+      }
+    }
     if (Object.keys(input).length === 0) {
       throw new HttpError(400, "At least one account field must be supplied.", "invalid_request_error");
     }
 
-    const account = await stateStore.updateAccount(id, input);
+    let account = await stateStore.updateAccount(id, input);
     if (input.enabled === false) {
       accountScheduler.invalidateStickyAccount(id);
+    }
+    if (input.proxy !== undefined) {
+      // The portal session may be bound to the previous egress IP, so force a
+      // fresh login through the updated proxy on the next request.
+      await stateStore.updateSession(id, undefined);
+      account = (await stateStore.getAccount(id)) ?? account;
     }
     return jsonResponse({ account: accountScheduler.publicState(account) });
   } catch (error) {

@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { maskProxyUrl } from "~/server/utils/proxy.ts";
 import { stateStore } from "~/server/utils/state-store.ts";
 import type { AccountRuntimeState, ManagedAccount, PublicAccount } from "~/server/utils/types.ts";
 
@@ -187,6 +188,7 @@ export class AccountScheduler {
       emailHint: maskEmail(account.email),
       enabled: account.enabled,
       weight: account.weight,
+      proxyHint: account.proxy ? maskProxyUrl(account.proxy) : null,
       hasSession: Boolean(account.session),
       sessionExpiresAt: account.session?.expiresAt ?? null,
       createdAt: account.createdAt,

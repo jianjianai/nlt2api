@@ -16,6 +16,7 @@ interface Account {
   emailHint: string;
   enabled: boolean;
   weight: number;
+  proxyHint: string | null;
   hasSession: boolean;
   sessionExpiresAt: number | null;
   createdAt: string;
@@ -118,7 +119,7 @@ const config = reactive({
   clientApiKeyRequired: false,
   defaultModel: "",
 });
-const newAccount = reactive({ label: "", email: "", password: "", weight: 1 });
+const newAccount = reactive({ label: "", email: "", password: "", weight: 1, proxy: "" });
 const isLoading = ref(false);
 const isSaving = ref(false);
 const isClearingRecords = ref(false);
@@ -268,6 +269,7 @@ async function addAccount() {
     newAccount.email = "";
     newAccount.password = "";
     newAccount.weight = 1;
+    newAccount.proxy = "";
     notice.value = "账号验证成功并已添加";
     await loadDashboard();
   } catch (error) {
@@ -287,6 +289,34 @@ async function verifyAccount(account: Account) {
     notice.value = `${account.label} 验证成功`;
   } catch (error) {
     errorMessage.value = error instanceof Error ? error.message : "账号验证失败。";
+  }
+}
+
+async function editProxy(account: Account) {
+  const current = account.proxyHint ?? "";
+  const input = window.prompt(
+    `设置账号“${account.label}”的出口代理，支持 http/https/socks4/socks5，可带认证（如 socks5://user:pass@host:1080）。留空并确定可清除代理。`,
+    current,
+  );
+  if (input === null) {
+    return;
+  }
+  const value = input.trim();
+  if (value === current) {
+    return;
+  }
+  errorMessage.value = "";
+  try {
+    const payload = await api(`/api/admin/accounts/${encodeURIComponent(account.id)}`, {
+      method: "PATCH",
+      body: JSON.stringify({ proxy: value === "" ? null : value }),
+    });
+    if (payload.account) {
+      replaceAccount(payload.account);
+    }
+    notice.value = value === "" ? `${account.label} 的代理已清除` : `${account.label} 的代理已更新，会话将重新登录`;
+  } catch (error) {
+    errorMessage.value = error instanceof Error ? error.message : "无法更新代理。";
   }
 }
 
@@ -942,6 +972,8 @@ onMounted(() => {
             <input id="account-password" v-model="newAccount.password" type="password" maxlength="4096" autocomplete="new-password" required />
             <label for="account-weight">权重</label>
             <input id="account-weight" v-model.number="newAccount.weight" type="number" min="1" max="100" step="1" required />
+            <label for="account-proxy">出口代理（可选）</label>
+            <input id="account-proxy" v-model="newAccount.proxy" type="text" maxlength="2048" autocomplete="off" spellcheck="false" placeholder="http://host:8080 或 socks5://user:pass@host:1080" />
             <button class="button button-primary form-submit" type="submit" :disabled="isSaving">
               {{ isSaving ? "验证中…" : "添加账号" }}
             </button>
@@ -966,6 +998,7 @@ onMounted(() => {
                     <td>
                       <strong>{{ account.label }}</strong>
                       <span class="muted">{{ account.emailHint }}</span>
+                      <span v-if="account.proxyHint" class="muted">代理 {{ account.proxyHint }}</span>
                     </td>
                     <td>
                       <span class="state-text" :class="{ good: account.hasSession && !(account.sessionExpiresAt && account.sessionExpiresAt < Date.now()) }">{{ sessionLabel(account) }}</span>
@@ -978,6 +1011,7 @@ onMounted(() => {
                     <td>{{ account.weight }}</td>
                     <td class="action-cell">
                       <button class="text-button" type="button" @click="verifyAccount(account)">验证</button>
+                      <button class="text-button" type="button" @click="editProxy(account)">代理</button>
                       <button class="text-button" type="button" @click="toggleAccount(account)">{{ account.enabled ? "禁用" : "启用" }}</button>
                       <button class="text-button danger" type="button" @click="removeAccount(account)">移除</button>
                     </td>

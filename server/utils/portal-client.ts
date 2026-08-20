@@ -1,5 +1,7 @@
+import type { Dispatcher } from "undici";
 import { stateStore } from "~/server/utils/state-store.ts";
 import { getProxyConfig } from "~/server/utils/config.ts";
+import { proxyDispatcher } from "~/server/utils/proxy.ts";
 import {
   MAX_PORTAL_CHAT_ATTEMPTS,
   portalRetryDelayMs,
@@ -86,7 +88,11 @@ function sessionFromResponse(response: Response): PortalSession | undefined {
   };
 }
 
-async function portalFetch(input: string, init: RequestInit, clientSignal?: AbortSignal): Promise<Response> {
+function accountDispatcher(account: ManagedAccount): Dispatcher | undefined {
+  return account.proxy ? proxyDispatcher(account.proxy) : undefined;
+}
+
+async function portalFetch(input: string, init: RequestInit, clientSignal?: AbortSignal, dispatcher?: Dispatcher): Promise<Response> {
   const controller = new AbortController();
   let timeout: ReturnType<typeof setTimeout> | undefined;
   let timedOut = false;
@@ -118,7 +124,11 @@ async function portalFetch(input: string, init: RequestInit, clientSignal?: Abor
   };
   armTimeout();
   try {
-    const response = await fetch(input, { ...init, signal: controller.signal });
+    const response = await fetch(input, {
+      ...init,
+      signal: controller.signal,
+      ...(dispatcher ? { dispatcher } : {}),
+    } as RequestInit);
     clearTimeoutTimer();
     if (!response.body) {
       finish();
@@ -431,7 +441,7 @@ export class PortalClient {
         if (signal?.aborted) {
           throw clientAbortError();
         }
-        response = await this.sendChat(session, body, signal);
+        response = await this.sendChat(session, body, signal, accountDispatcher(account));
       } catch (error) {
         if (signal?.aborted || error instanceof PortalError && error.status === 499) {
           throw clientAbortError();
@@ -498,7 +508,7 @@ export class PortalClient {
     const response = await portalFetch(SESSION_PROBE_URL, {
       headers: this.portalHeaders(session),
       redirect: "manual",
-    });
+    }, undefined, accountDispatcher(account));
     if (response.status !== 200) {
       throw new PortalError(await responseMessage(response), response.status, retryAfterSeconds(response));
     }
@@ -520,6 +530,7 @@ export class PortalClient {
   }
 
   private async login(account: ManagedAccount): Promise<PortalSession> {
+    const dispatcher = accountDispatcher(account);
     const form = new URLSearchParams({ email: account.email, password: account.password });
     const response = await portalFetch(LOGIN_URL, {
       method: "POST",
@@ -530,7 +541,7 @@ export class PortalClient {
         Referer: LOGIN_URL,
       },
       body: form,
-    });
+    }, undefined, dispatcher);
 
     if (response.status !== 302 && response.status !== 303 && !response.ok) {
       throw new PortalError(await responseMessage(response), response.status, retryAfterSeconds(response));
@@ -546,7 +557,7 @@ export class PortalClient {
     const probe = await portalFetch(SESSION_PROBE_URL, {
       headers: this.portalHeaders(session),
       redirect: "manual",
-    });
+    }, undefined, dispatcher);
     if (probe.status !== 200) {
       throw new PortalError(await responseMessage(probe), probe.status, retryAfterSeconds(probe));
     }
@@ -556,7 +567,7 @@ export class PortalClient {
     return session;
   }
 
-  private sendChat(session: PortalSession, body: Record<string, unknown>, signal?: AbortSignal): Promise<Response> {
+  private sendChat(session: PortalSession, body: Record<string, unknown>, signal?: AbortSignal, dispatcher?: Dispatcher): Promise<Response> {
     return portalFetch(CHAT_URL, {
       method: "POST",
       redirect: "manual",
@@ -565,7 +576,7 @@ export class PortalClient {
         "Content-Type": "application/json",
       },
       body: JSON.stringify(body),
-    }, signal);
+    }, signal, dispatcher);
   }
 
   private portalHeaders(session: PortalSession): HeadersInit {

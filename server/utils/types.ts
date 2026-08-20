@@ -78,6 +78,8 @@ export interface ManagedAccount {
   password: string;
   enabled: boolean;
   weight: number;
+  /** Optional per-account egress proxy URL (http/https/socks4/socks5). */
+  proxy?: string;
   session?: PortalSession;
   createdAt: string;
   updatedAt: string;
@@ -108,6 +110,7 @@ export interface PublicAccount {
   emailHint: string;
   enabled: boolean;
   weight: number;
+  proxyHint: string | null;
   hasSession: boolean;
   sessionExpiresAt: number | null;
   createdAt: string;

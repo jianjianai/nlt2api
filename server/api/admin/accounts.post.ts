@@ -3,6 +3,7 @@ import { accountScheduler } from "~/server/utils/account-scheduler.ts";
 import { asNumber, asString, jsonResponse, openAIErrorResponse, readJsonObject, requireAdminAuth, HttpError } from "~/server/utils/http.ts";
 import { adminHttpError } from "~/server/utils/route-helpers.ts";
 import { portalClient, PortalError } from "~/server/utils/portal-client.ts";
+import { normalizeProxyUrl } from "~/server/utils/proxy.ts";
 import { stateStore } from "~/server/utils/state-store.ts";
 
 export default defineHandler(async (event) => {
@@ -17,8 +18,10 @@ export default defineHandler(async (event) => {
     if (weight !== undefined && !Number.isInteger(weight)) {
       throw new HttpError(400, "`weight` must be an integer.", "invalid_request_error", "weight");
     }
+    const proxyInput = asString(body.proxy, "proxy", { optional: true, maxLength: 2_048 });
+    const proxy = proxyInput ? normalizeProxyUrl(proxyInput) : undefined;
 
-    const account = await stateStore.addAccount({ email, password, label, weight });
+    const account = await stateStore.addAccount({ email, password, label, weight, ...(proxy ? { proxy } : {}) });
     accountId = account.id;
     try {
       await portalClient.verifyAccount(account);

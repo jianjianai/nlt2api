@@ -29,12 +29,14 @@ function emptyState(): PersistentState {
 }
 
 function normaliseAccount(account: ManagedAccount): ManagedAccount {
+  const proxy = typeof account.proxy === "string" && account.proxy.trim() ? account.proxy.trim() : undefined;
   return {
     ...account,
     label: account.label.trim() || account.email,
     email: account.email.trim().toLowerCase(),
     weight: Math.max(1, Math.min(100, Math.floor(account.weight || 1))),
     enabled: account.enabled !== false,
+    ...(proxy ? { proxy } : {}),
   };
 }
 
@@ -102,6 +104,7 @@ export class StateStore {
     password: string;
     label?: string;
     weight?: number;
+    proxy?: string;
   }): Promise<ManagedAccount> {
     const email = input.email.trim().toLowerCase();
     if (!email || !input.password) {
@@ -121,6 +124,7 @@ export class StateStore {
         password: input.password,
         enabled: true,
         weight: input.weight ?? 1,
+        ...(input.proxy ? { proxy: input.proxy } : {}),
         createdAt: now,
         updatedAt: now,
       });
@@ -129,7 +133,7 @@ export class StateStore {
     });
   }
 
-  async updateAccount(id: string, input: Partial<Pick<ManagedAccount, "label" | "enabled" | "weight">>): Promise<ManagedAccount> {
+  async updateAccount(id: string, input: Partial<Pick<ManagedAccount, "label" | "enabled" | "weight"> & { proxy: string | null }>): Promise<ManagedAccount> {
     return this.mutate((state) => {
       const account = state.accounts.find((candidate) => candidate.id === id);
       if (!account) {
@@ -144,6 +148,11 @@ export class StateStore {
       }
       if (typeof input.weight === "number") {
         account.weight = Math.max(1, Math.min(100, Math.floor(input.weight)));
+      }
+      if (typeof input.proxy === "string") {
+        account.proxy = input.proxy;
+      } else if (input.proxy === null) {
+        delete account.proxy;
       }
       account.updatedAt = new Date().toISOString();
       return account;

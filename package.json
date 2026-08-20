@@ -13,7 +13,7 @@
     "preview": "vite preview",
     "probe:cli": "node scripts/probe-cli-agents.mjs",
     "probe:tools": "node scripts/probe-tool-first-pass.mjs",
-    "test": "node --experimental-transform-types --import ./tests/register-alias.mjs --test tests/core.test.ts tests/state-store.test.ts tests/chat-validation.test.ts",
+    "test": "node --experimental-transform-types --import ./tests/register-alias.mjs --test tests/core.test.ts tests/state-store.test.ts tests/chat-validation.test.ts tests/proxy.test.ts",
     "typecheck": "tsc --noEmit"
   },
   "devDependencies": {
@@ -27,6 +27,8 @@
     "ajv": "8.17.1",
     "json-source-map": "^0.6.1",
     "jsonrepair": "^3.15.0",
+    "socks": "^2.8.9",
+    "undici": "^8.10.0",
     "vue": "^3.5.41"
   }
 }
