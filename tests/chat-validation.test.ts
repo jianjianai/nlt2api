@@ -4,13 +4,15 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import {
+  chatChunksFromUpstreamFrame,
+  createChatStreamState,
   executeChatRequest,
   validateChatRequest,
 } from "../server/utils/chat-service.ts";
 import { getProxyConfig, resetProxyConfigForTests } from "../server/utils/config.ts";
 import { HttpError } from "../server/utils/http.ts";
 import { InvalidStructuredToolCallsError } from "../server/utils/tool-calls.ts";
-import type { JsonObject, JsonValue } from "../server/utils/types.ts";
+import type { JsonObject, JsonValue, UpstreamCompletion } from "../server/utils/types.ts";
 
 const tool = {
   type: "function",
@@ -358,5 +360,75 @@ test("executeChatRequest trusts a supplied validation result instead of re-valid
       },
     );
   });
+});
+
+function contentFrame(content: string): UpstreamCompletion {
+  return { choices: [{ delta: { role: "assistant", content } }] } as UpstreamCompletion;
+}
+
+function streamContents(
+  frames: UpstreamCompletion[],
+  request: JsonObject,
+): { streamed: string[]; state: ReturnType<typeof createChatStreamState> } {
+  const state = createChatStreamState(request);
+  const streamed: string[] = [];
+  for (const frame of frames) {
+    for (const chunk of chatChunksFromUpstreamFrame(frame, state)) {
+      const delta = (chunk.choices as Array<{ delta: { content?: string } }>)[0]?.delta;
+      if (typeof delta?.content === "string") {
+        streamed.push(delta.content);
+      }
+    }
+  }
+  return { streamed, state };
+}
+
+test("streaming tool turn holds a split marker, then streams the final reply", () => {
+  const { streamed, state } = streamContents([
+    contentFrame("@@FINAL"),
+    contentFrame("_REPLY@@The answer"),
+    contentFrame(" is 42."),
+  ], validRequest({ tools: [tool] }));
+  assert.deepEqual(streamed, ["The answer", " is 42."]);
+  assert.equal(state.toolContentMode, "final");
+  assert.equal(state.contentSent, true);
+});
+
+test("streaming tool turn tolerates leading whitespace before the final marker", () => {
+  const { streamed, state } = streamContents([
+    contentFrame("\n\n"),
+    contentFrame("@@FINAL_REPLY@@"),
+    contentFrame("Done."),
+  ], validRequest({ tools: [tool] }));
+  assert.deepEqual(streamed, ["Done."]);
+  assert.equal(state.toolContentMode, "final");
+});
+
+test("streaming tool turn suppresses content that diverges from the marker", () => {
+  const { streamed, state } = streamContents([
+    contentFrame("@"),
+    contentFrame("mention someone"),
+  ], validRequest({ tools: [tool] }));
+  assert.deepEqual(streamed, []);
+  assert.equal(state.toolContentMode, "tool");
+  assert.equal(state.contentSent, false);
+});
+
+test("streaming tool turn suppresses tool-call JSON from the client stream", () => {
+  const { streamed, state } = streamContents([
+    contentFrame('{"type":"tool_calls"'),
+    contentFrame(',"tool_calls":[]}'),
+  ], validRequest({ tools: [tool] }));
+  assert.deepEqual(streamed, []);
+  assert.equal(state.toolContentMode, "tool");
+});
+
+test("streaming non-tool turn forwards content immediately", () => {
+  const { streamed, state } = streamContents([
+    contentFrame("Hello"),
+    contentFrame(" world"),
+  ], validRequest());
+  assert.deepEqual(streamed, ["Hello", " world"]);
+  assert.equal(state.toolContentMode, "final");
 });
 

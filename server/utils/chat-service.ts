@@ -1200,16 +1200,25 @@ export function chatChunksFromUpstreamFrame(
     } else if (state.toolContentMode !== "tool") {
       state.toolContentBuffer += delta.content;
       if (state.toolContentMode === "unknown") {
-        if (state.toolContentBuffer === FINAL_REPLY_MARKER) {
+        // The parse side trims before checking the marker; mirror that here so
+        // a final reply with leading whitespace is not misclassified as tool
+        // JSON and held back from the client until the stream ends.
+        const candidate = state.toolContentBuffer.trimStart();
+        if (candidate === FINAL_REPLY_MARKER) {
           state.toolContentMode = "final";
           state.toolContentBuffer = "";
-        } else if (state.toolContentBuffer.startsWith(FINAL_REPLY_MARKER)) {
+        } else if (candidate.startsWith(FINAL_REPLY_MARKER)) {
           state.toolContentMode = "final";
-          state.toolContentBuffer = state.toolContentBuffer.slice(FINAL_REPLY_MARKER.length);
-        } else if (!FINAL_REPLY_MARKER.startsWith(state.toolContentBuffer)) {
+          state.toolContentBuffer = candidate.slice(FINAL_REPLY_MARKER.length);
+        } else if (!FINAL_REPLY_MARKER.startsWith(candidate)) {
+          // Diverged from the marker: this is tool-call JSON (or invalid prose
+          // the repair loop will correct). Either way it is protocol data, so
+          // suppress it from the client stream. The assembled completion keeps
+          // the full content for evaluation and repair.
           state.toolContentMode = "tool";
           state.toolContentBuffer = "";
         }
+        // A whitespace-only or marker-prefix buffer keeps waiting for deltas.
       }
       if (state.toolContentMode === "final" && state.toolContentBuffer.length > 0) {
         outputDelta.content = state.toolContentBuffer;
