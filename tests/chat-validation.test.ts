@@ -244,21 +244,21 @@ test("validateChatRequest rejects invalid requests with unchanged errors", () =>
       expected: { status: 400, message: "messages[0].content exceeds the 262144 byte tool-result limit.", param: "messages" },
     },
     {
-      name: "more than 64 tools",
+      name: "more than 512 tools",
       mutate: (request) => {
-        request.tools = Array.from({ length: 65 }, (_, index) => ({
+        request.tools = Array.from({ length: 513 }, (_, index) => ({
           type: "function",
           function: { name: `tool_${index}` },
         })) as unknown as JsonValue;
       },
-      expected: { status: 400, message: "`tools` must contain at most 64 function definitions.", param: "tools" },
+      expected: { status: 400, message: "`tools` must contain at most 512 function definitions.", param: "tools" },
     },
     {
       name: "oversized tool definitions",
       mutate: (request) => {
         request.tools = [{
           type: "function",
-          function: { name: "lookup", description: "x".repeat(257 * 1_024) },
+          function: { name: "lookup", description: "x".repeat(1025 * 1_024) },
         }] as unknown as JsonValue;
       },
       expected: { status: 400, message: "`tools` exceeds the supported definition size.", param: "tools" },

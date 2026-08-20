@@ -41,9 +41,9 @@ import type {
   UpstreamUsage,
 } from "~/server/utils/types.ts";
 
-const MAX_TOOLS = 64;
+const MAX_TOOLS = 512;
 const MAX_MESSAGES = 1_000;
-const MAX_TOOL_DEFINITION_BYTES = 256 * 1024;
+const MAX_TOOL_DEFINITION_BYTES = 1024 * 1024;
 const MAX_TOOL_ARGUMENT_BYTES = 64 * 1024;
 const MAX_TOOL_RESULT_BYTES = 256 * 1024;
 const DEFAULT_OUTPUT_TOKENS = 8_192;
