@@ -403,6 +403,29 @@ test("repair history keeps the reminder before the failed candidate and error", 
   assert.match(String(history[4]?.content), /JSON parse failed; retry/);
 });
 
+test("repair history separates the rejection result from the correction instruction", () => {
+  const contracted = withToolCallContract(
+    [{ role: "user" as const, content: "read package.json" }],
+    tools,
+    "required",
+  );
+  const history = buildToolRepairHistory(
+    contracted,
+    { role: "assistant" as const, content: '{"type":"tool_calls","tool_calls":[{"name":"calculator","arguments":{"a":1' },
+    { role: "tool" as const, tool_call_id: "call_repair_1", content: "The previous tool call failed validation.\n\nRejection details:\nJSON parse failed; retry" },
+    { role: "user" as const, content: "Tool-call repair attempt 1. Return only the corrected JSON object.\nRules:\n- Use the required envelope and a declared function name." },
+  );
+  assert.deepEqual(history.map((message) => message.role), ["system", "user", "user", "assistant", "tool", "user"]);
+  assert.equal(history[3]?.role, "assistant");
+  // The error is carried as tool-role data and the correction directive as a
+  // user-role instruction, matching OpenAI role semantics.
+  assert.equal(history[4]?.role, "tool");
+  assert.match(String(history[4]?.content), /Rejection details:\nJSON parse failed; retry/);
+  assert.equal(history[5]?.role, "user");
+  assert.match(String(history[5]?.content), /Tool-call repair attempt 1/);
+  assert.match(String(history[5]?.content), /Return only the corrected JSON object/);
+});
+
 test("adapter contract follows caller instructions and the latest tool result", () => {
   const messages = [
     { role: "system" as const, content: "caller tool syntax" },

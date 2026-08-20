@@ -186,7 +186,7 @@ export class InvalidStructuredToolCallsError extends Error {
 export function buildToolRepairHistory(
   originalHistory: ChatMessage[],
   candidate: ChatMessage,
-  repair: ChatMessage,
+  ...repairs: ChatMessage[]
 ): ChatMessage[] {
   // The failed candidate must model the same content-envelope format the
   // contract demands: native tool_calls fields never reach the portal, even
@@ -202,7 +202,11 @@ export function buildToolRepairHistory(
       // their raw form into the candidate content.
     }
   }
-  return [...originalHistory, serialized, repair];
+  // `repairs` is normally two messages: a tool-role rejection result followed
+  // by a user-role correction instruction. Keeping the error (data) separate
+  // from the corrective directive (instruction) matches role semantics and
+  // improves the model's adherence to the fix request.
+  return [...originalHistory, serialized, ...repairs];
 }
 
 export function envelopeAllowedForToolChoice(envelope: ControlledToolEnvelope | undefined, toolChoice: unknown): boolean {

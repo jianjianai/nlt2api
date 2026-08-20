@@ -649,7 +649,7 @@ function outputFinishReason(completion: UpstreamCompletion, message: ChatMessage
   return upstream === "length" ? "length" : "stop";
 }
 
-function repairMessage(error: string, attempt: number, candidate: ChatMessage, parallelToolCalls: boolean): ChatMessage {
+function repairMessages(error: string, attempt: number, candidate: ChatMessage, parallelToolCalls: boolean): ChatMessage[] {
   const hasCandidate = Boolean(
     (typeof candidate.content === "string" && candidate.content.length > 0)
     || candidate.tool_calls?.length,
@@ -665,17 +665,30 @@ function repairMessage(error: string, attempt: number, candidate: ChatMessage, p
   const callRule = parallelToolCalls
     ? "Preserve every intended call from the failed candidate; include multiple entries only when they are independent."
     : "Return exactly one call.";
-  return {
+
+  // Split the rejection across two role-correct messages. The `tool` message
+  // carries only the validation result (data), while the corrective directive
+  // (what to do next) is a separate `user` turn. Models are trained to follow
+  // user turns as instructions and to treat tool turns as returned data, so
+  // burying the fix instruction inside a tool result is obeyed less reliably
+  // than a dedicated user correction turn.
+  const rejection: ChatMessage = {
     role: "tool",
     tool_call_id: candidateToolCallId ?? `call_repair_${attempt}`,
+    content: [
+      "The previous tool call failed validation.",
+      "",
+      "Rejection details:",
+      error.slice(0, 2_000),
+    ].join("\n"),
+  };
+  const correction: ChatMessage = {
+    role: "user",
     content: [
       `Tool-call repair attempt ${attempt}.`,
       context,
       "",
       "The previous tool-call JSON was rejected. Return only the corrected JSON object.",
-      "",
-      "Rejection details:",
-      error.slice(0, 2_000),
       "",
       "Rules:",
       "- Use the required envelope and a declared function name.",
@@ -684,6 +697,8 @@ function repairMessage(error: string, attempt: number, candidate: ChatMessage, p
       "- Output exactly one JSON object with no prose, markdown, or code fences.",
     ].join("\n"),
   };
+
+  return [rejection, correction];
 }
 
 function rawAssistantContent(completion: UpstreamCompletion): string {
@@ -907,9 +922,10 @@ async function executeChatRequestOnce(
     // upstreamBody already applied the adapter contract and the internal
     // reminder to the original history exactly once; reuse that list so the
     // repair history cannot drift from what was actually sent. Repair turns
-    // append the failed candidate and the exact error after the reminder, so
-    // the reminder always stays right after the user instruction instead of
-    // after the error message.
+    // append the failed candidate, a tool-role rejection result, and a
+    // user-role correction instruction after the reminder, so the reminder
+    // always stays right after the user instruction instead of after the
+    // error message.
     const contractedOriginalMessages = builtUpstream.messages;
     const firstReasoning = initialReasoning(result.completion);
     // The portal occasionally returns a JSON completion even after accepting
@@ -960,7 +976,7 @@ async function executeChatRequestOnce(
       const repairHistory = buildToolRepairHistory(
         contractedOriginalMessages,
         repairCandidate.message,
-        repairMessage(error, toolCallAdapter.repairAttempts, repairCandidate.message, request.parallel_tool_calls !== false),
+        ...repairMessages(error, toolCallAdapter.repairAttempts, repairCandidate.message, request.parallel_tool_calls !== false),
       );
       const repairStream = Boolean(options?.onRepairReasoning);
       upstreamRequest = {
