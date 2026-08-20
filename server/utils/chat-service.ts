@@ -858,10 +858,18 @@ async function executeChatRequestOnce(
   let toolCallAdapter: ToolCallAdapterTrace | undefined;
 
   if (toolTurn) {
-    // Keep the caller history separate from the adapter contract. Repair turns
-    // append the bad candidate and exact error, then re-apply the contract so
-    // it remains the final instruction in every attempt.
+    // Keep the caller history separate from the adapter contract. The adapter
+    // contract and the internal reminder are applied once to the original
+    // history; repair turns then append the failed candidate and the exact
+    // error after the reminder so the reminder always stays right after the
+    // user instruction instead of after the error message.
     const originalUpstreamMessages = portalMessages(messages, true);
+    const contractedOriginalMessages = withToolCallContract(
+      originalUpstreamMessages,
+      tools,
+      request.tool_choice,
+      request.parallel_tool_calls !== false,
+    );
     const firstReasoning = initialReasoning(result.completion);
     // The portal occasionally returns a JSON completion even after accepting
     // a streaming request. Forward the original reasoning before a repair so
@@ -909,7 +917,7 @@ async function executeChatRequestOnce(
       toolCallAdapter.errors.push(error);
       toolCallAdapter.repairAttempts += 1;
       const repairHistory = buildToolRepairHistory(
-        originalUpstreamMessages,
+        contractedOriginalMessages,
         repairCandidate.message,
         repairMessage(error, toolCallAdapter.repairAttempts, repairCandidate.hasCandidate),
       );
@@ -924,12 +932,7 @@ async function executeChatRequestOnce(
         // Deterministic sampling improves JSON/schema correction even when
         // the caller intentionally used a higher temperature.
         temperature: 0,
-        messages: withToolCallContract(
-          repairHistory,
-          tools,
-          request.tool_choice,
-          request.parallel_tool_calls !== false,
-        ) as unknown as JsonValue,
+        messages: repairHistory as unknown as JsonValue,
       };
       try {
         result = await getCompletion(

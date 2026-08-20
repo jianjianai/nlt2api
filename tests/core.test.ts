@@ -335,6 +335,24 @@ test("repair history retains prior tool output and structured candidate calls", 
   assert.equal(history[3]?.reasoning, "thinking 1");
 });
 
+test("repair history keeps the reminder before the failed candidate and error", () => {
+  const contracted = withToolCallContract(
+    [{ role: "user" as const, content: "read package.json" }],
+    tools,
+    "required",
+  );
+  const history = buildToolRepairHistory(
+    contracted,
+    { role: "assistant" as const, content: '{"type":"tool_calls","tool_calls":[{"name":"calculator","arguments":{"a":1' },
+    { role: "user" as const, content: "JSON parse failed; retry" },
+  );
+  assert.deepEqual(history.map((message) => message.role), ["system", "user", "user", "assistant", "user"]);
+  assert.equal(history[1]?.content, "read package.json");
+  assert.match(String(history[2]?.content), /IMPORTANT TOOL TURN REMINDER/);
+  assert.equal(history[3]?.role, "assistant");
+  assert.match(String(history[4]?.content), /JSON parse failed; retry/);
+});
+
 test("adapter contract follows caller instructions and the latest tool result", () => {
   const messages = [
     { role: "system" as const, content: "caller tool syntax" },
