@@ -1,4 +1,4 @@
-# NeuralWatt
+# nlt2
 
 Vue 3 single-page application served through [Vite](https://vite.dev/) and [Nitro](https://nitro.build/).
 
