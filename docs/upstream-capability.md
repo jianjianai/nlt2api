@@ -74,10 +74,13 @@ password=<password>
 | `kimi-k2.7-code-fast` | 262,144 | 是 | 是 | 是 | 是 |
 | `kimi-k3` | 1,048,576 | 是 | 是 | 是 | 是 |
 | `kimi-k3-fast` | 1,048,576 | 是 | 是 | 是 | 否 |
+| `qwen-3.8-27b` | 262,144 | 是 | 是 | 是 | 是 |
 | `qwen3.6-35b` | 131,072 | 是 | 是 | 是 | 是 |
 | `qwen3.6-35b-fast` | 131,072 | 是 | 是 | 是 | 否 |
 
 目录中的能力声明只用于选型；工具调用的实际线路行为以下文实测结果为准。
+
+`qwen-3.8-27b`（Qwen3.8-27B，dense 27B VL + MTP 投机解码，FP8）为预览模型，通过 early-access 计划授权：未授权账号的请求返回 404（而非 403），且不出现在匿名 `GET /api/models` 目录中；授权后能力数据以门户模型卡为准（262K 上下文；reasoning effort 默认 `xhigh`，完整档位映射为 max/xhigh/high→xhigh、medium→medium、low/minimal→low、none→none）。
 
 ## `/api/chat` 请求契约
 
