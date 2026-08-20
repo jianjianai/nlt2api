@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, nextTick, onMounted, onUnmounted, reactive, ref, watch } from "vue";
+import { computed, nextTick, onMounted, onUnmounted, reactive, ref, shallowRef, watch } from "vue";
 
 interface RuntimeState {
   inFlight: number;
@@ -104,8 +104,9 @@ const tokenStorageKey = "neuralwatt-admin-token";
 const token = ref(typeof window === "undefined" ? "" : sessionStorage.getItem(tokenStorageKey) ?? "");
 const tokenDraft = ref(token.value);
 const view = ref<"accounts" | "records">("accounts");
-const accounts = ref<Account[]>([]);
-const records = ref<DebugRecord[]>([]);
+// shallowRef: record/account payloads are large and immutable; avoid deep reactivity.
+const accounts = shallowRef<Account[]>([]);
+const records = shallowRef<DebugRecord[]>([]);
 const settings = reactive({ recordMessages: false });
 const config = reactive({
   adminTokenConfigured: false,
@@ -470,9 +471,9 @@ async function confirmClearRecords() {
 function replaceAccount(next: Account) {
   const index = accounts.value.findIndex((account) => account.id === next.id);
   if (index === -1) {
-    accounts.value.push(next);
+    accounts.value = [...accounts.value, next];
   } else {
-    accounts.value[index] = next;
+    accounts.value = accounts.value.map((account, i) => (i === index ? next : account));
   }
 }
 
@@ -835,7 +836,17 @@ function callTitle(call: DebugUpstreamCall): string {
   return call.attempt > 1 ? `${base} · 上游重试 ${call.attempt - 1}` : base;
 }
 
+const tracesCache = new WeakMap<DebugRecord, ConversationTrace[]>();
+
 function recordTraces(record: DebugRecord): ConversationTrace[] {
+  const cached = tracesCache.get(record);
+  if (cached) return cached;
+  const traces = buildRecordTraces(record);
+  tracesCache.set(record, traces);
+  return traces;
+}
+
+function buildRecordTraces(record: DebugRecord): ConversationTrace[] {
   const traces: ConversationTrace[] = [{
     key: `${record.id}:client`,
     record,
@@ -973,13 +984,18 @@ function compactTime(value: string): string {
 }
 
 /** Short content preview shown in the sidebar: the last user message, else any last message. */
+const previewCache = new WeakMap<DebugRecord, string>();
+
 function recordPreview(record: DebugRecord): string {
+  const cached = previewCache.get(record);
+  if (cached !== undefined) return cached;
   const messages = collectBodyMessages(record.clientRequest, true);
   const lastUser = [...messages].reverse().find((message) => message.role === "user" && message.content);
   const source = lastUser ?? [...messages].reverse().find((message) => message.content);
-  if (!source) return "（无消息内容）";
-  const text = source.content.replace(/\s+/g, " ").trim();
-  return text.length > 60 ? `${text.slice(0, 60)}…` : text;
+  const text = source ? source.content.replace(/\s+/g, " ").trim() : "（无消息内容）";
+  const preview = text.length > 60 ? `${text.slice(0, 60)}…` : text;
+  previewCache.set(record, preview);
+  return preview;
 }
 
 // ---- Prev / next record navigation ----
@@ -1000,6 +1016,24 @@ function gotoRecord(offset: number): void {
     document.querySelector(".trace-group.active")?.scrollIntoView({ block: "nearest" });
   });
 }
+
+// Sidebar rows are precomputed once per records/filter change so rendering
+// never re-parses bodies or rebuilds traces per item per render.
+interface SidebarItem {
+  record: DebugRecord;
+  traces: ConversationTrace[];
+  preview: string;
+}
+
+const sidebarItems = computed<SidebarItem[]>(() => filteredRecords.value.map((record) => ({
+  record,
+  traces: recordTraces(record),
+  preview: recordPreview(record),
+})));
+
+// Parse the selected trace bodies once per selection instead of on every render.
+const selectedRequest = computed(() => (selectedTrace.value ? traceRequest(selectedTrace.value) : null));
+const selectedResponse = computed(() => (selectedTrace.value ? traceResponse(selectedTrace.value) : null));
 
 watch(selectedTraceKey, () => {
   expandedMessageKeys.value = new Set();
@@ -1218,21 +1252,27 @@ onUnmounted(() => {
           </div>
           <div v-else class="conversation-workbench">
             <aside class="trace-sidebar" aria-label="请求发送列表">
-              <section v-for="record in filteredRecords" :key="record.id" class="trace-group" :class="{ active: selectedTrace?.record.id === record.id }">
-                <button class="trace-record" type="button" @click="selectTrace(recordTraces(record)[0])">
+              <section
+                v-for="item in sidebarItems"
+                :key="item.record.id"
+                v-memo="[item.record.id === selectedTrace?.record.id, item.traces.some((trace) => trace.key === selectedTrace?.key)]"
+                class="trace-group"
+                :class="{ active: selectedTrace?.record.id === item.record.id }"
+              >
+                <button class="trace-record" type="button" @click="selectTrace(item.traces[0])">
                   <span class="trace-record-top">
-                    <span class="status-chip" :class="record.status < 400 ? 'ok' : 'err'">{{ record.status }}</span>
-                    <span class="trace-endpoint">{{ record.endpoint }}</span>
-                    <time class="trace-time">{{ compactTime(record.at) }}</time>
+                    <span class="status-chip" :class="item.record.status < 400 ? 'ok' : 'err'">{{ item.record.status }}</span>
+                    <span class="trace-endpoint">{{ item.record.endpoint }}</span>
+                    <time class="trace-time">{{ compactTime(item.record.at) }}</time>
                   </span>
-                  <span class="trace-preview">{{ recordPreview(record) }}</span>
+                  <span class="trace-preview">{{ item.preview }}</span>
                   <span class="trace-record-sub">
-                    {{ record.accountLabel || "未分配账号" }}<template v-if="recordTraces(record).length > 1"> · {{ recordTraces(record).length - 1 }} 次上游调用</template>
+                    {{ item.record.accountLabel || "未分配账号" }}<template v-if="item.traces.length > 1"> · {{ item.traces.length - 1 }} 次上游调用</template>
                   </span>
                 </button>
-                <div v-if="recordTraces(record).length > 1" class="trace-children">
+                <div v-if="item.traces.length > 1" class="trace-children">
                   <button
-                    v-for="trace in recordTraces(record).slice(1)"
+                    v-for="trace in item.traces.slice(1)"
                     :key="trace.key"
                     class="trace-child"
                     :class="{ active: selectedTrace?.key === trace.key, failed: trace.status >= 400 || Boolean(trace.error) }"
@@ -1269,18 +1309,18 @@ onUnmounted(() => {
 
               <div v-if="rawTraceKey === traceRawKey(selectedTrace)" class="raw-trace">
                 <section>
-                  <h4>请求正文 · {{ traceRequest(selectedTrace).contentType }}</h4>
-                  <pre>{{ traceRequest(selectedTrace).raw }}</pre>
+                  <h4>请求正文 · {{ selectedRequest?.contentType }}</h4>
+                  <pre>{{ selectedRequest?.raw }}</pre>
                 </section>
-                <section v-if="traceResponse(selectedTrace)">
-                  <h4>响应正文 · {{ traceResponse(selectedTrace)?.contentType }}</h4>
-                  <pre>{{ traceResponse(selectedTrace)?.raw }}</pre>
+                <section v-if="selectedResponse">
+                  <h4>响应正文 · {{ selectedResponse?.contentType }}</h4>
+                  <pre>{{ selectedResponse?.raw }}</pre>
                 </section>
               </div>
 
               <div v-else class="chat-flow">
                 <article
-                  v-for="(message, index) in traceRequest(selectedTrace).messages"
+                  v-for="(message, index) in selectedRequest?.messages ?? []"
                   :key="`request-${index}`"
                   class="chat-msg"
                   :class="[messageAlign(message.role) === 'right' ? 'right' : 'left', { thinking: message.roleLabel === '思考' }]"
@@ -1302,9 +1342,9 @@ onUnmounted(() => {
 
                 <div class="chat-divider"><span>{{ selectedTrace.direction === "client" ? "客户端响应" : "上游响应" }} · HTTP {{ selectedTrace.status }}</span></div>
 
-                <template v-if="traceResponse(selectedTrace)">
+                <template v-if="selectedResponse">
                   <article
-                    v-for="(message, index) in traceResponse(selectedTrace)?.messages"
+                    v-for="(message, index) in selectedResponse?.messages"
                     :key="`response-${index}`"
                     class="chat-msg"
                     :class="[messageAlign(message.role) === 'right' ? 'right' : 'left', { thinking: message.roleLabel === '思考' }]"
@@ -1323,25 +1363,25 @@ onUnmounted(() => {
                       </button>
                     </div>
                   </article>
-                  <p v-if="!traceResponse(selectedTrace)?.messages.length" class="parsed-empty">响应无消息内容。</p>
+                  <p v-if="!selectedResponse?.messages.length" class="parsed-empty">响应无消息内容。</p>
                 </template>
                 <p v-else class="parsed-empty">尚未收到响应正文。</p>
 
                 <p v-if="selectedTrace.error" class="trace-error">{{ selectedTrace.error }}</p>
 
-                <details v-if="traceRequest(selectedTrace).fields.length" class="fold-section">
-                  <summary>请求参数 <span class="fold-count">{{ traceRequest(selectedTrace).fields.length }}</span></summary>
+                <details v-if="selectedRequest?.fields.length" class="fold-section">
+                  <summary>请求参数 <span class="fold-count">{{ selectedRequest?.fields.length }}</span></summary>
                   <dl class="record-fields">
-                    <template v-for="(field, index) in traceRequest(selectedTrace).fields" :key="`request-field-${index}`">
+                    <template v-for="(field, index) in selectedRequest?.fields" :key="`request-field-${index}`">
                       <dt>{{ field.label }}</dt><dd>{{ field.value }}</dd>
                     </template>
                   </dl>
                 </details>
 
-                <details v-if="traceResponse(selectedTrace)?.fields.length" class="fold-section">
-                  <summary>响应元数据 <span class="fold-count">{{ traceResponse(selectedTrace)?.fields.length }}</span></summary>
+                <details v-if="selectedResponse?.fields.length" class="fold-section">
+                  <summary>响应元数据 <span class="fold-count">{{ selectedResponse?.fields.length }}</span></summary>
                   <dl class="record-fields">
-                    <template v-for="(field, index) in traceResponse(selectedTrace)?.fields" :key="`response-field-${index}`">
+                    <template v-for="(field, index) in selectedResponse?.fields" :key="`response-field-${index}`">
                       <dt>{{ field.label }}</dt><dd>{{ field.value }}</dd>
                     </template>
                   </dl>
