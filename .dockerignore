@@ -1,0 +1,17 @@
+.git
+.github
+.codegraph
+node_modules
+.output
+.nitro
+.cache
+.data
+data
+.env
+.env.local
+compose.yaml
+Dockerfile
+.dockerignore
+tests
+docs
+*.md
