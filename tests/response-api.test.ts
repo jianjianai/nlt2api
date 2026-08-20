@@ -182,18 +182,103 @@ test("validateResponseRequest maps instructions, tools, tool_choice and budgets"
   });
 });
 
-test("validateResponseRequest drops hosted and namespace tools", async () => {
+test("validateResponseRequest drops hosted tools and flattens namespaces", async () => {
   await withTempDataDir(async () => {
     const { chatRequest, context } = await validateResponseRequest(baseRequest({
       tools: [
         functionTool(),
         { type: "web_search", external_web_access: false },
-        { type: "namespace", name: "multi_agent_v1", tools: [{ type: "function", name: "spawn_agent" }] },
+        { type: "namespace", name: "multi_agent_v1", tools: [{ type: "function", name: "spawn_agent", parameters: { type: "object" } }] },
       ],
     }));
-    assert.equal((chatRequest.tools as JsonObject[]).length, 1);
-    assert.deepEqual(context.droppedTools, ["web_search", "namespace"]);
+    const chatTools = chatRequest.tools as JsonObject[];
+    assert.equal(chatTools.length, 2);
+    assert.equal((chatTools[1]!.function as JsonObject).name, "multi_agent_v1.spawn_agent");
+    assert.deepEqual(context.droppedTools, ["web_search"]);
   });
+});
+
+test("validateResponseRequest harvests tools from additional_tools and namespace input items", async () => {
+  await withTempDataDir(async () => {
+    const { chatRequest, context } = await validateResponseRequest({
+      model: "test-model",
+      store: false,
+      tool_choice: "auto",
+      input: [
+        {
+          type: "additional_tools",
+          role: "developer",
+          tools: [
+            {
+              type: "namespace",
+              name: "functions",
+              description: "",
+              tools: [
+                { type: "custom", name: "exec", description: "Run JS", format: { type: "grammar", syntax: "lark", definition: "start: SOURCE" } },
+                { type: "function", name: "wait", description: "Wait", parameters: { type: "object" } },
+              ],
+            },
+          ],
+        },
+        {
+          type: "namespace",
+          name: "collaboration",
+          description: "Sub-agents",
+          tools: [{ type: "function", name: "spawn_agent", description: "Spawn", parameters: { type: "object" } }],
+        },
+        userInput("Run something"),
+      ],
+    });
+    const names = (chatRequest.tools as JsonObject[]).map((tool) => (tool.function as JsonObject).name);
+    assert.deepEqual(names, ["exec", "wait", "collaboration.spawn_agent"]);
+    assert.deepEqual(context.tools.map((tool) => [tool.kind, tool.name]), [
+      ["custom", "exec"],
+      ["function", "wait"],
+      ["function", "collaboration.spawn_agent"],
+    ]);
+    // The custom exec tool keeps its grammar format for the response echo.
+    assert.deepEqual((context.tools[0] as { format?: JsonObject }).format, { type: "grammar", syntax: "lark", definition: "start: SOURCE" });
+    // Tool-carrier items never become messages.
+    const messages = chatRequest.messages as JsonObject[];
+    assert.deepEqual(messages, [{ role: "user", content: "Run something" }]);
+    // tool_choice auto with harvested tools must not raise.
+    assert.equal(chatRequest.tool_choice, "auto");
+  });
+});
+
+test("validateResponseRequest validates named tool_choice against harvested tools", async () => {
+  await withTempDataDir(async () => {
+    const { chatRequest } = await validateResponseRequest({
+      model: "test-model",
+      store: false,
+      tool_choice: { type: "function", name: "collaboration.spawn_agent" },
+      input: [
+        { type: "namespace", name: "collaboration", tools: [{ type: "function", name: "spawn_agent", parameters: { type: "object" } }] },
+        userInput("Delegate"),
+      ],
+    });
+    assert.deepEqual(chatRequest.tool_choice, { type: "function", function: { name: "collaboration.spawn_agent" } });
+    await assertHttpError(() => validateResponseRequest({
+      model: "test-model",
+      store: false,
+      tool_choice: { type: "function", name: "collaboration.missing" },
+      input: [
+        { type: "namespace", name: "collaboration", tools: [{ type: "function", name: "spawn_agent", parameters: { type: "object" } }] },
+        userInput("Delegate"),
+      ],
+    }), { status: 400, param: "tool_choice" });
+  });
+});
+
+test("messagesFromResponseItems matches prefixed custom call names", () => {
+  const messages = messagesFromResponseItems([
+    userInput("go"),
+    { type: "custom_tool_call", name: "functions.exec", input: "exit()", call_id: "call_1" },
+    { type: "custom_tool_call_output", call_id: "call_1", output: "done" },
+  ], new Set(["exec"]));
+  const assistant = messages[1]!;
+  assert.equal(assistant.tool_calls?.[0]?.function.name, "functions.exec");
+  assert.deepEqual(JSON.parse(assistant.tool_calls![0]!.function.arguments), { input: "exit()" });
 });
 
 test("validateResponseRequest wraps custom tools with an input string schema", async () => {

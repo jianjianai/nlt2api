@@ -158,7 +158,7 @@ export function parseTools(value: unknown): ToolDefinition[] {
     const tool = asRecord(raw);
     const functionDefinition = asRecord(tool?.function);
     const name = functionDefinition?.name;
-    if (tool?.type !== "function" || !functionDefinition || typeof name !== "string" || !/^[A-Za-z0-9_-]{1,64}$/.test(name)) {
+    if (tool?.type !== "function" || !functionDefinition || typeof name !== "string" || !/^[A-Za-z0-9_.-]{1,64}$/.test(name)) {
       throw new HttpError(400, `tools[${index}] must be an OpenAI function definition with a valid name.`, "invalid_request_error", "tools");
     }
     if (names.has(name)) {

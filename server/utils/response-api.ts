@@ -35,6 +35,7 @@ export interface ResponseToolCustom {
   kind: "custom";
   name: string;
   description?: string;
+  format?: JsonObject;
 }
 
 export type ResponseTool = ResponseToolFunction | ResponseToolCustom;
@@ -175,7 +176,11 @@ function toolCallFromItem(item: Record<string, unknown>, customTools: Set<string
   if (!name) {
     throw invalid(`input[${index}].name is required for a function call item.`, "input");
   }
-  if (item.type === "custom_tool_call" || customTools.has(name)) {
+  // A client may echo a call with an explicit namespace prefix even for the
+  // default namespace (for example `functions.exec`); fall back to the plain
+  // name when matching custom tools.
+  const plainName = name.includes(".") ? name.slice(name.indexOf(".") + 1) : name;
+  if (item.type === "custom_tool_call" || customTools.has(name) || customTools.has(plainName)) {
     const input = asStringValue(item.input) ?? asStringValue(item.arguments) ?? "";
     return { id: callId, type: "function", function: { name, arguments: JSON.stringify({ input }) } };
   }
@@ -290,63 +295,79 @@ export function messagesFromResponseItems(items: JsonObject[], customTools: Set<
   return messages;
 }
 
-function parseResponseTools(value: unknown): { tools: ResponseTool[]; chatTools: ToolDefinition[]; dropped: string[] } {
-  if (value === undefined || value === null) {
-    return { tools: [], chatTools: [], dropped: [] };
-  }
-  if (!Array.isArray(value)) {
-    throw invalid("`tools` must be an array of tool definitions.", "tools");
-  }
-  const tools: ResponseTool[] = [];
-  const dropped: string[] = [];
-  const names = new Set<string>();
-  for (let index = 0; index < value.length; index += 1) {
-    const tool = asRecord(value[index]);
+// Namespaced tools are invoked by dotted wire names (`collaboration.spawn_agent`).
+// The `functions` namespace is the default recipient namespace, so its members
+// keep their plain names.
+const TOOL_NAME_PATTERN = /^[A-Za-z0-9_.-]{1,64}$/;
+const DEFAULT_TOOL_NAMESPACE = "functions";
+
+interface ParsedResponseTools {
+  tools: ResponseTool[];
+  chatTools: ToolDefinition[];
+  dropped: string[];
+}
+
+function flattenResponseTools(
+  entries: unknown[],
+  prefix: string,
+  into: { tools: ResponseTool[]; names: Set<string>; dropped: string[] },
+  location: string,
+): void {
+  for (let index = 0; index < entries.length; index += 1) {
+    const tool = asRecord(entries[index]);
     const type = asStringValue(tool?.type);
-    if (type === "function") {
-      const name = asStringValue(tool?.name);
-      if (!name || !/^[A-Za-z0-9_-]{1,64}$/.test(name)) {
-        throw invalid(`tools[${index}] must be a function definition with a valid name.`, "tools");
+    const at = `${location}[${index}]`;
+    if (type === "namespace") {
+      const namespaceName = asStringValue(tool?.name);
+      const members = Array.isArray(tool?.tools) ? tool.tools : [];
+      if (!namespaceName || !TOOL_NAME_PATTERN.test(namespaceName)) {
+        throw invalid(`${at} must be a namespace with a valid name.`, "tools");
       }
-      if (names.has(name)) {
-        throw invalid(`Tool name \`${name}\` is duplicated.`, "tools");
-      }
-      names.add(name);
-      const parameters = tool?.parameters === undefined ? undefined : asRecord(tool.parameters);
-      if (tool?.parameters !== undefined && !parameters) {
-        throw invalid(`tools[${index}].parameters must be a JSON Schema object.`, "tools");
-      }
-      tools.push({
-        kind: "function",
-        name,
-        ...(typeof tool?.description === "string" ? { description: tool.description } : {}),
-        ...(parameters ? { parameters: parameters as JsonObject } : {}),
-        ...(typeof tool?.strict === "boolean" ? { strict: tool.strict } : {}),
-      });
+      const childPrefix = namespaceName === DEFAULT_TOOL_NAMESPACE ? prefix : `${prefix}${namespaceName}.`;
+      flattenResponseTools(members, childPrefix, into, `${at}.tools`);
       continue;
     }
-    if (type === "custom") {
-      const name = asStringValue(tool?.name);
-      if (!name || !/^[A-Za-z0-9_-]{1,64}$/.test(name)) {
-        throw invalid(`tools[${index}] must be a custom tool definition with a valid name.`, "tools");
+    if (type === "function" || type === "custom") {
+      const rawName = asStringValue(tool?.name);
+      const name = rawName ? `${prefix}${rawName}` : undefined;
+      if (!name || !TOOL_NAME_PATTERN.test(name) || (rawName?.includes(".") && prefix)) {
+        throw invalid(`${at} must be a ${type} definition with a valid name.`, "tools");
       }
-      if (names.has(name)) {
+      if (into.names.has(name)) {
         throw invalid(`Tool name \`${name}\` is duplicated.`, "tools");
       }
-      names.add(name);
-      tools.push({
-        kind: "custom",
-        name,
-        ...(typeof tool?.description === "string" ? { description: tool.description } : {}),
-      });
+      into.names.add(name);
+      if (type === "function") {
+        const parameters = tool?.parameters === undefined ? undefined : asRecord(tool.parameters);
+        if (tool?.parameters !== undefined && !parameters) {
+          throw invalid(`${at}.parameters must be a JSON Schema object.`, "tools");
+        }
+        into.tools.push({
+          kind: "function",
+          name,
+          ...(typeof tool?.description === "string" ? { description: tool.description } : {}),
+          ...(parameters ? { parameters: parameters as JsonObject } : {}),
+          ...(typeof tool?.strict === "boolean" ? { strict: tool.strict } : {}),
+        });
+      } else {
+        into.tools.push({
+          kind: "custom",
+          name,
+          ...(typeof tool?.description === "string" ? { description: tool.description } : {}),
+          ...(asRecord(tool?.format) ? { format: asRecord(tool?.format) as JsonObject } : {}),
+        });
+      }
       continue;
     }
-    // Hosted/server-side tools (web_search, namespaces, MCP listings, ...) have
-    // no executor on this gateway. Dropping them keeps the model from issuing
-    // calls the client could not complete.
-    dropped.push(type ?? `tools[${index}]`);
+    // Hosted/server-side tools (web_search, MCP listings, ...) have no executor
+    // on this gateway. Dropping them keeps the model from issuing calls the
+    // client could not complete.
+    into.dropped.push(type ?? at);
   }
-  const chatTools: ToolDefinition[] = tools.map((tool) => tool.kind === "function"
+}
+
+function toChatTools(tools: ResponseTool[]): ToolDefinition[] {
+  return tools.map((tool) => tool.kind === "function"
     ? {
       type: "function",
       function: {
@@ -369,17 +390,59 @@ function parseResponseTools(value: unknown): { tools: ResponseTool[]; chatTools:
         },
       },
     });
-  return { tools, chatTools, dropped };
 }
 
-function parseResponseToolChoice(value: unknown, tools: ResponseTool[]): JsonValue | undefined {
+function parseResponseTools(value: unknown): ParsedResponseTools {
+  if (value === undefined || value === null) {
+    return { tools: [], chatTools: [], dropped: [] };
+  }
+  if (!Array.isArray(value)) {
+    throw invalid("`tools` must be an array of tool definitions.", "tools");
+  }
+  const into = { tools: [] as ResponseTool[], names: new Set<string>(), dropped: [] as string[] };
+  flattenResponseTools(value, "", into, "tools");
+  return { tools: into.tools, chatTools: toChatTools(into.tools), dropped: into.dropped };
+}
+
+/**
+ * Codex-style clients may carry tool declarations inside the input list:
+ * `additional_tools` items hold a `tools` array, and `namespace` items appear
+ * as top-level input entries. Harvest both into the effective tool set.
+ */
+function harvestInputTools(items: JsonObject[], existing: ParsedResponseTools): ParsedResponseTools {
+  const into = {
+    tools: [...existing.tools],
+    names: new Set(existing.tools.map((tool) => tool.name)),
+    dropped: [...existing.dropped],
+  };
+  for (let index = 0; index < items.length; index += 1) {
+    const item = asRecord(items[index]);
+    const type = asStringValue(item?.type);
+    if (type === "additional_tools") {
+      const tools = item?.tools;
+      if (tools !== undefined && !Array.isArray(tools)) {
+        throw invalid(`input[${index}].tools must be an array of tool definitions.`, "input");
+      }
+      flattenResponseTools(Array.isArray(tools) ? tools : [], "", into, `input[${index}].tools`);
+      continue;
+    }
+    if (type === "namespace") {
+      flattenResponseTools([item], "", into, "input");
+    }
+  }
+  return { tools: into.tools, chatTools: toChatTools(into.tools), dropped: into.dropped };
+}
+
+function parseResponseToolChoice(value: unknown, tools: ResponseTool[] | undefined): JsonValue | undefined {
   if (value === undefined || value === null || value === "auto" || value === "none" || value === "required") {
     return value === null ? undefined : value as JsonValue;
   }
   const choice = asRecord(value);
   const type = asStringValue(choice?.type);
   if ((type === "function" || type === "custom") && typeof choice?.name === "string") {
-    if (!tools.some((tool) => tool.name === choice.name)) {
+    // Membership is checked in a second phase once input-carried tool
+    // declarations have been harvested; the first call passes no tool list.
+    if (tools && !tools.some((tool) => tool.name === choice.name)) {
       throw invalid("`tool_choice` must reference one of the supplied tools.", "tool_choice");
     }
     return { type: "function", function: { name: choice.name } } as unknown as JsonValue;
@@ -491,8 +554,7 @@ export async function validateResponseRequest(body: JsonObject): Promise<Validat
     throw invalid("`previous_response_id` must be a string.", "previous_response_id");
   }
 
-  const { tools, chatTools, dropped } = parseResponseTools(body.tools);
-  const toolChoice = parseResponseToolChoice(body.tool_choice, tools);
+
   const { reasoning, effort } = parseResponseReasoning(body.reasoning);
   const { text, responseFormat } = parseTextFormat(body.text);
   const parallelToolCalls = body.parallel_tool_calls === undefined ? true : body.parallel_tool_calls;
@@ -515,6 +577,8 @@ export async function validateResponseRequest(body: JsonObject): Promise<Validat
     inputItems = [...stored.items, ...inputItems];
     chainModel = stored.model;
   }
+  const { tools, chatTools, dropped } = harvestInputTools(inputItems, parseResponseTools(body.tools));
+  const toolChoice = parseResponseToolChoice(body.tool_choice, tools);
   if (inputItems.length === 0) {
     throw invalid("`input` must not be empty.", "input");
   }
@@ -601,6 +665,7 @@ function responseToolShape(tool: ResponseTool): JsonObject {
       type: "custom",
       name: tool.name,
       ...(tool.description ? { description: tool.description } : {}),
+      ...(tool.format ? { format: tool.format } : {}),
     };
 }
 
