@@ -9,6 +9,10 @@ const model = process.env.NEURALWATT_PROBE_MODEL || "kimi-k3-fast";
 const temperature = Number(process.env.NEURALWATT_PROBE_TEMPERATURE ?? "0");
 const requireFirstPassThreshold = process.env.NEURALWATT_PROBE_REQUIRE_FIRST_PASS !== "false";
 const minimumRepairEligible = Number.parseInt(process.env.NEURALWATT_PROBE_MIN_REPAIRS || "0", 10);
+const endpoint = process.env.NEURALWATT_PROBE_ENDPOINT || "chat";
+if (!["chat", "responses"].includes(endpoint)) {
+  throw new Error("NEURALWATT_PROBE_ENDPOINT must be chat or responses.");
+}
 
 for (const [name, value] of Object.entries({ adminToken, clientKey, email, password })) {
   if (!value) {
@@ -202,21 +206,32 @@ async function cooldownDelay() {
 const failures = [];
 let httpSuccess = 0;
 let sseToolSuccess = 0;
+let ownsAccount = false;
 
 try {
   const settingsBeforeProbe = await jsonRequest("/api/admin/settings", { headers: adminHeaders });
   previousRecordMessages = Boolean(settingsBeforeProbe?.settings?.recordMessages);
-  const created = await jsonRequest("/api/admin/accounts", {
-    method: "POST",
-    headers: adminHeaders,
-    body: JSON.stringify({
-      email,
-      password,
-      label: `${total}-turn first-pass tool JSON probe`,
-      weight: 1,
-    }),
-  });
-  accountId = created.account.id;
+  const requestedAccountId = process.env.NEURALWATT_PROBE_ACCOUNT_ID;
+  if (requestedAccountId) {
+    const existing = await jsonRequest("/api/admin/accounts", { headers: adminHeaders });
+    if (!existing.accounts?.some((account) => account.id === requestedAccountId)) {
+      throw new Error(`Probe account ${requestedAccountId} was not found.`);
+    }
+    accountId = requestedAccountId;
+  } else {
+    const created = await jsonRequest("/api/admin/accounts", {
+      method: "POST",
+      headers: adminHeaders,
+      body: JSON.stringify({
+        email,
+        password,
+        label: `${total}-turn first-pass tool JSON probe`,
+        weight: 1,
+      }),
+    });
+    accountId = created.account.id;
+    ownsAccount = true;
+  }
   await jsonRequest("/api/admin/settings", {
     method: "PATCH",
     headers: adminHeaders,
@@ -226,11 +241,31 @@ try {
   for (let index = 0; index < total; index += 1) {
     if (index > 0 && delayMs > 0) await sleep(delayMs);
     const variant = variants[index % variants.length];
-    const requestBody = JSON.stringify({
+    const prompt = `${variant.prompt} Probe turn ${index + 1}. Return the function call, not prose.`;
+    const requestBody = endpoint === "responses"
+      ? JSON.stringify({
+        model,
+        input: [{ type: "message", role: "user", content: [{ type: "input_text", text: prompt }] }],
+        tools: [{
+          type: "function",
+          name: variant.name,
+          description: "A deterministic local agent test function.",
+          parameters: variant.schema,
+          strict: true,
+        }],
+        tool_choice: { type: "function", name: variant.name },
+        parallel_tool_calls: false,
+        temperature,
+        max_output_tokens: 1_024,
+        stream: true,
+        store: false,
+        prompt_cache_key: `${runId}-${index}`,
+      })
+      : JSON.stringify({
         model,
         messages: [{
           role: "user",
-          content: `${variant.prompt} Probe turn ${index + 1}. Return the function call, not prose.`,
+          content: prompt,
         }],
         tools: [{
           type: "function",
@@ -252,7 +287,7 @@ try {
     let response;
     let body = "";
     for (let attempt = 0; attempt < 4; attempt += 1) {
-      response = await fetch(`${baseUrl}/v1/chat/completions`, {
+      response = await fetch(`${baseUrl}${endpoint === "responses" ? "/v1/responses" : "/v1/chat/completions"}`, {
         method: "POST",
         headers: clientHeaders,
         body: requestBody,
@@ -276,12 +311,27 @@ try {
     }
     try {
       const frames = parseChatSse(body);
-      const toolCall = frames
-        .flatMap((frame) => frame.choices?.[0]?.delta?.tool_calls || [])
-        .find(Boolean);
-      const finish = frames.some((frame) => frame.choices?.[0]?.finish_reason === "tool_calls");
-      const parsedArguments = JSON.parse(toolCall?.function?.arguments || "");
-      if (toolCall?.function?.name !== variant.name || !finish || !parsedArguments) {
+      let toolName;
+      let rawArguments;
+      let finish;
+      if (endpoint === "responses") {
+        const argsDone = frames.find((frame) => frame.type === "response.function_call_arguments.done");
+        const itemDone = frames.find((frame) =>
+          frame.type === "response.output_item.done" && frame.item?.type === "function_call");
+        const completed = frames.find((frame) => frame.type === "response.completed");
+        toolName = itemDone?.item?.name;
+        rawArguments = argsDone?.arguments ?? itemDone?.item?.arguments ?? "";
+        finish = completed?.response?.status === "completed";
+      } else {
+        const toolCall = frames
+          .flatMap((frame) => frame.choices?.[0]?.delta?.tool_calls || [])
+          .find(Boolean);
+        toolName = toolCall?.function?.name;
+        rawArguments = toolCall?.function?.arguments || "";
+        finish = frames.some((frame) => frame.choices?.[0]?.finish_reason === "tool_calls");
+      }
+      const parsedArguments = JSON.parse(rawArguments);
+      if (toolName !== variant.name || !finish || !parsedArguments) {
         throw new Error("tool name, arguments, or finish_reason mismatch");
       }
       sseToolSuccess += 1;
@@ -294,8 +344,15 @@ try {
   }
 
   const debug = await jsonRequest("/api/admin/records?limit=500", { headers: adminHeaders });
-  const records = (debug.records || []).filter((record) =>
-    typeof record.clientRequest?.user === "string" && record.clientRequest.user.startsWith(runId));
+  const recordRunKey = (record) => {
+    try {
+      const parsed = JSON.parse(record.clientRequest?.body || "{}");
+      return typeof parsed.user === "string" ? parsed.user : typeof parsed.prompt_cache_key === "string" ? parsed.prompt_cache_key : undefined;
+    } catch {
+      return undefined;
+    }
+  };
+  const records = (debug.records || []).filter((record) => recordRunKey(record)?.startsWith(runId));
   const traced = records.filter((record) => {
     const trace = record.toolCallAdapter;
     return trace && (trace.initialOutcome === "invalid"
@@ -353,7 +410,7 @@ try {
   console.log(JSON.stringify(summary, null, 2));
   if (!passed) process.exitCode = 1;
 } finally {
-  if (accountId) {
+  if (accountId && ownsAccount) {
     await fetch(`${baseUrl}/api/admin/records?account_id=${encodeURIComponent(accountId)}`, {
       method: "DELETE",
       headers: adminHeaders,

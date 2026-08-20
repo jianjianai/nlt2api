@@ -1,6 +1,7 @@
 # nlt2 OpenAI 网关
 
-本服务将 OpenAI 兼容的 `POST /v1/chat/completions` 转换为带 Cookie 登录态的
+本服务将 OpenAI 兼容的 `POST /v1/chat/completions` 和 `POST /v1/responses`
+转换为带 Cookie 登录态的
 `https://portal.neuralwatt.com/api/chat` Playground 请求。上游真实能力、Kimi K3
 视觉测试和工具调用探测结果见
 [`docs/upstream-capability.md`](docs/upstream-capability.md)。
@@ -45,6 +46,17 @@ curl http://localhost:3000/v1/chat/completions \
 
 Chat 会保持上游的 `reasoning` 与 `reasoning_content` 两个字段并在流中分别转发。请求侧支持 `reasoning: { "effort": "..." }`，并映射为门户的 `reasoning_effort`；冲突的直接 `reasoning_effort` 或不支持的选项会返回错误，而不会静默忽略。
 
+## Responses 接口
+
+`POST /v1/responses` 与 Chat 接口共用同一套执行、工具适配和纠错管线，行为一致：
+
+- `input` 支持字符串和条目数组：`message`（`input_text`/`output_text`/`input_image`/`refusal`）、`function_call`、`function_call_output`、`custom_tool_call`、`custom_tool_call_output` 和 `reasoning` 条目。连续的函数调用会合并为一个 assistant 轮次；`reasoning` 条目的 `encrypted_content`（或摘要文本）会还原为上游 reasoning 字段。`item_reference` 返回 400。
+- `instructions` 作为请求级系统指令；`tools` 接受扁平的 `function` 定义和 `custom` 自由文本工具（以 `{ "input": "..." }` 包装参与契约，输出时还原为 `custom_tool_call`）。`web_search`、`namespace` 等托管工具会被丢弃，不会进入门户函数契约，也不会被网关模拟。
+- `tool_choice` 支持 `auto`/`none`/`required` 和指定函数；`max_output_tokens` 映射为 `max_completion_tokens`；`reasoning.effort` 映射为 `reasoning_effort`；`text.format` 的 `json_object`/`json_schema` 映射为 `response_format`；`prompt_cache_key` 用作粘性会话键。
+- 流式发送完整的 `response.created` → `response.output_item.added` → 推理摘要/正文/函数参数 delta → `response.output_item.done` → `response.completed` 事件序列；工具轮在校验完成后一次性释放函数调用项，与 Chat 工具轮的缓冲语义一致。失败时以 `response.failed` 事件收尾。
+- `store` 默认开启：每个响应的完整条目链保存在服务端，`previous_response_id` 可续接（沿用链路模型），状态保留 12 小时并受 `NEURALWATT_MAX_RESPONSE_HISTORY_BYTES`/`NEURALWATT_MAX_RESPONSE_STATE_BYTES` 限制。`store: false` 的客户端（如 Codex）自行重放完整历史，不依赖服务端状态。
+- 推理文本以 `reasoning` 输出项的摘要形式实时展示，同时编码进 `encrypted_content` 供客户端回传还原；这与 Chat 接口直接转发 reasoning 字段等价。
+
 ## 账号池与管理面板
 
 管理面板和以下管理接口使用 `x-admin-token`（或匹配 `NEURALWATT_ADMIN_TOKEN` 的 Bearer 令牌）保护：
@@ -85,7 +97,9 @@ pnpm build
 pnpm probe:cli
 ```
 
-该脚本使用本机安装的 Codex 和 OpenCode，在一次性多文件 JavaScript 项目中进行真实编辑和测试。它要求通过 `NEURALWATT_PROBE_*` 环境变量提供与服务一致的本地管理员/客户端凭据，两个客户端都发送 `stream: true`，验证可见测试与隐藏测试，并在 `finally` 中清理脚本自己创建的账号、消息记录和临时工作区。对已有账号做验收时设置 `NEURALWATT_PROBE_ACCOUNT_ID`；脚本只清理本次临时工作区，不删除该账号或其历史记录。只有所有项目通过、首次控制工具调用率高于 90%，且每个纠错候选最终都得到有效工具调用时才通过。OpenCode 在 Codex Windows `:workspace` 受限令牌沙箱内运行，Shell、主目录、配置和临时文件均限制在一次性项目内。独立回环请求追踪必须与调试记录分母一致，避免记录淘汰导致成功率虚高。
+该脚本使用本机安装的 Codex 和 OpenCode，在一次性多文件 JavaScript 项目中进行真实编辑和测试。设置 `NEURALWATT_CLI_PROBE_CLIENTS=codex-responses` 可让 Codex 改用 Responses 线协议（`wire_api="responses"`）运行同一任务；`NEURALWATT_PROBE_ENDPOINT=responses` 可让 `probe:tools` 通过 `/v1/responses` 测量首次工具调用成功率和纠错成功率。它要求通过 `NEURALWATT_PROBE_*` 环境变量提供与服务一致的本地管理员/客户端凭据，两个客户端都发送 `stream: true`，验证可见测试与隐藏测试，并在 `finally` 中清理脚本自己创建的账号、消息记录和临时工作区。对已有账号做验收时设置 `NEURALWATT_PROBE_ACCOUNT_ID`；脚本只清理本次临时工作区，不删除该账号或其历史记录。只有所有项目通过、首次控制工具调用率高于 90%，且每个纠错候选最终都得到有效工具调用时才通过。OpenCode 在 Codex Windows `:workspace` 受限令牌沙箱内运行，Shell、主目录、配置和临时文件均限制在一次性项目内。独立回环请求追踪必须与调试记录分母一致，避免记录淘汰导致成功率虚高。
+
+最近一次 Responses 验收（2026-08-21）：Codex 以 `wire_api="responses"` 完成真实多文件编辑、可见测试和隐藏测试，网关观察到 7 个流式轮次、6 个受控工具意图，首次解析 6/6（100%）。`/v1/responses` 强制工具选择 20 轮（温度 0）首次成功 20/20（100%）；温度 1.5 的 20 轮中首次成功 10/20、纠错 10/10（100%），与 Chat 接口同条件结果（11/20 首次、9/9 纠错）统计等价。这些是当前门户部署的验收观测值，不是对未来上游行为的永久承诺。
 
 最近一次本地验收（2026-08-19）使用两个 CLI 和两个一次性项目。Codex 与 OpenCode 均完成了真实多文件编辑、可见测试和隐藏测试；网关观察到 28 个流式轮次、25 个受控工具意图，25 个首次解析成功（100%），且没有失败工具调用。此前一次包含畸形 JSON 的真实轮次中，纠错 1/1 成功（100%）；另有 Kimi K3 Fast 的 20 轮强制工具选择纠错测试，20/20 在一次纠错内完成（100%）。这些是当前门户部署的验收观测值，不是对未来上游行为的永久承诺。
 

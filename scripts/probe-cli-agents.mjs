@@ -70,7 +70,7 @@ async function startCliGatewayProxy() {
       const incomingUrl = new URL(incoming.url || "/", "http://127.0.0.1");
       const method = incoming.method || "GET";
       const isModelRoute = incomingUrl.pathname === "/v1/models" || incomingUrl.pathname.startsWith("/v1/models/");
-      const isCompletionRoute = incomingUrl.pathname === "/v1/chat/completions";
+      const isCompletionRoute = incomingUrl.pathname === "/v1/chat/completions" || incomingUrl.pathname === "/v1/responses";
       if (incoming.headers.authorization !== `Bearer ${token}` || !((method === "GET" && isModelRoute) || (method === "POST" && isCompletionRoute))) {
         outgoing.writeHead(403, { "content-type": "application/json" });
         outgoing.end(JSON.stringify({ error: { message: "Probe gateway route denied." } }));
@@ -331,7 +331,7 @@ function parseJsonLines(output) {
   return events;
 }
 
-async function runCodex(workspace, seed, gateway) {
+async function runCodex(workspace, seed, gateway, wireApi = "chat") {
   await mkdir(codexHome, { recursive: true });
   // Keep the child isolated from the user's Codex configuration while retaining
   // the Windows sandbox mode required for workspace-write command execution.
@@ -362,7 +362,7 @@ async function runCodex(workspace, seed, gateway) {
     "-c", 'model_providers.neuralwatt.name="NeuralWatt local gateway"',
     "-c", `model_providers.neuralwatt.base_url="${gateway.baseUrl}/v1"`,
     "-c", 'model_providers.neuralwatt.env_key="NEURALWATT_CLI_TEST_KEY"',
-    "-c", 'model_providers.neuralwatt.wire_api="chat"',
+    "-c", `model_providers.neuralwatt.wire_api="${wireApi}"`,
     "-c", "model_providers.neuralwatt.requires_openai_auth=false",
     taskPrompt(seed),
   ];
@@ -491,10 +491,17 @@ try {
     body: JSON.stringify({ recordMessages: true }),
   });
 
-  const clients = [
-    { name: "codex", run: runCodex, seedBase: 100 },
-    { name: "opencode", run: runOpenCode, seedBase: 200 },
-  ];
+  const allClients = {
+    codex: { name: "codex", run: (workspace, seed, gateway) => runCodex(workspace, seed, gateway, "chat"), seedBase: 100 },
+    "codex-responses": { name: "codex-responses", run: (workspace, seed, gateway) => runCodex(workspace, seed, gateway, "responses"), seedBase: 300 },
+    opencode: { name: "opencode", run: runOpenCode, seedBase: 200 },
+  };
+  const selectedNames = (process.env.NEURALWATT_CLI_PROBE_CLIENTS || "codex,opencode").split(",").map((name) => name.trim()).filter(Boolean);
+  const clients = selectedNames.map((name) => {
+    const client = allClients[name];
+    if (!client) throw new Error(`Unknown probe client: ${name}`);
+    return client;
+  });
   let taskIndex = 0;
   for (const client of clients) {
     for (let run = 0; run < runsPerCli; run += 1) {
@@ -561,7 +568,10 @@ try {
   const repairSuccessPercent = repairEligible.length === 0
     ? null
     : Number((100 * repairSuccess / repairEligible.length).toFixed(2));
-  const streamRequests = records.filter((record) => record.clientRequest?.stream === true).length;
+  const recordIsStream = (record) => {
+    try { return JSON.parse(record.clientRequest?.body || "{}").stream === true; } catch { return false; }
+  };
+  const streamRequests = records.filter(recordIsStream).length;
   const proxiedStreamRequests = cliGatewayProxy.postRequests.filter((request) => request.stream).length;
   const byEndpoint = Object.entries(Object.groupBy(records, (record) => record.endpoint))
     .map(([endpoint, items]) => ({ endpoint, turns: items.length }));

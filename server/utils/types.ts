@@ -134,6 +134,16 @@ export interface DebugRawBody {
   body: string;
 }
 
+/** Persisted Responses API state for `previous_response_id` chaining. */
+export interface StoredResponseState {
+  id: string;
+  createdAt: string;
+  model: string;
+  previousResponseId?: string;
+  /** Normalized Responses input items: request input plus the output items. */
+  items: JsonObject[];
+}
+
 export type DebugUpstreamCallType = "initial" | "repair" | "continuation";
 
 export interface DebugUpstreamCall {
@@ -152,7 +162,7 @@ export interface DebugUpstreamCall {
 export interface DebugRecord {
   id: string;
   at: string;
-  endpoint: "/v1/chat/completions";
+  endpoint: "/v1/chat/completions" | "/v1/responses";
   accountId?: string;
   accountLabel?: string;
   clientRequest: DebugRawBody;
