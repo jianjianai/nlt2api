@@ -362,13 +362,20 @@ export function serializeAssistantToolCallsForPortal(messages: ChatMessage[]): C
 }
 
 function stripToolContract(content: string): string {
-  const marker = content.indexOf(TOOL_CONTRACT_MARKER);
+  // Match the full fixed contract text, not just its first sentence: a caller
+  // system prompt merely quoting the marker sentence keeps its trailing
+  // content, while a previously injected contract (which always starts with
+  // the complete fixed text) is still stripped before re-application.
+  const marker = content.indexOf(TOOL_CONTRACT);
   return marker < 0 ? content : content.slice(0, marker).trimEnd();
 }
 
 function isToolTurnReminder(message: ChatMessage): boolean {
+  // The reminder is a fixed string, so exact matching dedupes re-applied
+  // contracts without deleting a genuine user message that merely quotes the
+  // marker text (for example, a user debugging or discussing this adapter).
   return message.role === "user"
-    && String(message.content ?? "").includes(TOOL_TURN_REMINDER_MARKER);
+    && String(message.content ?? "").trim() === TOOL_TURN_REMINDER;
 }
 
 /** Keep the portal history to one system message at index zero. */

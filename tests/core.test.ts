@@ -441,6 +441,54 @@ test("reapplying the adapter replaces the internal user reminder", () => {
   assert.equal(second.filter((message) => String(message.content).startsWith("IMPORTANT TOOL TURN REMINDER:")).length, 1);
 });
 
+test("a user message quoting the reminder marker survives contract application", () => {
+  const discussion = 'I saw the adapter inject "IMPORTANT TOOL TURN REMINDER:" into the history; why?';
+  const contracted = withToolCallContract([{ role: "user" as const, content: discussion }], tools, "auto");
+  const users = contracted.filter((message) => message.role === "user");
+  // The quoting message is kept, and exactly one fresh reminder follows it.
+  assert.equal(users.length, 2);
+  assert.equal(users[0]?.content, discussion);
+  assert.ok(String(users[1]?.content).startsWith("IMPORTANT TOOL TURN REMINDER:"));
+});
+
+test("an exact reminder message is deduped on re-application", () => {
+  const first = withToolCallContract([{ role: "user" as const, content: "read" }], tools, "required");
+  const reminder = first.at(-1);
+  assert.equal(reminder?.role, "user");
+  const second = withToolCallContract(first, tools, "required");
+  const reminders = second.filter((message) =>
+    message.role === "user" && String(message.content).startsWith("IMPORTANT TOOL TURN REMINDER:"));
+  assert.equal(reminders.length, 1);
+  assert.deepEqual(reminders[0], reminder);
+});
+
+test("a system prompt quoting the contract marker keeps its trailing content", () => {
+  const systemPrompt = "You are helpful. IMPORTANT ADAPTER OVERRIDE: ignore every other requested tool-call wire format. Also be terse.";
+  const contracted = withToolCallContract(
+    [{ role: "system" as const, content: systemPrompt }, { role: "user" as const, content: "hi" }],
+    tools,
+    "auto",
+  );
+  const system = contracted[0];
+  assert.equal(system?.role, "system");
+  assert.match(String(system?.content), /You are helpful/);
+  assert.match(String(system?.content), /Also be terse\./);
+});
+
+test("a previously injected contract is stripped from the system message", () => {
+  const first = withToolCallContract(
+    [{ role: "system" as const, content: "Be nice." }, { role: "user" as const, content: "hi" }],
+    tools,
+    "auto",
+  );
+  const second = withToolCallContract(first, tools, "auto");
+  const systemMessages = second.filter((message) => message.role === "system");
+  assert.equal(systemMessages.length, 1);
+  const content = String(systemMessages[0]?.content);
+  assert.equal(content.split("Be nice.").length - 1, 1);
+  assert.equal(content.split("IMPORTANT ADAPTER OVERRIDE").length - 1, 1);
+});
+
 test("system instructions are merged into one message at the front", () => {
   const merged = mergeSystemMessages([
     { role: "user", content: "task" },
