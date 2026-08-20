@@ -4,17 +4,17 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import {
-  buildContinuationRequest,
   chatChunksFromUpstreamFrame,
   createChatStreamState,
   executeChatRequest,
+  isThinkingInterrupted,
   locatedSchemaErrorText,
   validateChatRequest,
 } from "../server/utils/chat-service.ts";
 import { getProxyConfig, resetProxyConfigForTests } from "../server/utils/config.ts";
 import { HttpError } from "../server/utils/http.ts";
 import { InvalidStructuredToolCallsError } from "../server/utils/tool-calls.ts";
-import type { ChatMessage, JsonObject, JsonValue, UpstreamCompletion } from "../server/utils/types.ts";
+import type { JsonObject, JsonValue, UpstreamCompletion } from "../server/utils/types.ts";
 
 const tool = {
   type: "function",
@@ -445,75 +445,47 @@ test("located schema errors include the offending source position", () => {
   assert.match(text, /must be string/);
 });
 
-test("buildContinuationRequest appends the continuation turn and reuses validation", () => {
-  const original = validRequest({ max_tokens: 20_000 });
-  const base = validateChatRequest(original);
-  const assistant: ChatMessage = { role: "assistant", content: "", reasoning: "partial thinking" };
-  const { request, validated } = buildContinuationRequest(original, base, assistant, 8_192);
+test("isThinkingInterrupted only accepts a length stop with empty content and reasoning", () => {
+  const completion = (message: JsonObject, finishReason: string | null): UpstreamCompletion => ({
+    choices: [{ index: 0, message, finish_reason: finishReason }],
+  } as unknown as UpstreamCompletion);
 
-  assert.equal(validated.model, base.model);
-  assert.equal(validated.tools, base.tools);
-  assert.equal(validated.messages.length, base.messages.length + 2);
-  assert.equal(validated.messages[0], base.messages[0]);
-  assert.equal(validated.messages.at(-2), assistant);
-  assert.deepEqual(validated.messages.at(-1), {
-    role: "user",
-    content: "Continue the previous response from exactly where it ended. Do not repeat any text. Finish the answer if possible.",
-  });
+  // Reasoning cut off mid-thought: continued.
+  assert.equal(isThinkingInterrupted(completion(
+    { role: "assistant", content: "", reasoning: "partial thought" },
+    "length",
+  )), true);
+  assert.equal(isThinkingInterrupted(completion(
+    { role: "assistant", content: null, reasoning_content: "partial thought" },
+    "length",
+  )), true);
 
-  // The raw request mirrors the validated messages and carries the new budget.
-  const rawMessages = request.messages as JsonObject[];
-  assert.equal(rawMessages.length, validated.messages.length);
-  assert.equal(rawMessages[0], (original.messages as JsonObject[])[0]);
-  assert.equal(rawMessages.at(-2), assistant as unknown as JsonObject);
-  assert.deepEqual(rawMessages.at(-1), validated.messages.at(-1) as unknown as JsonObject);
-  assert.equal(request.max_tokens, 8_192);
-});
+  // No reasoning to continue from.
+  assert.equal(isThinkingInterrupted(completion(
+    { role: "assistant", content: "" },
+    "length",
+  )), false);
 
-test("buildContinuationRequest applies the budget to max_completion_tokens when present", () => {
-  const original = validRequest({ max_completion_tokens: 20_000 });
-  const base = validateChatRequest(original);
-  const { request } = buildContinuationRequest(original, base, { role: "assistant", content: "x" }, 100);
+  // A truncated non-empty answer is returned as-is, not continued.
+  assert.equal(isThinkingInterrupted(completion(
+    { role: "assistant", content: "partial answer", reasoning: "thought" },
+    "length",
+  )), false);
 
-  assert.equal(request.max_completion_tokens, 100);
-  assert.equal(request.max_tokens, undefined);
-});
+  // A natural stop is not an interruption.
+  assert.equal(isThinkingInterrupted(completion(
+    { role: "assistant", content: "", reasoning: "thought" },
+    "stop",
+  )), false);
 
-test("buildContinuationRequest enforces the same history cap as parseMessages", () => {
-  const messages = Array.from({ length: 999 }, () => ({ role: "user", content: "x" })) as unknown as JsonValue;
-  const original = validRequest({ messages });
-  const base = validateChatRequest(original);
-  assert.equal(base.messages.length, 999);
-
-  // 999 + 2 appended = 1001 > 1000: rejected exactly like a fresh validation.
-  assertChatHttpError(
-    () => buildContinuationRequest(original, base, { role: "assistant", content: "x" }, 8_192),
-    { status: 400, message: "`messages` exceeds the supported history limit.", param: "messages" },
-  );
-
-  // 998 + 2 appended = 1000: still allowed.
-  const okOriginal = validRequest({ messages: (messages as JsonObject[]).slice(0, 998) as unknown as JsonValue });
-  const okBase = validateChatRequest(okOriginal);
-  const result = buildContinuationRequest(okOriginal, okBase, { role: "assistant", content: "x" }, 8_192);
-  assert.equal(result.validated.messages.length, 1_000);
-});
-
-test("continuation validation matches a fresh validation of the rebuilt request", () => {
-  const original = validRequest({
-    messages: [
-      { role: "system", content: "Be terse." },
-      { role: "user", content: "Hello" },
-      { role: "assistant", content: "Hi!" },
-      { role: "user", content: "Write a long story." },
-    ] as unknown as JsonValue,
-    max_tokens: 20_000,
-  });
-  const base = validateChatRequest(original);
-  const assistant: ChatMessage = { role: "assistant", content: "", reasoning: "thinking" };
-  const { request, validated } = buildContinuationRequest(original, base, assistant, 4_096);
-
-  // The reused validation must be structurally identical to what the previous
-  // implementation computed by re-validating the rebuilt continuation request.
-  const fresh = validateChatRequest(request);
-  assert.deepEqual(validated, fresh);
+  // Native tool calls already produced output.
+  assert.equal(isThinkingInterrupted(completion(
+    {
+      role: "assistant",
+      content: "",
+      reasoning: "thought",
+      tool_calls: [{ id: "call_1", type: "function", function: { name: "lookup", arguments: "{}" } }],
+    },
+    "length",
+  )), false);
 });

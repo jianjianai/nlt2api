@@ -893,8 +893,6 @@ async function executeChatRequestOnce(
     onRepairReasoning?: (reasoning: ReasoningFields) => void | Promise<void>;
     signal?: AbortSignal;
     upstreamCalls?: DebugUpstreamCall[];
-    upstreamType?: DebugUpstreamCallType;
-    upstreamRound?: number;
     validated?: ValidatedChatRequest;
   },
 ): Promise<ChatExecution> {
@@ -910,17 +908,35 @@ async function executeChatRequestOnce(
   const streamUpstream = options?.stream ?? request.stream === true;
   const builtUpstream = upstreamBody(request, model, messages, tools, streamUpstream);
   let upstreamRequest = builtUpstream.body;
+  // A client budget above the per-round portal cap enables thinking
+  // continuation: when the upstream stops with finish_reason "length" while
+  // the visible content is still empty, the turn was cut off mid-thought and
+  // is continued below before any tool-call evaluation or repair. While
+  // continuation is possible, terminal and usage frames are held back so the
+  // client only ever sees the combined terminal state.
+  const thinkingBudget = requestedOutputBudget(request);
+  const mayContinueThinking = thinkingBudget !== undefined && thinkingBudget > PORTAL_MAX_OUTPUT_TOKENS;
+  const clientFrameHandler = streamUpstream ? options?.onUpstreamFrame : undefined;
   let result = await getCompletion(
     upstreamRequest,
     options?.stickyKey,
     options?.requiredAccountId ?? toolAssignedAccountId,
     toolTurn,
-    streamUpstream ? options?.onUpstreamFrame : undefined,
+    mayContinueThinking && clientFrameHandler ? holdTerminalFrames(clientFrameHandler) : clientFrameHandler,
     options?.signal,
     options?.upstreamCalls
-      ? { calls: options.upstreamCalls, type: options.upstreamType ?? "initial", round: options.upstreamRound ?? 1 }
+      ? { calls: options.upstreamCalls, type: "initial", round: 1 }
       : undefined,
   );
+  if (mayContinueThinking && thinkingBudget !== undefined && isThinkingInterrupted(result.completion)) {
+    result = await continueThinking(upstreamRequest, result, thinkingBudget, {
+      stickyKey: options?.stickyKey,
+      allowEmptyContent: toolTurn,
+      onUpstreamFrame: clientFrameHandler,
+      signal: options?.signal,
+      upstreamCalls: options?.upstreamCalls,
+    });
+  }
   let message: ChatMessage;
   let toolCallAdapter: ToolCallAdapterTrace | undefined;
 
@@ -1116,44 +1132,55 @@ function requestedOutputBudget(request: JsonObject): number | undefined {
   return typeof value === "number" && Number.isInteger(value) && value >= 1 ? value : undefined;
 }
 
-function requestWithOutputBudget(request: JsonObject, budget: number): JsonObject {
-  if (request.max_completion_tokens !== undefined) {
-    return { ...request, max_completion_tokens: budget };
-  }
-  return { ...request, max_tokens: budget };
+function completionReasoningText(completion: UpstreamCompletion, field: "reasoning" | "reasoning_content"): string {
+  const value = completion.choices?.[0]?.message?.[field];
+  return typeof value === "string" ? value : "";
 }
 
-function continuationMessage(message: ChatMessage): ChatMessage | undefined {
-  const content = typeof message.content === "string" ? message.content : "";
-  const reasoning = typeof message.reasoning === "string" ? message.reasoning : undefined;
-  const reasoningContent = typeof message.reasoning_content === "string" ? message.reasoning_content : undefined;
-  if (!content && !reasoning && !reasoningContent) {
-    return undefined;
-  }
-  return {
-    role: "assistant",
-    content,
-    ...(reasoning ? { reasoning } : {}),
-    ...(reasoningContent ? { reasoning_content: reasoningContent } : {}),
-  };
+function consumedCompletionTokens(completion: UpstreamCompletion): number {
+  const tokens = completion.usage?.completion_tokens;
+  // Without usage data assume the round spent the whole per-round cap so the
+  // continuation budget shrinks conservatively instead of looping forever.
+  return typeof tokens === "number" ? tokens : PORTAL_MAX_OUTPUT_TOKENS;
 }
 
-function appendContinuationMessage(
-  accumulated: ChatMessage,
-  next: ChatMessage,
-): ChatMessage {
-  const append = (left: unknown, right: unknown): string | undefined => {
-    const a = typeof left === "string" ? left : "";
-    const b = typeof right === "string" ? right : "";
-    return a || b ? `${a}${b}` : undefined;
-  };
-  return {
-    role: "assistant",
-    content: append(accumulated.content, next.content) ?? "",
-    ...(append(accumulated.reasoning, next.reasoning) ? { reasoning: append(accumulated.reasoning, next.reasoning) } : {}),
-    ...(append(accumulated.reasoning_content, next.reasoning_content)
-      ? { reasoning_content: append(accumulated.reasoning_content, next.reasoning_content) }
-      : {}),
+/**
+ * A thinking interruption means the upstream hit the output cap while still
+ * reasoning: finish_reason is "length", the visible content is still empty,
+ * and there is partial reasoning to continue from. A truncated non-empty
+ * answer is not continued; it is returned as-is with finish_reason "length".
+ */
+export function isThinkingInterrupted(completion: UpstreamCompletion): boolean {
+  const choice = completion.choices?.[0];
+  const message = choice?.message;
+  if (choice?.finish_reason !== "length" || !message) {
+    return false;
+  }
+  if (typeof message.content === "string" && message.content.length > 0) {
+    return false;
+  }
+  if (Array.isArray(message.tool_calls) && message.tool_calls.length > 0) {
+    return false;
+  }
+  return completionReasoningText(completion, "reasoning").length > 0
+    || completionReasoningText(completion, "reasoning_content").length > 0;
+}
+
+/**
+ * Wrap a client frame handler so terminal and usage frames are held back.
+ * Each upstream round is an internal segment; the client only sees the
+ * combined terminal state emitted after the final round.
+ */
+function holdTerminalFrames(handler: UpstreamFrameHandler): UpstreamFrameHandler {
+  return async (frame) => {
+    const choice = frame.choices?.[0];
+    if (choice?.finish_reason !== undefined && choice.finish_reason !== null) {
+      return false;
+    }
+    if (frame.usage) {
+      return false;
+    }
+    return handler(frame);
   };
 }
 
@@ -1184,153 +1211,136 @@ export async function executeChatRequest(
   },
 ): Promise<ChatExecution> {
   const { validated: prevalidated, ...forwardedOptions } = options ?? {};
-  // Validate once per client request. Continuation rounds below only append
-  // internally constructed messages and shrink the token budget, so they reuse
-  // this result instead of re-running the full validation pipeline.
+  // Validate once per client request; execution reuses the supplied result
+  // instead of re-running the full validation pipeline.
   const validated = prevalidated ?? validateChatRequest(request);
-  const budget = requestedOutputBudget(request);
-  // Tool-call turns use a controlled JSON envelope and must remain atomic.
-  const toolTurn = Array.isArray(request.tools) && request.tools.length > 0 && request.tool_choice !== "none";
-  const canContinue = !toolTurn && budget !== undefined && budget > PORTAL_MAX_OUTPUT_TOKENS;
-  const maxRounds = canContinue ? MAX_CONTINUATION_ROUNDS : 1;
-  let remaining = budget;
-  let currentRequest = canContinue ? requestWithOutputBudget(request, Math.min(budget, PORTAL_MAX_OUTPUT_TOKENS)) : request;
-  let currentValidated = validated;
-  let execution: ChatExecution | undefined;
-  let accumulatedMessage: ChatMessage | undefined;
-  let accumulatedUsage: UpstreamUsage | undefined;
-  let didContinue = false;
   const upstreamCalls: DebugUpstreamCall[] = [];
-
-  for (let round = 0; round < maxRounds; round += 1) {
-    const relayFrame: UpstreamFrameHandler | undefined = forwardedOptions.onUpstreamFrame
-      ? async (frame) => {
-        const choice = frame.choices?.[0];
-        // Each upstream round is an internal segment. Hold its terminal frame
-        // and usage until all continuation rounds have been combined.
-        if (choice?.finish_reason !== undefined && choice.finish_reason !== null) {
-          return false;
-        }
-        if (frame.usage) {
-          return false;
-        }
-        return forwardedOptions.onUpstreamFrame!(frame);
-      }
-      : undefined;
-
-    let current: ChatExecution;
-    try {
-      if (round > 0) {
-        const continuation = buildContinuationRequest(
-          request,
-          validated,
-          accumulatedMessage!,
-          Math.min(remaining!, PORTAL_MAX_OUTPUT_TOKENS),
-        );
-        currentRequest = continuation.request;
-        currentValidated = continuation.validated;
-      }
-      current = await executeChatRequestOnce(currentRequest, {
-        ...forwardedOptions,
-        requiredAccountId: execution?.account.id ?? forwardedOptions.requiredAccountId,
-        onUpstreamFrame: relayFrame,
-        onRepairReasoning: forwardedOptions.onRepairReasoning,
-        upstreamCalls,
-        upstreamType: round === 0 ? "initial" : "continuation",
-        upstreamRound: round === 0 ? 1 : round,
-        validated: currentValidated,
-      });
-    } catch (error) {
-      if (error instanceof ProxyRequestError) {
-        error.debugContext.upstreamCalls = upstreamCalls;
-        throw error;
-      }
-      if (upstreamCalls.length > 0) {
-        throw new ProxyRequestError(error, { upstreamCalls });
-      }
+  try {
+    return await executeChatRequestOnce(request, {
+      ...forwardedOptions,
+      upstreamCalls,
+      validated,
+    });
+  } catch (error) {
+    if (error instanceof ProxyRequestError) {
+      error.debugContext.upstreamCalls = upstreamCalls;
       throw error;
     }
-    execution = current;
-    accumulatedMessage = accumulatedMessage
-      ? appendContinuationMessage(accumulatedMessage, current.message)
-      : continuationMessage(current.message);
-    accumulatedUsage = addUsageTotals(accumulatedUsage, current.completion.usage);
-
-    const consumed = typeof current.completion.usage?.completion_tokens === "number"
-      ? current.completion.usage.completion_tokens
-      : PORTAL_MAX_OUTPUT_TOKENS;
-    if (remaining !== undefined) {
-      remaining = Math.max(0, remaining - consumed);
+    if (upstreamCalls.length > 0) {
+      throw new ProxyRequestError(error, { upstreamCalls });
     }
-    // Only a thinking interruption is continued: the upstream hit the output
-    // cap while still reasoning, so the visible content is still empty. A
-    // truncated non-empty answer is returned as-is with finish_reason
-    // "length" instead of being continued. Continuation reasoning is appended
-    // verbatim, without the repair marker used for tool-call repair rounds.
-    const thinkingInterrupted = current.finishReason === "length"
-      && !(typeof current.message.content === "string" && current.message.content.length > 0)
-      && !current.message.tool_calls?.length;
-    const shouldContinue = canContinue
-      && thinkingInterrupted
-      && (remaining ?? 0) > 0
-      && accumulatedMessage !== undefined
-      && round + 1 < maxRounds;
-
-    if (!shouldContinue) {
-      break;
-    }
-
-    didContinue = true;
+    throw error;
   }
-
-  if (!execution) {
-    throw new HttpError(502, "The portal returned no completion.", "server_error");
-  }
-  if (didContinue && accumulatedMessage) {
-    execution = {
-      ...execution,
-      message: accumulatedMessage,
-      completion: {
-        ...execution.completion,
-        choices: [{
-          index: 0,
-          message: accumulatedMessage,
-          finish_reason: execution.finishReason,
-        }],
-        ...(accumulatedUsage ? { usage: accumulatedUsage } : {}),
-      },
-    };
-  }
-  return execution;
 }
 
 const CONTINUATION_USER_PROMPT = "Continue the previous response from exactly where it ended. Do not repeat any text. Finish the answer if possible.";
 
+interface ThinkingContinuationOptions {
+  stickyKey?: string;
+  allowEmptyContent: boolean;
+  onUpstreamFrame?: UpstreamFrameHandler;
+  signal?: AbortSignal;
+  upstreamCalls?: DebugUpstreamCall[];
+}
+
 /**
- * Build the next continuation request together with its validated form. The
- * two appended messages are constructed here and always satisfy parseMessages,
- * so the validated message list reuses the base validation instead of
- * re-checking the entire history. The history cap is still enforced exactly
- * the way parseMessages would enforce it for the rebuilt request.
+ * Continue a thinking-interrupted completion with the remaining output
+ * budget. Each round appends the accumulated reasoning as an assistant turn
+ * plus a fixed continuation prompt to the already-built upstream messages
+ * (for tool turns these are the contracted messages, so the tool contract
+ * stays intact), pinned to the account that produced the partial thinking.
+ * Continuation reasoning is appended verbatim, without the repair marker
+ * used for tool-call repair rounds.
  */
-export function buildContinuationRequest(
-  request: JsonObject,
-  base: ValidatedChatRequest,
-  assistant: ChatMessage,
+async function continueThinking(
+  body: JsonObject,
+  first: { account: ManagedAccount; completion: UpstreamCompletion; receivedSse: boolean },
   budget: number,
-): { request: JsonObject; validated: ValidatedChatRequest } {
-  const userMessage: ChatMessage = { role: "user", content: CONTINUATION_USER_PROMPT };
-  const rawMessages = [
-    ...(Array.isArray(request.messages) ? request.messages : []),
-    assistant as unknown as JsonValue,
-    userMessage as unknown as JsonValue,
-  ];
-  if (rawMessages.length > MAX_MESSAGES) {
-    throw new HttpError(400, "`messages` exceeds the supported history limit.", "invalid_request_error", "messages");
+  options: ThinkingContinuationOptions,
+): Promise<{ account: ManagedAccount; completion: UpstreamCompletion; receivedSse: boolean }> {
+  let { account, completion, receivedSse } = first;
+  let reasoning = completionReasoningText(completion, "reasoning");
+  let reasoningContent = completionReasoningText(completion, "reasoning_content");
+  let usage = completion.usage;
+  let remaining = budget - consumedCompletionTokens(completion);
+  let round = 1;
+  // A JSON-fallback round never streamed its reasoning; forward it now so
+  // every round's thinking reaches the client exactly once.
+  const forwardReasoning = async (interrupted: UpstreamCompletion): Promise<void> => {
+    if (!options.onUpstreamFrame) return;
+    const fields = initialReasoning(interrupted);
+    if (fields.reasoning || fields.reasoning_content) {
+      await options.onUpstreamFrame({ choices: [{ delta: { role: "assistant", ...fields } }] });
+    }
+  };
+  if (!receivedSse) {
+    await forwardReasoning(completion);
   }
+
+  while (isThinkingInterrupted(completion) && remaining > 0 && round < MAX_CONTINUATION_ROUNDS) {
+    const assistant: ChatMessage = {
+      role: "assistant",
+      content: "",
+      ...(reasoning ? { reasoning } : {}),
+      ...(reasoningContent ? { reasoning_content: reasoningContent } : {}),
+    };
+    const continuationBody: JsonObject = {
+      ...body,
+      max_tokens: Math.min(remaining, PORTAL_MAX_OUTPUT_TOKENS),
+      messages: [
+        ...(Array.isArray(body.messages) ? body.messages : []),
+        assistant as unknown as JsonValue,
+        { role: "user", content: CONTINUATION_USER_PROMPT } as unknown as JsonValue,
+      ],
+    };
+    const next = await getCompletion(
+      continuationBody,
+      options.stickyKey,
+      account.id,
+      options.allowEmptyContent,
+      options.onUpstreamFrame ? holdTerminalFrames(options.onUpstreamFrame) : undefined,
+      options.signal,
+      options.upstreamCalls
+        ? { calls: options.upstreamCalls, type: "continuation", round }
+        : undefined,
+    );
+    round += 1;
+    account = next.account;
+    completion = next.completion;
+    if (!next.receivedSse) {
+      await forwardReasoning(next.completion);
+    }
+    receivedSse = receivedSse && next.receivedSse;
+    reasoning += completionReasoningText(completion, "reasoning");
+    reasoningContent += completionReasoningText(completion, "reasoning_content");
+    usage = addUsageTotals(usage, completion.usage);
+    remaining -= consumedCompletionTokens(completion);
+  }
+
+  const lastChoice = completion.choices?.[0];
+  const merged: UpstreamCompletion = {
+    ...completion,
+    choices: [{
+      ...lastChoice,
+      index: lastChoice?.index ?? 0,
+      message: {
+        role: "assistant",
+        content: null,
+        ...(lastChoice?.message ?? {}),
+        ...(reasoning ? { reasoning } : {}),
+        ...(reasoningContent ? { reasoning_content: reasoningContent } : {}),
+      },
+      finish_reason: lastChoice?.finish_reason ?? null,
+    }],
+    ...(usage ? { usage } : {}),
+  };
   return {
-    request: requestWithOutputBudget({ ...request, messages: rawMessages as unknown as JsonValue }, budget),
-    validated: { ...base, messages: [...base.messages, assistant, userMessage] },
+    account,
+    completion: merged,
+    // When a client stream is active every round's reasoning has been
+    // forwarded already, so downstream JSON-fallback forwarding must not
+    // repeat the accumulated reasoning.
+    receivedSse: receivedSse || Boolean(options.onUpstreamFrame),
   };
 }
 
