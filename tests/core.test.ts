@@ -344,12 +344,14 @@ test("repair history keeps the reminder before the failed candidate and error", 
   const history = buildToolRepairHistory(
     contracted,
     { role: "assistant" as const, content: '{"type":"tool_calls","tool_calls":[{"name":"calculator","arguments":{"a":1' },
-    { role: "user" as const, content: "JSON parse failed; retry" },
+    { role: "tool" as const, tool_call_id: "call_repair_1", content: "JSON parse failed; retry" },
   );
-  assert.deepEqual(history.map((message) => message.role), ["system", "user", "user", "assistant", "user"]);
+  assert.deepEqual(history.map((message) => message.role), ["system", "user", "user", "assistant", "tool"]);
   assert.equal(history[1]?.content, "read package.json");
   assert.match(String(history[2]?.content), /IMPORTANT TOOL TURN REMINDER/);
   assert.equal(history[3]?.role, "assistant");
+  assert.equal(history[4]?.role, "tool");
+  assert.equal(history[4]?.tool_call_id, "call_repair_1");
   assert.match(String(history[4]?.content), /JSON parse failed; retry/);
 });
 
