@@ -220,6 +220,16 @@ export async function collectUpstreamStream(
       }
       throw error;
     }
+    const statusValue = asObject(error)?.status;
+    if (typeof statusValue === "number" && Number.isInteger(statusValue) && statusValue >= 400 && statusValue <= 599) {
+      const retryValue = asObject(error)?.retryAfterSeconds;
+      throw new UpstreamStreamError(
+        error instanceof Error ? error.message : "The NeuralWatt portal streaming response failed.",
+        statusValue,
+        typeof retryValue === "number" ? retryValue : undefined,
+        raw,
+      );
+    }
     throw new UpstreamStreamError(
       error instanceof Error ? error.message : "The NeuralWatt portal streaming response failed.",
       502,

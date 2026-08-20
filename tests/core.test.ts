@@ -604,6 +604,16 @@ test("upstream SSE error and empty streams fail closed", async () => {
     (error: unknown) => error instanceof UpstreamStreamError && error.status === 404,
   );
   await assert.rejects(
+    collectUpstreamStream(new Response(new ReadableStream({
+      pull(controller) {
+        controller.error(Object.assign(new Error("upstream activity timeout"), { status: 504 }));
+      },
+    }))),
+    (error: unknown) => error instanceof UpstreamStreamError
+      && error.status === 504
+      && error.message === "upstream activity timeout",
+  );
+  await assert.rejects(
     collectUpstreamStream(new Response("data: [DONE]\n\n")),
     /no data frames/,
   );

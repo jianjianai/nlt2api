@@ -88,38 +88,96 @@ function sessionFromResponse(response: Response): PortalSession | undefined {
 
 async function portalFetch(input: string, init: RequestInit, clientSignal?: AbortSignal): Promise<Response> {
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), getProxyConfig().upstreamTimeoutMs);
-  const abortForClient = () => controller.abort();
-  if (clientSignal?.aborted) {
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  let timedOut = false;
+  let clientAborted = false;
+  const clearTimeoutTimer = () => {
+    if (timeout) clearTimeout(timeout);
+    timeout = undefined;
+  };
+  const armTimeout = () => {
+    clearTimeoutTimer();
+    timedOut = false;
+    timeout = setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+    }, getProxyConfig().upstreamTimeoutMs);
+  };
+  const abortForClient = () => {
+    clientAborted = true;
     controller.abort();
+  };
+  if (clientSignal?.aborted) {
+    abortForClient();
   } else {
     clientSignal?.addEventListener("abort", abortForClient, { once: true });
   }
   const finish = () => {
-    clearTimeout(timeout);
+    clearTimeoutTimer();
     clientSignal?.removeEventListener("abort", abortForClient);
   };
+  armTimeout();
   try {
     const response = await fetch(input, { ...init, signal: controller.signal });
+    clearTimeoutTimer();
     if (!response.body) {
       finish();
-    } else {
-      let finished = false;
-      responseFinishes.set(response, () => {
-        if (!finished) {
-          finished = true;
+      return response;
+    }
+
+    const reader = response.body.getReader();
+    let bodyFinished = false;
+    const body = new ReadableStream<Uint8Array>({
+      async pull(streamController) {
+        try {
+          // Treat the configured timeout as inactivity, not a total generation
+          // deadline. Long reasoning streams remain valid while data arrives.
+          armTimeout();
+          const chunk = await reader.read();
+          clearTimeoutTimer();
+          if (chunk.done) {
+            bodyFinished = true;
+            finish();
+            streamController.close();
+            return;
+          }
+          if (chunk.value) streamController.enqueue(chunk.value);
+        } catch (error) {
+          bodyFinished = true;
+          finish();
+          if (clientAborted || clientSignal?.aborted) {
+            streamController.error(clientAbortError());
+          } else if (timedOut) {
+            streamController.error(new PortalError("The NeuralWatt portal response timed out while waiting for data.", 504));
+          } else {
+            streamController.error(error);
+          }
+        }
+      },
+      async cancel(reason) {
+        if (bodyFinished) return;
+        bodyFinished = true;
+        try {
+          await reader.cancel(reason);
+        } finally {
           finish();
         }
-      });
-    }
-    return response;
+      },
+    });
+    const wrapped = new Response(body, {
+      status: response.status,
+      statusText: response.statusText,
+      headers: response.headers,
+    });
+    responseFinishes.set(wrapped, finish);
+    return wrapped;
   } catch (error) {
     finish();
     if (error instanceof Error && error.name === "AbortError") {
-      if (clientSignal?.aborted) {
+      if (clientAborted || clientSignal?.aborted) {
         throw new PortalError("The client disconnected before the portal response completed.", 499);
       }
-      throw new PortalError("The NeuralWatt portal request timed out.", 504);
+      throw new PortalError("The NeuralWatt portal request timed out while waiting for response headers.", 504);
     }
     throw error;
   }

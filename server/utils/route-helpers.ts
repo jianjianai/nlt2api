@@ -18,6 +18,9 @@ export function upstreamHttpError(error: unknown): HttpError {
     if (error.status === 429) {
       return new HttpError(429, "The selected portal account is rate limited.", "rate_limit_error", undefined, "rate_limit_exceeded");
     }
+    if (error.status === 504) {
+      return new HttpError(504, "The NeuralWatt portal timed out while waiting for upstream data.", "api_error", undefined, "upstream_timeout");
+    }
     return new HttpError(502, "The NeuralWatt portal could not complete the request.", "api_error", undefined, "upstream_error");
   }
   return new HttpError(500, "Internal proxy error.", "server_error");
