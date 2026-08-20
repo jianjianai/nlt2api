@@ -56,7 +56,7 @@ const PORTAL_MAX_OUTPUT_TOKENS = 8_192;
 const MAX_CONTINUATION_ROUNDS = 16;
 const MAX_TOOL_REPAIR_ATTEMPTS = 5;
 const MAX_TOOL_REPAIR_CANDIDATE_CHARS = 131_072;
-const EMPTY_REPAIR_CANDIDATE = "[The previous assistant turn produced no tool-call JSON. Reconstruct the intended call from the preceding conversation and return only a valid controlled tool-call JSON object.]";
+const EMPTY_REPAIR_CANDIDATE = "[The previous assistant turn produced no tool-call JSON. Reconstruct the intended calls from the preceding conversation and return only a valid controlled envelope JSON object.]";
 
 export interface ChatExecution {
   account: ManagedAccount;
@@ -667,7 +667,7 @@ function repairMessages(error: string, attempt: number, candidate: ChatMessage, 
   // model drop otherwise valid calls from the failed candidate. The rule must
   // also stay domain-neutral; this proxy serves non-coding clients too.
   const callRule = parallelToolCalls
-    ? "Preserve every intended call from the failed candidate; include multiple entries only when they are independent."
+    ? "Preserve every intended call from the failed candidate; the corrected envelope holds one entry per intended call."
     : "Return exactly one call.";
 
   // Split the rejection across two role-correct messages. The `tool` message
@@ -692,13 +692,13 @@ function repairMessages(error: string, attempt: number, candidate: ChatMessage, 
       `Tool-call repair attempt ${attempt}.`,
       context,
       "",
-      "The previous tool-call JSON was rejected. Return only the corrected JSON object.",
+      "The previous tool-call JSON was rejected. Return only the corrected envelope JSON object.",
       "",
       "Rules:",
       "- Use the required envelope and a declared function name.",
       "- Make arguments satisfy the declared JSON Schema.",
       `- ${callRule}`,
-      "- Output exactly one JSON object with no prose, markdown, or code fences.",
+      "- Output exactly one envelope JSON object (with all intended calls inside) and no prose, markdown, or code fences.",
     ].join("\n"),
   };
 

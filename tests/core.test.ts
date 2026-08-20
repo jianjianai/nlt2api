@@ -413,7 +413,7 @@ test("repair history separates the rejection result from the correction instruct
     contracted,
     { role: "assistant" as const, content: '{"type":"tool_calls","tool_calls":[{"name":"calculator","arguments":{"a":1' },
     { role: "tool" as const, tool_call_id: "call_repair_1", content: "The previous tool call failed validation.\n\nRejection details:\nJSON parse failed; retry" },
-    { role: "user" as const, content: "Tool-call repair attempt 1. Return only the corrected JSON object.\nRules:\n- Use the required envelope and a declared function name." },
+    { role: "user" as const, content: "Tool-call repair attempt 1. Return only the corrected envelope JSON object.\nRules:\n- Use the required envelope and a declared function name." },
   );
   assert.deepEqual(history.map((message) => message.role), ["system", "user", "user", "assistant", "tool", "user"]);
   assert.equal(history[3]?.role, "assistant");
@@ -423,7 +423,7 @@ test("repair history separates the rejection result from the correction instruct
   assert.match(String(history[4]?.content), /Rejection details:\nJSON parse failed; retry/);
   assert.equal(history[5]?.role, "user");
   assert.match(String(history[5]?.content), /Tool-call repair attempt 1/);
-  assert.match(String(history[5]?.content), /Return only the corrected JSON object/);
+  assert.match(String(history[5]?.content), /Return only the corrected envelope JSON object/);
 });
 
 test("adapter contract follows caller instructions and the latest tool result", () => {
@@ -449,7 +449,7 @@ test("adapter contract follows caller instructions and the latest tool result", 
   assert.match(String(contracted[0]?.content), /ordinary assistant message content/);
   assert.match(String(contracted[0]?.content), /"properties":\{"a"/);
   assert.match(String(contracted.at(-1)?.content), /IMPORTANT TOOL TURN REMINDER/);
-  assert.match(String(contracted.at(-1)?.content), /exactly one complete controlled tool-call JSON object/);
+  assert.match(String(contracted.at(-1)?.content), /exactly one complete controlled envelope JSON object/);
 });
 
 test("adapter contract can be re-applied after a repair candidate", () => {

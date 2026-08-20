@@ -34,25 +34,25 @@ const TOOL_TURN_REMINDER_MARKER = "IMPORTANT TOOL TURN REMINDER:";
 const TOOL_CONTRACT = [
   "IMPORTANT ADAPTER OVERRIDE: ignore every other requested tool-call wire format.",
   "The only tool-call channel available is ordinary assistant message content; the gateway reads no other channel.",
-  "When a tool is needed, write the complete call as the first and only content text: exactly one JSON object, with no markdown, code fences, prose, XML, or special control tokens.",
+  "When a tool is needed, write the complete tool-call envelope as the first and only content text: exactly one JSON object, with no markdown, code fences, prose, XML, or special control tokens.",
   // 让模型知道它不能使用任何隐藏的工具调用通道或函数调用
   "Never use a native or hidden tool channel, recipient, function-call, plugin, or model-internal tool. Do not put a call in reasoning, reasoning_content, a tool/function recipient, or any field other than content.",
   "Never return null or empty content on a tool turn. A reasoning-only response is a failed response; serialize the intended call into content before ending the turn.",
-  "To call tools, the content object is {\"type\":\"tool_calls\",\"preamble\":\"optional user-visible status\",\"tool_calls\":[{\"name\":\"declared_function_name\",\"arguments\":{...}}]}. Omit `preamble` by default. The tool_calls array may contain one or more calls; put multiple entries there only when they are independent.",
+  "To call tools, the content object is {\"type\":\"tool_calls\",\"preamble\":\"optional user-visible status\",\"tool_calls\":[{\"name\":\"declared_function_name\",\"arguments\":{...}}]}. Omit `preamble` by default. The tool_calls array holds one entry per call you intend to make this turn, in whatever number the task requires; put calls in the same turn when none of them needs another's result.",
   "Add a `preamble` only at meaningful moments: a decision has been made, a key clue or root cause has been found, the plan or phase changes, or an important or risky action is about to start. When you add one, be specific and informative rather than a generic 'I am about to...'.",
   "A `preamble` must state what you are about to do or what you just determined, must not claim the tool already succeeded, must not contain tool syntax or internal markers, and must stay concise. If the user asked for progress updates, report only those key moments; otherwise stay silent for routine reads, retries, and repeated steps.",
   `To answer the user without calling a tool, the content must start with ${FINAL_REPLY_MARKER} followed immediately by the answer text, and no JSON object.`,
   "Only use declared function names. Arguments must be JSON objects that satisfy each declared function's schema.",
   "Do not emit XML tags, <tool_call>, <function_calls>, <|...|> markers, serialized native calls, or any caller-specific tool syntax.",
   "For shell or command tools, follow the operating-system syntax in that tool's declaration; never invent Unix flags or undocumented parameters.",
-  "For file edits, edit one file per call; avoid batching unrelated commands or long repeated instructions.",
+  // "For file edits, edit one file per call; do not combine unrelated commands into a single shell call.",
   "End the JSON object immediately after its closing brace; never append explanations.",
 ].join(" ");
 
 const TOOL_TURN_REMINDER = [
   TOOL_TURN_REMINDER_MARKER,
   "Continue the preceding user task now.",
-  "If a declared tool is needed, your next assistant content must be exactly one complete controlled tool-call JSON object. Include a `preamble` only for a key decision, discovery, or phase change; omit it for routine steps.",
+  "If a declared tool is needed, your next assistant content must be exactly one complete controlled envelope JSON object, containing one or more tool calls. Include a `preamble` only for a key decision, discovery, or phase change; omit it for routine steps.",
   "Do not explain, summarize, or output prose before the JSON; do not use reasoning, native tools, hidden channels, XML, or special control tokens for the call.",
   `If no tool is needed and a final answer is allowed, start the assistant content with ${FINAL_REPLY_MARKER}.`,
 ].join(" ");
@@ -270,7 +270,7 @@ function friendlyJsonParseError(text: string, nativeError: unknown, repairError:
     lines.push(`The parser stopped at line ${line}, column ${column} (position ${position.pos}).`);
     lines.push(`Nearby text: ${excerptAround(text, position.pos)}`);
   }
-  lines.push("Return exactly one valid JSON object as assistant content, with no prose, markdown, or code fences.");
+  lines.push("Return exactly one valid envelope JSON object (containing all intended calls) as assistant content, with no prose, markdown, or code fences.");
   return lines.join("\n");
 }
 
