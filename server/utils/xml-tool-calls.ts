@@ -21,8 +21,11 @@ import type { JsonObject, JsonValue, ToolDefinition } from "~/server/utils/types
  * the validator's position with txml's error, plus a format escape hatch.
  */
 
+// The skeleton shows the shape models most reliably imitate: the function
+// name as a <tool_call> attribute and each argument as a <parameter> element.
+// The parser additionally tolerates <name>/<arguments> child elements.
 export const XML_ENVELOPE_SKELETON =
-  "<tool_calls><tool_call><name>declared_function_name</name><arguments><parameter_name>value</parameter_name></arguments></tool_call></tool_calls>";
+  '<tool_calls><tool_call name="declared_function_name"><parameter name="parameter_name">value</parameter></tool_call></tool_calls>';
 
 function objectValue(value: unknown): JsonObject | undefined {
   return value && typeof value === "object" && !Array.isArray(value) ? value as JsonObject : undefined;
@@ -88,11 +91,12 @@ function txmlElementToValue(element: TNode): unknown {
   const children = element.children ?? [];
   const elementChildren = children.filter((child): child is TNode => typeof child !== "string");
   const text = children.filter((child): child is string => typeof child === "string").join("");
-  if (elementChildren.length === 0) {
+  const attributes = Object.entries(element.attributes ?? {});
+  if (elementChildren.length === 0 && attributes.length === 0) {
     return text.trim();
   }
   const output: Record<string, unknown> = {};
-  for (const [key, value] of Object.entries(element.attributes ?? {})) {
+  for (const [key, value] of attributes) {
     output[`@_${key}`] = value ?? "";
   }
   const trimmedText = text.trim();
@@ -446,7 +450,12 @@ function parameterChildrenToObject(value: unknown): unknown {
     if (typeof name !== "string" || !name) {
       continue;
     }
-    output[name] = object["#text"] ?? "";
+    // A parameter with element children carries a nested object; a text-only
+    // parameter carries its scalar (or JSON-text) value under #text.
+    const elementKeys = Object.keys(object).filter((key) => !key.startsWith("@_") && key !== "#text");
+    output[name] = elementKeys.length > 0
+      ? Object.fromEntries(elementKeys.map((key) => [key, object[key]]))
+      : object["#text"] ?? "";
   }
   return output;
 }
@@ -570,36 +579,23 @@ function escapeXmlText(value: string): string {
     .replace(/>/g, "&gt;");
 }
 
-function skeletonElement(key: string, value: JsonValue, indent: string): string {
-  if (value && typeof value === "object" && !Array.isArray(value)) {
-    const children = Object.entries(value as JsonObject)
-      .filter((entry): entry is [string, JsonValue] => entry[1] !== undefined)
-      .map(([childKey, childValue]) => skeletonElement(childKey, childValue, `${indent}  `))
-      .join("\n");
-    return children
-      ? `${indent}<${key}>\n${children}\n${indent}</${key}>`
-      : `${indent}<${key}></${key}>`;
-  }
-  if (Array.isArray(value)) {
-    // Arrays have no element-level notation in the envelope; show JSON text.
-    return `${indent}<${key}>${escapeXmlText(JSON.stringify(value))}</${key}>`;
-  }
-  return `${indent}<${key}>${escapeXmlText(String(value))}</${key}>`;
-}
-
 /** XML counterpart of the JSON repair-escalation skeleton. */
 export function buildXmlSkeleton(calls: { name: string; arguments: JsonObject }[]): string {
   const body = calls.map((call) => {
     const args = Object.entries(call.arguments)
       .filter((entry): entry is [string, JsonValue] => entry[1] !== undefined)
-      .map(([key, value]) => skeletonElement(key, value, "      "))
+      .map(([key, value]) => {
+        // Parameter values are scalars or JSON text; nested structures have
+        // no element-level notation in the parameter style.
+        const text = value !== null && typeof value === "object"
+          ? JSON.stringify(value)
+          : String(value);
+        return `    <parameter name="${escapeXmlText(key)}">${escapeXmlText(text)}</parameter>`;
+      })
       .join("\n");
     return [
-      "  <tool_call>",
-      `    <name>${escapeXmlText(call.name)}</name>`,
-      "    <arguments>",
+      `  <tool_call name="${escapeXmlText(call.name)}">`,
       args,
-      "    </arguments>",
       "  </tool_call>",
     ].filter((line) => line.length > 0).join("\n");
   }).join("\n");

@@ -54,7 +54,7 @@ const CONTRACT_SENTENCE_NO_NATIVE =
 const CONTRACT_SENTENCE_SHELL =
   "For shell or command tools, follow the operating-system syntax in that tool's declaration; never invent Unix flags or undocumented parameters.";
 const CONTRACT_SENTENCE_XML_RULES =
-  "In the XML format, write each argument as a child element of <arguments> named after the parameter, typed against the declared JSON Schema (numbers and booleans without quotes, arrays and objects as JSON text); escape & as &amp; and < as &lt; inside values, or wrap free-form text in <![CDATA[...]]>.";
+  "In the XML format, put the function name in the <tool_call> name attribute and write each argument as a <parameter name=\"...\"> element, typed against the declared JSON Schema (numbers and booleans without quotes, arrays and objects as JSON text); escape & as &amp; and < as &lt; inside values, or wrap free-form text in <![CDATA[...]]>.";
 
 const TOOL_CONTRACT_SENTENCES: Record<ToolCallFormat, string[]> = {
   json: [

@@ -103,6 +103,52 @@ test("XML envelope accepts the name attribute and JSON arguments text", () => {
   assert.deepEqual(JSON.parse(direct.envelope.toolCalls[0]!.function.arguments), { a: 3, b: 4 });
 });
 
+test("the model-preferred attribute+parameter format parses end to end", () => {
+  // The format XML-fluent models produce natively, including a bare && that
+  // strict validation rejects and the tolerant txml pass recovers.
+  const xml = [
+    "<tool_calls>",
+    '<tool_call name="bash">',
+    '<parameter name="command">cd /c/Users/28018/Desktop/neuralwatt-ai && npx tsx --test tests/xml-tool-calls.test.ts 2>&1 | tail -30</parameter>',
+    "</tool_call>",
+    "</tool_calls>",
+  ].join("\n");
+  const result = parseControlledToolEnvelopeDetailed(xml, shellTools, "seed");
+  assert.equal(result.envelope?.type, "tool_calls");
+  assert.equal(result.repaired, true);
+  if (result.envelope?.type !== "tool_calls") return;
+  assert.equal(result.envelope.toolCalls[0]?.function.name, "bash");
+  assert.deepEqual(JSON.parse(result.envelope.toolCalls[0]!.function.arguments), {
+    command: "cd /c/Users/28018/Desktop/neuralwatt-ai && npx tsx --test tests/xml-tool-calls.test.ts 2>&1 | tail -30",
+  });
+});
+
+test("parameter elements carry nested objects and JSON text", () => {
+  const nested = parseControlledToolEnvelopeDetailed(
+    '<tool_calls><tool_call name="bash"><parameter name="options"><verbose>true</verbose><retries>3</retries></parameter><parameter name="command">ls</parameter></tool_call></tool_calls>',
+    shellTools,
+    "seed",
+  );
+  assert.equal(nested.envelope?.type, "tool_calls");
+  if (nested.envelope?.type !== "tool_calls") return;
+  assert.deepEqual(JSON.parse(nested.envelope.toolCalls[0]!.function.arguments), {
+    options: { verbose: true, retries: 3 },
+    command: "ls",
+  });
+
+  const jsonText = parseControlledToolEnvelopeDetailed(
+    '<tool_calls><tool_call name="bash"><parameter name="options">{"verbose":true,"retries":3}</parameter><parameter name="command">ls</parameter></tool_call></tool_calls>',
+    shellTools,
+    "seed",
+  );
+  assert.equal(jsonText.envelope?.type, "tool_calls");
+  if (jsonText.envelope?.type !== "tool_calls") return;
+  assert.deepEqual(JSON.parse(jsonText.envelope.toolCalls[0]!.function.arguments), {
+    options: { verbose: true, retries: 3 },
+    command: "ls",
+  });
+});
+
 test("XML envelope batches parallel calls and carries a preamble", () => {
   const xml = [
     "<tool_calls>",
@@ -296,8 +342,8 @@ test("buildXmlSkeleton renders schema-derived placeholders", () => {
   ]);
   assert.match(skeleton, /^<tool_calls>/);
   assert.match(skeleton, /<\/tool_calls>$/);
-  assert.match(skeleton, /<name>calculator<\/name>/);
-  assert.match(skeleton, /<a>0<\/a>/);
+  assert.match(skeleton, /<tool_call name="calculator">/);
+  assert.match(skeleton, /<parameter name="a">0<\/parameter>/);
   // The skeleton itself must be a parseable envelope.
   const parsed = parseControlledToolEnvelopeDetailed(skeleton, tools, "seed");
   assert.equal(parsed.envelope?.type, "tool_calls");
@@ -306,7 +352,7 @@ test("buildXmlSkeleton renders schema-derived placeholders", () => {
 test("the auto contract offers both formats and lets the model choose", () => {
   assert.match(TOOL_CONTRACT, /IMPORTANT ADAPTER OVERRIDE/);
   assert.match(TOOL_CONTRACT, /\{"type":"tool_calls"/);
-  assert.match(TOOL_CONTRACT, /<tool_calls><tool_call><name>declared_function_name<\/name>/);
+  assert.match(TOOL_CONTRACT, /<tool_calls><tool_call name="declared_function_name">/);
   assert.match(TOOL_CONTRACT, /Choose the format you produce most reliably/);
   assert.match(TOOL_CONTRACT, /never mix or nest them/);
   assert.match(TOOL_CONTRACT, /CDATA/);
