@@ -61,7 +61,7 @@ export async function readJsonObjectWithRaw(request: Request): Promise<ReadJsonO
   const maxBytes = getProxyConfig().maxRequestBytes;
   const declaredLength = Number(request.headers.get("content-length") ?? "");
   if (Number.isFinite(declaredLength) && declaredLength > maxBytes) {
-    throw new HttpError(413, "Request body is too large.", "invalid_request_error");
+    throw new HttpError(413, `Request body is too large (limit ${maxBytes} bytes; raise NEURALWATT_MAX_REQUEST_BYTES).`, "invalid_request_error");
   }
 
   let text = "";
@@ -79,7 +79,7 @@ export async function readJsonObjectWithRaw(request: Request): Promise<ReadJsonO
           total += value.byteLength;
           if (total > maxBytes) {
             await reader.cancel();
-            throw new HttpError(413, "Request body is too large.", "invalid_request_error");
+            throw new HttpError(413, `Request body is too large (limit ${maxBytes} bytes; raise NEURALWATT_MAX_REQUEST_BYTES).`, "invalid_request_error");
           }
           chunks.push(value);
         }

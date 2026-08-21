@@ -21,7 +21,7 @@ export function getProxyConfig(): ProxyConfig {
     return cachedConfig;
   }
 
-  const rawMaxRequestBytes = Number(process.env.NEURALWATT_MAX_REQUEST_BYTES ?? "8388608");
+  const rawMaxRequestBytes = Number(process.env.NEURALWATT_MAX_REQUEST_BYTES ?? "67108864");
   const rawMaxOutputTokens = Number(process.env.NEURALWATT_MAX_OUTPUT_TOKENS ?? "128000");
   const rawMaxUpstreamBytes = Number(process.env.NEURALWATT_MAX_UPSTREAM_BYTES ?? "16777216");
   const rawMaxResponseHistoryBytes = Number(process.env.NEURALWATT_MAX_RESPONSE_HISTORY_BYTES ?? "2097152");
@@ -35,7 +35,7 @@ export function getProxyConfig(): ProxyConfig {
     defaultModel: process.env.NEURALWATT_DEFAULT_MODEL ?? "kimi-k3-fast",
     maxRequestBytes: Number.isFinite(rawMaxRequestBytes) && rawMaxRequestBytes > 0
       ? Math.floor(rawMaxRequestBytes)
-      : 8_388_608,
+      : 67_108_864,
     maxOutputTokens: Number.isFinite(rawMaxOutputTokens) && rawMaxOutputTokens > 0
       ? Math.max(1, Math.min(1_000_000, Math.floor(rawMaxOutputTokens)))
       : 128_000,
