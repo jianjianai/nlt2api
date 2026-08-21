@@ -1,8 +1,8 @@
 import { jsonrepair } from "jsonrepair";
 import type { ChatMessage, JsonObject, JsonValue, NormalizedToolCall, ToolDefinition } from "~/server/utils/types.ts";
 
-export const FINAL_REPLY_MARKER = "@@FINAL_REPLY@@";
-export const REPAIR_REASONING_START = "@@REPAIR_REASONING@@";
+export const FINAL_REPLY_MARKER = "<|FINAL_REPLY|>";
+export const REPAIR_REASONING_START = "<|REPAIR_REASONING|>";
 
 export interface ReasoningFields {
   reasoning?: string;

@@ -224,7 +224,7 @@ test("repair reasoning is tagged for clients and stripped before upstream replay
   ].join("");
   assert.equal(streamed, `${REPAIR_REASONING_START}fix the JSON`);
   assert.equal(stripRepairReasoning(`first ${tagged.reasoning} second`), "first ");
-  assert.equal(stripRepairReasoning("first @@REPAIR_REASONING@@unfinished"), "first ");
+  assert.equal(stripRepairReasoning("first <|REPAIR_REASONING|>unfinished"), "first ");
 
   const firstReasoning = "inspect package.json first";
   const clientVisibleReasoning = `${firstReasoning}${tagRepairReasoning({ reasoning: "repair the JSON" }).reasoning}`;

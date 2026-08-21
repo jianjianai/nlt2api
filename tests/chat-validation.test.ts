@@ -444,8 +444,8 @@ function streamContents(
 
 test("streaming tool turn holds a split marker, then streams the final reply", () => {
   const { streamed, state } = streamContents([
-    contentFrame("@@FINAL"),
-    contentFrame("_REPLY@@The answer"),
+    contentFrame("<|FINAL"),
+    contentFrame("_REPLY|>The answer"),
     contentFrame(" is 42."),
   ], validRequest({ tools: [tool] }));
   assert.deepEqual(streamed, ["The answer", " is 42."]);
@@ -456,7 +456,7 @@ test("streaming tool turn holds a split marker, then streams the final reply", (
 test("streaming tool turn tolerates leading whitespace before the final marker", () => {
   const { streamed, state } = streamContents([
     contentFrame("\n\n"),
-    contentFrame("@@FINAL_REPLY@@"),
+    contentFrame("<|FINAL_REPLY|>"),
     contentFrame("Done."),
   ], validRequest({ tools: [tool] }));
   assert.deepEqual(streamed, ["Done."]);

@@ -737,7 +737,7 @@ function isStreamingChunk(value: unknown): boolean {
 
 /** Strip internal adapter markers so debug output shows clean content. */
 function cleanMarkers(value: string): string {
-  return value.split("@@REPAIR_REASONING@@").join(" ").split("@@FINAL_REPLY@@").join("").replace(/\s+/g, " ").trim();
+  return value.split("<|REPAIR_REASONING|>").join(" ").split("<|FINAL_REPLY|>").join("").replace(/\s+/g, " ").trim();
 }
 
 function buildAggregatedMessages(options: {
