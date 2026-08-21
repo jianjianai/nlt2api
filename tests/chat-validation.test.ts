@@ -14,7 +14,7 @@ import {
 } from "../server/utils/chat-service.ts";
 import { getProxyConfig, resetProxyConfigForTests } from "../server/utils/config.ts";
 import { HttpError } from "../server/utils/http.ts";
-import { InvalidStructuredToolCallsError } from "../server/utils/tool-calls.ts";
+import { FINAL_REPLY_MARKER, InvalidStructuredToolCallsError, withToolCallContract } from "../server/utils/tool-calls.ts";
 import type { ChatMessage, JsonObject, JsonValue, ToolDefinition, UpstreamCompletion } from "../server/utils/types.ts";
 
 const tool = {
@@ -331,6 +331,62 @@ test("validateChatRequest still surfaces malformed history tool calls early", ()
     })),
     (error: unknown) => error instanceof InvalidStructuredToolCallsError,
   );
+});
+
+test("validateChatRequest prebuilds the contracted upstream messages", () => {
+  const request = validRequest({ tools: [tool] });
+  const validated = validateChatRequest(request);
+  const expected = withToolCallContract(
+    [{ role: "user", content: "Hello" }],
+    validated.tools,
+    undefined,
+    true,
+  );
+  assert.deepEqual(validated.upstreamMessages, expected);
+});
+
+test("validateChatRequest prebuilds plain portal messages when no tools are declared", () => {
+  const validated = validateChatRequest(validRequest());
+  assert.deepEqual(validated.upstreamMessages, [{ role: "user", content: "Hello" }]);
+});
+
+test("validateChatRequest prebuilds marked history for tool turns", () => {
+  const validated = validateChatRequest(validRequest({
+    tools: [tool],
+    messages: [
+      { role: "user", content: "hi" },
+      { role: "assistant", content: "done" },
+      { role: "user", content: "again" },
+    ] as unknown as JsonValue,
+  }));
+  const roles = validated.upstreamMessages.map((message) => message.role);
+  assert.deepEqual(roles, ["system", "user", "assistant", "user", "user"]);
+  assert.match(String(validated.upstreamMessages[0]?.content), /IMPORTANT ADAPTER OVERRIDE/);
+  assert.ok(String(validated.upstreamMessages[2]?.content).startsWith(FINAL_REPLY_MARKER));
+  assert.match(String(validated.upstreamMessages.at(-1)?.content), /IMPORTANT TOOL TURN REMINDER/);
+});
+
+test("validateChatRequest prebuilds serialized tool-call history for tool turns", () => {
+  const validated = validateChatRequest(validRequest({
+    tools: [tool],
+    messages: [
+      { role: "user", content: "hi" },
+      {
+        role: "assistant",
+        content: null,
+        tool_calls: [{ id: "call_1", type: "function", function: { name: "lookup", arguments: '{"query":"x"}' } }],
+      },
+      { role: "tool", tool_call_id: "call_1", content: "result" },
+      { role: "user", content: "again" },
+    ] as unknown as JsonValue,
+  }));
+  const roles = validated.upstreamMessages.map((message) => message.role);
+  assert.deepEqual(roles, ["system", "user", "assistant", "tool", "user", "user"]);
+  const assistant = validated.upstreamMessages[2];
+  assert.equal(assistant?.tool_calls, undefined);
+  const envelope = JSON.parse(String(assistant?.content));
+  assert.equal(envelope.type, "tool_calls");
+  assert.deepEqual(envelope.tool_calls, [{ name: "lookup", arguments: { query: "x" } }]);
 });
 
 test("executeChatRequest validates when no validation result is supplied", async () => {

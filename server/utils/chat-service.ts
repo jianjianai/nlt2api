@@ -253,6 +253,13 @@ export interface ValidatedChatRequest {
   model: string;
   messages: ChatMessage[];
   tools: ToolDefinition[];
+  /**
+   * Portal-ready messages built during validation (contract applied, system
+   * messages merged, schemas serialized). Execution reuses them instead of
+   * re-running the message pipeline; the only stream-dependent output of the
+   * builder is the body's `stream` flag.
+   */
+  upstreamMessages: ChatMessage[];
 }
 
 export function validateChatRequest(request: JsonObject): ValidatedChatRequest {
@@ -267,8 +274,8 @@ export function validateChatRequest(request: JsonObject): ValidatedChatRequest {
   if (request.n !== undefined && request.n !== 1) {
     throw new HttpError(400, "Only n=1 is supported by the portal adapter.", "invalid_request_error", "n");
   }
-  upstreamBody(request, model, messages, tools, false);
-  return { model, messages, tools };
+  const built = upstreamBody(request, model, messages, tools, false);
+  return { model, messages, tools, upstreamMessages: built.messages };
 }
 
 function portalMessages(messages: ChatMessage[], markFinalReplies = false): ChatMessage[] {
@@ -304,6 +311,7 @@ function upstreamBody(
   messages: ChatMessage[],
   tools: ToolDefinition[],
   stream: boolean,
+  prebuiltMessages?: ChatMessage[],
 ): { body: JsonObject; messages: ChatMessage[] } {
   const tokenLimit = validateTokenLimit(request);
   const toolChoice = request.tool_choice;
@@ -322,9 +330,12 @@ function upstreamBody(
     "chat_template_kwargs",
     "parallel_tool_calls",
   ];
-  const upstreamMessages = toolTurn
+  // Validation already ran the message pipeline (contract application, system
+  // merge, schema serialization); only the scalar body fields, including
+  // `stream`, are rebuilt per execution.
+  const upstreamMessages = prebuiltMessages ?? (toolTurn
     ? withToolCallContract(portalMessages(messages, true), tools, toolChoice, parallelToolCalls)
-    : portalMessages(messages, false);
+    : portalMessages(messages, false));
   const body: JsonObject = {
     model,
     messages: upstreamMessages as unknown as JsonValue,
@@ -989,7 +1000,7 @@ async function executeChatRequestOnce(
     validated?: ValidatedChatRequest;
   },
 ): Promise<ChatExecution> {
-  const { model, messages, tools } = options?.validated ?? validateChatRequest(request);
+  const { model, messages, tools, upstreamMessages: prebuiltMessages } = options?.validated ?? validateChatRequest(request);
 
   const toolTurn = tools.length > 0 && request.tool_choice !== "none";
   const observedToolCallIds = messages
@@ -999,7 +1010,7 @@ async function executeChatRequestOnce(
     ? undefined
     : accountScheduler.accountForToolCalls(observedToolCallIds);
   const streamUpstream = options?.stream ?? request.stream === true;
-  const builtUpstream = upstreamBody(request, model, messages, tools, streamUpstream);
+  const builtUpstream = upstreamBody(request, model, messages, tools, streamUpstream, prebuiltMessages);
   let upstreamRequest = builtUpstream.body;
   // A client budget above the per-round portal cap enables thinking
   // continuation: when the upstream stops with finish_reason "length" while
