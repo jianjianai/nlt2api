@@ -18,7 +18,7 @@ import {
   type ResponseRequestContext,
 } from "../server/utils/response-api.ts";
 import { ResponseStore } from "../server/utils/response-store.ts";
-import type { ChatExecution, } from "../server/utils/chat-service.ts";
+import { validateChatRequest, type ChatExecution } from "../server/utils/chat-service.ts";
 import type { JsonObject, JsonValue, ManagedAccount } from "../server/utils/types.ts";
 
 async function withTempDataDir<T>(run: () => Promise<T>): Promise<T> {
@@ -243,6 +243,25 @@ test("validateResponseRequest harvests tools from additional_tools and namespace
     assert.deepEqual(messages, [{ role: "user", content: "Run something" }]);
     // tool_choice auto with harvested tools must not raise.
     assert.equal(chatRequest.tool_choice, "auto");
+  });
+});
+
+test("validateResponseRequest accepts tool_choice auto when every tool is dropped", async () => {
+  await withTempDataDir(async () => {
+    // Hosted tools have no executor on this gateway and are dropped; a client
+    // default of tool_choice "auto" must not turn the request into a 400.
+    const { chatRequest, context } = await validateResponseRequest({
+      model: "test-model",
+      store: false,
+      tool_choice: "auto",
+      tools: [{ type: "web_search" }],
+      input: [userInput("Search something")],
+    });
+    assert.equal(chatRequest.tools, undefined);
+    assert.equal(chatRequest.tool_choice, "auto");
+    assert.deepEqual(context.droppedTools, ["web_search"]);
+    // The downstream chat validation accepts the no-op selection.
+    validateChatRequest(chatRequest);
   });
 });
 

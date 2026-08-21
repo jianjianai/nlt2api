@@ -196,7 +196,11 @@ export function parseTools(value: unknown): ToolDefinition[] {
 }
 
 function validateToolChoice(value: unknown, tools: ToolDefinition[]): void {
-  if (tools.length === 0 && value !== undefined && value !== "none") {
+  // "auto" and "none" stay valid without tools: both are no-op selections
+  // (auto is the OpenAI default), and clients such as Codex send them even
+  // when every declared tool was dropped or absent. "required" and named
+  // functions are unsatisfiable without tools and keep failing.
+  if (tools.length === 0 && value !== undefined && value !== "none" && value !== "auto") {
     throw new HttpError(400, "`tool_choice` requires at least one function in `tools`.", "invalid_request_error", "tool_choice");
   }
   if (value === undefined || value === "auto" || value === "none" || value === "required") {
