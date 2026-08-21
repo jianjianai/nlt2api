@@ -1,6 +1,6 @@
 {
   "name": "nlt2api",
-  "version": "3.2.6",
+  "version": "3.3.0",
   "private": true,
   "packageManager": "pnpm@10.34.5",
   "engines": {
