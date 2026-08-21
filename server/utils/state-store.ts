@@ -171,6 +171,12 @@ export class StateStore {
   private mutationQueue: Promise<void> = Promise.resolve();
   private recordIndexInit: Promise<RecordIndexEntry[]> | undefined;
 
+  /** Clear cached state so tests can point the singleton at a fresh data dir. */
+  resetForTests(): void {
+    this.state = undefined;
+    this.recordIndexInit = undefined;
+  }
+
   private get storePath(): string {
     return join(getProxyConfig().dataDir, STORE_FILE);
   }
