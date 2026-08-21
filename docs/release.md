@@ -29,7 +29,8 @@
 
 5. 推送标签后 GitHub Actions 自动执行 `.github/workflows/docker-publish.yml`：
    - **verify**：校验标签与 `package.json` 版本一致 → 安装依赖 → 测试 → 类型检查 → 构建。
-   - **docker**：构建 `linux/amd64` + `linux/arm64` 多架构镜像并推送到 GHCR（`ghcr.io/<owner>/<repo>`），同时打上 `X.Y.Z`、`X.Y`、`latest` 三个标签。
+   - **docker**：`linux/amd64` 与 `linux/arm64` 两个架构**并行**构建（matrix，每个架构一个 job），单架构镜像按 digest 推送到 GHCR。
+   - **merge**：将全部架构的 digest 合并为多架构 manifest，打上 `X.Y.Z`、`X.Y`、`latest` 三个标签推送到 GHCR（`ghcr.io/<owner>/<repo>`）。
    - **release**：基于标签自动创建 GitHub Release（自动生成更新日志）。
 
 ## 注意事项
