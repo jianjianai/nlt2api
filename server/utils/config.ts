@@ -24,7 +24,7 @@ export function getProxyConfig(): ProxyConfig {
   const rawMaxRequestBytes = Number(process.env.NEURALWATT_MAX_REQUEST_BYTES ?? "67108864");
   const rawMaxOutputTokens = Number(process.env.NEURALWATT_MAX_OUTPUT_TOKENS ?? "128000");
   const rawMaxUpstreamBytes = Number(process.env.NEURALWATT_MAX_UPSTREAM_BYTES ?? "16777216");
-  const rawMaxResponseHistoryBytes = Number(process.env.NEURALWATT_MAX_RESPONSE_HISTORY_BYTES ?? "2097152");
+  const rawMaxResponseHistoryBytes = Number(process.env.NEURALWATT_MAX_RESPONSE_HISTORY_BYTES ?? "16777216");
   const rawMaxResponseStateBytes = Number(process.env.NEURALWATT_MAX_RESPONSE_STATE_BYTES ?? "16777216");
   const rawUpstreamTimeoutMs = Number(process.env.NEURALWATT_UPSTREAM_TIMEOUT_MS ?? "120000");
   cachedConfig = {
@@ -44,7 +44,7 @@ export function getProxyConfig(): ProxyConfig {
       : 16_777_216,
     maxResponseHistoryBytes: Number.isFinite(rawMaxResponseHistoryBytes) && rawMaxResponseHistoryBytes > 0
       ? Math.floor(rawMaxResponseHistoryBytes)
-      : 2_097_152,
+      : 16_777_216,
     maxResponseStateBytes: Number.isFinite(rawMaxResponseStateBytes) && rawMaxResponseStateBytes > 0
       ? Math.floor(rawMaxResponseStateBytes)
       : 16_777_216,

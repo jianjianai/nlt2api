@@ -586,7 +586,7 @@ export async function validateResponseRequest(body: JsonObject): Promise<Validat
   }
   const historyBytes = Buffer.byteLength(JSON.stringify(inputItems), "utf8");
   if (historyBytes > getProxyConfig().maxResponseHistoryBytes) {
-    throw invalid("The reconstructed response history exceeds the supported size.", "input");
+    throw invalid(`The reconstructed response history exceeds the supported size (limit ${getProxyConfig().maxResponseHistoryBytes} bytes; raise NEURALWATT_MAX_RESPONSE_HISTORY_BYTES).`, "input");
   }
 
   const customTools = new Set(tools.filter((tool) => tool.kind === "custom").map((tool) => tool.name));
