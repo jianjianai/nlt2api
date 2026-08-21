@@ -43,25 +43,25 @@ jobs:
         run: pnpm run build
 
   # 每个架构一个并行 job，各自构建单架构镜像并按 digest 推送，
-  # 避免单 job 内顺序构建拖慢发布（arm64 走 QEMU 模拟，耗时远长于 amd64）。
+  # 避免单 job 内顺序构建拖慢发布。arm64 跑在原生 ARM runner 上
+  # （ubuntu-24.04-arm，公开仓库免费），无需 QEMU 模拟，构建快得多。
   docker:
     needs: verify
     strategy:
       fail-fast: false
       matrix:
-        platform:
-          - linux/amd64
-          - linux/arm64
-    runs-on: ubuntu-latest
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-latest
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
       packages: write
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
