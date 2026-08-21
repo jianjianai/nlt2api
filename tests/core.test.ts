@@ -17,6 +17,7 @@ import {
   withToolCallContract,
 } from "../server/utils/tool-calls.ts";
 import {
+  minimalSchemaExample,
   parseAndValidateToolArguments,
   jsonSchemaCacheStats,
   validateJsonSchema,
@@ -807,4 +808,42 @@ test("upstream SSE error and empty streams fail closed", async () => {
 test("Chat SSE uses the OpenAI [DONE] termination contract", async () => {
   const chat = await openAISse([{ data: { id: "chatcmpl-1" } }]).text();
   assert.match(chat, /data: \[DONE\]/);
+});
+
+test("minimal schema example prefers explicit values and required keys", () => {
+  assert.deepEqual(minimalSchemaExample(undefined), {});
+  assert.deepEqual(minimalSchemaExample({ const: "fixed" }), "fixed");
+  assert.deepEqual(minimalSchemaExample({ default: 7, type: "integer" }), 7);
+  assert.deepEqual(minimalSchemaExample({ enum: ["a", "b"] }), "a");
+  assert.deepEqual(minimalSchemaExample({ examples: [42], type: "integer" }), 42);
+  // Only required keys appear when required is declared.
+  assert.deepEqual(minimalSchemaExample({
+    type: "object",
+    properties: {
+      mode: { enum: ["fast", "slow"] },
+      count: { type: "integer", default: 3 },
+      note: { type: "string" },
+    },
+    required: ["mode"],
+  }), { mode: "fast" });
+  // Without required, the first few properties illustrate the shape.
+  assert.deepEqual(minimalSchemaExample({
+    type: "object",
+    properties: { a: { type: "string" }, b: { type: "boolean" }, c: { type: "null" }, d: { type: "number" } },
+  }), { a: "string", b: false, c: null });
+});
+
+test("minimal schema example handles nesting, unions, arrays, and type lists", () => {
+  assert.deepEqual(minimalSchemaExample({
+    type: "object",
+    properties: { range: { type: "object", properties: { start: { type: "integer" } }, required: ["start"] } },
+    required: ["range"],
+  }), { range: { start: 0 } });
+  assert.deepEqual(minimalSchemaExample({ anyOf: [{ type: "string" }, { type: "number" }] }), "string");
+  assert.deepEqual(minimalSchemaExample({ oneOf: [{ type: "boolean" }] }), false);
+  assert.deepEqual(minimalSchemaExample({ type: "array", items: { type: "string" }, minItems: 2 }), ["string", "string"]);
+  assert.deepEqual(minimalSchemaExample({ type: "array", items: { type: "string" } }), []);
+  assert.deepEqual(minimalSchemaExample({ type: ["null", "string"] }), "string");
+  assert.deepEqual(minimalSchemaExample({ type: "number", minimum: 5 }), 5);
+  assert.deepEqual(minimalSchemaExample({ type: "string", minLength: 10 }), "stringxxxx");
 });

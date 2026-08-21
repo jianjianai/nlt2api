@@ -167,3 +167,82 @@ export function parseAndValidateToolArgumentsLocated(
   }
   return { value, validation: validateJsonSchemaLocated(value, schema) };
 }
+
+/**
+ * Synthesize a minimal example value for a JSON Schema. Repair escalations
+ * embed the result as a skeleton the model completes with real arguments, so
+ * structure and required keys matter more than the placeholder values.
+ * Explicit const/default/examples/enum win over type-based placeholders.
+ */
+export function minimalSchemaExample(schema: JsonObject | undefined, depth = 0): JsonValue {
+  if (!schema || depth > 6) {
+    return {};
+  }
+  if (schema.const !== undefined) {
+    return schema.const;
+  }
+  if (schema.default !== undefined) {
+    return schema.default;
+  }
+  if (Array.isArray(schema.examples) && schema.examples.length > 0) {
+    return schema.examples[0] as JsonValue;
+  }
+  if (Array.isArray(schema.enum) && schema.enum.length > 0) {
+    return schema.enum[0] as JsonValue;
+  }
+  for (const keyword of ["anyOf", "oneOf"] as const) {
+    const branches = schema[keyword];
+    const first = Array.isArray(branches)
+      ? branches.find((branch): branch is JsonObject => Boolean(branch) && typeof branch === "object" && !Array.isArray(branch))
+      : undefined;
+    if (first) {
+      return minimalSchemaExample(first, depth + 1);
+    }
+  }
+  const type = Array.isArray(schema.type)
+    ? schema.type.find((candidate) => candidate !== "null")
+    : schema.type;
+  if (type === "string") {
+    const minLength = typeof schema.minLength === "number" ? schema.minLength : 0;
+    return minLength > 6 ? "string".padEnd(Math.min(minLength, 32), "x") : "string";
+  }
+  if (type === "integer" || type === "number") {
+    return typeof schema.minimum === "number" ? schema.minimum : 0;
+  }
+  if (type === "boolean") {
+    return false;
+  }
+  if (type === "null") {
+    return null;
+  }
+  if (type === "array") {
+    const minItems = typeof schema.minItems === "number" ? Math.min(Math.max(schema.minItems, 0), 2) : 0;
+    const items = schema.items && typeof schema.items === "object" && !Array.isArray(schema.items)
+      ? schema.items as JsonObject
+      : undefined;
+    return Array.from({ length: minItems }, () => minimalSchemaExample(items, depth + 1));
+  }
+  const properties = schema.properties && typeof schema.properties === "object" && !Array.isArray(schema.properties)
+    ? schema.properties as Record<string, unknown>
+    : undefined;
+  if (!properties) {
+    return {};
+  }
+  const required = Array.isArray(schema.required)
+    ? new Set(schema.required.filter((key): key is string => typeof key === "string"))
+    : new Set<string>();
+  // Required keys must appear in a valid call; when nothing is required, show
+  // the first few properties so the model still sees the expected shape.
+  const keys = required.size > 0
+    ? Object.keys(properties).filter((key) => required.has(key))
+    : Object.keys(properties).slice(0, 3);
+  const example: Record<string, JsonValue> = {};
+  for (const key of keys) {
+    const subschema = properties[key];
+    example[key] = minimalSchemaExample(
+      subschema && typeof subschema === "object" && !Array.isArray(subschema) ? subschema as JsonObject : undefined,
+      depth + 1,
+    );
+  }
+  return example;
+}

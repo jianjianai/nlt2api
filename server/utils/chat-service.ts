@@ -4,6 +4,7 @@ import { accountScheduler } from "~/server/utils/account-scheduler.ts";
 import { getProxyConfig } from "~/server/utils/config.ts";
 import { HttpError } from "~/server/utils/http.ts";
 import {
+  minimalSchemaExample,
   parseAndValidateToolArgumentsLocated,
   validateSchemaDefinition,
   type LocatedSchemaValidationResult,
@@ -23,6 +24,7 @@ import {
   normaliseAssistantToolCalls,
   mergeSystemMessages,
   parseControlledToolEnvelopeDetailed,
+  parseRepairJson,
   serializeAssistantToolCallsForPortal,
   withToolCallContract,
 } from "~/server/utils/tool-calls.ts";
@@ -56,6 +58,11 @@ const PORTAL_MAX_OUTPUT_TOKENS = 8_192;
 const MAX_CONTINUATION_ROUNDS = 16;
 const MAX_TOOL_REPAIR_ATTEMPTS = 5;
 const MAX_TOOL_REPAIR_CANDIDATE_CHARS = 131_072;
+// From this attempt on, the correction carries a prefill skeleton: static
+// rules alone stop converging once the model has failed twice.
+const REPAIR_ESCALATION_ATTEMPT = 3;
+const MAX_REPAIR_SKELETON_CALLS = 3;
+const MAX_REPAIR_SKELETON_CHARS = 4_000;
 const EMPTY_REPAIR_CANDIDATE = "[The previous assistant turn produced no tool-call JSON. Reconstruct the intended calls from the preceding conversation and return only a valid controlled envelope JSON object.]";
 
 export interface ChatExecution {
@@ -653,7 +660,89 @@ function outputFinishReason(completion: UpstreamCompletion, message: ChatMessage
   return upstream === "length" ? "length" : "stop";
 }
 
-function repairMessages(error: string, attempt: number, candidate: ChatMessage, parallelToolCalls: boolean): ChatMessage[] {
+export interface RepairPromptOptions {
+  error: string;
+  attempt: number;
+  candidate: ChatMessage;
+  tools: ToolDefinition[];
+  toolChoice: unknown;
+  parallelToolCalls: boolean;
+}
+
+/** Declared function names the failed candidate tried to call. */
+function candidateCallNames(candidate: ChatMessage, tools: ToolDefinition[]): string[] {
+  const declared = new Set(tools.map((tool) => tool.function.name));
+  const names: string[] = [];
+  for (const call of candidate.tool_calls ?? []) {
+    if (declared.has(call.function.name)) {
+      names.push(call.function.name);
+    }
+  }
+  if (names.length === 0 && typeof candidate.content === "string" && candidate.content.trim()) {
+    const parsed = parseRepairJson(candidate.content.trim());
+    if ("value" in parsed) {
+      const calls = asRecord(parsed.value)?.tool_calls;
+      for (const raw of Array.isArray(calls) ? calls : []) {
+        const object = asRecord(raw);
+        const name = asRecord(object?.function)?.name ?? object?.name;
+        if (typeof name === "string" && declared.has(name)) {
+          names.push(name);
+        }
+      }
+    }
+  }
+  return [...new Set(names)];
+}
+
+/**
+ * Late-repair escalation: a skeleton envelope naming the failed functions
+ * with schema-derived placeholder arguments. Static rules stop converging
+ * after repeated failures; a concrete, structurally valid starting point
+ * gives the model something to edit instead of regenerate.
+ */
+function repairEscalationLines(options: RepairPromptOptions): string[] {
+  if (options.attempt < REPAIR_ESCALATION_ATTEMPT) {
+    return [];
+  }
+  const forced = asRecord(options.toolChoice)?.type === "function"
+    ? asRecord(asRecord(options.toolChoice)?.function)?.name
+    : undefined;
+  let names = candidateCallNames(options.candidate, options.tools);
+  if (names.length === 0 && typeof forced === "string") {
+    names = [forced];
+  }
+  if (names.length === 0) {
+    return [
+      "",
+      "Escalated repair: re-read the declared function list in the system message, copy each function name exactly, and build the envelope around those names.",
+    ];
+  }
+  const limited = (options.parallelToolCalls ? names : names.slice(0, 1)).slice(0, MAX_REPAIR_SKELETON_CALLS);
+  const skeletonCalls = limited.map((name) => {
+    const tool = options.tools.find((candidateTool) => candidateTool.function.name === name);
+    const example = minimalSchemaExample(tool?.function.parameters);
+    return {
+      name,
+      arguments: example && typeof example === "object" && !Array.isArray(example) ? example : {},
+    };
+  });
+  let skeleton = JSON.stringify({ type: "tool_calls", tool_calls: skeletonCalls });
+  if (skeleton.length > MAX_REPAIR_SKELETON_CHARS) {
+    skeleton = JSON.stringify({
+      type: "tool_calls",
+      tool_calls: limited.map((name) => ({ name, arguments: {} })),
+    });
+  }
+  return [
+    "",
+    "Escalated repair: start from this skeleton envelope; keep its structure and function names unchanged and replace every placeholder value with the real arguments from the conversation:",
+    skeleton,
+    "Return only the completed envelope JSON object.",
+  ];
+}
+
+export function repairMessages(options: RepairPromptOptions): ChatMessage[] {
+  const { error, attempt, candidate, parallelToolCalls } = options;
   const hasCandidate = Boolean(
     (typeof candidate.content === "string" && candidate.content.length > 0)
     || candidate.tool_calls?.length,
@@ -699,6 +788,7 @@ function repairMessages(error: string, attempt: number, candidate: ChatMessage, 
       "- Make arguments satisfy the declared JSON Schema.",
       `- ${callRule}`,
       "- Output exactly one envelope JSON object (with all intended calls inside) and no prose, markdown, or code fences.",
+      ...repairEscalationLines(options),
     ].join("\n"),
   };
 
@@ -998,7 +1088,14 @@ async function executeChatRequestOnce(
       const repairHistory = buildToolRepairHistory(
         contractedOriginalMessages,
         repairCandidate.message,
-        ...repairMessages(error, toolCallAdapter.repairAttempts, repairCandidate.message, request.parallel_tool_calls !== false),
+        ...repairMessages({
+          error,
+          attempt: toolCallAdapter.repairAttempts,
+          candidate: repairCandidate.message,
+          tools,
+          toolChoice: request.tool_choice,
+          parallelToolCalls: request.parallel_tool_calls !== false,
+        }),
       );
       const repairStream = Boolean(options?.onRepairReasoning);
       upstreamRequest = {

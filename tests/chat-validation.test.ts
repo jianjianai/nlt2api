@@ -9,12 +9,13 @@ import {
   executeChatRequest,
   isThinkingInterrupted,
   locatedSchemaErrorText,
+  repairMessages,
   validateChatRequest,
 } from "../server/utils/chat-service.ts";
 import { getProxyConfig, resetProxyConfigForTests } from "../server/utils/config.ts";
 import { HttpError } from "../server/utils/http.ts";
 import { InvalidStructuredToolCallsError } from "../server/utils/tool-calls.ts";
-import type { JsonObject, JsonValue, UpstreamCompletion } from "../server/utils/types.ts";
+import type { ChatMessage, JsonObject, JsonValue, ToolDefinition, UpstreamCompletion } from "../server/utils/types.ts";
 
 const tool = {
   type: "function",
@@ -488,4 +489,109 @@ test("isThinkingInterrupted only accepts a length stop with empty content and re
     },
     "length",
   )), false);
+});
+
+const lookupTool: ToolDefinition = {
+  type: "function",
+  function: {
+    name: "lookup",
+    parameters: {
+      type: "object",
+      properties: { query: { type: "string" } },
+      required: ["query"],
+      additionalProperties: false,
+    },
+  },
+};
+const otherTool: ToolDefinition = {
+  type: "function",
+  function: { name: "other", parameters: { type: "object", properties: {} } },
+};
+
+test("repair messages stay static before the escalation attempt", () => {
+  const candidate: ChatMessage = {
+    role: "assistant",
+    content: '{"type":"tool_calls","tool_calls":[{"name":"lookup","arguments":{"query":123}}]}',
+  };
+  for (const attempt of [1, 2]) {
+    const [rejection, correction] = repairMessages({
+      error: "Tool `lookup` arguments failed schema validation:\n- /query: must be string",
+      attempt,
+      candidate,
+      tools: [lookupTool],
+      toolChoice: "auto",
+      parallelToolCalls: true,
+    });
+    assert.equal(rejection?.role, "tool");
+    assert.equal(correction?.role, "user");
+    assert.ok(!String(correction?.content).includes("Escalated repair"));
+  }
+});
+
+test("repair escalation embeds a schema-derived skeleton naming the failed functions", () => {
+  const candidate: ChatMessage = {
+    role: "assistant",
+    content: '{"type":"tool_calls","tool_calls":[{"name":"lookup","arguments":{"query":123}}]}',
+  };
+  const [, correction] = repairMessages({
+    error: "Tool `lookup` arguments failed schema validation:\n- /query: must be string",
+    attempt: 3,
+    candidate,
+    tools: [lookupTool],
+    toolChoice: "auto",
+    parallelToolCalls: true,
+  });
+  const content = String(correction?.content);
+  assert.ok(content.includes("Escalated repair"));
+  assert.ok(content.includes('{"type":"tool_calls","tool_calls":[{"name":"lookup","arguments":{"query":"string"}}]}'));
+});
+
+test("repair escalation reads names from normalized tool_calls and honors parallel_tool_calls", () => {
+  const candidate: ChatMessage = {
+    role: "assistant",
+    content: null,
+    tool_calls: [
+      { id: "call_1", type: "function", function: { name: "lookup", arguments: "{}" } },
+      { id: "call_2", type: "function", function: { name: "other", arguments: "{}" } },
+    ],
+  };
+  const base = {
+    error: "schema mismatch",
+    attempt: 4,
+    candidate,
+    tools: [lookupTool, otherTool],
+    toolChoice: "auto" as const,
+  };
+  const parallel = String(repairMessages({ ...base, parallelToolCalls: true })[1]?.content);
+  assert.ok(parallel.includes('"name":"lookup"'));
+  assert.ok(parallel.includes('"name":"other"'));
+  const single = String(repairMessages({ ...base, parallelToolCalls: false })[1]?.content);
+  assert.ok(single.includes('"name":"lookup"'));
+  assert.ok(!single.includes('"name":"other"'));
+});
+
+test("repair escalation falls back to the forced tool_choice and to generic guidance", () => {
+  const emptyCandidate: ChatMessage = { role: "assistant", content: "" };
+  const forced = repairMessages({
+    error: "no envelope",
+    attempt: 5,
+    candidate: emptyCandidate,
+    tools: [lookupTool],
+    toolChoice: { type: "function", function: { name: "lookup" } },
+    parallelToolCalls: true,
+  });
+  assert.ok(String(forced[1]?.content).includes('"name":"lookup"'));
+
+  const proseCandidate: ChatMessage = { role: "assistant", content: "I could not decide." };
+  const generic = repairMessages({
+    error: "no envelope",
+    attempt: 3,
+    candidate: proseCandidate,
+    tools: [lookupTool],
+    toolChoice: "auto",
+    parallelToolCalls: true,
+  });
+  const content = String(generic[1]?.content);
+  assert.ok(content.includes("Escalated repair: re-read the declared function list"));
+  assert.ok(!content.includes('"tool_calls":[{"name"'));
 });
