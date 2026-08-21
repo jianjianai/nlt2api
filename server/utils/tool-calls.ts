@@ -378,6 +378,14 @@ function friendlyJsonParseError(text: string, nativeError: unknown, repairError:
   return lines.join("\n");
 }
 
+function friendlyUnknownEnvelopeError(text: string): string {
+  return [
+    "The response was not recognized as a tool-call envelope in either supported format.",
+    `Nearby text: ${excerptAround(text, 0)}`,
+    `Return exactly one valid envelope as assistant content, with no prose, markdown, or code fences: either the JSON form ${TOOL_ENVELOPE_SKELETON} or the XML form ${XML_ENVELOPE_SKELETON}.`,
+  ].join("\n");
+}
+
 export function parseRepairJson(text: string): JsonRepairResult | JsonRepairFailure {
   try {
     return { value: JSON.parse(text), repaired: false };
@@ -406,7 +414,13 @@ export function parseControlledToolEnvelopeDetailed(
   // Propagate whether the repair pass modified the raw text so callers can
   // tell a clean first pass from a repair-assisted one.
   let repaired: boolean | undefined;
-  if (detectEnvelopeFormat(trimmed) === "xml") {
+  const format = detectEnvelopeFormat(trimmed);
+  if (format === "unknown") {
+    // Neither JSON- nor XML-shaped: a format-neutral error beats routing the
+    // content into one parser and reporting the wrong format's failure.
+    return { error: friendlyUnknownEnvelopeError(trimmed) };
+  }
+  if (format === "xml") {
     const parsedXml = parseRepairXml(trimmed);
     if ("error" in parsedXml) {
       return { error: parsedXml.error };

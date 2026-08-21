@@ -602,6 +602,11 @@ export function buildXmlSkeleton(calls: { name: string; arguments: JsonObject }[
   return `<tool_calls>\n${body}\n</tool_calls>`;
 }
 
+// Any tag-like opener marks an XML envelope attempt in a tool-turn context.
+// The JSON marker is checked first because JSON argument text can contain
+// tag-like strings.
+const XML_TAG_PATTERN = /<\/?[a-zA-Z][\w.-]*(?:\s[^>]*)?>/;
+
 /**
  * Format detection shared by the parser and the repair escalations. The
  * leading character decides; when prose precedes the envelope, the envelope
@@ -615,11 +620,14 @@ export function detectEnvelopeFormat(content: string): "xml" | "json" | "unknown
   if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
     return "json";
   }
-  if (trimmed.includes("<tool_calls") || trimmed.includes("<tool_call")) {
+  if (trimmed.includes("<tool_calls") || trimmed.includes("<tool_call") || trimmed.includes("<invoke")) {
     return "xml";
   }
   if (trimmed.includes('"tool_calls"')) {
     return "json";
+  }
+  if (XML_TAG_PATTERN.test(trimmed)) {
+    return "xml";
   }
   return "unknown";
 }

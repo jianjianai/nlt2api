@@ -324,6 +324,36 @@ test("detectEnvelopeFormat classifies the wire formats", () => {
   assert.equal(detectEnvelopeFormat('  {"type":"tool_calls"}'), "json");
   assert.equal(detectEnvelopeFormat("\n<tool_calls>"), "xml");
   assert.equal(detectEnvelopeFormat("hello"), "unknown");
+  // <invoke> and generic tag-like content are XML attempts, never JSON.
+  assert.equal(detectEnvelopeFormat('prose then <invoke name="bash">'), "xml");
+  assert.equal(detectEnvelopeFormat("text with a <div> tag"), "xml");
+});
+
+test("invoke-style XML with leading prose is not misrouted to the JSON path", () => {
+  // Regression: a bare <invoke> fragment behind prose must reach the XML
+  // parser (which wraps it), not the JSON parser with its misleading error.
+  const prose = 'I will run it:\n<invoke name="bash"><parameter name="command">ls</parameter></invoke>';
+  const result = parseControlledToolEnvelopeDetailed(prose, shellTools, "seed");
+  assert.equal(result.envelope?.type, "tool_calls");
+  assert.equal(result.repaired, true);
+  if (result.envelope?.type !== "tool_calls") return;
+  assert.deepEqual(JSON.parse(result.envelope.toolCalls[0]!.function.arguments), { command: "ls" });
+});
+
+test("leading whitespace before the XML envelope keeps XML detection", () => {
+  const xml = '  \n  <tool_calls>\n  <invoke name="bash">\n  <parameter name="command">ls -la && pwd</parameter>\n  </invoke>\n  </tool_calls>';
+  const result = parseControlledToolEnvelopeDetailed(xml, shellTools, "seed");
+  assert.equal(result.envelope?.type, "tool_calls");
+  if (result.envelope?.type !== "tool_calls") return;
+  assert.deepEqual(JSON.parse(result.envelope.toolCalls[0]!.function.arguments), { command: "ls -la && pwd" });
+});
+
+test("unrecognized content gets a format-neutral error naming both envelopes", () => {
+  const result = parseControlledToolEnvelopeDetailed("just plain prose, no envelope at all", tools, "seed");
+  assert.equal(result.envelope, undefined);
+  assert.match(result.error ?? "", /not recognized as a tool-call envelope/);
+  assert.match(result.error ?? "", /JSON/);
+  assert.match(result.error ?? "", /XML/);
 });
 
 test("extractXmlCallNames lifts declared names from broken candidates", () => {
