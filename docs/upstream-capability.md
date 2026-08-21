@@ -65,6 +65,7 @@ password=<password>
 | ID | 上下文 | 工具 | JSON 模式 | 视觉 | 推理 |
 | --- | ---: | :---: | :---: | :---: | :---: |
 | `deepseek-v4-flash` | 1,048,576 | 是 | 是 | 否 | 是 |
+| `deepseek-v4-pro` | 1,048,576 | 是 | 是 | 否 | 是 |
 | `glm-5.2` | 1,048,576 | 是 | 否 | 否 | 是 |
 | `glm-5.2-fast` | 1,048,576 | 是 | 否 | 否 | 是 |
 | `glm-5.2-short` | 200,000 | 是 | 否 | 否 | 是 |
@@ -81,6 +82,8 @@ password=<password>
 目录中的能力声明只用于选型；工具调用的实际线路行为以下文实测结果为准。
 
 `qwen-3.8-27b`（Qwen3.8-27B，dense 27B VL + MTP 投机解码，FP8）为预览模型，通过 early-access 计划授权：未授权账号的请求返回 404（而非 403），且不出现在匿名 `GET /api/models` 目录中；授权后能力数据以门户模型卡为准（262K 上下文；reasoning effort 默认 `xhigh`，完整档位映射为 max/xhigh/high→xhigh、medium→medium、low/minimal→low、none→none）。
+
+`deepseek-v4-pro`（DeepSeek V4-Pro，Preview）同为预览模型：出现在 Playground 下拉框中，但不出现在 `GET /api/models` 目录（匿名与已登录响应均不含）。2026-08-21 复测确认普通已登录账号可直接调用，无需 early-access 授权：非流式请求正常返回 `finish_reason: "stop"`；reasoning 默认开启（未传 reasoning 参数时 `message.reasoning` 与 `usage.completion_tokens_details.reasoning_tokens` 仍有值）；`max_tokens` 过小时推理会耗尽预算并返回 `finish_reason: "length"`、`content: null`，适配器现有的“仅当 length 截断且内容为空才续写”逻辑可覆盖该情况。JSON 模式支持未在 Playground 声明中标注，暂未实测。适配器对 model 仅做透传且无本地白名单，该模型经代理立即可用，无需代码改动。
 
 ## `/api/chat` 请求契约
 
