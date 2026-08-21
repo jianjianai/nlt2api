@@ -175,3 +175,40 @@ export interface DebugRecord {
   status: number;
   error?: string;
 }
+
+/** Upstream call metadata kept in list summaries (no request/response bodies). */
+export interface DebugUpstreamCallSummary {
+  sequence: number;
+  type: DebugUpstreamCallType;
+  round: number;
+  attempt: number;
+  accountId?: string;
+  accountLabel?: string;
+  responseStatus?: number;
+  error?: string;
+}
+
+/**
+ * Lightweight record metadata for list views. Bodies stay on disk and are
+ * only read when a single record is requested via `getDebugRecord`.
+ */
+export interface DebugRecordSummary {
+  id: string;
+  at: string;
+  endpoint: DebugRecord["endpoint"];
+  status: number;
+  accountId?: string;
+  accountLabel?: string;
+  error?: string;
+  /** Short content preview: the last user message, else any last message. */
+  preview: string;
+  upstreamCalls?: DebugUpstreamCallSummary[];
+  /** True when the record only has legacy upstreamRequest/upstreamResponse fields. */
+  legacyUpstream?: boolean;
+  /** Tool-call adapter outcomes plus whether the request forced tool use. */
+  toolCall?: {
+    forces: boolean;
+    initialOutcome: ToolCallAdapterTrace["initialOutcome"];
+    finalOutcome: ToolCallAdapterTrace["finalOutcome"];
+  };
+}

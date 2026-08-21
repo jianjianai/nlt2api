@@ -67,7 +67,8 @@ Chat 会保持上游的 `reasoning` 与 `reasoning_content` 两个字段并在�
 - `POST /api/admin/accounts/:id/verify`：强制重新验证登录
 - `DELETE /api/admin/accounts/:id`
 - `GET/PATCH /api/admin/settings`：开启或关闭消息记录
-- `GET /api/admin/records?limit=100`：读取按客户端请求分组、包含全部上游调用的脱敏调试记录
+- `GET /api/admin/records?limit=100`：读取调试记录摘要列表（不含请求/响应正文，含预览与上游调用元数据）
+- `GET /api/admin/records/{id}`：按需读取单条完整调试记录（包含全部脱敏正文与上游调用）
 - `DELETE /api/admin/records?account_id=...`：清理指定账号的调试记录
 - `DELETE /api/admin/records`：清空全部调试记录（仅管理员可用）
 

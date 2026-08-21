@@ -1,9 +1,10 @@
 import { randomBytes, randomUUID } from "node:crypto";
 import { mkdir, readFile, readdir, rename, unlink, writeFile } from "node:fs/promises";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { getProxyConfig } from "~/server/utils/config.ts";
 import type {
   DebugRecord,
+  DebugRecordSummary,
   ManagedAccount,
   PersistentState,
   PortalSession,
@@ -12,11 +13,11 @@ import type {
 
 const STORE_FILE = "accounts.json";
 const RECORDS_DIR = "records";
+const RECORD_INDEX_FILE = "records-index.json";
 const MAX_DEBUG_RECORDS = 500;
 
 interface RecordIndexEntry {
-  id: string;
-  at: string;
+  summary: DebugRecordSummary;
   file: string;
 }
 
@@ -44,6 +45,108 @@ function compareAt(a: string, b: string): number {
   if (a < b) return -1;
   if (a > b) return 1;
   return 0;
+}
+
+const PREVIEW_MAX_LENGTH = 60;
+const NO_PREVIEW_TEXT = "（无消息内容）";
+
+function previewContentText(value: unknown): string {
+  if (typeof value === "string") {
+    return value;
+  }
+  if (Array.isArray(value)) {
+    return value.map((part) => {
+      if (!part || typeof part !== "object" || Array.isArray(part)) {
+        return "";
+      }
+      const item = part as Record<string, unknown>;
+      if (typeof item.text === "string") return item.text;
+      if (typeof item.content === "string") return item.content;
+      return "";
+    }).filter(Boolean).join("\n");
+  }
+  return "";
+}
+
+/** Short content preview: the last user message, else any last message. */
+function recordPreview(record: DebugRecord): string {
+  try {
+    if (record.clientRequest.contentType !== "application/json") {
+      return NO_PREVIEW_TEXT;
+    }
+    const parsed = JSON.parse(record.clientRequest.body) as { messages?: unknown };
+    const messages = Array.isArray(parsed.messages) ? parsed.messages : [];
+    const texts = messages
+      .map((message) => {
+        const item = message && typeof message === "object" && !Array.isArray(message)
+          ? message as Record<string, unknown>
+          : {};
+        return { role: item.role, text: previewContentText(item.content ?? item.text) };
+      })
+      .filter((item) => item.text);
+    const lastUser = [...texts].reverse().find((item) => item.role === "user");
+    const source = lastUser ?? texts[texts.length - 1];
+    const text = source ? source.text.replace(/\s+/g, " ").trim() : "";
+    if (!text) {
+      return NO_PREVIEW_TEXT;
+    }
+    return text.length > PREVIEW_MAX_LENGTH ? `${text.slice(0, PREVIEW_MAX_LENGTH)}…` : text;
+  } catch {
+    return NO_PREVIEW_TEXT;
+  }
+}
+
+/** True when the client request forces tool use via `tool_choice`. */
+function recordForcesTool(record: DebugRecord): boolean {
+  try {
+    if (record.clientRequest.contentType !== "application/json") {
+      return false;
+    }
+    const parsed = JSON.parse(record.clientRequest.body) as { tool_choice?: unknown };
+    const choice = parsed.tool_choice;
+    return choice === "required"
+      || Boolean(choice && typeof choice === "object" && !Array.isArray(choice)
+        && (choice as { type?: unknown }).type === "function");
+  } catch {
+    return false;
+  }
+}
+
+/** Lightweight list metadata; bodies stay on disk until a record is opened. */
+function summarizeRecord(record: DebugRecord): DebugRecordSummary {
+  const legacy = record as { upstreamRequest?: unknown; upstreamResponse?: unknown };
+  const summary: DebugRecordSummary = {
+    id: record.id,
+    at: record.at,
+    endpoint: record.endpoint,
+    status: record.status,
+    preview: recordPreview(record),
+    ...(record.accountId ? { accountId: record.accountId } : {}),
+    ...(record.accountLabel ? { accountLabel: record.accountLabel } : {}),
+    ...(record.error ? { error: record.error } : {}),
+  };
+  if (record.upstreamCalls?.length) {
+    summary.upstreamCalls = record.upstreamCalls.map((call) => ({
+      sequence: call.sequence,
+      type: call.type,
+      round: call.round,
+      attempt: call.attempt,
+      ...(call.accountId ? { accountId: call.accountId } : {}),
+      ...(call.accountLabel ? { accountLabel: call.accountLabel } : {}),
+      ...(call.responseStatus !== undefined ? { responseStatus: call.responseStatus } : {}),
+      ...(call.error ? { error: call.error } : {}),
+    }));
+  } else if (legacy.upstreamRequest || legacy.upstreamResponse) {
+    summary.legacyUpstream = true;
+  }
+  if (record.toolCallAdapter) {
+    summary.toolCall = {
+      forces: recordForcesTool(record),
+      initialOutcome: record.toolCallAdapter.initialOutcome,
+      finalOutcome: record.toolCallAdapter.finalOutcome,
+    };
+  }
+  return summary;
 }
 
 export class StateStore {
@@ -205,8 +308,9 @@ export class StateStore {
     const temporary = `${target}.${process.pid}.${randomBytes(6).toString("hex")}.tmp`;
     await writeFile(temporary, JSON.stringify(record), { encoding: "utf8", mode: 0o600 });
     await rename(temporary, target);
-    index.push({ id: record.id, at: record.at, file: target });
+    index.push({ summary: summarizeRecord(record), file: target });
     await this.pruneDebugRecords(index);
+    await this.persistRecordIndex(index);
   }
 
   async listDebugRecords(limit = 100): Promise<DebugRecord[]> {
@@ -218,15 +322,32 @@ export class StateStore {
     return records.reverse();
   }
 
+  /**
+   * List metadata for the newest records without touching record files. The
+   * summaries are cached in the in-memory index, so this stays O(limit) no
+   * matter how large the stored bodies are.
+   */
+  async listDebugRecordSummaries(limit = 100): Promise<DebugRecordSummary[]> {
+    const index = await this.getRecordIndex();
+    const bounded = Math.max(1, Math.min(limit, MAX_DEBUG_RECORDS));
+    return index.slice(-bounded).map((entry) => entry.summary).reverse();
+  }
+
+  /** Read one full record (with bodies) on demand. */
+  async getDebugRecord(id: string): Promise<DebugRecord | undefined> {
+    const index = await this.getRecordIndex();
+    const entry = index.find((candidate) => candidate.summary.id === id);
+    return entry ? this.readRecordFile(entry.file) : undefined;
+  }
+
   async deleteDebugRecordsForAccount(accountId: string): Promise<number> {
     const index = await this.getRecordIndex();
     const matches = new Set<string>();
-    await Promise.all(index.map(async (entry) => {
-      const record = await this.readRecordFile(entry.file);
-      if (record?.accountId === accountId) {
+    for (const entry of index) {
+      if (entry.summary.accountId === accountId) {
         matches.add(entry.file);
       }
-    }));
+    }
     if (matches.size === 0) {
       return 0;
     }
@@ -237,6 +358,7 @@ export class StateStore {
         index.splice(position, 1);
       }
     }
+    await this.persistRecordIndex(index);
     return matches.size;
   }
 
@@ -245,6 +367,7 @@ export class StateStore {
     const files = await this.listRecordFiles();
     await Promise.all(files.map((file) => unlink(file).catch(() => undefined)));
     index.length = 0;
+    await this.persistRecordIndex(index);
     return files.length;
   }
 
@@ -287,17 +410,75 @@ export class StateStore {
     return this.recordIndexInit;
   }
 
+  private get recordIndexPath(): string {
+    return join(getProxyConfig().dataDir, RECORD_INDEX_FILE);
+  }
+
+  /**
+   * Build the in-memory index. A persisted index is reused when it covers
+   * exactly the files on disk (record files are write-once and named by id,
+   * so a matching filename set means the summaries are still valid);
+   * otherwise every record file is parsed once and the index is rewritten.
+   */
   private async buildRecordIndex(): Promise<RecordIndexEntry[]> {
     const files = await this.listRecordFiles();
-    const entries: RecordIndexEntry[] = [];
-    for (const file of files) {
-      const record = await this.readRecordFile(file);
-      if (record) {
-        entries.push({ id: record.id, at: record.at, file });
+    const persisted = await this.readPersistedRecordIndex();
+    if (persisted) {
+      const onDisk = new Set(files.map((file) => basename(file)));
+      if (persisted.length === onDisk.size && persisted.every((entry) => onDisk.has(basename(entry.file)))) {
+        return persisted;
       }
     }
-    entries.sort((a, b) => compareAt(a.at, b.at));
+    const parsed = await Promise.all(files.map(async (file) => ({ file, record: await this.readRecordFile(file) })));
+    const entries: RecordIndexEntry[] = [];
+    for (const { file, record } of parsed) {
+      if (record) {
+        entries.push({ summary: summarizeRecord(record), file });
+      }
+    }
+    entries.sort((a, b) => compareAt(a.summary.at, b.summary.at));
+    await this.persistRecordIndex(entries);
     return entries;
+  }
+
+  private async readPersistedRecordIndex(): Promise<RecordIndexEntry[] | undefined> {
+    try {
+      const parsed = JSON.parse(await readFile(this.recordIndexPath, "utf8")) as {
+        version?: number;
+        entries?: Array<{ summary?: DebugRecordSummary; name?: string }>;
+      };
+      if (parsed.version !== 1 || !Array.isArray(parsed.entries)) {
+        return undefined;
+      }
+      const entries: RecordIndexEntry[] = [];
+      for (const entry of parsed.entries) {
+        if (typeof entry.name !== "string" || typeof entry.summary?.id !== "string" || typeof entry.summary.at !== "string") {
+          return undefined;
+        }
+        entries.push({ summary: entry.summary, file: join(this.recordsDir, entry.name) });
+      }
+      entries.sort((a, b) => compareAt(a.summary.at, b.summary.at));
+      return entries;
+    } catch {
+      return undefined;
+    }
+  }
+
+  /** Persist the index so restarts skip re-parsing every record file. */
+  private async persistRecordIndex(index: RecordIndexEntry[]): Promise<void> {
+    try {
+      const target = this.recordIndexPath;
+      await mkdir(dirname(target), { recursive: true });
+      const temporary = `${target}.${process.pid}.${randomBytes(6).toString("hex")}.tmp`;
+      const body = JSON.stringify({
+        version: 1,
+        entries: index.map((entry) => ({ summary: entry.summary, name: basename(entry.file) })),
+      });
+      await writeFile(temporary, body, { encoding: "utf8", mode: 0o600 });
+      await rename(temporary, target);
+    } catch {
+      // A missing persisted index only means the next boot re-parses files.
+    }
   }
 
   private async pruneDebugRecords(index: RecordIndexEntry[]): Promise<void> {

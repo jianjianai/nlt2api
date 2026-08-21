@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readdir, rm } from "node:fs/promises";
+import { mkdtemp, readFile, readdir, rm, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -124,6 +124,97 @@ test("deleting all records clears both the index and the directory", async () =>
     assert.deepEqual(await store.listDebugRecords(), []);
     await store.appendDebugRecord(makeRecord("dbg_3", timestamp(3)));
     assert.deepEqual((await store.listDebugRecords()).map((record) => record.id), ["dbg_3"]);
+  });
+});
+
+test("record summaries expose list metadata without bodies", async () => {
+  await withTempStore(async (store) => {
+    await store.updateSettings({ recordMessages: true });
+    const record: DebugRecord = {
+      id: "dbg_sum",
+      at: timestamp(1),
+      endpoint: "/v1/chat/completions",
+      accountId: "acc-a",
+      accountLabel: "主账号",
+      clientRequest: {
+        contentType: "application/json",
+        body: JSON.stringify({
+          messages: [
+            { role: "user", content: "第一条消息" },
+            { role: "assistant", content: "回复" },
+            { role: "user", content: "  最后一条\n用户消息  " },
+          ],
+          tool_choice: "required",
+        }),
+      },
+      upstreamCalls: [{
+        sequence: 1,
+        type: "initial",
+        round: 1,
+        attempt: 1,
+        accountLabel: "主账号",
+        responseStatus: 200,
+        request: { contentType: "application/json", body: "{}" },
+      }],
+      toolCallAdapter: {
+        toolCallExpected: "auto",
+        initialParseSucceeded: true,
+        finalParseSucceeded: true,
+        initialOutcome: "tool_calls",
+        finalOutcome: "tool_calls",
+        repairAttempts: 0,
+        maxRepairAttempts: 2,
+        errors: [],
+      },
+      status: 200,
+    };
+    await store.appendDebugRecord(record);
+    const summaries = await store.listDebugRecordSummaries();
+    assert.equal(summaries.length, 1);
+    const summary = summaries[0]!;
+    assert.equal(summary.id, "dbg_sum");
+    assert.equal(summary.preview, "最后一条 用户消息");
+    assert.equal(summary.accountLabel, "主账号");
+    assert.equal(summary.upstreamCalls?.length, 1);
+    assert.equal(summary.upstreamCalls?.[0]?.sequence, 1);
+    assert.ok(!("request" in (summary.upstreamCalls?.[0] ?? {})));
+    assert.deepEqual(summary.toolCall, { forces: true, initialOutcome: "tool_calls", finalOutcome: "tool_calls" });
+    assert.ok(!("clientRequest" in summary));
+  });
+});
+
+test("getDebugRecord loads a single full record on demand", async () => {
+  await withTempStore(async (store) => {
+    await store.updateSettings({ recordMessages: true });
+    await store.appendDebugRecord(makeRecord("dbg_one", timestamp(1)));
+    const record = await store.getDebugRecord("dbg_one");
+    assert.equal(record?.id, "dbg_one");
+    assert.equal(record?.clientRequest.body, "{}");
+    assert.equal(await store.getDebugRecord("dbg_missing"), undefined);
+  });
+});
+
+test("a fresh store reuses the persisted record index while it matches disk", async () => {
+  await withTempStore(async (store, dir) => {
+    await store.updateSettings({ recordMessages: true });
+    await store.appendDebugRecord(makeRecord("dbg_p1", timestamp(1)));
+    await store.appendDebugRecord(makeRecord("dbg_p2", timestamp(2)));
+    const persisted = JSON.parse(await readFile(join(dir, "records-index.json"), "utf8")) as { version: number; entries: unknown[] };
+    assert.equal(persisted.version, 1);
+    assert.equal(persisted.entries.length, 2);
+
+    const rebuilt = new StateStore();
+    assert.deepEqual((await rebuilt.listDebugRecordSummaries()).map((summary) => summary.id), ["dbg_p2", "dbg_p1"]);
+
+    // A corrupt persisted index falls back to parsing the record files.
+    await writeFile(join(dir, "records-index.json"), "not json", "utf8");
+    const recovered = new StateStore();
+    assert.deepEqual((await recovered.listDebugRecordSummaries()).map((summary) => summary.id), ["dbg_p2", "dbg_p1"]);
+
+    // A stale index (files changed externally) is discarded and rebuilt.
+    await unlink(join(dir, "records", "dbg_p2.json"));
+    const stale = new StateStore();
+    assert.deepEqual((await stale.listDebugRecordSummaries()).map((summary) => summary.id), ["dbg_p1"]);
   });
 });
 

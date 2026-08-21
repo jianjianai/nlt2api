@@ -70,6 +70,36 @@ interface DebugRecord {
   error?: string;
 }
 
+interface DebugUpstreamCallSummary {
+  sequence: number;
+  type: "initial" | "repair" | "continuation";
+  round: number;
+  attempt: number;
+  accountId?: string;
+  accountLabel?: string;
+  responseStatus?: number;
+  error?: string;
+}
+
+/** Lightweight list metadata; full bodies load on demand per record. */
+interface DebugRecordSummary {
+  id: string;
+  at: string;
+  endpoint: string;
+  status: number;
+  accountId?: string;
+  accountLabel?: string;
+  error?: string;
+  preview: string;
+  upstreamCalls?: DebugUpstreamCallSummary[];
+  legacyUpstream?: boolean;
+  toolCall?: {
+    forces: boolean;
+    initialOutcome: "tool_calls" | "final" | "invalid";
+    finalOutcome: "tool_calls" | "final" | "invalid";
+  };
+}
+
 interface ApiPayload {
   accounts?: Account[];
   settings?: { recordMessages: boolean };
@@ -78,7 +108,8 @@ interface ApiPayload {
     clientApiKeyRequired: boolean;
     defaultModel: string;
   };
-  records?: DebugRecord[];
+  records?: DebugRecordSummary[];
+  record?: DebugRecord;
   account?: Account | null;
 }
 
@@ -108,7 +139,7 @@ const tokenDraft = ref(token.value);
 const view = ref<"accounts" | "records">("accounts");
 // shallowRef: record/account payloads are large and immutable; avoid deep reactivity.
 const accounts = shallowRef<Account[]>([]);
-const records = shallowRef<DebugRecord[]>([]);
+const records = shallowRef<DebugRecordSummary[]>([]);
 const settings = reactive({ recordMessages: false });
 const config = reactive({
   adminTokenConfigured: false,
@@ -119,9 +150,29 @@ const newAccount = reactive({ label: "", email: "", password: "", weight: 1, pro
 const isLoading = ref(false);
 const isSaving = ref(false);
 const isClearingRecords = ref(false);
+const selectedRecordId = ref<string | null>(null);
 const selectedTraceKey = ref<string | null>(null);
 const rawTraceKey = ref<string | null>(null);
 const loginError = ref("");
+// The full record (with bodies) for the selected summary, loaded on demand.
+const selectedRecord = shallowRef<DebugRecord | null>(null);
+const isLoadingRecord = ref(false);
+
+// Full record bodies can be megabytes each; keep only a small LRU cache of
+// opened details so prev/next navigation stays instant without holding
+// hundreds of records in memory.
+const DETAIL_CACHE_MAX = 20;
+const detailCache = new Map<string, DebugRecord>();
+
+function cacheRecordDetail(record: DebugRecord): void {
+  detailCache.delete(record.id);
+  detailCache.set(record.id, record);
+  while (detailCache.size > DETAIL_CACHE_MAX) {
+    const oldest = detailCache.keys().next().value;
+    if (oldest === undefined) break;
+    detailCache.delete(oldest);
+  }
+}
 
 // ---- Toast notifications (replace the old one-line notice / error banner) ----
 interface ToastItem {
@@ -189,7 +240,7 @@ const filteredAccounts = computed(() => {
     || (account.proxyHint ?? "").toLowerCase().includes(query));
 });
 
-function recordFailed(record: DebugRecord): boolean {
+function recordFailed(record: DebugRecordSummary): boolean {
   return record.status >= 400 || Boolean(record.error);
 }
 const failedRecordCount = computed(() => records.value.filter(recordFailed).length);
@@ -206,21 +257,10 @@ const filteredRecords = computed(() => {
   return list;
 });
 
-function recordRequestObject(record: DebugRecord): JsonRecord | null {
-  return parsedBodyValues(record.clientRequest)
-    .map(asObject)
-    .find((value): value is JsonRecord => Boolean(value)) ?? null;
-}
-
-function forcesTool(record: DebugRecord): boolean {
-  const choice = recordRequestObject(record)?.tool_choice;
-  return choice === "required" || (choice && typeof choice === "object" && (choice as { type?: unknown }).type === "function");
-}
-
-function isToolIntent(record: DebugRecord): boolean {
-  const trace = record.toolCallAdapter;
+function isToolIntent(record: DebugRecordSummary): boolean {
+  const trace = record.toolCall;
   if (!trace) return false;
-  return forcesTool(record)
+  return trace.forces
     || trace.initialOutcome === "invalid"
     || trace.finalOutcome === "tool_calls"
     || trace.finalOutcome === "invalid";
@@ -230,7 +270,7 @@ const toolAdapterRecords = computed(() => records.value.filter((record) =>
   isToolIntent(record)));
 const toolFirstPassRate = computed(() => {
   if (toolAdapterRecords.value.length === 0) return null;
-  const successes = toolAdapterRecords.value.filter((record) => record.toolCallAdapter?.initialOutcome === "tool_calls").length;
+  const successes = toolAdapterRecords.value.filter((record) => record.toolCall?.initialOutcome === "tool_calls").length;
   return Math.round((successes / toolAdapterRecords.value.length) * 1_000) / 10;
 });
 
@@ -272,6 +312,11 @@ function signOut() {
   sessionStorage.removeItem(tokenStorageKey);
   accounts.value = [];
   records.value = [];
+  detailCache.clear();
+  selectedRecordId.value = null;
+  selectedRecord.value = null;
+  selectedTraceKey.value = null;
+  rawTraceKey.value = null;
   loginError.value = "";
   toasts.value = [];
   showAddAccount.value = false;
@@ -313,10 +358,54 @@ async function loadRecords() {
   const payload = await api("/api/admin/records?limit=100");
   records.value = payload.records ?? [];
   Object.assign(settings, payload.settings ?? {});
-  const traces = records.value.flatMap(recordTraces);
-  if (!traces.some((trace) => trace.key === selectedTraceKey.value)) {
-    selectedTraceKey.value = traces[0]?.key ?? null;
-    rawTraceKey.value = null;
+  // Drop cached details for records that were pruned or cleared server-side.
+  const ids = new Set(records.value.map((record) => record.id));
+  for (const id of [...detailCache.keys()]) {
+    if (!ids.has(id)) detailCache.delete(id);
+  }
+  if (selectedRecordId.value && ids.has(selectedRecordId.value)) {
+    return;
+  }
+  selectedRecordId.value = null;
+  selectedTraceKey.value = null;
+  selectedRecord.value = null;
+  rawTraceKey.value = null;
+  const first = records.value[0];
+  if (first) {
+    await selectRecord(first.id);
+  }
+}
+
+/** Select a record (optionally one of its upstream calls) and lazy-load its full detail. */
+async function selectRecord(recordId: string, traceKey?: string): Promise<void> {
+  selectedRecordId.value = recordId;
+  selectedTraceKey.value = traceKey ?? `${recordId}:client`;
+  rawTraceKey.value = null;
+  const cached = detailCache.get(recordId);
+  if (cached) {
+    cacheRecordDetail(cached);
+    selectedRecord.value = cached;
+    isLoadingRecord.value = false;
+    return;
+  }
+  selectedRecord.value = null;
+  isLoadingRecord.value = true;
+  try {
+    const payload = await api(`/api/admin/records/${encodeURIComponent(recordId)}`);
+    if (payload.record) {
+      cacheRecordDetail(payload.record);
+      if (selectedRecordId.value === recordId) {
+        selectedRecord.value = payload.record;
+      }
+    }
+  } catch (error) {
+    if (selectedRecordId.value === recordId) {
+      pushToast("error", errorText(error, "无法加载记录详情。"));
+    }
+  } finally {
+    if (selectedRecordId.value === recordId) {
+      isLoadingRecord.value = false;
+    }
   }
 }
 
@@ -458,6 +547,9 @@ async function confirmClearRecords() {
   isClearingRecords.value = true;
   try {
     await api("/api/admin/records", { method: "DELETE" });
+    detailCache.clear();
+    selectedRecordId.value = null;
+    selectedRecord.value = null;
     rawTraceKey.value = null;
     selectedTraceKey.value = null;
     records.value = [];
@@ -829,7 +921,7 @@ interface BodyPresentation {
   messages: DisplayMessage[];
 }
 
-function callTitle(call: DebugUpstreamCall): string {
+function callTitle(call: Pick<DebugUpstreamCall, "type" | "round" | "attempt">): string {
   const base = call.type === "repair"
     ? `纠错轮 ${call.round}`
     : call.type === "continuation"
@@ -888,14 +980,10 @@ function buildRecordTraces(record: DebugRecord): ConversationTrace[] {
   return traces;
 }
 
-const allTraces = computed(() => records.value.flatMap(recordTraces));
-const upstreamCallCount = computed(() => allTraces.value.filter((trace) => trace.direction === "upstream").length);
-const selectedTrace = computed(() => allTraces.value.find((trace) => trace.key === selectedTraceKey.value) ?? allTraces.value[0]);
-
-function selectTrace(trace: ConversationTrace): void {
-  selectedTraceKey.value = trace.key;
-  rawTraceKey.value = null;
-}
+const selectedRecordTraces = computed(() => (selectedRecord.value ? recordTraces(selectedRecord.value) : []));
+const selectedTrace = computed(() => selectedRecordTraces.value.find((trace) => trace.key === selectedTraceKey.value) ?? selectedRecordTraces.value[0]);
+const upstreamCallCount = computed(() => records.value.reduce((total, record) =>
+  total + (record.upstreamCalls?.length ?? (record.legacyUpstream ? 1 : 0)), 0));
 
 function presentBody(value: DebugRawBody | JsonRecord | undefined, options?: { stripMarkers?: boolean }): BodyPresentation {
   const values = parsedBodyValues(value);
@@ -985,34 +1073,17 @@ function compactTime(value: string): string {
     : `${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${time}`;
 }
 
-/** Short content preview shown in the sidebar: the last user message, else any last message. */
-const previewCache = new WeakMap<DebugRecord, string>();
-
-function recordPreview(record: DebugRecord): string {
-  const cached = previewCache.get(record);
-  if (cached !== undefined) return cached;
-  const messages = collectBodyMessages(record.clientRequest, true);
-  const lastUser = [...messages].reverse().find((message) => message.role === "user" && message.content);
-  const source = lastUser ?? [...messages].reverse().find((message) => message.content);
-  const text = source ? source.content.replace(/\s+/g, " ").trim() : "（无消息内容）";
-  const preview = text.length > 60 ? `${text.slice(0, 60)}…` : text;
-  previewCache.set(record, preview);
-  return preview;
-}
-
 // ---- Prev / next record navigation ----
 const detailEl = ref<HTMLElement | null>(null);
 const selectedRecordIndex = computed(() => {
-  if (!selectedTrace.value) return -1;
-  return filteredRecords.value.findIndex((record) => record.id === selectedTrace.value!.record.id);
+  if (!selectedRecordId.value) return -1;
+  return filteredRecords.value.findIndex((record) => record.id === selectedRecordId.value);
 });
 
 function gotoRecord(offset: number): void {
   const next = filteredRecords.value[selectedRecordIndex.value + offset] ?? (selectedRecordIndex.value === -1 ? filteredRecords.value[0] : undefined);
   if (!next) return;
-  const traces = recordTraces(next);
-  if (!traces.length) return;
-  selectTrace(traces[0]);
+  void selectRecord(next.id);
   void nextTick(() => {
     detailEl.value?.scrollIntoView({ block: "start" });
     document.querySelector(".trace-group.active")?.scrollIntoView({ block: "nearest" });
@@ -1020,17 +1091,48 @@ function gotoRecord(offset: number): void {
 }
 
 // Sidebar rows are precomputed once per records/filter change so rendering
-// never re-parses bodies or rebuilds traces per item per render.
+// never rebuilds upstream items per item per render.
+interface SidebarUpstreamItem {
+  key: string;
+  title: string;
+  subtitle: string;
+  status: number;
+  failed: boolean;
+}
+
 interface SidebarItem {
-  record: DebugRecord;
-  traces: ConversationTrace[];
-  preview: string;
+  record: DebugRecordSummary;
+  upstream: SidebarUpstreamItem[];
+}
+
+function summaryUpstreamItems(record: DebugRecordSummary): SidebarUpstreamItem[] {
+  if (record.upstreamCalls?.length) {
+    return record.upstreamCalls.map((call) => {
+      const status = call.responseStatus ?? record.status;
+      return {
+        key: `${record.id}:upstream:${call.sequence}`,
+        title: callTitle(call),
+        subtitle: call.accountLabel || call.accountId || "上游账号未分配",
+        status,
+        failed: status >= 400 || Boolean(call.error),
+      };
+    });
+  }
+  if (record.legacyUpstream) {
+    return [{
+      key: `${record.id}:upstream:legacy`,
+      title: "上游请求",
+      subtitle: record.accountLabel || record.accountId || "上游账号未分配",
+      status: record.status,
+      failed: record.status >= 400 || Boolean(record.error),
+    }];
+  }
+  return [];
 }
 
 const sidebarItems = computed<SidebarItem[]>(() => filteredRecords.value.map((record) => ({
   record,
-  traces: recordTraces(record),
-  preview: recordPreview(record),
+  upstream: summaryUpstreamItems(record),
 })));
 
 // Parse the selected trace bodies once per selection instead of on every render.
@@ -1257,32 +1359,32 @@ onUnmounted(() => {
               <section
                 v-for="item in sidebarItems"
                 :key="item.record.id"
-                v-memo="[item.record.id === selectedTrace?.record.id, item.traces.some((trace) => trace.key === selectedTrace?.key)]"
+                v-memo="[item.record.id === selectedRecordId, item.upstream.some((child) => child.key === selectedTraceKey)]"
                 class="trace-group"
-                :class="{ active: selectedTrace?.record.id === item.record.id }"
+                :class="{ active: selectedRecordId === item.record.id }"
               >
-                <button class="trace-record" type="button" @click="selectTrace(item.traces[0])">
+                <button class="trace-record" type="button" @click="selectRecord(item.record.id)">
                   <span class="trace-record-top">
                     <span class="status-chip" :class="item.record.status < 400 ? 'ok' : 'err'">{{ item.record.status }}</span>
                     <span class="trace-endpoint">{{ item.record.endpoint }}</span>
                     <time class="trace-time">{{ compactTime(item.record.at) }}</time>
                   </span>
-                  <span class="trace-preview">{{ item.preview }}</span>
+                  <span class="trace-preview">{{ item.record.preview }}</span>
                   <span class="trace-record-sub">
-                    {{ item.record.accountLabel || "未分配账号" }}<template v-if="item.traces.length > 1"> · {{ item.traces.length - 1 }} 次上游调用</template>
+                    {{ item.record.accountLabel || "未分配账号" }}<template v-if="item.upstream.length"> · {{ item.upstream.length }} 次上游调用</template>
                   </span>
                 </button>
-                <div v-if="item.traces.length > 1" class="trace-children">
+                <div v-if="item.upstream.length" class="trace-children">
                   <button
-                    v-for="trace in item.traces.slice(1)"
-                    :key="trace.key"
+                    v-for="child in item.upstream"
+                    :key="child.key"
                     class="trace-child"
-                    :class="{ active: selectedTrace?.key === trace.key, failed: trace.status >= 400 || Boolean(trace.error) }"
+                    :class="{ active: selectedTraceKey === child.key, failed: child.failed }"
                     type="button"
-                    @click="selectTrace(trace)"
+                    @click="selectRecord(item.record.id, child.key)"
                   >
-                    <span class="trace-child-title">{{ trace.title }}</span>
-                    <span class="trace-child-sub">{{ trace.subtitle }} · HTTP {{ trace.status }}</span>
+                    <span class="trace-child-title">{{ child.title }}</span>
+                    <span class="trace-child-sub">{{ child.subtitle }} · HTTP {{ child.status }}</span>
                   </button>
                 </div>
               </section>
@@ -1408,6 +1510,10 @@ onUnmounted(() => {
                   </ul>
                 </details>
               </div>
+            </section>
+
+            <section v-else-if="isLoadingRecord" class="conversation-detail">
+              <p class="parsed-empty">正在加载记录详情…</p>
             </section>
           </div>
         </section>

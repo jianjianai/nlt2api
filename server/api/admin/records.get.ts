@@ -10,7 +10,8 @@ export default defineHandler(async (event) => {
     const limit = Number.isFinite(rawLimit) ? Math.floor(rawLimit) : 100;
     const [settings, records] = await Promise.all([
       stateStore.getSettings(),
-      stateStore.listDebugRecords(limit),
+      // Summaries only: record bodies stay on disk until one is opened.
+      stateStore.listDebugRecordSummaries(limit),
     ]);
     return jsonResponse({ settings, records });
   } catch (error) {
