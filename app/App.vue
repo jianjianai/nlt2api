@@ -58,6 +58,8 @@ interface DebugRecord {
     toolCallExpected: "auto" | "required" | "forced";
     initialParseSucceeded: boolean;
     finalParseSucceeded: boolean;
+    initialParseRepaired?: boolean;
+    finalParseRepaired?: boolean;
     initialOutcome: "tool_calls" | "final" | "invalid";
     finalOutcome: "tool_calls" | "final" | "invalid";
     repairAttempts: number;
@@ -1398,7 +1400,8 @@ onUnmounted(() => {
                     <dt>首次结果</dt><dd>{{ toolOutcomeLabel(selectedTrace.record.toolCallAdapter.initialOutcome) }}</dd>
                     <dt>最终结果</dt><dd>{{ toolOutcomeLabel(selectedTrace.record.toolCallAdapter.finalOutcome) }}</dd>
                     <dt>修复次数</dt><dd>{{ selectedTrace.record.toolCallAdapter.repairAttempts }} / {{ selectedTrace.record.toolCallAdapter.maxRepairAttempts }}</dd>
-                    <dt>首次解析</dt><dd>{{ selectedTrace.record.toolCallAdapter.initialParseSucceeded ? "成功" : "失败" }}</dd>
+                    <dt>首次解析</dt><dd>{{ selectedTrace.record.toolCallAdapter.initialParseSucceeded ? (selectedTrace.record.toolCallAdapter.initialParseRepaired ? "成功（自动修复）" : "成功") : "失败" }}</dd>
+                    <dt>最终解析</dt><dd>{{ selectedTrace.record.toolCallAdapter.finalParseSucceeded ? (selectedTrace.record.toolCallAdapter.finalParseRepaired ? "成功（自动修复）" : "成功") : "失败" }}</dd>
                   </dl>
                   <ul v-if="selectedTrace.record.toolCallAdapter.errors.length" class="error-list">
                     <li v-for="error in selectedTrace.record.toolCallAdapter.errors" :key="error">{{ error }}</li>

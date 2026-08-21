@@ -246,9 +246,18 @@ test("controlled envelope repairs recoverable JSON and reports call-shape errors
     "seed",
   );
   assert.equal(repaired.envelope?.type, "tool_calls");
+  assert.equal(repaired.repaired, true);
   if (repaired.envelope?.type !== "tool_calls") return;
   assert.equal(repaired.envelope.toolCalls.length, 1);
   assert.deepEqual(JSON.parse(repaired.envelope.toolCalls[0]!.function.arguments), { a: 1, b: 2 });
+
+  const clean = parseControlledToolEnvelopeDetailed(
+    '{"type":"tool_calls","tool_calls":[{"name":"calculator","arguments":{"a":1,"b":2}}]}',
+    tools,
+    "seed",
+  );
+  assert.equal(clean.envelope?.type, "tool_calls");
+  assert.equal(clean.repaired, undefined);
 
   const badArguments = parseControlledToolEnvelopeDetailed(
     '{"type":"tool_calls","tool_calls":[{"name":"calculator","arguments":[]}]}',
@@ -256,7 +265,17 @@ test("controlled envelope repairs recoverable JSON and reports call-shape errors
     "seed",
   );
   assert.equal(badArguments.envelope, undefined);
+  assert.equal(badArguments.repaired, undefined);
   assert.match(badArguments.error ?? "", /tool_calls\[0\]/);
+
+  const repairedInvalid = parseControlledToolEnvelopeDetailed(
+    '{"type":"tool_calls","tool_calls":[{"name":"calculator","arguments":[]}]',
+    tools,
+    "seed",
+  );
+  assert.equal(repairedInvalid.envelope, undefined);
+  assert.equal(repairedInvalid.repaired, true);
+  assert.match(repairedInvalid.error ?? "", /tool_calls\[0\]/);
 });
 
 test("jsonrepair recovers truncated tool-call JSON before reporting an error", () => {

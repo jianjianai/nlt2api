@@ -905,13 +905,14 @@ function evaluateToolCandidate(
   tools: ToolDefinition[],
   toolChoice: unknown,
   parallelToolCalls: boolean,
-): { accepted: boolean; outcome: "tool_calls" | "final" | "invalid"; message: ChatMessage; error?: string } {
+): { accepted: boolean; outcome: "tool_calls" | "final" | "invalid"; message: ChatMessage; error?: string; repaired?: boolean } {
   const rawContent = rawAssistantContent(completion);
   const parsed = parseControlledToolEnvelopeDetailed(
     rawContent,
     tools,
     completion.id ?? randomUUID(),
   );
+  const repaired = parsed.repaired ? { repaired: true } : {};
 
   // Prefer an exact controlled envelope when both content and native fields
   // are present. Some portal responses put an unusable native tool_calls array
@@ -925,20 +926,21 @@ function evaluateToolCandidate(
     };
     try {
       validateGeneratedCalls(message.tool_calls ?? [], tools, toolChoice, parallelToolCalls);
-      return { accepted: true, outcome: "tool_calls", message };
+      return { accepted: true, outcome: "tool_calls", message, ...repaired };
     } catch (error) {
-      return { accepted: false, outcome: "invalid", message, error: candidateError(error) };
+      return { accepted: false, outcome: "invalid", message, error: candidateError(error), ...repaired };
     }
   }
   if (parsed.envelope?.type === "final") {
     const message: ChatMessage = { role: "assistant", content: parsed.envelope.content };
     return envelopeAllowedForToolChoice(parsed.envelope, toolChoice)
-      ? { accepted: true, outcome: "final", message }
+      ? { accepted: true, outcome: "final", message, ...repaired }
       : {
         accepted: false,
         outcome: "invalid",
         message,
         error: "The controlled envelope violates the requested tool_choice.",
+        ...repaired,
       };
   }
 
@@ -970,6 +972,7 @@ function evaluateToolCandidate(
     outcome: "invalid",
     message,
     error: parsed.error ?? "The controlled envelope violates the requested tool_choice.",
+    ...repaired,
   };
 }
 
@@ -1074,6 +1077,8 @@ async function executeChatRequestOnce(
       toolCallExpected: toolCallExpectation(request.tool_choice),
       initialParseSucceeded: evaluation.outcome === "tool_calls",
       finalParseSucceeded: evaluation.outcome === "tool_calls",
+      initialParseRepaired: evaluation.repaired === true,
+      finalParseRepaired: evaluation.repaired === true,
       initialOutcome: evaluation.outcome,
       finalOutcome: evaluation.outcome,
       repairAttempts: 0,
@@ -1170,6 +1175,7 @@ async function executeChatRequestOnce(
     }
 
     toolCallAdapter.finalParseSucceeded = evaluation.outcome === "tool_calls";
+    toolCallAdapter.finalParseRepaired = evaluation.repaired === true;
     toolCallAdapter.finalOutcome = evaluation.outcome;
     if (!evaluation.accepted) {
       toolCallAdapter.errors.push(evaluation.error ?? "The final repair output was invalid.");

@@ -360,10 +360,16 @@ try {
       || trace.finalOutcome === "invalid");
   });
   const initialSuccess = traced.filter((record) => record.toolCallAdapter.initialOutcome === "tool_calls").length;
+  // Split the first pass into clean parses and parses jsonrepair had to fix,
+  // so a degraded raw rate is not hidden behind the repair fallback.
+  const initialRepairedSuccess = traced.filter((record) =>
+    record.toolCallAdapter.initialOutcome === "tool_calls" && record.toolCallAdapter.initialParseRepaired).length;
+  const initialRawSuccess = initialSuccess - initialRepairedSuccess;
   const repairedSuccess = traced.filter((record) =>
     !record.toolCallAdapter.initialParseSucceeded && record.toolCallAdapter.finalParseSucceeded).length;
   const finalParseFailure = traced.filter((record) => !record.toolCallAdapter.finalParseSucceeded).length;
   const firstPassRatePercent = traced.length === 0 ? 0 : Number((100 * initialSuccess / traced.length).toFixed(2));
+  const rawFirstPassRatePercent = traced.length === 0 ? 0 : Number((100 * initialRawSuccess / traced.length).toFixed(2));
   const repairEligible = traced.filter((record) => record.toolCallAdapter.initialOutcome === "invalid").length;
   const repairSuccessRatePercent = repairEligible === 0
     ? null
@@ -397,11 +403,14 @@ try {
     debugRecords: records.length,
     tracedToolTurns: traced.length,
     initialSuccess,
+    initialRawSuccess,
+    initialRepairedSuccess,
     repairedSuccess,
     repairEligible,
     repairSuccessRatePercent,
     finalParseFailure,
     firstPassRatePercent,
+    rawFirstPassRatePercent,
     repairHistogram,
     errorSamples,
     failures,

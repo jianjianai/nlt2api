@@ -560,9 +560,14 @@ try {
       || trace.finalOutcome === "invalid";
   });
   const initialToolSuccess = toolIntents.filter((record) => record.toolCallAdapter.initialOutcome === "tool_calls").length;
+  const initialRepairedSuccess = toolIntents.filter((record) =>
+    record.toolCallAdapter.initialOutcome === "tool_calls" && record.toolCallAdapter.initialParseRepaired).length;
   const initialAccuracyPercent = toolIntents.length === 0
     ? 0
     : Number((100 * initialToolSuccess / toolIntents.length).toFixed(2));
+  const rawAccuracyPercent = toolIntents.length === 0
+    ? 0
+    : Number((100 * (initialToolSuccess - initialRepairedSuccess) / toolIntents.length).toFixed(2));
   const repairEligible = adapterRecords.filter((record) => record.toolCallAdapter.initialOutcome === "invalid");
   const repairSuccess = repairEligible.filter((record) => record.toolCallAdapter.finalParseSucceeded).length;
   const repairSuccessPercent = repairEligible.length === 0
@@ -589,7 +594,9 @@ try {
       proxiedTurns: cliGatewayProxy.postRequests.length,
       toolIntents: toolIntents.length,
       initialToolSuccess,
+      initialRepairedSuccess,
       initialAccuracyPercent,
+      rawAccuracyPercent,
       repairEligible: repairEligible.length,
       repairSuccess,
       repairSuccessPercent,

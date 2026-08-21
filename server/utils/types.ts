@@ -122,6 +122,9 @@ export interface ToolCallAdapterTrace {
   toolCallExpected: "auto" | "required" | "forced";
   initialParseSucceeded: boolean;
   finalParseSucceeded: boolean;
+  /** True when the accepted envelope parse needed jsonrepair to modify the raw text. */
+  initialParseRepaired?: boolean;
+  finalParseRepaired?: boolean;
   initialOutcome: "tool_calls" | "final" | "invalid";
   finalOutcome: "tool_calls" | "final" | "invalid";
   repairAttempts: number;

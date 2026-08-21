@@ -151,6 +151,8 @@ export type ControlledToolEnvelope =
 export interface ControlledToolEnvelopeResult {
   envelope?: ControlledToolEnvelope;
   error?: string;
+  /** True when jsonrepair had to modify the raw text to make it parseable. */
+  repaired?: boolean;
 }
 
 function parseToolPreamble(value: unknown): { preamble?: string; error?: string } {
@@ -304,43 +306,49 @@ export function parseControlledToolEnvelopeDetailed(
     return { error: parsedJson.error };
   }
   parsed = parsedJson.value;
+  // Propagate whether jsonrepair modified the raw text so callers can tell a
+  // clean first pass from a repair-assisted one.
+  const repaired = parsedJson.repaired || undefined;
+  const result = (value: ControlledToolEnvelopeResult): ControlledToolEnvelopeResult => repaired
+    ? { ...value, repaired }
+    : value;
   const envelope = objectValue(parsed);
   if (!envelope) {
-    return { error: "The response must be one JSON object." };
+    return result({ error: "The response must be one JSON object." });
   }
   if (envelope.type === "final") {
-    return typeof envelope.content === "string"
+    return result(typeof envelope.content === "string"
       ? { envelope: { type: "final", content: envelope.content } }
-      : { error: "A final envelope must contain a string `content` field." };
+      : { error: "A final envelope must contain a string `content` field." });
   }
   if (envelope.type !== "tool_calls") {
-    return { error: "The envelope `type` must be `tool_calls` or `final`." };
+    return result({ error: "The envelope `type` must be `tool_calls` or `final`." });
   }
   const parsedPreamble = parseToolPreamble(envelope.preamble);
   if (parsedPreamble.error) {
-    return { error: parsedPreamble.error };
+    return result({ error: parsedPreamble.error });
   }
   if (!Array.isArray(envelope.tool_calls) || envelope.tool_calls.length === 0) {
-    return { error: "A tool_calls envelope must contain at least one call." };
+    return result({ error: "A tool_calls envelope must contain at least one call." });
   }
   if (declaredTools.size === 0) {
-    return { error: "No tools were declared for this tool_calls envelope." };
+    return result({ error: "No tools were declared for this tool_calls envelope." });
   }
   const parsedToolCalls = envelope.tool_calls
     .map((candidate, index) => normalizeCandidate(candidate, declaredTools, seed, index));
   const invalidIndex = parsedToolCalls.findIndex((call) => !call);
   if (invalidIndex >= 0) {
-    return {
+    return result({
       error: `tool_calls[${invalidIndex}] must name a declared function and contain JSON-object arguments.`,
-    };
+    });
   }
-  return {
+  return result({
     envelope: {
       type: "tool_calls",
       ...(parsedPreamble.preamble ? { preamble: parsedPreamble.preamble } : {}),
       toolCalls: deduplicateCallIds(parsedToolCalls as NormalizedToolCall[], seed),
     },
-  };
+  });
 }
 
 export function parseControlledToolEnvelope(
