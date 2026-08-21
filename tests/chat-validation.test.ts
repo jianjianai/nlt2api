@@ -147,9 +147,11 @@ test("validateChatRequest accepts valid tool_choice and sampling variants", () =
     { tools: [tool], tool_choice: { type: "function", function: { name: "lookup" } } },
     { tools: [tool], tool_choice: "none", parallel_tool_calls: false },
     { tool_choice: "none" },
-    // "auto" is the OpenAI default and a no-op without tools; clients send it
-    // even when no tool declarations survive.
+    // Every tool_choice is a no-op without tools: the turn is a non-tool turn
+    // either way, and clients send these even when no tool declarations survive.
     { tool_choice: "auto" },
+    { tool_choice: "required" },
+    { tool_choice: { type: "function", function: { name: "lookup" } } },
   ] as JsonObject[]) {
     const validated = validateChatRequest(validRequest(overrides));
     assert.equal(validated.model, "test-model");
@@ -295,18 +297,6 @@ test("validateChatRequest rejects invalid requests with unchanged errors", () =>
         }] as unknown as JsonValue;
       },
       expected: { status: 400, match: /^tools\[0\]\.function\.parameters is invalid: /, param: "tools" },
-    },
-    {
-      name: "tool_choice without tools",
-      mutate: (request) => { request.tool_choice = "required"; },
-      expected: { status: 400, message: "`tool_choice` requires at least one function in `tools`.", param: "tool_choice" },
-    },
-    {
-      name: "named tool_choice without tools",
-      mutate: (request) => {
-        request.tool_choice = { type: "function", function: { name: "lookup" } } as unknown as JsonValue;
-      },
-      expected: { status: 400, message: "`tool_choice` requires at least one function in `tools`.", param: "tool_choice" },
     },
     {
       name: "tool_choice referencing an unknown function",

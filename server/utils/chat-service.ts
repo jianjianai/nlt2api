@@ -198,14 +198,10 @@ export function parseTools(value: unknown): ToolDefinition[] {
 }
 
 function validateToolChoice(value: unknown, tools: ToolDefinition[]): void {
-  // "auto" and "none" stay valid without tools: both are no-op selections
-  // (auto is the OpenAI default), and clients such as Codex send them even
-  // when every declared tool was dropped or absent. "required" and named
-  // functions are unsatisfiable without tools and keep failing.
-  if (tools.length === 0 && value !== undefined && value !== "none" && value !== "auto") {
-    throw new HttpError(400, "`tool_choice` requires at least one function in `tools`.", "invalid_request_error", "tool_choice");
-  }
-  if (value === undefined || value === "auto" || value === "none" || value === "required") {
+  // Without tools every tool_choice is a no-op selection: the turn is a
+  // non-tool turn regardless, and clients such as Codex send "required" or a
+  // named function even when every declared tool was dropped or absent.
+  if (tools.length === 0 || value === undefined || value === "auto" || value === "none" || value === "required") {
     return;
   }
   const choice = asRecord(value);
@@ -638,6 +634,11 @@ export function locatedSchemaErrorText(argumentsValue: string, validation: Locat
 }
 
 function validateGeneratedCalls(calls: NormalizedToolCall[], tools: ToolDefinition[], toolChoice: unknown, parallelToolCalls: boolean): void {
+  // No declared tools means tool_choice was accepted as a no-op during
+  // validation; nothing here is satisfiable or violable.
+  if (tools.length === 0) {
+    return;
+  }
   if (toolChoice === "none" && calls.length > 0) {
     throw new HttpError(502, "Portal attempted a tool call despite tool_choice='none'.", "server_error");
   }
