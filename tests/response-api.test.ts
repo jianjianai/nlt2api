@@ -3,7 +3,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { resetProxyConfigForTests } from "../server/utils/config.ts";
+import { getProxyConfig, resetProxyConfigForTests } from "../server/utils/config.ts";
 import { HttpError } from "../server/utils/http.ts";
 import {
   createResponseStreamState,
@@ -324,7 +324,7 @@ test("validateResponseRequest rejects invalid shapes", async () => {
     await assertHttpError(() => validateResponseRequest(baseRequest({ input: [] })), { status: 400, param: "input" });
     // Over-limit payloads are 413, not 400: the request shape is valid.
     await assertHttpError(
-      () => validateResponseRequest(baseRequest({ input: Array.from({ length: 1_001 }, () => userInput("hi")) })),
+      () => validateResponseRequest(baseRequest({ input: Array.from({ length: getProxyConfig().maxResponseItems + 1 }, () => userInput("hi")) })),
       { status: 413, param: "input", match: /item limit/ },
     );
     await assertHttpError(() => validateResponseRequest(baseRequest({ input: [userInput("a")], previous_response_id: "resp_missing" })), {
