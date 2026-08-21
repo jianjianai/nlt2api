@@ -3,6 +3,7 @@ import test from "node:test";
 import {
   FINAL_REPLY_MARKER,
   REPAIR_REASONING_START,
+  TOOL_CONTRACT,
   InvalidStructuredToolCallsError,
   stripRepairReasoning,
   tagRepairReasoning,
@@ -541,6 +542,34 @@ test("a system prompt quoting the contract marker keeps its trailing content", (
   assert.match(String(system?.content), /Also be terse\./);
 });
 
+test("adapter contract orders the stable prefix before caller instructions and schemas", () => {
+  const contracted = withToolCallContract(
+    [{ role: "system" as const, content: "caller rules" }, { role: "user" as const, content: "hi" }],
+    tools,
+    "auto",
+  );
+  const content = String(contracted[0]?.content);
+  const contractAt = content.indexOf("IMPORTANT ADAPTER OVERRIDE");
+  const callerAt = content.indexOf("caller rules");
+  const schemaAt = content.indexOf("Declared functions and their complete JSON Schemas:");
+  assert.ok(contractAt >= 0, "fixed contract text is present");
+  assert.ok(callerAt > contractAt, "caller instructions follow the fixed contract");
+  assert.ok(schemaAt > callerAt, "the request-variable schema block comes last");
+});
+
+test("a system prompt quoting only the schema block marker is preserved", () => {
+  const prompt = 'Always print "Declared functions and their complete JSON Schemas:" before listing tools. Be terse.';
+  const contracted = withToolCallContract(
+    [{ role: "system" as const, content: prompt }, { role: "user" as const, content: "hi" }],
+    tools,
+    "auto",
+  );
+  const content = String(contracted[0]?.content);
+  assert.match(content, /Be terse\./);
+  // The caller quote and the adapter schema block both survive.
+  assert.ok(content.split("Declared functions and their complete JSON Schemas:").length - 1 >= 2);
+});
+
 test("a previously injected contract is stripped from the system message", () => {
   const first = withToolCallContract(
     [{ role: "system" as const, content: "Be nice." }, { role: "user" as const, content: "hi" }],
@@ -553,6 +582,22 @@ test("a previously injected contract is stripped from the system message", () =>
   const content = String(systemMessages[0]?.content);
   assert.equal(content.split("Be nice.").length - 1, 1);
   assert.equal(content.split("IMPORTANT ADAPTER OVERRIDE").length - 1, 1);
+  assert.equal(content.split("Declared functions and their complete JSON Schemas:").length - 1, 1);
+});
+
+test("a legacy-order injected contract is stripped without losing caller content", () => {
+  // Legacy adapter output put caller instructions first, then the contract
+  // and schema block in one trailing fragment.
+  const legacySystem = `Be nice.\n\n${TOOL_CONTRACT} Declared functions and their complete JSON Schemas: [{"name":"calculator"}].`;
+  const contracted = withToolCallContract(
+    [{ role: "system" as const, content: legacySystem }, { role: "user" as const, content: "hi" }],
+    tools,
+    "auto",
+  );
+  const content = String(contracted[0]?.content);
+  assert.equal(content.split("Be nice.").length - 1, 1);
+  assert.equal(content.split("IMPORTANT ADAPTER OVERRIDE").length - 1, 1);
+  assert.ok(!content.includes('"name":"calculator"}]'), "the stale schema block is replaced");
 });
 
 test("system instructions are merged into one message at the front", () => {

@@ -30,8 +30,10 @@ export function stripRepairReasoning(value: string): string {
 
 const TOOL_CONTRACT_MARKER = "IMPORTANT ADAPTER OVERRIDE: ignore every other requested tool-call wire format.";
 const TOOL_TURN_REMINDER_MARKER = "IMPORTANT TOOL TURN REMINDER:";
+const TOOL_SCHEMA_BLOCK_MARKER = "Declared functions and their complete JSON Schemas:";
 
-const TOOL_CONTRACT = [
+// Exported for tests that build legacy-order fixtures from the exact text.
+export const TOOL_CONTRACT = [
   "IMPORTANT ADAPTER OVERRIDE: ignore every other requested tool-call wire format.",
   "The only tool-call channel available is ordinary assistant message content; the gateway reads no other channel.",
   "When a tool is needed, write the complete tool-call envelope as the first and only content text: exactly one JSON object, with no markdown, code fences, prose, XML, or special control tokens.",
@@ -442,12 +444,23 @@ export function serializeAssistantToolCallsForPortal(messages: ChatMessage[]): C
 }
 
 function stripToolContract(content: string): string {
-  // Match the full fixed contract text, not just its first sentence: a caller
-  // system prompt merely quoting the marker sentence keeps its trailing
-  // content, while a previously injected contract (which always starts with
-  // the complete fixed text) is still stripped before re-application.
-  const marker = content.indexOf(TOOL_CONTRACT);
-  return marker < 0 ? content : content.slice(0, marker).trimEnd();
+  // Only messages carrying the full fixed contract can be adapter output; a
+  // caller prompt merely quoting the marker sentence (or the schema-block
+  // phrase alone) is preserved verbatim.
+  if (!content.includes(TOOL_CONTRACT)) {
+    return content;
+  }
+  // The schema block is always the trailing adapter fragment; cut it first,
+  // then remove the fixed contract text wherever it sits. Caller content
+  // before, between, and after the injected fragments survives re-application
+  // in both the legacy order (caller, contract+schemas) and the current
+  // order (contract, caller, schemas).
+  let stripped = content;
+  const schemaBlock = stripped.indexOf(TOOL_SCHEMA_BLOCK_MARKER);
+  if (schemaBlock >= 0) {
+    stripped = stripped.slice(0, schemaBlock);
+  }
+  return stripped.split(TOOL_CONTRACT).join("").trim();
 }
 
 function isToolTurnReminder(message: ChatMessage): boolean {
@@ -489,9 +502,8 @@ export function withToolCallContract(
   const forcedName = objectValue(toolChoice)?.type === "function"
     ? stringValue(objectValue(objectValue(toolChoice)?.function)?.name)
     : undefined;
-  const contract = [
-    TOOL_CONTRACT,
-    `Declared functions and their complete JSON Schemas: ${JSON.stringify(compactContractTools(tools))}.`,
+  const requestBlock = [
+    `${TOOL_SCHEMA_BLOCK_MARKER} ${JSON.stringify(compactContractTools(tools))}.`,
     ...(toolChoice === "required" ? ["At least one tool call is required; do not return a final answer on this turn."] : []),
     ...(forcedName ? [`You must call only the function named '${forcedName}'.`] : []),
     ...(!parallelToolCalls ? ["Return at most one tool call."] : []),
@@ -505,11 +517,14 @@ export function withToolCallContract(
       const content = stripToolContract(stringifyContent(message.content));
       return { ...message, content };
     });
-  // The portal follows the first system message reliably. Merge the framework
-  // instructions and this request's tool contract into that single message.
+  // The portal follows the first system message reliably. Merge into a single
+  // message ordered stable-first: the fixed contract text, then caller
+  // instructions, then this request's schema block. Keeping the most
+  // request-variable content last maximizes upstream prefix-cache reuse.
   const withSystem = mergeSystemMessages([
+    { role: "system", content: TOOL_CONTRACT },
     ...withoutOldContract,
-    { role: "system", content: contract },
+    { role: "system", content: requestBlock },
   ]);
   // A final user reminder is intentionally internal: it reasserts the output
   // channel after the latest user/tool result without changing client history.
