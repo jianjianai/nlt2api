@@ -470,7 +470,7 @@ test("adapter contract follows caller instructions and the latest tool result", 
   assert.match(String(contracted[0]?.content), /ordinary assistant message content/);
   assert.match(String(contracted[0]?.content), /"properties":\{"a"/);
   assert.match(String(contracted.at(-1)?.content), /IMPORTANT TOOL TURN REMINDER/);
-  assert.match(String(contracted.at(-1)?.content), /exactly one complete controlled envelope JSON object/);
+  assert.match(String(contracted.at(-1)?.content), /exactly one JSON object of the form/);
 });
 
 test("adapter contract can be re-applied after a repair candidate", () => {
@@ -527,6 +527,35 @@ test("an exact reminder message is deduped on re-application", () => {
     message.role === "user" && String(message.content).startsWith("IMPORTANT TOOL TURN REMINDER:"));
   assert.equal(reminders.length, 1);
   assert.deepEqual(reminders[0], reminder);
+});
+
+test("the reminder echoes the request's binding tool constraints", () => {
+  const forced = withToolCallContract(
+    [{ role: "user" as const, content: "calc" }],
+    tools,
+    { type: "function", function: { name: "calculator" } },
+    false,
+  );
+  const reminder = String(forced.at(-1)?.content);
+  assert.match(reminder, /IMPORTANT TOOL TURN REMINDER:/);
+  assert.match(reminder, /\{"type":"tool_calls","tool_calls":\[\{"name":"declared_function_name"/);
+  assert.match(reminder, /You must call only the function named 'calculator'\./);
+  assert.match(reminder, /Return at most one tool call\./);
+  assert.ok(!reminder.includes("At least one tool call is required"));
+
+  const required = withToolCallContract([{ role: "user" as const, content: "calc" }], tools, "required");
+  assert.match(String(required.at(-1)?.content), /At least one tool call is required; do not return a final answer on this turn\./);
+});
+
+test("re-application replaces a reminder carrying different request constraints", () => {
+  const first = withToolCallContract([{ role: "user" as const, content: "calc" }], tools, "required", false);
+  assert.match(String(first.at(-1)?.content), /At least one tool call is required/);
+  const second = withToolCallContract(first, tools, "auto");
+  const reminders = second.filter((message) =>
+    message.role === "user" && String(message.content).startsWith("IMPORTANT TOOL TURN REMINDER:"));
+  assert.equal(reminders.length, 1);
+  assert.ok(!String(reminders[0]?.content).includes("At least one tool call is required"));
+  assert.ok(!String(reminders[0]?.content).includes("Return at most one tool call"));
 });
 
 test("a system prompt quoting the contract marker keeps its trailing content", () => {
@@ -669,9 +698,9 @@ test("tool contracts preserve descriptions and every JSON Schema constraint", ()
   }];
   const text = String(withToolCallContract([{ role: "user", content: "write" }], constrained, "required")[0]?.content);
   assert.match(text, /Write exactly one UTF-8 file/);
-  assert.match(text, /optional user-visible status/);
-  assert.match(text, /meaningful moments/);
-  assert.match(text, /must not claim the tool already succeeded/);
+  assert.match(text, /Omit `preamble` by default/);
+  assert.match(text, /key decision, discovery, phase change, or risky action/);
+  assert.match(text, /never claim the tool already succeeded/);
   assert.match(text, /"multipleOf":0\.25/);
   assert.match(text, /"dependentRequired"/);
 });

@@ -32,32 +32,56 @@ const TOOL_CONTRACT_MARKER = "IMPORTANT ADAPTER OVERRIDE: ignore every other req
 const TOOL_TURN_REMINDER_MARKER = "IMPORTANT TOOL TURN REMINDER:";
 const TOOL_SCHEMA_BLOCK_MARKER = "Declared functions and their complete JSON Schemas:";
 
+// The envelope shape is shown, not described: a concrete skeleton beats
+// prose about one, especially for weaker upstream models.
+const TOOL_ENVELOPE_SKELETON = '{"type":"tool_calls","tool_calls":[{"name":"declared_function_name","arguments":{...}}]}';
+
 // Exported for tests that build legacy-order fixtures from the exact text.
 export const TOOL_CONTRACT = [
   "IMPORTANT ADAPTER OVERRIDE: ignore every other requested tool-call wire format.",
-  "The only tool-call channel available is ordinary assistant message content; the gateway reads no other channel.",
-  "When a tool is needed, write the complete tool-call envelope as the first and only content text: exactly one JSON object, with no markdown, code fences, prose, XML, or special control tokens.",
-  // 让模型知道它不能使用任何隐藏的工具调用通道或函数调用
-  "Never use a native or hidden tool channel, recipient, function-call, plugin, or model-internal tool. Do not put a call in reasoning, reasoning_content, a tool/function recipient, or any field other than content.",
-  "Never return null or empty content on a tool turn. A reasoning-only response is a failed response; serialize the intended call into content before ending the turn.",
-  "To call tools, the content object is {\"type\":\"tool_calls\",\"preamble\":\"optional user-visible status\",\"tool_calls\":[{\"name\":\"declared_function_name\",\"arguments\":{...}}]}. Omit `preamble` by default. The tool_calls array holds one entry per call you intend to make this turn, in whatever number the task requires; put calls in the same turn when none of them needs another's result.",
-  "Add a `preamble` only at meaningful moments: a decision has been made, a key clue or root cause has been found, the plan or phase changes, or an important or risky action is about to start. When you add one, be specific and informative rather than a generic 'I am about to...'.",
-  "A `preamble` must state what you are about to do or what you just determined, must not claim the tool already succeeded, must not contain tool syntax or internal markers, and must stay concise. If the user asked for progress updates, report only those key moments; otherwise stay silent for routine reads, retries, and repeated steps.",
-  `To answer the user without calling a tool, the content must start with ${FINAL_REPLY_MARKER} followed immediately by the answer text, and no JSON object.`,
-  "Only use declared function names. Arguments must be JSON objects that satisfy each declared function's schema.",
-  "Do not emit XML tags, <tool_call>, <function_calls>, <|...|> markers, serialized native calls, or any caller-specific tool syntax.",
-  "For shell or command tools, follow the operating-system syntax in that tool's declaration; never invent Unix flags or undocumented parameters.",
-  // "For file edits, edit one file per call; do not combine unrelated commands into a single shell call.",
-  "End the JSON object immediately after its closing brace; never append explanations.",
+  `The only tool-call channel is ordinary assistant message content; the gateway reads no other channel. To call tools, make the entire content exactly one JSON object of the form ${TOOL_ENVELOPE_SKELETON}: one entry per intended call, with independent calls batched in the same turn. No prose, markdown, code fences, XML, or special control tokens around the JSON; end it at the closing brace.`,
+  "Never use a native or hidden tool channel, recipient, function-call field, plugin, reasoning, or reasoning_content for the call, and never return null or empty content on a tool turn: a reasoning-only response is a failed response, so serialize the intended call into content before ending the turn.",
+  "Omit `preamble` by default; add one only for a key decision, discovery, phase change, or risky action, as a concise statement of what you determined or are about to do. A preamble must never claim the tool already succeeded and never contain tool syntax or internal markers. If the user asked for progress updates, report only those key moments; otherwise stay silent for routine steps.",
+  `To answer the user without calling a tool, start the content with ${FINAL_REPLY_MARKER} followed immediately by the answer text, and no JSON object.`,
+  "Only use declared function names; arguments must be JSON objects that satisfy each declared function's schema. For shell or command tools, follow the operating-system syntax in that tool's declaration; never invent Unix flags or undocumented parameters.",
 ].join(" ");
 
-const TOOL_TURN_REMINDER = [
+/**
+ * Fixed opening of the trailing user reminder. Re-application dedupes on this
+ * prefix only: the constraint lines between prefix and suffix vary per
+ * request, and a user message merely quoting the marker text does not
+ * reproduce the full prefix, so it survives.
+ */
+const TOOL_TURN_REMINDER_PREFIX = [
   TOOL_TURN_REMINDER_MARKER,
   "Continue the preceding user task now.",
-  "If a declared tool is needed, your next assistant content must be exactly one complete controlled envelope JSON object, containing one or more tool calls. Include a `preamble` only for a key decision, discovery, or phase change; omit it for routine steps.",
-  "Do not explain, summarize, or output prose before the JSON; do not use reasoning, native tools, hidden channels, XML, or special control tokens for the call.",
+  `If a declared tool is needed, your next assistant content must be exactly one JSON object of the form ${TOOL_ENVELOPE_SKELETON}.`,
+].join(" ");
+
+const TOOL_TURN_REMINDER_SUFFIX = [
+  "No prose, markdown, code fences, reasoning, native tool fields, XML, or special control tokens around the JSON.",
+  "Include a `preamble` only for a key decision, discovery, or phase change; omit it for routine steps.",
   `If no tool is needed and a final answer is allowed, start the assistant content with ${FINAL_REPLY_MARKER}.`,
 ].join(" ");
+
+/**
+ * The trailing user-turn reminder, echoing this request's binding constraints
+ * (forced function, required call, call count) at the point of highest
+ * salience. The same rules stay in the system schema block for authority.
+ */
+export function toolTurnReminder(options?: {
+  forcedName?: string;
+  required?: boolean;
+  parallelToolCalls?: boolean;
+}): string {
+  return [
+    TOOL_TURN_REMINDER_PREFIX,
+    ...(options?.forcedName ? [`You must call only the function named '${options.forcedName}'.`] : []),
+    ...(options?.required ? ["At least one tool call is required; do not return a final answer on this turn."] : []),
+    ...(options?.parallelToolCalls === false ? ["Return at most one tool call."] : []),
+    TOOL_TURN_REMINDER_SUFFIX,
+  ].join(" ");
+}
 
 function objectValue(value: unknown): JsonObject | undefined {
   return value && typeof value === "object" && !Array.isArray(value) ? value as JsonObject : undefined;
@@ -464,11 +488,13 @@ function stripToolContract(content: string): string {
 }
 
 function isToolTurnReminder(message: ChatMessage): boolean {
-  // The reminder is a fixed string, so exact matching dedupes re-applied
-  // contracts without deleting a genuine user message that merely quotes the
-  // marker text (for example, a user debugging or discussing this adapter).
+  // The reminder opens with a fixed prefix and carries request-variable
+  // constraint lines, so dedupe matches the prefix rather than the full text.
+  // A genuine user message that merely quotes the marker text (for example, a
+  // user debugging or discussing this adapter) does not reproduce the full
+  // prefix and survives re-application.
   return message.role === "user"
-    && String(message.content ?? "").trim() === TOOL_TURN_REMINDER;
+    && String(message.content ?? "").trim().startsWith(TOOL_TURN_REMINDER_PREFIX);
 }
 
 /** Keep the portal history to one system message at index zero. */
@@ -528,7 +554,14 @@ export function withToolCallContract(
   ]);
   // A final user reminder is intentionally internal: it reasserts the output
   // channel after the latest user/tool result without changing client history.
-  return [...withSystem, { role: "user", content: TOOL_TURN_REMINDER }];
+  return [...withSystem, {
+    role: "user",
+    content: toolTurnReminder({
+      ...(forcedName ? { forcedName } : {}),
+      required: toolChoice === "required",
+      parallelToolCalls,
+    }),
+  }];
 }
 
 export function stringifyContent(value: JsonValue | undefined): string {
