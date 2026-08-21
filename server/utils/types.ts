@@ -80,6 +80,8 @@ export interface ManagedAccount {
   weight: number;
   /** Optional per-account egress proxy URL (http/https/socks4/socks5). */
   proxy?: string;
+  /** Model ids this account can serve, fetched from the portal playground. */
+  models: string[];
   session?: PortalSession;
   createdAt: string;
   updatedAt: string;
@@ -111,6 +113,7 @@ export interface PublicAccount {
   enabled: boolean;
   weight: number;
   proxyHint: string | null;
+  models: string[];
   hasSession: boolean;
   sessionExpiresAt: number | null;
   createdAt: string;

@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { defineHandler } from "nitro";
 import {
+  assertModelSupported,
   ClientDisconnectedError,
   executeChatRequest,
   stickyKeyFrom,
@@ -62,6 +63,7 @@ export default defineHandler(async (event) => {
     // endpoint. Execution reuses the validated chat request.
     const { chatRequest, context } = await validateResponseRequest(requestBody);
     const validated = validateChatRequest(chatRequest);
+    await assertModelSupported(validated.model);
 
     if (requestBody.stream === true) {
       const streamState = createResponseStreamState(context);

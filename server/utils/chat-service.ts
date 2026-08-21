@@ -280,6 +280,22 @@ export function validateChatRequest(request: JsonObject): ValidatedChatRequest {
   return { model, messages, tools, upstreamMessages: built.messages };
 }
 
+/**
+ * Reject requests for models no enabled account can serve. Accounts that
+ * support the model but are cooling down are left to the scheduler, which
+ * reports them as temporarily unavailable.
+ */
+export async function assertModelSupported(model: string): Promise<void> {
+  const accounts = await stateStore.listAccounts();
+  const enabled = accounts.filter((account) => account.enabled);
+  if (enabled.length === 0) {
+    throw new HttpError(503, "No enabled NeuralWatt account is currently available.", "server_error", undefined, "no_account_available");
+  }
+  if (!enabled.some((account) => account.models.includes(model))) {
+    throw new HttpError(404, `The model '${model}' is not supported by any enabled account.`, "invalid_request_error", "model", "model_not_supported");
+  }
+}
+
 function portalMessages(messages: ChatMessage[], markFinalReplies = false): ChatMessage[] {
   // The Playground currently rejects the OpenAI `developer` role. Map it to
   // system, then normalize all system instructions into one message at index 0.
@@ -406,6 +422,7 @@ async function getCompletion(
     upstreamRequest: body,
     ...(trace ? { upstreamCalls: trace.calls } : {}),
   };
+  const model = typeof body.model === "string" && body.model ? body.model : undefined;
   // A required account is an affinity preference (repair pinning, tool-call
   // binding), never a hard requirement: the full conversation state travels in
   // the request messages, so when the preferred account is cooling down,
@@ -420,12 +437,12 @@ async function getCompletion(
         const stored = await stateStore.getAccount(requiredAccountId);
         if (stored?.enabled) {
           pinnedAttempt = true;
-          account = await accountScheduler.acquire(stickyKey, new Set((await stateStore.listAccounts()).filter((item) => item.id !== requiredAccountId).map((item) => item.id)));
+          account = await accountScheduler.acquire(stickyKey, new Set((await stateStore.listAccounts()).filter((item) => item.id !== requiredAccountId).map((item) => item.id)), model);
         } else {
-          account = await accountScheduler.acquire(stickyKey, excluded);
+          account = await accountScheduler.acquire(stickyKey, excluded, model);
         }
       } else {
-        account = await accountScheduler.acquire(stickyKey, excluded);
+        account = await accountScheduler.acquire(stickyKey, excluded, model);
       }
     } catch (error) {
       if (error instanceof HttpError) {

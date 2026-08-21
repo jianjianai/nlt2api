@@ -13,7 +13,7 @@ export default defineHandler(async (event) => {
       throw new HttpError(400, "Account id is required.", "invalid_request_error", "id");
     }
     const body = await readJsonObject(event.req);
-    const input: { label?: string; enabled?: boolean; weight?: number; proxy?: string | null } = {};
+    const input: { label?: string; enabled?: boolean; weight?: number; proxy?: string | null; models?: string[] } = {};
     if (body.label !== undefined) {
       input.label = asString(body.label, "label", { maxLength: 120 });
     }
@@ -33,6 +33,12 @@ export default defineHandler(async (event) => {
         ? null
         : asString(body.proxy, "proxy", { allowEmpty: true, maxLength: 2_048 });
       input.proxy = proxyInput?.trim() ? normalizeProxyUrl(proxyInput) : null;
+    }
+    if (body.models !== undefined) {
+      if (!Array.isArray(body.models) || body.models.some((model) => typeof model !== "string")) {
+        throw new HttpError(400, "`models` must be an array of model id strings.", "invalid_request_error", "models");
+      }
+      input.models = body.models as string[];
     }
     if (Object.keys(input).length === 0) {
       throw new HttpError(400, "At least one account field must be supplied.", "invalid_request_error");

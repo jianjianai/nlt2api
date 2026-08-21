@@ -1,6 +1,7 @@
 import { defineHandler } from "nitro";
 import {
   asChatCompletion,
+  assertModelSupported,
   chatChunksFromUpstreamFrame,
   ClientDisconnectedError,
   createChatStreamState,
@@ -69,6 +70,7 @@ export default defineHandler(async (event) => {
     // headers are committed, only runtime/upstream failures can use SSE errors.
     // The validated artifacts are forwarded so execution does not re-validate.
     const validated = validateChatRequest(requestBody);
+    await assertModelSupported(validated.model);
     if (body.stream === true) {
       const includeUsage = streamOptions?.include_usage === true;
       const state = createChatStreamState(requestBody);

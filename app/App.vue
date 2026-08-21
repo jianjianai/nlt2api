@@ -17,6 +17,7 @@ interface Account {
   enabled: boolean;
   weight: number;
   proxyHint: string | null;
+  models: string[];
   hasSession: boolean;
   sessionExpiresAt: number | null;
   createdAt: string;
@@ -111,6 +112,7 @@ interface ApiPayload {
   records?: DebugRecordSummary[];
   record?: DebugRecord;
   account?: Account | null;
+  models?: string[];
 }
 
 type JsonRecord = Record<string, unknown>;
@@ -197,6 +199,7 @@ function errorText(error: unknown, fallback: string): string {
 // ---- Modals & per-account busy state ----
 const showAddAccount = ref(false);
 const proxyEditor = ref<{ account: Account; value: string } | null>(null);
+const modelEditor = ref<{ account: Account; value: string } | null>(null);
 const pendingRemoval = ref<Account | null>(null);
 const showClearConfirm = ref(false);
 const busyAccountIds = ref(new Set<string>());
@@ -321,6 +324,7 @@ function signOut() {
   toasts.value = [];
   showAddAccount.value = false;
   proxyEditor.value = null;
+  modelEditor.value = null;
   pendingRemoval.value = null;
   showClearConfirm.value = false;
   autoRefresh.value = false;
@@ -461,6 +465,53 @@ async function verifyAccount(account: Account) {
 
 function openProxyEditor(account: Account) {
   proxyEditor.value = { account, value: "" };
+}
+
+function openModelEditor(account: Account) {
+  modelEditor.value = { account, value: account.models.join("\n") };
+}
+
+async function fetchAccountModels(account: Account) {
+  if (isAccountBusy(account.id)) return;
+  const before = account.models.length;
+  setAccountBusy(account.id, true);
+  try {
+    const payload = await api(`/api/admin/accounts/${encodeURIComponent(account.id)}/models`, { method: "POST" });
+    if (payload.account) {
+      replaceAccount(payload.account);
+    }
+    const after = payload.account?.models.length ?? before;
+    pushToast("success", `${account.label} 已自动获取模型列表（新增 ${Math.max(0, after - before)} 个）`);
+  } catch (error) {
+    pushToast("error", errorText(error, "无法获取模型列表。"));
+  } finally {
+    setAccountBusy(account.id, false);
+  }
+}
+
+async function saveModels() {
+  const editor = modelEditor.value;
+  if (!editor || isAccountBusy(editor.account.id)) return;
+  const models = editor.value
+    .split(/[\n,，;；]+/)
+    .map((model) => model.trim())
+    .filter(Boolean);
+  setAccountBusy(editor.account.id, true);
+  try {
+    const payload = await api(`/api/admin/accounts/${encodeURIComponent(editor.account.id)}`, {
+      method: "PATCH",
+      body: JSON.stringify({ models }),
+    });
+    if (payload.account) {
+      replaceAccount(payload.account);
+    }
+    pushToast("success", `${editor.account.label} 的模型列表已更新`);
+    modelEditor.value = null;
+  } catch (error) {
+    pushToast("error", errorText(error, "无法更新模型列表。"));
+  } finally {
+    setAccountBusy(editor.account.id, false);
+  }
 }
 
 async function saveProxy() {
@@ -1158,6 +1209,7 @@ watch(autoRefresh, (enabled) => {
 function onKeydown(event: KeyboardEvent): void {
   if (event.key === "Escape") {
     if (proxyEditor.value) proxyEditor.value = null;
+    else if (modelEditor.value) modelEditor.value = null;
     else if (pendingRemoval.value) pendingRemoval.value = null;
     else if (showClearConfirm.value) showClearConfirm.value = false;
     else if (showAddAccount.value) showAddAccount.value = false;
@@ -1310,10 +1362,19 @@ onUnmounted(() => {
                   <dd>{{ formatDate(account.updatedAt) }}</dd>
                 </div>
               </dl>
+              <div class="account-models">
+                <span class="account-models-label">可用模型（{{ account.models.length }}）</span>
+                <div class="model-chips">
+                  <span v-for="model in account.models" :key="model" class="model-chip">{{ model }}</span>
+                  <span v-if="account.models.length === 0" class="muted">未配置</span>
+                </div>
+              </div>
               <p v-if="account.runtime.lastError" class="account-error" :title="account.runtime.lastError">{{ account.runtime.lastError }}</p>
               <footer class="account-actions">
                 <button class="text-button" type="button" :disabled="isAccountBusy(account.id)" @click="verifyAccount(account)">验证</button>
                 <button class="text-button" type="button" :disabled="isAccountBusy(account.id)" @click="openProxyEditor(account)">代理</button>
+                <button class="text-button" type="button" :disabled="isAccountBusy(account.id)" @click="fetchAccountModels(account)">自动获取</button>
+                <button class="text-button" type="button" :disabled="isAccountBusy(account.id)" @click="openModelEditor(account)">模型</button>
                 <button class="text-button" type="button" :disabled="isAccountBusy(account.id)" @click="toggleAccount(account)">{{ account.enabled ? "禁用" : "启用" }}</button>
                 <button class="text-button danger" type="button" :disabled="isAccountBusy(account.id)" @click="askRemoveAccount(account)">移除</button>
               </footer>
@@ -1567,6 +1628,25 @@ onUnmounted(() => {
         <footer class="modal-foot">
           <button class="button button-quiet" type="button" @click="proxyEditor = null">取消</button>
           <button class="button button-primary" type="submit" :disabled="isAccountBusy(proxyEditor.account.id)">保存</button>
+        </footer>
+      </form>
+    </div>
+
+    <div v-if="modelEditor" class="modal-backdrop" @click.self="modelEditor = null">
+      <form class="modal" @submit.prevent="saveModels">
+        <header class="modal-head">
+          <h2>编辑模型列表</h2>
+          <button class="modal-close" type="button" aria-label="关闭" @click="modelEditor = null">×</button>
+        </header>
+        <p class="modal-note">账号「{{ modelEditor.account.label }}」 · 当前 {{ modelEditor.account.models.length }} 个模型</p>
+        <div class="modal-body">
+          <label for="models-input">模型 ID（每行一个，或用逗号分隔）</label>
+          <textarea id="models-input" v-model="modelEditor.value" rows="8" spellcheck="false" placeholder="deepseek-v4-flash&#10;glm-5.2"></textarea>
+          <p class="field-hint">保存将替换当前列表；「自动获取」会追加并去重。</p>
+        </div>
+        <footer class="modal-foot">
+          <button class="button button-quiet" type="button" @click="modelEditor = null">取消</button>
+          <button class="button button-primary" type="submit" :disabled="isAccountBusy(modelEditor.account.id)">保存</button>
         </footer>
       </form>
     </div>

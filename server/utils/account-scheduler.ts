@@ -78,13 +78,21 @@ function isAvailable(account: ManagedAccount, now: number): boolean {
   return account.enabled && runtime.cooldownUntil <= now;
 }
 
+function supportsModel(account: ManagedAccount, model: string | undefined): boolean {
+  if (!model) {
+    return true;
+  }
+  return account.models.includes(model);
+}
+
 export class AccountScheduler {
-  async acquire(stickyKey?: string, excludedAccountIds = new Set<string>()): Promise<ManagedAccount> {
+  async acquire(stickyKey?: string, excludedAccountIds = new Set<string>(), model?: string): Promise<ManagedAccount> {
     pruneAssignments();
     const now = Date.now();
     const accounts = (await stateStore.listAccounts())
       .filter((account) => !excludedAccountIds.has(account.id))
-      .filter((account) => isAvailable(account, now));
+      .filter((account) => isAvailable(account, now))
+      .filter((account) => supportsModel(account, model));
 
     if (accounts.length === 0) {
       throw new Error("No enabled NeuralWatt account is currently available.");
@@ -189,6 +197,7 @@ export class AccountScheduler {
       enabled: account.enabled,
       weight: account.weight,
       proxyHint: account.proxy ? maskProxyUrl(account.proxy) : null,
+      models: [...account.models],
       hasSession: Boolean(account.session),
       sessionExpiresAt: account.session?.expiresAt ?? null,
       createdAt: account.createdAt,

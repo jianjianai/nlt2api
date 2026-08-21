@@ -28,6 +28,10 @@ export default defineHandler(async (event) => {
     try {
       await portalClient.verifyAccount(account);
       accountScheduler.markSuccess(account.id);
+      // Fetch the account's available model list once on creation so routing
+      // can immediately restrict requests to models this account supports.
+      const models = await portalClient.listAccountModels(account);
+      await stateStore.mergeAccountModels(account.id, models);
     } catch (error) {
       await stateStore.deleteAccount(account.id).catch(() => undefined);
       accountScheduler.remove(account.id);

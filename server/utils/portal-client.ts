@@ -13,6 +13,7 @@ import type { ManagedAccount, PortalSession } from "~/server/utils/types.ts";
 const PORTAL_ORIGIN = "https://portal.neuralwatt.com";
 const CHAT_URL = `${PORTAL_ORIGIN}/api/chat`;
 const LOGIN_URL = `${PORTAL_ORIGIN}/auth/login`;
+const PLAYGROUND_URL = `${PORTAL_ORIGIN}/playground`;
 // `/api/usage` also responds for an anonymous portal trial. `/dashboard` is the
 // authenticated surface and redirects to `/auth/login` when the session expires.
 const SESSION_PROBE_URL = `${PORTAL_ORIGIN}/dashboard`;
@@ -527,6 +528,33 @@ export class PortalClient {
     return Array.isArray(payload.models)
       ? payload.models.filter((model): model is Record<string, unknown> => Boolean(model) && typeof model === "object" && !Array.isArray(model))
       : [];
+  }
+
+  /**
+   * Fetch the model ids available to one authenticated account. The portal
+   * exposes the per-account model list through the Playground page's model
+   * `<select>` options, not through an anonymous `/api/models` endpoint.
+   */
+  async listAccountModels(account: ManagedAccount, signal?: AbortSignal): Promise<string[]> {
+    const session = await this.ensureSession(account, signal);
+    const response = await portalFetch(PLAYGROUND_URL, {
+      headers: this.portalHeaders(session),
+      redirect: "manual",
+    }, signal, accountDispatcher(account));
+    if (response.status !== 200) {
+      throw new PortalError(await responseMessage(response), response.status, retryAfterSeconds(response));
+    }
+    const html = await readPortalText(response);
+    const models = new Set<string>();
+    const optionPattern = /<option\s+[^>]*value="([^"]+)"/gi;
+    let match: RegExpExecArray | null;
+    while ((match = optionPattern.exec(html)) !== null) {
+      const value = match[1]?.trim();
+      if (value) {
+        models.add(value);
+      }
+    }
+    return [...models];
   }
 
   private async login(account: ManagedAccount): Promise<PortalSession> {

@@ -1,23 +1,28 @@
 import { defineHandler } from "nitro";
 import { jsonResponse, openAIErrorResponse, requireClientAuth } from "~/server/utils/http.ts";
-import { portalClient } from "~/server/utils/portal-client.ts";
+import { stateStore } from "~/server/utils/state-store.ts";
 import { upstreamHttpError } from "~/server/utils/route-helpers.ts";
 
-function asModel(model: Record<string, unknown>) {
-  const id = typeof model.id === "string" ? model.id : typeof model.name === "string" ? model.name : undefined;
-  if (!id) return undefined;
+function asModel(id: string) {
   return {
     id,
     object: "model",
     created: 0,
-    owned_by: typeof model.provider === "string" ? model.provider : "neuralwatt",
+    owned_by: "neuralwatt",
   };
 }
 
 export default defineHandler(async (event) => {
   try {
     requireClientAuth(event.req);
-    const models = (await portalClient.listModels()).map(asModel).filter((model): model is NonNullable<typeof model> => Boolean(model));
+    const accounts = await stateStore.listAccounts();
+    const ids = new Set<string>();
+    for (const account of accounts) {
+      for (const model of account.models) {
+        ids.add(model);
+      }
+    }
+    const models = [...ids].sort().map(asModel);
     return jsonResponse({ object: "list", data: models });
   } catch (error) {
     return openAIErrorResponse(upstreamHttpError(error));

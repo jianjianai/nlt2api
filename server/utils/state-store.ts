@@ -29,6 +29,22 @@ function emptyState(): PersistentState {
   };
 }
 
+function normaliseModels(value: unknown): string[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  const seen = new Set<string>();
+  const models: string[] = [];
+  for (const item of value) {
+    if (typeof item !== "string") continue;
+    const model = item.trim();
+    if (!model || seen.has(model)) continue;
+    seen.add(model);
+    models.push(model);
+  }
+  return models;
+}
+
 function normaliseAccount(account: ManagedAccount): ManagedAccount {
   const proxy = typeof account.proxy === "string" && account.proxy.trim() ? account.proxy.trim() : undefined;
   return {
@@ -37,6 +53,7 @@ function normaliseAccount(account: ManagedAccount): ManagedAccount {
     email: account.email.trim().toLowerCase(),
     weight: Math.max(1, Math.min(100, Math.floor(account.weight || 1))),
     enabled: account.enabled !== false,
+    models: normaliseModels(account.models),
     ...(proxy ? { proxy } : {}),
   };
 }
@@ -208,6 +225,7 @@ export class StateStore {
     label?: string;
     weight?: number;
     proxy?: string;
+    models?: string[];
   }): Promise<ManagedAccount> {
     const email = input.email.trim().toLowerCase();
     if (!email || !input.password) {
@@ -227,6 +245,7 @@ export class StateStore {
         password: input.password,
         enabled: true,
         weight: input.weight ?? 1,
+        models: input.models ?? [],
         ...(input.proxy ? { proxy: input.proxy } : {}),
         createdAt: now,
         updatedAt: now,
@@ -236,7 +255,7 @@ export class StateStore {
     });
   }
 
-  async updateAccount(id: string, input: Partial<Pick<ManagedAccount, "label" | "enabled" | "weight"> & { proxy: string | null }>): Promise<ManagedAccount> {
+  async updateAccount(id: string, input: Partial<Pick<ManagedAccount, "label" | "enabled" | "weight"> & { proxy: string | null; models: string[] }>): Promise<ManagedAccount> {
     return this.mutate((state) => {
       const account = state.accounts.find((candidate) => candidate.id === id);
       if (!account) {
@@ -257,6 +276,9 @@ export class StateStore {
       } else if (input.proxy === null) {
         delete account.proxy;
       }
+      if (Array.isArray(input.models)) {
+        account.models = normaliseModels(input.models);
+      }
       account.updatedAt = new Date().toISOString();
       return account;
     });
@@ -269,6 +291,19 @@ export class StateStore {
         throw new Error("Account not found.");
       }
       state.accounts.splice(index, 1);
+    });
+  }
+
+  /** Append model ids to an account's list, deduplicating in place. */
+  async mergeAccountModels(id: string, models: string[]): Promise<ManagedAccount> {
+    return this.mutate((state) => {
+      const account = state.accounts.find((candidate) => candidate.id === id);
+      if (!account) {
+        throw new Error("Account not found.");
+      }
+      account.models = normaliseModels([...(account.models ?? []), ...models]);
+      account.updatedAt = new Date().toISOString();
+      return account;
     });
   }
 
