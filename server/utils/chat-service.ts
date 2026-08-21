@@ -44,7 +44,6 @@ import type {
 } from "~/server/utils/types.ts";
 
 const MAX_TOOLS = 512;
-const MAX_MESSAGES = 1_000;
 const MAX_TOOL_DEFINITION_BYTES = 1024 * 1024;
 const MAX_TOOL_ARGUMENT_BYTES = 64 * 1024;
 const MAX_TOOL_RESULT_BYTES = 256 * 1024;
@@ -125,10 +124,11 @@ function parseMessages(value: unknown): ChatMessage[] {
   if (!Array.isArray(value) || value.length === 0) {
     throw new HttpError(400, "`messages` must be a non-empty array.", "invalid_request_error", "messages");
   }
-  if (value.length > MAX_MESSAGES) {
+  const maxMessages = getProxyConfig().maxChatMessages;
+  if (value.length > maxMessages) {
     // 413, not 400: the request is well-formed but exceeds a server payload
     // limit, matching the body-size handling in http.ts.
-    throw new HttpError(413, "`messages` exceeds the supported history limit.", "invalid_request_error", "messages");
+    throw new HttpError(413, `\`messages\` exceeds the supported history limit (limit ${maxMessages} messages; raise NEURALWATT_MAX_CHAT_MESSAGES).`, "invalid_request_error", "messages");
   }
 
   return value.map((raw, index) => {

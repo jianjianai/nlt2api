@@ -228,9 +228,9 @@ test("validateChatRequest rejects invalid requests with unchanged errors", () =>
     {
       name: "history above the message cap",
       mutate: (request) => {
-        request.messages = Array.from({ length: 1_001 }, () => ({ role: "user", content: "x" })) as unknown as JsonValue;
+        request.messages = Array.from({ length: getProxyConfig().maxChatMessages + 1 }, () => ({ role: "user", content: "x" })) as unknown as JsonValue;
       },
-      expected: { status: 413, message: "`messages` exceeds the supported history limit.", param: "messages" },
+      expected: { status: 413, message: "`messages` exceeds the supported history limit (limit 10000 messages; raise NEURALWATT_MAX_CHAT_MESSAGES).", param: "messages" },
     },
     {
       name: "unsupported role",
