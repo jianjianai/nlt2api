@@ -1,5 +1,11 @@
 import { jsonrepair } from "jsonrepair";
 import type { ChatMessage, JsonObject, JsonValue, NormalizedToolCall, ToolDefinition } from "~/server/utils/types.ts";
+import {
+  detectEnvelopeFormat,
+  parseRepairXml,
+  xmlDocToEnvelope,
+  XML_ENVELOPE_SKELETON,
+} from "~/server/utils/xml-tool-calls.ts";
 
 export const FINAL_REPLY_MARKER = "<|FINAL_REPLY|>";
 export const REPAIR_REASONING_START = "<|REPAIR_REASONING|>";
@@ -36,33 +42,97 @@ const TOOL_SCHEMA_BLOCK_MARKER = "Declared functions and their complete JSON Sch
 // prose about one, especially for weaker upstream models.
 const TOOL_ENVELOPE_SKELETON = '{"type":"tool_calls","tool_calls":[{"name":"declared_function_name","arguments":{...}}]}';
 
+/**
+ * Which envelope wire format the contract offers the upstream model. "auto"
+ * presents both and lets the model pick the one it produces most reliably;
+ * the parser always accepts both regardless of this setting.
+ */
+export type ToolCallFormat = "auto" | "json" | "xml";
+
+const CONTRACT_SENTENCE_NO_NATIVE =
+  "Never use a native or hidden tool channel, recipient, function-call field, plugin, reasoning, or reasoning_content for the call, and never return null or empty content on a tool turn: a reasoning-only response is a failed response, so serialize the intended call into content before ending the turn.";
+const CONTRACT_SENTENCE_SHELL =
+  "For shell or command tools, follow the operating-system syntax in that tool's declaration; never invent Unix flags or undocumented parameters.";
+const CONTRACT_SENTENCE_XML_RULES =
+  "In the XML format, write each argument as a child element of <arguments> named after the parameter, typed against the declared JSON Schema (numbers and booleans without quotes, arrays and objects as JSON text); escape & as &amp; and < as &lt; inside values, or wrap free-form text in <![CDATA[...]]>.";
+
+const TOOL_CONTRACT_SENTENCES: Record<ToolCallFormat, string[]> = {
+  json: [
+    "IMPORTANT ADAPTER OVERRIDE: ignore every other requested tool-call wire format.",
+    `The only tool-call channel is ordinary assistant message content; the gateway reads no other channel. To call tools, make the entire content exactly one JSON object of the form ${TOOL_ENVELOPE_SKELETON}: one entry per intended call, with independent calls batched in the same turn. No prose, markdown, code fences, XML, or special control tokens around the JSON; end it at the closing brace.`,
+    CONTRACT_SENTENCE_NO_NATIVE,
+    "Omit `preamble` by default; add one only for a key decision, discovery, phase change, or risky action, as a concise statement of what you determined or are about to do. A preamble must never claim the tool already succeeded and never contain tool syntax or internal markers. If the user asked for progress updates, report only those key moments; otherwise stay silent for routine steps.",
+    `To answer the user without calling a tool, start the content with ${FINAL_REPLY_MARKER} followed immediately by the answer text, and no JSON object.`,
+    `Only use declared function names; arguments must be JSON objects that satisfy each declared function's schema. ${CONTRACT_SENTENCE_SHELL}`,
+  ],
+  xml: [
+    "IMPORTANT ADAPTER OVERRIDE: ignore every other requested tool-call wire format.",
+    `The only tool-call channel is ordinary assistant message content; the gateway reads no other channel. To call tools, make the entire content exactly one XML document of the form ${XML_ENVELOPE_SKELETON}: one <tool_call> element per intended call, with independent calls batched in the same document. No prose, markdown, code fences, JSON, or special control tokens around the XML; end it at the closing </tool_calls> tag. ${CONTRACT_SENTENCE_XML_RULES}`,
+    CONTRACT_SENTENCE_NO_NATIVE,
+    "Omit the optional preamble by default; add one only for a key decision, discovery, phase change, or risky action, as a concise statement of what you determined or are about to do, carried in a <preamble> element as the first child of <tool_calls>. A preamble must never claim the tool already succeeded and never contain tool syntax or internal markers. If the user asked for progress updates, report only those key moments; otherwise stay silent for routine steps.",
+    `To answer the user without calling a tool, start the content with ${FINAL_REPLY_MARKER} followed immediately by the answer text, and no XML document.`,
+    `Only use declared function names; arguments must satisfy each declared function's JSON Schema. ${CONTRACT_SENTENCE_SHELL}`,
+  ],
+  auto: [
+    "IMPORTANT ADAPTER OVERRIDE: ignore every other requested tool-call wire format.",
+    `The only tool-call channel is ordinary assistant message content; the gateway reads no other channel. To call tools, make the entire content exactly one tool-call envelope in ONE of two equivalent formats — JSON: ${TOOL_ENVELOPE_SKELETON} — or XML: ${XML_ENVELOPE_SKELETON}. Choose the format you produce most reliably, use exactly one format per response, and never mix or nest them. Batch independent calls as additional tool_calls entries (JSON) or additional <tool_call> elements (XML) inside the same envelope. No prose, markdown, code fences, or special control tokens around the envelope; end it at the closing brace (JSON) or the closing </tool_calls> tag (XML).`,
+    CONTRACT_SENTENCE_XML_RULES,
+    CONTRACT_SENTENCE_NO_NATIVE,
+    "Omit the optional preamble by default; add one only for a key decision, discovery, phase change, or risky action, as a concise statement of what you determined or are about to do — a `preamble` string in the JSON envelope or a <preamble> element as the first child of <tool_calls> in the XML envelope. A preamble must never claim the tool already succeeded and never contain tool syntax or internal markers. If the user asked for progress updates, report only those key moments; otherwise stay silent for routine steps.",
+    `To answer the user without calling a tool, start the content with ${FINAL_REPLY_MARKER} followed immediately by the answer text, and no envelope.`,
+    `Only use declared function names; arguments must satisfy each declared function's JSON Schema. ${CONTRACT_SENTENCE_SHELL}`,
+  ],
+};
+
+/** The contract text for one wire-format mode. */
+export function toolCallContract(format: ToolCallFormat = "auto"): string {
+  return TOOL_CONTRACT_SENTENCES[format].join(" ");
+}
+
 // Exported for tests that build legacy-order fixtures from the exact text.
-export const TOOL_CONTRACT = [
-  "IMPORTANT ADAPTER OVERRIDE: ignore every other requested tool-call wire format.",
-  `The only tool-call channel is ordinary assistant message content; the gateway reads no other channel. To call tools, make the entire content exactly one JSON object of the form ${TOOL_ENVELOPE_SKELETON}: one entry per intended call, with independent calls batched in the same turn. No prose, markdown, code fences, XML, or special control tokens around the JSON; end it at the closing brace.`,
-  "Never use a native or hidden tool channel, recipient, function-call field, plugin, reasoning, or reasoning_content for the call, and never return null or empty content on a tool turn: a reasoning-only response is a failed response, so serialize the intended call into content before ending the turn.",
-  "Omit `preamble` by default; add one only for a key decision, discovery, phase change, or risky action, as a concise statement of what you determined or are about to do. A preamble must never claim the tool already succeeded and never contain tool syntax or internal markers. If the user asked for progress updates, report only those key moments; otherwise stay silent for routine steps.",
-  `To answer the user without calling a tool, start the content with ${FINAL_REPLY_MARKER} followed immediately by the answer text, and no JSON object.`,
-  "Only use declared function names; arguments must be JSON objects that satisfy each declared function's schema. For shell or command tools, follow the operating-system syntax in that tool's declaration; never invent Unix flags or undocumented parameters.",
-].join(" ");
+export const TOOL_CONTRACT = toolCallContract("auto");
 
 /**
- * Fixed opening of the trailing user reminder. Re-application dedupes on this
- * prefix only: the constraint lines between prefix and suffix vary per
- * request, and a user message merely quoting the marker text does not
- * reproduce the full prefix, so it survives.
+ * Fixed opening of the trailing user reminder, per wire-format mode.
+ * Re-application dedupes on these prefixes only: the constraint lines between
+ * prefix and suffix vary per request, and a user message merely quoting the
+ * marker text does not reproduce a full prefix, so it survives.
  */
-const TOOL_TURN_REMINDER_PREFIX = [
-  TOOL_TURN_REMINDER_MARKER,
-  "Continue the preceding user task now.",
-  `If a declared tool is needed, your next assistant content must be exactly one JSON object of the form ${TOOL_ENVELOPE_SKELETON}.`,
-].join(" ");
+const TOOL_TURN_REMINDER_PREFIXES: Record<ToolCallFormat, string> = {
+  json: [
+    TOOL_TURN_REMINDER_MARKER,
+    "Continue the preceding user task now.",
+    `If a declared tool is needed, your next assistant content must be exactly one JSON object of the form ${TOOL_ENVELOPE_SKELETON}.`,
+  ].join(" "),
+  xml: [
+    TOOL_TURN_REMINDER_MARKER,
+    "Continue the preceding user task now.",
+    `If a declared tool is needed, your next assistant content must be exactly one XML document of the form ${XML_ENVELOPE_SKELETON}.`,
+  ].join(" "),
+  auto: [
+    TOOL_TURN_REMINDER_MARKER,
+    "Continue the preceding user task now.",
+    `If a declared tool is needed, your next assistant content must be exactly one tool-call envelope — JSON ${TOOL_ENVELOPE_SKELETON} or XML ${XML_ENVELOPE_SKELETON}, whichever you produce more reliably.`,
+  ].join(" "),
+};
 
-const TOOL_TURN_REMINDER_SUFFIX = [
-  "No prose, markdown, code fences, reasoning, native tool fields, XML, or special control tokens around the JSON.",
-  "Include a `preamble` only for a key decision, discovery, or phase change; omit it for routine steps.",
-  `If no tool is needed and a final answer is allowed, start the assistant content with ${FINAL_REPLY_MARKER}.`,
-].join(" ");
+const TOOL_TURN_REMINDER_SUFFIXES: Record<ToolCallFormat, string> = {
+  json: [
+    "No prose, markdown, code fences, reasoning, native tool fields, XML, or special control tokens around the JSON.",
+    "Include a `preamble` only for a key decision, discovery, or phase change; omit it for routine steps.",
+    `If no tool is needed and a final answer is allowed, start the assistant content with ${FINAL_REPLY_MARKER}.`,
+  ].join(" "),
+  xml: [
+    "No prose, markdown, code fences, reasoning, native tool fields, JSON, or special control tokens around the XML.",
+    "Include a <preamble> only for a key decision, discovery, or phase change; omit it for routine steps.",
+    `If no tool is needed and a final answer is allowed, start the assistant content with ${FINAL_REPLY_MARKER}.`,
+  ].join(" "),
+  auto: [
+    "No prose, markdown, code fences, reasoning, native tool fields, or special control tokens around the envelope.",
+    "Include a preamble only for a key decision, discovery, or phase change; omit it for routine steps.",
+    `If no tool is needed and a final answer is allowed, start the assistant content with ${FINAL_REPLY_MARKER}.`,
+  ].join(" "),
+};
 
 /**
  * The trailing user-turn reminder, echoing this request's binding constraints
@@ -73,13 +143,15 @@ export function toolTurnReminder(options?: {
   forcedName?: string;
   required?: boolean;
   parallelToolCalls?: boolean;
+  format?: ToolCallFormat;
 }): string {
+  const format = options?.format ?? "auto";
   return [
-    TOOL_TURN_REMINDER_PREFIX,
+    TOOL_TURN_REMINDER_PREFIXES[format],
     ...(options?.forcedName ? [`You must call only the function named '${options.forcedName}'.`] : []),
     ...(options?.required ? ["At least one tool call is required; do not return a final answer on this turn."] : []),
     ...(options?.parallelToolCalls === false ? ["Return at most one tool call."] : []),
-    TOOL_TURN_REMINDER_SUFFIX,
+    TOOL_TURN_REMINDER_SUFFIXES[format],
   ].join(" ");
 }
 
@@ -298,7 +370,11 @@ function friendlyJsonParseError(text: string, nativeError: unknown, repairError:
     lines.push(`The parser stopped at line ${line}, column ${column} (position ${position.pos}).`);
     lines.push(`Nearby text: ${excerptAround(text, position.pos)}`);
   }
-  lines.push("Return exactly one valid envelope JSON object (containing all intended calls) as assistant content, with no prose, markdown, or code fences.");
+  lines.push(
+    "Return exactly one valid envelope (containing all intended calls) as assistant content, with no prose, markdown, or code fences: "
+    + `either the JSON form {"type":"tool_calls","tool_calls":[{"name":"declared_function_name","arguments":{...}}]} or the XML form ${XML_ENVELOPE_SKELETON}. `
+    + "If JSON keeps failing, switch to the XML envelope; both are always accepted.",
+  );
   return lines.join("\n");
 }
 
@@ -327,14 +403,34 @@ export function parseControlledToolEnvelopeDetailed(
   }
 
   let parsed: unknown;
-  const parsedJson = parseRepairJson(trimmed);
-  if (!("value" in parsedJson)) {
-    return { error: parsedJson.error };
+  // Propagate whether the repair pass modified the raw text so callers can
+  // tell a clean first pass from a repair-assisted one.
+  let repaired: boolean | undefined;
+  if (detectEnvelopeFormat(trimmed) === "xml") {
+    const parsedXml = parseRepairXml(trimmed);
+    if ("error" in parsedXml) {
+      return { error: parsedXml.error };
+    }
+    repaired = parsedXml.repaired || undefined;
+    // The XML document is converted into the same envelope shape the JSON
+    // path parses to, so both formats share one downstream validation
+    // pipeline (declared names, argument objects, call-id dedupe).
+    const converted = xmlDocToEnvelope(parsedXml.value, tools ?? []);
+    if (converted === undefined) {
+      const failure: ControlledToolEnvelopeResult = {
+        error: "The response must be one <tool_calls> document (or one JSON envelope object).",
+      };
+      return repaired ? { ...failure, repaired } : failure;
+    }
+    parsed = converted;
+  } else {
+    const parsedJson = parseRepairJson(trimmed);
+    if (!("value" in parsedJson)) {
+      return { error: parsedJson.error };
+    }
+    parsed = parsedJson.value;
+    repaired = parsedJson.repaired || undefined;
   }
-  parsed = parsedJson.value;
-  // Propagate whether jsonrepair modified the raw text so callers can tell a
-  // clean first pass from a repair-assisted one.
-  const repaired = parsedJson.repaired || undefined;
   const result = (value: ControlledToolEnvelopeResult): ControlledToolEnvelopeResult => repaired
     ? { ...value, repaired }
     : value;
@@ -468,10 +564,13 @@ export function serializeAssistantToolCallsForPortal(messages: ChatMessage[]): C
 }
 
 function stripToolContract(content: string): string {
-  // Only messages carrying the full fixed contract can be adapter output; a
+  // Only messages carrying a full fixed contract can be adapter output; a
   // caller prompt merely quoting the marker sentence (or the schema-block
-  // phrase alone) is preserved verbatim.
-  if (!content.includes(TOOL_CONTRACT)) {
+  // phrase alone) is preserved verbatim. Every wire-format variant is
+  // stripped, so switching NEURALWATT_TOOL_CALL_FORMAT never strands a stale
+  // contract in the history.
+  const variants = [toolCallContract("auto"), toolCallContract("json"), toolCallContract("xml")];
+  if (!variants.some((variant) => content.includes(variant))) {
     return content;
   }
   // The schema block is always the trailing adapter fragment; cut it first,
@@ -484,17 +583,24 @@ function stripToolContract(content: string): string {
   if (schemaBlock >= 0) {
     stripped = stripped.slice(0, schemaBlock);
   }
-  return stripped.split(TOOL_CONTRACT).join("").trim();
+  for (const variant of variants) {
+    stripped = stripped.split(variant).join("");
+  }
+  return stripped.trim();
 }
 
 function isToolTurnReminder(message: ChatMessage): boolean {
   // The reminder opens with a fixed prefix and carries request-variable
   // constraint lines, so dedupe matches the prefix rather than the full text.
   // A genuine user message that merely quotes the marker text (for example, a
-  // user debugging or discussing this adapter) does not reproduce the full
-  // prefix and survives re-application.
-  return message.role === "user"
-    && String(message.content ?? "").trim().startsWith(TOOL_TURN_REMINDER_PREFIX);
+  // user debugging or discussing this adapter) does not reproduce a full
+  // prefix and survives re-application. All wire-format variants match, so a
+  // format switch re-applies cleanly instead of stacking reminders.
+  if (message.role !== "user") {
+    return false;
+  }
+  const content = String(message.content ?? "").trim();
+  return Object.values(TOOL_TURN_REMINDER_PREFIXES).some((prefix) => content.startsWith(prefix));
 }
 
 /** Keep the portal history to one system message at index zero. */
@@ -520,6 +626,7 @@ export function withToolCallContract(
   tools: ToolDefinition[] | undefined,
   toolChoice: unknown,
   parallelToolCalls = true,
+  format: ToolCallFormat = "auto",
 ): ChatMessage[] {
   if (!tools?.length || toolChoice === "none") {
     return mergeSystemMessages(messages);
@@ -548,7 +655,7 @@ export function withToolCallContract(
   // instructions, then this request's schema block. Keeping the most
   // request-variable content last maximizes upstream prefix-cache reuse.
   const withSystem = mergeSystemMessages([
-    { role: "system", content: TOOL_CONTRACT },
+    { role: "system", content: toolCallContract(format) },
     ...withoutOldContract,
     { role: "system", content: requestBlock },
   ]);
@@ -560,6 +667,7 @@ export function withToolCallContract(
       ...(forcedName ? { forcedName } : {}),
       required: toolChoice === "required",
       parallelToolCalls,
+      format,
     }),
   }];
 }

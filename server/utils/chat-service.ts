@@ -28,6 +28,11 @@ import {
   serializeAssistantToolCallsForPortal,
   withToolCallContract,
 } from "~/server/utils/tool-calls.ts";
+import {
+  buildXmlSkeleton,
+  detectEnvelopeFormat,
+  extractXmlCallNames,
+} from "~/server/utils/xml-tool-calls.ts";
 import type {
   ChatMessage,
   DebugRawBody,
@@ -62,7 +67,7 @@ const MAX_TOOL_REPAIR_CANDIDATE_CHARS = 131_072;
 const REPAIR_ESCALATION_ATTEMPT = 3;
 const MAX_REPAIR_SKELETON_CALLS = 3;
 const MAX_REPAIR_SKELETON_CHARS = 4_000;
-const EMPTY_REPAIR_CANDIDATE = "[The previous assistant turn produced no tool-call JSON. Reconstruct the intended calls from the preceding conversation and return only a valid controlled envelope JSON object.]";
+const EMPTY_REPAIR_CANDIDATE = "[The previous assistant turn produced no tool-call envelope. Reconstruct the intended calls from the preceding conversation and return only a valid controlled tool-call envelope (JSON or XML).]";
 
 export interface ChatExecution {
   account: ManagedAccount;
@@ -352,7 +357,13 @@ function upstreamBody(
   // merge, schema serialization); only the scalar body fields, including
   // `stream`, are rebuilt per execution.
   const upstreamMessages = prebuiltMessages ?? (toolTurn
-    ? withToolCallContract(portalMessages(messages, true), tools, toolChoice, parallelToolCalls)
+    ? withToolCallContract(
+      portalMessages(messages, true),
+      tools,
+      toolChoice,
+      parallelToolCalls,
+      getProxyConfig().toolCallFormat,
+    )
     : portalMessages(messages, false));
   const body: JsonObject = {
     model,
@@ -714,14 +725,21 @@ function candidateCallNames(candidate: ChatMessage, tools: ToolDefinition[]): st
     }
   }
   if (names.length === 0 && typeof candidate.content === "string" && candidate.content.trim()) {
-    const parsed = parseRepairJson(candidate.content.trim());
-    if ("value" in parsed) {
-      const calls = asRecord(parsed.value)?.tool_calls;
-      for (const raw of Array.isArray(calls) ? calls : []) {
-        const object = asRecord(raw);
-        const name = asRecord(object?.function)?.name ?? object?.name;
-        if (typeof name === "string" && declared.has(name)) {
-          names.push(name);
+    const content = candidate.content.trim();
+    if (detectEnvelopeFormat(content) === "xml") {
+      // The candidate is known-broken XML, so names are lifted with a
+      // tolerant regex pass rather than a real parse.
+      names.push(...extractXmlCallNames(content, declared));
+    } else {
+      const parsed = parseRepairJson(content);
+      if ("value" in parsed) {
+        const calls = asRecord(parsed.value)?.tool_calls;
+        for (const raw of Array.isArray(calls) ? calls : []) {
+          const object = asRecord(raw);
+          const name = asRecord(object?.function)?.name ?? object?.name;
+          if (typeof name === "string" && declared.has(name)) {
+            names.push(name);
+          }
         }
       }
     }
@@ -758,9 +776,28 @@ function repairEscalationLines(options: RepairPromptOptions): string[] {
     const example = minimalSchemaExample(tool?.function.parameters);
     return {
       name,
-      arguments: example && typeof example === "object" && !Array.isArray(example) ? example : {},
+      arguments: example && typeof example === "object" && !Array.isArray(example) ? example as JsonObject : {} as JsonObject,
     };
   });
+  // Escalate in the format the failed candidate used: a model that already
+  // struggles with one wire format converges faster editing a skeleton of
+  // that same format, while the correction rules offer the other format as
+  // the escape hatch.
+  const candidateFormat = typeof options.candidate.content === "string"
+    ? detectEnvelopeFormat(options.candidate.content)
+    : "unknown";
+  if (candidateFormat === "xml") {
+    let xmlSkeleton = buildXmlSkeleton(skeletonCalls);
+    if (xmlSkeleton.length > MAX_REPAIR_SKELETON_CHARS) {
+      xmlSkeleton = buildXmlSkeleton(limited.map((name) => ({ name, arguments: {} })));
+    }
+    return [
+      "",
+      "Escalated repair: start from this skeleton envelope; keep its structure and function names unchanged and replace every placeholder value with the real arguments from the conversation:",
+      xmlSkeleton,
+      "Return only the completed XML envelope.",
+    ];
+  }
   let skeleton = JSON.stringify({ type: "tool_calls", tool_calls: skeletonCalls });
   if (skeleton.length > MAX_REPAIR_SKELETON_CHARS) {
     skeleton = JSON.stringify({
@@ -816,13 +853,19 @@ export function repairMessages(options: RepairPromptOptions): ChatMessage[] {
       `Tool-call repair attempt ${attempt}.`,
       context,
       "",
-      "The previous tool-call JSON was rejected. Return only the corrected envelope JSON object.",
+      "The previous tool-call envelope was rejected. Return only the corrected envelope, in the same format you used or the other supported one.",
       "",
       "Rules:",
-      "- Use the required envelope and a declared function name.",
+      "- Use the required envelope (JSON or XML) and a declared function name.",
       "- Make arguments satisfy the declared JSON Schema.",
       `- ${callRule}`,
-      "- Output exactly one envelope JSON object (with all intended calls inside) and no prose, markdown, or code fences.",
+      "- Output exactly one envelope (with all intended calls inside) and no prose, markdown, or code fences.",
+      // The format escape hatch: a model stuck on one wire format often
+      // succeeds immediately in the other, so name the option explicitly
+      // once the first correction has failed.
+      ...(attempt >= 2
+        ? ["- Both envelope formats are always accepted; if this format keeps failing, switch to the other one (JSON <-> XML)."]
+        : []),
       ...repairEscalationLines(options),
     ].join("\n"),
   };

@@ -306,7 +306,10 @@ test("controlled envelope leaves embedded or bare call forms to the repair loop"
     "seed",
   );
   assert.equal(embedded.envelope, undefined);
-  assert.match(embedded.error ?? "", /could not be parsed/);
+  // The XML repair pass wraps the bare fragment, but a JSON text node carries
+  // no <name> element, so the envelope still rejects and the repair loop
+  // re-generates a clean call.
+  assert.match(embedded.error ?? "", /at least one call/);
 
   const bare = parseControlledToolEnvelopeDetailed(
     '{"name":"calculator","arguments":{"a":1,"b":2}}',
@@ -470,7 +473,7 @@ test("adapter contract follows caller instructions and the latest tool result", 
   assert.match(String(contracted[0]?.content), /ordinary assistant message content/);
   assert.match(String(contracted[0]?.content), /"properties":\{"a"/);
   assert.match(String(contracted.at(-1)?.content), /IMPORTANT TOOL TURN REMINDER/);
-  assert.match(String(contracted.at(-1)?.content), /exactly one JSON object of the form/);
+  assert.match(String(contracted.at(-1)?.content), /exactly one tool-call envelope/);
 });
 
 test("adapter contract can be re-applied after a repair candidate", () => {
@@ -698,7 +701,7 @@ test("tool contracts preserve descriptions and every JSON Schema constraint", ()
   }];
   const text = String(withToolCallContract([{ role: "user", content: "write" }], constrained, "required")[0]?.content);
   assert.match(text, /Write exactly one UTF-8 file/);
-  assert.match(text, /Omit `preamble` by default/);
+  assert.match(text, /Omit the optional preamble by default/);
   assert.match(text, /key decision, discovery, phase change, or risky action/);
   assert.match(text, /never claim the tool already succeeded/);
   assert.match(text, /"multipleOf":0\.25/);

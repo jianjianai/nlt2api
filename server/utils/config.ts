@@ -1,11 +1,19 @@
 import { resolve } from "node:path";
 
+/**
+ * Which tool-call envelope format the injected contract offers the upstream
+ * model. "auto" presents both JSON and XML and lets the model pick the one
+ * it produces most reliably; the parser always accepts both either way.
+ */
+export type ToolCallFormat = "auto" | "json" | "xml";
+
 export interface ProxyConfig {
   adminToken: string;
   apiKey: string;
   allowAnonymous: boolean;
   dataDir: string;
   defaultModel: string;
+  toolCallFormat: ToolCallFormat;
   maxRequestBytes: number;
   maxOutputTokens: number;
   maxUpstreamBytes: number;
@@ -31,12 +39,14 @@ export function getProxyConfig(): ProxyConfig {
   const rawMaxResponseItems = Number(process.env.NEURALWATT_MAX_RESPONSE_ITEMS ?? "10000");
   const rawMaxChatMessages = Number(process.env.NEURALWATT_MAX_CHAT_MESSAGES ?? "10000");
   const rawUpstreamTimeoutMs = Number(process.env.NEURALWATT_UPSTREAM_TIMEOUT_MS ?? "120000");
+  const rawToolCallFormat = process.env.NEURALWATT_TOOL_CALL_FORMAT ?? "auto";
   cachedConfig = {
     adminToken: process.env.NEURALWATT_ADMIN_TOKEN ?? "",
     apiKey: process.env.NEURALWATT_API_KEY ?? "",
     allowAnonymous: process.env.NEURALWATT_ALLOW_ANONYMOUS === "true",
     dataDir: resolve(process.env.NEURALWATT_DATA_DIR ?? ".data/neuralwatt"),
     defaultModel: process.env.NEURALWATT_DEFAULT_MODEL ?? "kimi-k3-fast",
+    toolCallFormat: rawToolCallFormat === "json" || rawToolCallFormat === "xml" ? rawToolCallFormat : "auto",
     maxRequestBytes: Number.isFinite(rawMaxRequestBytes) && rawMaxRequestBytes > 0
       ? Math.floor(rawMaxRequestBytes)
       : 67_108_864,
