@@ -9,3 +9,7 @@ Refer to `node_modules/nitro/dist/docs/README.md` when working on server (your k
 ## Conventions
 
 - Path alias `~/*` (tsconfig), use explicit `.ts` extensions
+
+## Release
+
+发布流程见 [docs/release.md](docs/release.md)：只有推送 `v*` 标签才会触发打包发布（Docker 镜像 + GitHub Release），标签必须与 `package.json` 的 `version` 一致。

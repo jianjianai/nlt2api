@@ -1,13 +1,10 @@
 name: Publish Docker image
 
+# 仅推送 v* 标签触发打包发布流程（发布步骤见 docs/release.md）。
 on:
   push:
-    branches:
-      - main
     tags:
       - "v*"
-  pull_request:
-  workflow_dispatch:
 
 env:
   IMAGE_NAME: ghcr.io/${{ github.repository }}
@@ -20,7 +17,6 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Validate release tag
-        if: startsWith(github.ref, 'refs/tags/')
         run: node scripts/verify-release-tag.mjs
 
       - name: Set up pnpm
@@ -47,7 +43,6 @@ jobs:
         run: pnpm run build
 
   docker:
-    if: startsWith(github.ref, 'refs/tags/v')
     needs: verify
     runs-on: ubuntu-latest
     permissions:
@@ -92,7 +87,6 @@ jobs:
           cache-to: type=gha,mode=max
 
   release:
-    if: startsWith(github.ref, 'refs/tags/v')
     needs: docker
     runs-on: ubuntu-latest
     permissions:
