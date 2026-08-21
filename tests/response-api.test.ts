@@ -322,6 +322,11 @@ test("validateResponseRequest rejects invalid shapes", async () => {
   await withTempDataDir(async () => {
     await assertHttpError(() => validateResponseRequest({ model: "m", store: false }), { status: 400, param: "input" });
     await assertHttpError(() => validateResponseRequest(baseRequest({ input: [] })), { status: 400, param: "input" });
+    // Over-limit payloads are 413, not 400: the request shape is valid.
+    await assertHttpError(
+      () => validateResponseRequest(baseRequest({ input: Array.from({ length: 1_001 }, () => userInput("hi")) })),
+      { status: 413, param: "input", match: /item limit/ },
+    );
     await assertHttpError(() => validateResponseRequest(baseRequest({ input: [userInput("a")], previous_response_id: "resp_missing" })), {
       status: 400,
       param: "previous_response_id",

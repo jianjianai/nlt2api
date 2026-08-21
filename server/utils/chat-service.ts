@@ -126,7 +126,9 @@ function parseMessages(value: unknown): ChatMessage[] {
     throw new HttpError(400, "`messages` must be a non-empty array.", "invalid_request_error", "messages");
   }
   if (value.length > MAX_MESSAGES) {
-    throw new HttpError(400, "`messages` exceeds the supported history limit.", "invalid_request_error", "messages");
+    // 413, not 400: the request is well-formed but exceeds a server payload
+    // limit, matching the body-size handling in http.ts.
+    throw new HttpError(413, "`messages` exceeds the supported history limit.", "invalid_request_error", "messages");
   }
 
   return value.map((raw, index) => {

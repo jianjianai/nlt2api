@@ -228,7 +228,7 @@ test("validateChatRequest rejects invalid requests with unchanged errors", () =>
       mutate: (request) => {
         request.messages = Array.from({ length: 1_001 }, () => ({ role: "user", content: "x" })) as unknown as JsonValue;
       },
-      expected: { status: 400, message: "`messages` exceeds the supported history limit.", param: "messages" },
+      expected: { status: 413, message: "`messages` exceeds the supported history limit.", param: "messages" },
     },
     {
       name: "unsupported role",

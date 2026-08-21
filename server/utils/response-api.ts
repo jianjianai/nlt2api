@@ -512,7 +512,9 @@ function normalizeInputItems(input: unknown): JsonObject[] {
     throw invalid("`input` must be a string or an array of input items.", "input");
   }
   if (input.length > MAX_RESPONSE_ITEMS) {
-    throw invalid("`input` exceeds the supported item limit.", "input");
+    // 413, not 400: the request is well-formed but exceeds a server payload
+    // limit, matching the body-size handling in http.ts.
+    throw new HttpError(413, "`input` exceeds the supported item limit.", "invalid_request_error", "input");
   }
   return input.map((item, index) => {
     const record = asRecord(item);
