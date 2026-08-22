@@ -102,8 +102,13 @@ test("resolveToolCallPolicy prefers per-model, then global, then env defaults", 
       assert.deepEqual(await resolveToolCallPolicy("model-a"), { format: "xml", preambleVerbosity: "quiet" });
       assert.deepEqual(await resolveToolCallPolicy("model-b"), { format: "json", preambleVerbosity: "quiet" });
 
+      // Per-model verbosity overrides the global setting, independently of format.
+      await stateStore.updateSettings({ modelPreambleVerbosities: { "model-a": "verbose" } });
+      assert.deepEqual(await resolveToolCallPolicy("model-a"), { format: "xml", preambleVerbosity: "verbose" });
+      assert.deepEqual(await resolveToolCallPolicy("model-b"), { format: "json", preambleVerbosity: "quiet" });
+
       // Clearing returns to the env defaults.
-      await stateStore.updateSettings({ toolCallFormat: null, preambleVerbosity: null, modelToolCallFormats: null });
+      await stateStore.updateSettings({ toolCallFormat: null, preambleVerbosity: null, modelToolCallFormats: null, modelPreambleVerbosities: null });
       assert.deepEqual(await resolveToolCallPolicy("model-a"), { format: "auto", preambleVerbosity: "normal" });
     } finally {
       stateStore.resetForTests();

@@ -111,6 +111,7 @@ interface ApiPayload {
     toolCallFormat?: ToolCallFormat;
     preambleVerbosity?: PreambleVerbosity;
     modelToolCallFormats?: Record<string, ToolCallFormat>;
+    modelPreambleVerbosities?: Record<string, PreambleVerbosity>;
   };
   config?: {
     adminTokenConfigured: boolean;
@@ -157,6 +158,7 @@ const settings = reactive({
   toolCallFormat: undefined as ToolCallFormat | undefined,
   preambleVerbosity: undefined as PreambleVerbosity | undefined,
   modelToolCallFormats: {} as Record<string, ToolCallFormat>,
+  modelPreambleVerbosities: {} as Record<string, PreambleVerbosity>,
 });
 const config = reactive({
   adminTokenConfigured: false,
@@ -657,6 +659,20 @@ function onModelToolCallFormatChange(model: string, event: Event) {
   setModelToolCallFormat(model, (event.target as HTMLSelectElement).value);
 }
 
+function setModelPreambleVerbosity(model: string, value: string) {
+  const next: Record<string, PreambleVerbosity> = { ...(settings.modelPreambleVerbosities ?? {}) };
+  if (value === "quiet" || value === "normal" || value === "verbose") {
+    next[model] = value;
+  } else {
+    delete next[model];
+  }
+  void patchToolCallSettings({ modelPreambleVerbosities: next }, value ? `模型 ${model} 播报已设为 ${value}` : `模型 ${model} 播报已恢复跟随全局`);
+}
+
+function onModelPreambleVerbosityChange(model: string, event: Event) {
+  setModelPreambleVerbosity(model, (event.target as HTMLSelectElement).value);
+}
+
 // Replace (not merge) the optional fields: cleared keys are absent from the
 // server payload, and Object.assign would keep the stale local value.
 function applySettings(next: ApiPayload["settings"]) {
@@ -664,6 +680,7 @@ function applySettings(next: ApiPayload["settings"]) {
   settings.toolCallFormat = next?.toolCallFormat;
   settings.preambleVerbosity = next?.preambleVerbosity;
   settings.modelToolCallFormats = next?.modelToolCallFormats ?? {};
+  settings.modelPreambleVerbosities = next?.modelPreambleVerbosities ?? {};
 }
 
 function askClearRecords() {
@@ -1487,9 +1504,14 @@ onUnmounted(() => {
             </label>
           </div>
           <div class="toolcall-models">
-            <span class="account-models-label">按模型覆盖格式</span>
+            <span class="account-models-label">按模型覆盖</span>
             <p v-if="allModels.length === 0" class="muted toolcall-empty">暂无已配置模型；请先在账号上配置可用模型。</p>
             <div v-else class="toolcall-model-list">
+              <div class="toolcall-model-row toolcall-model-head">
+                <span></span>
+                <span class="toolcall-col-label">信封格式</span>
+                <span class="toolcall-col-label">播报档位</span>
+              </div>
               <div v-for="model in allModels" :key="model" class="toolcall-model-row">
                 <span class="mono toolcall-model-name">{{ model }}</span>
                 <select :value="settings.modelToolCallFormats?.[model] ?? ''" @change="onModelToolCallFormatChange(model, $event)">
@@ -1497,6 +1519,12 @@ onUnmounted(() => {
                   <option value="auto">auto</option>
                   <option value="json">json</option>
                   <option value="xml">xml</option>
+                </select>
+                <select :value="settings.modelPreambleVerbosities?.[model] ?? ''" @change="onModelPreambleVerbosityChange(model, $event)">
+                  <option value="">跟随全局（{{ effectivePreambleVerbosity }}）</option>
+                  <option value="normal">normal</option>
+                  <option value="verbose">verbose</option>
+                  <option value="quiet">quiet</option>
                 </select>
               </div>
             </div>

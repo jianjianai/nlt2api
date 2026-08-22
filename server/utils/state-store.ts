@@ -52,6 +52,21 @@ function normaliseModelToolCallFormats(value: unknown): Record<string, "auto" | 
   return Object.keys(result).length > 0 ? result : undefined;
 }
 
+function normaliseModelPreambleVerbosities(value: unknown): Record<string, "quiet" | "normal" | "verbose"> | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return undefined;
+  }
+  const result: Record<string, "quiet" | "normal" | "verbose"> = {};
+  for (const [key, verbosity] of Object.entries(value)) {
+    const model = key.trim();
+    const normalised = normalisePreambleVerbosity(verbosity);
+    if (model && normalised) {
+      result[model] = normalised;
+    }
+  }
+  return Object.keys(result).length > 0 ? result : undefined;
+}
+
 /**
  * Accepted settings mutations. `undefined` leaves a field untouched; `null`
  * (or an empty map) clears it, returning to the env-configured default.
@@ -61,6 +76,7 @@ export interface ProxySettingsUpdate {
   toolCallFormat?: "auto" | "json" | "xml" | null;
   preambleVerbosity?: "quiet" | "normal" | "verbose" | null;
   modelToolCallFormats?: Record<string, "auto" | "json" | "xml"> | null;
+  modelPreambleVerbosities?: Record<string, "quiet" | "normal" | "verbose"> | null;
 }
 
 /** Drop unknown/invalid persisted settings while preserving every valid one. */
@@ -71,11 +87,13 @@ function normaliseSettings(value: unknown): ProxySettings {
   const toolCallFormat = normaliseToolCallFormat(parsed.toolCallFormat);
   const modelToolCallFormats = normaliseModelToolCallFormats(parsed.modelToolCallFormats);
   const preambleVerbosity = normalisePreambleVerbosity(parsed.preambleVerbosity);
+  const modelPreambleVerbosities = normaliseModelPreambleVerbosities(parsed.modelPreambleVerbosities);
   return {
     recordMessages: Boolean(parsed.recordMessages),
     ...(toolCallFormat ? { toolCallFormat } : {}),
     ...(modelToolCallFormats ? { modelToolCallFormats } : {}),
     ...(preambleVerbosity ? { preambleVerbosity } : {}),
+    ...(modelPreambleVerbosities ? { modelPreambleVerbosities } : {}),
   };
 }
 
@@ -405,6 +423,14 @@ export class StateStore {
           state.settings.modelToolCallFormats = formats;
         } else {
           delete state.settings.modelToolCallFormats;
+        }
+      }
+      if (settings.modelPreambleVerbosities !== undefined) {
+        const verbosities = normaliseModelPreambleVerbosities(settings.modelPreambleVerbosities);
+        if (verbosities) {
+          state.settings.modelPreambleVerbosities = verbosities;
+        } else {
+          delete state.settings.modelPreambleVerbosities;
         }
       }
       return { ...state.settings };

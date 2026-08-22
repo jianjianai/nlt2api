@@ -96,6 +96,8 @@ export interface ProxySettings {
   toolCallFormat?: "auto" | "json" | "xml";
   /** Per-model tool-call wire-format overrides, keyed by model id. */
   modelToolCallFormats?: Record<string, "auto" | "json" | "xml">;
+  /** Per-model preamble-verbosity overrides, keyed by model id. */
+  modelPreambleVerbosities?: Record<string, "quiet" | "normal" | "verbose">;
   /**
    * How readily the contract asks the model for user-visible preambles.
    * Falls back to NEURALWATT_PREAMBLE_VERBOSITY.

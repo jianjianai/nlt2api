@@ -28,27 +28,31 @@ function asPreambleVerbosity(value: unknown): "quiet" | "normal" | "verbose" | n
   throw new HttpError(400, "`preambleVerbosity` must be one of \"quiet\", \"normal\" or \"verbose\" (or null to inherit the env default).", "invalid_request_error", "preambleVerbosity");
 }
 
-function asModelToolCallFormats(value: unknown): Record<string, "auto" | "json" | "xml"> | null {
+function asModelEnumMap<T extends string>(
+  value: unknown,
+  field: string,
+  allowed: Set<string>,
+): Record<string, T> | null {
   if (value === null) {
     return null;
   }
   if (!value || typeof value !== "object" || Array.isArray(value)) {
-    throw new HttpError(400, "`modelToolCallFormats` must be an object mapping model ids to formats.", "invalid_request_error", "modelToolCallFormats");
+    throw new HttpError(400, `\`${field}\` must be an object mapping model ids to values.`, "invalid_request_error", field);
   }
   const entries = Object.entries(value);
   if (entries.length > MAX_MODEL_FORMAT_ENTRIES) {
-    throw new HttpError(400, `\`modelToolCallFormats\` accepts at most ${MAX_MODEL_FORMAT_ENTRIES} entries.`, "invalid_request_error", "modelToolCallFormats");
+    throw new HttpError(400, `\`${field}\` accepts at most ${MAX_MODEL_FORMAT_ENTRIES} entries.`, "invalid_request_error", field);
   }
-  const result: Record<string, "auto" | "json" | "xml"> = {};
-  for (const [key, format] of entries) {
+  const result: Record<string, T> = {};
+  for (const [key, entry] of entries) {
     const model = key.trim();
     if (!model || model.length > MAX_MODEL_ID_LENGTH) {
-      throw new HttpError(400, "`modelToolCallFormats` keys must be non-empty model ids.", "invalid_request_error", "modelToolCallFormats");
+      throw new HttpError(400, `\`${field}\` keys must be non-empty model ids.`, "invalid_request_error", field);
     }
-    if (typeof format !== "string" || !TOOL_CALL_FORMATS.has(format)) {
-      throw new HttpError(400, `\`modelToolCallFormats.${model}\` must be one of \"auto\", \"json\" or \"xml\".`, "invalid_request_error", "modelToolCallFormats");
+    if (typeof entry !== "string" || !allowed.has(entry)) {
+      throw new HttpError(400, `\`${field}.${model}\` must be one of ${[...allowed].map((item) => `"${item}"`).join(", ")}.`, "invalid_request_error", field);
     }
-    result[model] = format as "auto" | "json" | "xml";
+    result[model] = entry as T;
   }
   return result;
 }
@@ -68,7 +72,10 @@ export default defineHandler(async (event) => {
       update.preambleVerbosity = asPreambleVerbosity(body.preambleVerbosity);
     }
     if (body.modelToolCallFormats !== undefined) {
-      update.modelToolCallFormats = asModelToolCallFormats(body.modelToolCallFormats);
+      update.modelToolCallFormats = asModelEnumMap(body.modelToolCallFormats, "modelToolCallFormats", TOOL_CALL_FORMATS);
+    }
+    if (body.modelPreambleVerbosities !== undefined) {
+      update.modelPreambleVerbosities = asModelEnumMap(body.modelPreambleVerbosities, "modelPreambleVerbosities", PREAMBLE_VERBOSITIES);
     }
     return jsonResponse({ settings: await stateStore.updateSettings(update) });
   } catch (error) {

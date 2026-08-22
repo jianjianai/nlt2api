@@ -55,17 +55,20 @@ test("settings persist tool-call policy fields and clear on null or empty map", 
       toolCallFormat: "json",
       preambleVerbosity: "verbose",
       modelToolCallFormats: { "model-a": "xml", "model-b": "auto" },
+      modelPreambleVerbosities: { "model-a": "quiet" },
     });
     const settings = await store.getSettings();
     assert.equal(settings.toolCallFormat, "json");
     assert.equal(settings.preambleVerbosity, "verbose");
     assert.deepEqual(settings.modelToolCallFormats, { "model-a": "xml", "model-b": "auto" });
+    assert.deepEqual(settings.modelPreambleVerbosities, { "model-a": "quiet" });
 
     // Clearing with null / an empty map removes the overrides.
-    await store.updateSettings({ toolCallFormat: null, modelToolCallFormats: {} });
+    await store.updateSettings({ toolCallFormat: null, modelToolCallFormats: {}, modelPreambleVerbosities: null });
     const cleared = await store.getSettings();
     assert.equal(cleared.toolCallFormat, undefined);
     assert.equal(cleared.modelToolCallFormats, undefined);
+    assert.equal(cleared.modelPreambleVerbosities, undefined);
     assert.equal(cleared.preambleVerbosity, "verbose");
   });
 });
@@ -78,12 +81,14 @@ test("persisted settings reload with invalid tool-call policy entries dropped", 
     parsed.settings.toolCallFormat = "yaml";
     parsed.settings.preambleVerbosity = "loud";
     parsed.settings.modelToolCallFormats = { "model-a": "json", "model-b": "yaml", "": "auto" };
+    parsed.settings.modelPreambleVerbosities = { "model-a": "verbose", "model-b": "loud" };
     await writeFile(file, JSON.stringify(parsed), "utf8");
     const reloaded = new StateStore();
     const settings = await reloaded.getSettings();
     assert.equal(settings.toolCallFormat, undefined);
     assert.equal(settings.preambleVerbosity, undefined);
     assert.deepEqual(settings.modelToolCallFormats, { "model-a": "json" });
+    assert.deepEqual(settings.modelPreambleVerbosities, { "model-a": "verbose" });
   });
 });
 

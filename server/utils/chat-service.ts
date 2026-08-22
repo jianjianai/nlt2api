@@ -297,7 +297,7 @@ export async function resolveToolCallPolicy(model: string): Promise<ToolCallPoli
   const env = envToolCallPolicy();
   return {
     format: settings.modelToolCallFormats?.[model] ?? settings.toolCallFormat ?? env.format,
-    preambleVerbosity: settings.preambleVerbosity ?? env.preambleVerbosity,
+    preambleVerbosity: settings.modelPreambleVerbosities?.[model] ?? settings.preambleVerbosity ?? env.preambleVerbosity,
   };
 }
 
