@@ -637,6 +637,21 @@ function xmlEscapeAttribute(value: string): string {
   return xmlEscapeText(value).replace(/"/g, "&quot;");
 }
 
+/** Wrap free-form text in CDATA, splitting any literal `]]>` across sections. */
+function cdataSection(value: string): string {
+  return `<![CDATA[${value.replaceAll("]]>", "]]]]><![CDATA[>")}]]>`;
+}
+
+/**
+ * Encode a value for history re-encoding the way the contract asks the model
+ * to write it: values containing angle brackets or ampersands travel in CDATA
+ * so models imitating the history learn the robust pattern; simple values
+ * stay plain text.
+ */
+function xmlValueText(value: string): string {
+  return /[<>&]/.test(value) ? cdataSection(value) : value;
+}
+
 /**
  * Re-encode validated calls in the wire format the contract offers, so the
  * history models the same format the model is asked to emit: a pinned XML
@@ -656,12 +671,12 @@ function toolCallsEnvelopeContent(
           // Mirror the contract's XML typing: strings as text, numbers and
           // booleans bare, arrays and objects as JSON text.
           const serialized = typeof value === "string" ? value : JSON.stringify(value);
-          return `<parameter name="${xmlEscapeAttribute(key)}">${xmlEscapeText(serialized)}</parameter>`;
+          return `<parameter name="${xmlEscapeAttribute(key)}">${xmlValueText(serialized)}</parameter>`;
         })
         .join("");
       return `<tool_call name="${xmlEscapeAttribute(call.name)}">${parameters}</tool_call>`;
     }).join("");
-    return `<tool_calls>${preamble ? `<preamble>${xmlEscapeText(preamble)}</preamble>` : ""}${calls}</tool_calls>`;
+    return `<tool_calls>${preamble ? `<preamble>${xmlValueText(preamble)}</preamble>` : ""}${calls}</tool_calls>`;
   }
   return JSON.stringify({
     type: "tool_calls",

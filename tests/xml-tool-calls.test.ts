@@ -575,7 +575,7 @@ test("history tool calls are re-encoded in the contract's wire format", () => {
   }
 });
 
-test("XML history re-encoding escapes markup in names, keys and values", () => {
+test("XML history re-encoding wraps markup-bearing values in CDATA", () => {
   const history = [
     { role: "user" as const, content: "calc" },
     {
@@ -586,10 +586,58 @@ test("XML history re-encoding escapes markup in names, keys and values", () => {
   ];
   const contracted = withToolCallContract(history, tools, "auto", true, "xml");
   const assistant = contracted.find((message) => message.role === "assistant");
+  // Markup-bearing preamble travels in CDATA (the pattern the contract asks
+  // the model to imitate); simple parameter values stay plain text.
   assert.equal(
     assistant?.content,
-    '<tool_calls><preamble>5 &lt; 6 &amp; 7 &gt; 4</preamble><tool_call name="calculator"><parameter name="a">1</parameter><parameter name="b">2</parameter></tool_call></tool_calls>',
+    '<tool_calls><preamble><![CDATA[5 < 6 & 7 > 4]]></preamble><tool_call name="calculator"><parameter name="a">1</parameter><parameter name="b">2</parameter></tool_call></tool_calls>',
   );
+});
+
+test("CDATA-wrapped history round-trips, including a literal ]]> split", () => {
+  const editTools: ToolDefinition[] = [{
+    type: "function",
+    function: {
+      name: "edit_file",
+      parameters: {
+        type: "object",
+        properties: {
+          path: { type: "string" },
+          edits: {
+            type: "array",
+            items: {
+              type: "object",
+              properties: { oldText: { type: "string" }, newText: { type: "string" } },
+              required: ["oldText", "newText"],
+            },
+          },
+        },
+        required: ["path", "edits"],
+      },
+    },
+  }];
+  const edits = [{ oldText: "a < b & c]]>d", newText: '<span v-if="x">{{ y }}</span>' }];
+  const history = [
+    { role: "user" as const, content: "edit" },
+    {
+      role: "assistant" as const,
+      content: null,
+      tool_calls: [{ id: "call_1", type: "function" as const, function: { name: "edit_file", arguments: JSON.stringify({ path: "a.vue", edits }) } }],
+    },
+    { role: "tool" as const, tool_call_id: "call_1", content: "ok" },
+  ];
+  const contracted = withToolCallContract(history, editTools, "auto", true, "xml");
+  const assistant = contracted.find((message) => message.role === "assistant");
+  const content = String(assistant?.content);
+  assert.ok(content.includes("<![CDATA["));
+  // A literal ]]> inside a value is split across adjacent CDATA sections.
+  assert.ok(content.includes("]]]]><![CDATA[>"));
+  // The re-encoded history parses back to the exact original arguments.
+  const parsed = parseControlledToolEnvelopeDetailed(content, editTools, "seed");
+  assert.equal(parsed.error, undefined);
+  if (parsed.envelope?.type !== "tool_calls") return;
+  const args = JSON.parse(parsed.envelope.toolCalls[0]!.function.arguments);
+  assert.deepEqual(args, { path: "a.vue", edits });
 });
 
 test("contract re-application strips every verbosity variant", () => {
