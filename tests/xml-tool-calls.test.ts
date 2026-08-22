@@ -264,16 +264,17 @@ test("bare tool_call fragments are wrapped in a root element", () => {
   assert.equal(wrapped.tool_calls.length, 2);
 });
 
-test("mis-nested tags fail both parsers with a located diagnostic", () => {
-  // txml throws on mis-nesting; the repair loop gets a located error.
+test("mis-nested tags fall back to the envelope scanner", () => {
+  // txml throws on mis-nesting; the envelope scanner recovers the call. The
+  // arguments are lossy here, so downstream schema validation reports the
+  // missing properties and the repair loop takes over.
   const result = parseRepairXml(
     "<tool_calls><tool_call><name>calculator</name><arguments><a>1</a></tool_call></arguments><b>2</b></tool_calls>",
   );
-  assert.ok(!("value" in result));
-  if ("value" in result) return;
-  assert.match(result.error, /could not be parsed/);
-  assert.match(result.error, /line \d+, column \d+/);
-  assert.match(result.error, />>>/);
+  assert.ok("value" in result);
+  if (!("value" in result)) return;
+  assert.equal(result.repaired, true);
+  assert.ok(result.changes.some((change) => change.includes("envelope scanner")));
 });
 
 test("undeclared functions and non-object arguments fail with the shared messages", () => {
@@ -291,7 +292,9 @@ test("undeclared functions and non-object arguments fail with the shared message
 });
 
 test("unrepairable XML produces a located, AI-friendly diagnostic", () => {
-  const result = parseRepairXml("<tool_calls><tool_call><name>bash</name><arguments><command>a < b</command></arguments></tool_call></tool_calls>");
+  // Strict validation fails, txml throws on the mis-nested close, and the
+  // scanner finds no complete call: the repair loop gets a located error.
+  const result = parseRepairXml("<tool_calls></tool_call></tool_calls>");
   assert.ok(!("value" in result));
   if ("value" in result) return;
   assert.match(result.error, /could not be parsed/);
@@ -301,6 +304,79 @@ test("unrepairable XML produces a located, AI-friendly diagnostic", () => {
   // Diagnostics never suggest switching wire formats.
   assert.ok(!result.error.includes("switch"));
   assert.ok(!result.error.includes("JSON form"));
+});
+
+test("the envelope scanner recovers raw markup, stray close tags and alias closes", () => {
+  // The observed DeepSeek failure mode: the edits value carries Vue template
+  // code with raw `<` and embedded elements, followed by a duplicate
+  // </parameter> and an alias </invoke> close.
+  const editTools: ToolDefinition[] = [{
+    type: "function",
+    function: {
+      name: "edit",
+      parameters: {
+        type: "object",
+        properties: {
+          path: { type: "string" },
+          edits: {
+            type: "array",
+            items: {
+              type: "object",
+              properties: { oldText: { type: "string" }, newText: { type: "string" } },
+              required: ["oldText", "newText"],
+            },
+          },
+        },
+        required: ["path", "edits"],
+      },
+    },
+  }];
+  const edits = JSON.stringify([{
+    oldText: '<span class="status-chip" :class="item.record.status < 400 ? \'ok\' : \'err\'">{{ item.record.status }}</span>',
+    newText: '<span v-if="item.record.model" class="trace-model" :title="item.record.model">{{ item.record.model }}</span>',
+  }]);
+  const content = [
+    "<tool_calls>",
+    '<tool_call name="edit">',
+    '<parameter name="path">app/App.vue</parameter>',
+    `<parameter name="edits">${edits}</parameter>`,
+    "</parameter>",
+    "</invoke>",
+    "</tool_calls>",
+  ].join("\n");
+  const result = parseControlledToolEnvelopeDetailed(content, editTools, "seed");
+  assert.equal(result.error, undefined);
+  assert.equal(result.envelope?.type, "tool_calls");
+  if (result.envelope?.type !== "tool_calls") return;
+  assert.equal(result.envelope.toolCalls.length, 1);
+  assert.equal(result.envelope.toolCalls[0]?.function.name, "edit");
+  const args = JSON.parse(result.envelope.toolCalls[0]!.function.arguments);
+  assert.equal(args.path, "app/App.vue");
+  assert.equal(args.edits.length, 1);
+  // The parameter value survived verbatim: raw `<` and embedded markup intact.
+  assert.ok(args.edits[0].oldText.includes("< 400"));
+  assert.ok(args.edits[0].newText.includes('<span v-if="item.record.model"'));
+});
+
+test("the envelope scanner decodes entities and keeps CDATA content verbatim", () => {
+  const content = [
+    "<tool_calls>",
+    '<tool_call name="calculator">',
+    '<parameter name="a">1 &lt; 2</parameter>',
+    "<parameter name=\"b\"><![CDATA[3 > 2 && 1 < 4]]></parameter>",
+    "</tool_call>",
+    "</tool_calls>",
+  ].join("\n");
+  // Break it so the scanner (not the strict pass) does the work: a stray
+  // duplicate close tag makes the document invalid XML.
+  const broken = content.replace("</tool_call>", "</parameter>\n</tool_call>");
+  const result = parseControlledToolEnvelopeDetailed(broken, tools, "seed");
+  assert.equal(result.error, undefined);
+  assert.equal(result.envelope?.type, "tool_calls");
+  if (result.envelope?.type !== "tool_calls") return;
+  const args = JSON.parse(result.envelope.toolCalls[0]!.function.arguments);
+  assert.equal(args.a, "1 < 2");
+  assert.equal(args.b, "3 > 2 && 1 < 4");
 });
 
 test("unclosed-tag diagnostics name the tags left open", () => {

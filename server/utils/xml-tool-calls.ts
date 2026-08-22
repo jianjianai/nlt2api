@@ -241,10 +241,281 @@ function friendlyXmlParseError(
   return lines.join("\n");
 }
 
+// ---------------------------------------------------------------------------
+// Domain-aware envelope scanner (last-resort fallback)
+// ---------------------------------------------------------------------------
+
+const XML_ENTITY_MAP: Record<string, string> = { amp: "&", lt: "<", gt: ">", quot: '"', apos: "'" };
+
+function decodeXmlEntities(text: string): string {
+  return text.replace(/&(#x?[0-9a-fA-F]+|[a-zA-Z]+);/g, (match, entity: string) => {
+    if (entity.startsWith("#x") || entity.startsWith("#X")) {
+      const code = Number.parseInt(entity.slice(2), 16);
+      return Number.isFinite(code) ? String.fromCodePoint(code) : match;
+    }
+    if (entity.startsWith("#")) {
+      const code = Number.parseInt(entity.slice(1), 10);
+      return Number.isFinite(code) ? String.fromCodePoint(code) : match;
+    }
+    return XML_ENTITY_MAP[entity] ?? match;
+  });
+}
+
+interface ScannedTag {
+  lt: number;
+  close: boolean;
+  name: string;
+  raw: string;
+  end: number;
+  selfClosing: boolean;
+}
+
 /**
- * Parse the XML envelope with a jsonrepair-style two-pass strategy: strict
+ * Find the next tag-like token, quote-aware so a `>` inside an attribute
+ * value does not end the tag early. `<` followed by anything other than a
+ * letter or `/` is literal text (covers raw `<` like `a < 400` in values).
+ */
+function nextXmlTag(text: string, from: number): ScannedTag | undefined {
+  let lt = text.indexOf("<", from);
+  while (lt >= 0) {
+    const marker = text[lt + 1];
+    if (marker === "/" || (marker !== undefined && /[A-Za-z]/.test(marker))) {
+      let cursor = lt + 1;
+      let quote: string | undefined;
+      while (cursor < text.length) {
+        const ch = text[cursor];
+        if (quote) {
+          if (ch === quote) quote = undefined;
+        } else if (ch === '"' || ch === "'") {
+          quote = ch;
+        } else if (ch === ">") {
+          break;
+        }
+        cursor += 1;
+      }
+      if (cursor >= text.length) {
+        return undefined; // truncated tag
+      }
+      const raw = text.slice(lt, cursor + 1);
+      const name = /^<\/?\s*([A-Za-z][\w.-]*)/.exec(raw)?.[1];
+      if (name) {
+        return { lt, close: marker === "/", name, raw, end: cursor + 1, selfClosing: /\/\s*>$/.test(raw) };
+      }
+    }
+    lt = text.indexOf("<", lt + 1);
+  }
+  return undefined;
+}
+
+function readXmlTagAttribute(raw: string, name: string): string | undefined {
+  const match = new RegExp(`\\b${name}\\s*=\\s*("([^"]*)"|'([^']*)')`).exec(raw);
+  if (!match) {
+    return undefined;
+  }
+  return decodeXmlEntities(match[2] ?? match[3] ?? "");
+}
+
+/**
+ * Last-resort envelope scanner. The envelope grammar is fixed and tiny —
+ * a <tool_calls> root, an optional <preamble>, and <tool_call name="...">
+ * elements whose <parameter name="..."> children carry raw text — so a
+ * purpose-built scanner recovers the malformations generic XML parsers
+ * cannot: raw `<` or embedded markup inside parameter values (e.g. Vue/HTML
+ * code being edited), stray duplicate close tags, and alias close tags like
+ * </invoke>. Parameter content is read as raw text up to the first
+ * </parameter>, which is unambiguous because parameters never legitimately
+ * contain child elements.
+ */
+function scanToolCallEnvelope(text: string): { value: unknown; changes: string[] } | undefined {
+  const changes = new Set<string>();
+  const n = text.length;
+
+  // A parameter value ends at the first </parameter>; a close tag of an
+  // ancestor element terminates an unclosed parameter without consuming it.
+  const VALUE_TERMINATORS = ["</parameter", "</tool_call", "</invoke", "</tool_calls"];
+  function readParameterValue(from: number): { value: string; end: number } {
+    let value = "";
+    let plain = "";
+    let cursor = from;
+    const flushPlain = () => {
+      if (plain) {
+        value += decodeXmlEntities(plain);
+        plain = "";
+      }
+    };
+    while (cursor < n) {
+      if (text.startsWith("<![CDATA[", cursor)) {
+        flushPlain();
+        const cdataEnd = text.indexOf("]]>", cursor + 9);
+        if (cdataEnd < 0) {
+          value += text.slice(cursor + 9);
+          changes.add("recovered a truncated CDATA section");
+          return { value, end: n };
+        }
+        value += text.slice(cursor + 9, cdataEnd);
+        cursor = cdataEnd + 3;
+        continue;
+      }
+      const terminator = VALUE_TERMINATORS.find((candidate) => text.startsWith(candidate, cursor));
+      if (terminator) {
+        flushPlain();
+        if (terminator === "</parameter") {
+          const gt = text.indexOf(">", cursor);
+          return { value, end: gt < 0 ? n : gt + 1 };
+        }
+        changes.add("recovered an unclosed parameter element");
+        return { value, end: cursor };
+      }
+      plain += text[cursor]!;
+      cursor += 1;
+    }
+    flushPlain();
+    changes.add("recovered a truncated parameter value");
+    return { value, end: n };
+  }
+
+  function readToolCall(tag: ScannedTag): { call: JsonObject; end: number } | undefined {
+    if (tag.name === "invoke") {
+      changes.add("rewrote <invoke> as <tool_call>");
+    }
+    let name = readXmlTagAttribute(tag.raw, "name");
+    const parameters: JsonObject[] = [];
+    let argumentsText: string | undefined;
+    let cursor = tag.end;
+    while (cursor < n) {
+      const next = nextXmlTag(text, cursor);
+      if (!next) {
+        changes.add("recovered a truncated tool_call element");
+        cursor = n;
+        break;
+      }
+      if (next.close) {
+        if (next.name === "tool_call" || next.name === "invoke") {
+          cursor = next.end;
+          break;
+        }
+        if (next.name === "tool_calls") {
+          break; // the root closed early; leave it for the outer loop
+        }
+        // A close tag matching nothing open here is stray markup (the
+        // observed duplicate-</parameter> failure mode, among others).
+        changes.add(`dropped a stray </${next.name}> close tag`);
+        cursor = next.end;
+        continue;
+      }
+      if (next.name === "parameter") {
+        const paramName = readXmlTagAttribute(next.raw, "name");
+        if (next.selfClosing) {
+          if (paramName) parameters.push({ "@_name": paramName, "#text": "" });
+          cursor = next.end;
+          continue;
+        }
+        const value = readParameterValue(next.end);
+        if (paramName) {
+          parameters.push({ "@_name": paramName, "#text": value.value });
+        }
+        cursor = value.end;
+        continue;
+      }
+      if (next.name === "name" || next.name === "arguments") {
+        // Child-element variant: <name>bash</name><arguments>{...}</arguments>.
+        const closer = `</${next.name}`;
+        const closeAt = text.indexOf(closer, next.end);
+        const rawText = closeAt < 0 ? text.slice(next.end) : text.slice(next.end, closeAt);
+        const decoded = decodeXmlEntities(rawText).trim();
+        if (next.name === "name") {
+          name = name ?? decoded;
+        } else {
+          argumentsText = decoded;
+        }
+        cursor = closeAt < 0 ? n : closeAt + closer.length;
+        continue;
+      }
+      // An unknown open tag inside a call is skipped; embedded markup that
+      // followed a truncated parameter value is recovered this way.
+      cursor = next.end;
+    }
+    if (!name) {
+      return undefined;
+    }
+    const call: JsonObject = { "@_name": name };
+    if (parameters.length > 0) {
+      call.parameter = parameters;
+    }
+    if (argumentsText !== undefined) {
+      call.arguments = argumentsText;
+    }
+    return { call, end: cursor };
+  }
+
+  // Linear top-level scan: rooted documents, junk wrappers and bare
+  // <tool_call> fragments are all handled uniformly — unknown open tags are
+  // descended into, stray close tags are skipped, prose between tags is
+  // ignored (and reported).
+  const calls: JsonObject[] = [];
+  let preamble: string | undefined;
+  let skippedProse = false;
+  let cursor = 0;
+  while (cursor < n) {
+    const tag = nextXmlTag(text, cursor);
+    if (!tag) {
+      if (text.slice(cursor).trim()) skippedProse = true;
+      break;
+    }
+    if (tag.lt > cursor && text.slice(cursor, tag.lt).trim()) {
+      skippedProse = true;
+    }
+    if (tag.close) {
+      cursor = tag.end;
+      continue;
+    }
+    if (tag.name === "tool_calls") {
+      cursor = tag.end;
+      continue;
+    }
+    if (tag.name === "preamble") {
+      const closeAt = text.indexOf("</preamble", tag.end);
+      const rawText = closeAt < 0 ? text.slice(tag.end) : text.slice(tag.end, closeAt);
+      const decoded = decodeXmlEntities(rawText).trim();
+      if (decoded) preamble = decoded;
+      if (closeAt < 0) {
+        cursor = n;
+      } else {
+        const gt = text.indexOf(">", closeAt);
+        cursor = gt < 0 ? n : gt + 1;
+      }
+      continue;
+    }
+    if (tag.name === "tool_call" || tag.name === "invoke") {
+      const scanned = readToolCall(tag);
+      if (scanned) {
+        calls.push(scanned.call);
+        cursor = scanned.end;
+        continue;
+      }
+      cursor = tag.end;
+      continue;
+    }
+    cursor = tag.end;
+  }
+  if (calls.length === 0) {
+    return undefined;
+  }
+  if (skippedProse) {
+    changes.add("ignored prose or markdown fences outside the <tool_calls> document");
+  }
+  const root: JsonObject = { tool_call: calls };
+  if (preamble) {
+    root.preamble = preamble;
+  }
+  return { value: { tool_calls: root }, changes: [...changes] };
+}
+
+/**
+ * Parse the XML envelope with a jsonrepair-style multi-pass strategy: strict
  * fast-xml-parser validation first, tolerant txml parsing as the repair
- * attempt, and a located diagnostic combining both when neither works.
+ * attempt, the domain-aware envelope scanner as the last resort, and a
+ * located diagnostic combining the errors when nothing works.
  */
 export function parseRepairXml(input: string): XmlParseResult {
   const trimmed = input.trim();
@@ -267,10 +538,35 @@ export function parseRepairXml(input: string): XmlParseResult {
       selfClosingTags: [],
     });
   } catch (tolerantError) {
+    // Last resort: the domain-aware envelope scanner recovers value-level
+    // malformations generic XML parsers cannot (raw `<` or embedded markup in
+    // parameter values, stray duplicate close tags, alias </invoke> closes).
+    const scanned = scanToolCallEnvelope(trimmed);
+    if (scanned) {
+      return {
+        value: scanned.value,
+        repaired: true,
+        changes: [
+          "strict XML validation and the tolerant parser both failed; recovered with the envelope scanner",
+          ...scanned.changes,
+        ],
+      };
+    }
     return { error: friendlyXmlParseError(trimmed, validationError, tolerantError) };
   }
   const located = locateToolCalls(dom);
   if (!located) {
+    const scanned = scanToolCallEnvelope(trimmed);
+    if (scanned) {
+      return {
+        value: scanned.value,
+        repaired: true,
+        changes: [
+          "no <tool_calls> root was found by the tolerant parser; recovered with the envelope scanner",
+          ...scanned.changes,
+        ],
+      };
+    }
     return {
       error: friendlyXmlParseError(
         trimmed,
