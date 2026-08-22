@@ -958,6 +958,178 @@ function aggregateStreamingMessages(values: unknown[], stripMarkers: boolean): D
   return aggregateChatCompletionChunks(chunks, stripMarkers);
 }
 
+/** Parse a Responses API stream event (`response.*`), else null. */
+function asResponseEvent(value: unknown): JsonRecord | null {
+  const source = asObject(value);
+  return source && typeof source.type === "string" && source.type.startsWith("response.") ? source : null;
+}
+
+/** True when a parsed SSE datum is a Responses API event. */
+function isResponseStreamEvent(value: unknown): boolean {
+  return asResponseEvent(value) !== null;
+}
+
+/** Text carried by one Responses content part (input_text/output_text/refusal/image). */
+function responsePartText(part: unknown): string {
+  const item = asObject(part);
+  if (!item) return "";
+  if (typeof item.text === "string") return item.text;
+  if (typeof item.refusal === "string") return item.refusal;
+  if (typeof item.image_url === "string") return `[图片] ${item.image_url}`;
+  return "";
+}
+
+/** Render one Responses input/output item (message, reasoning, function call, tool output). */
+function responseItemMessages(item: unknown, stripMarkers: boolean): DisplayMessage[] {
+  const source = asObject(item);
+  if (!source) return [];
+  const type = typeof source.type === "string" ? source.type : typeof source.role === "string" ? "message" : "";
+  if (type === "message") {
+    const role = typeof source.role === "string" ? source.role : "assistant";
+    const content = typeof source.content === "string"
+      ? source.content
+      : Array.isArray(source.content)
+        ? source.content.map(responsePartText).filter(Boolean).join("\n")
+        : "";
+    if (!content) return [];
+    return [{
+      role,
+      roleLabel: roleName(role),
+      content: stripMarkers && role === "assistant" ? cleanMarkers(content) : content,
+      toolCalls: [],
+    }];
+  }
+  if (type === "reasoning") {
+    const summary = Array.isArray(source.summary) ? source.summary : [];
+    const text = summary
+      .map((part) => asObject(part)?.text)
+      .filter((value): value is string => typeof value === "string")
+      .join("\n");
+    const cleaned = stripMarkers ? cleanMarkers(text) : text.trim();
+    return cleaned ? [{ role: "assistant", roleLabel: "思考", content: cleaned, toolCalls: [] }] : [];
+  }
+  if (type === "function_call" || type === "custom_tool_call") {
+    const payload = type === "custom_tool_call" ? source.input : source.arguments;
+    return [{
+      role: "assistant",
+      roleLabel: "工具调用",
+      content: "",
+      toolCalls: [{
+        id: typeof source.call_id === "string" ? source.call_id : typeof source.id === "string" ? source.id : "tool_call",
+        name: typeof source.name === "string" ? source.name : "未命名工具",
+        arguments: contentText(payload ?? ""),
+      }],
+    }];
+  }
+  if (type === "function_call_output" || type === "custom_tool_call_output") {
+    const output = source.output;
+    const record = asObject(output);
+    const text = typeof output === "string"
+      ? output
+      : typeof record?.content === "string"
+        ? record.content
+        : Array.isArray(record?.content)
+          ? record.content.map(responsePartText).filter(Boolean).join("\n")
+          : pretty(output ?? "");
+    return [{ role: "tool", roleLabel: roleName("tool"), content: text, toolCalls: [] }];
+  }
+  return [];
+}
+
+/** Render the `output` array of a Responses object. */
+function responseOutputMessages(output: unknown[], stripMarkers: boolean): DisplayMessage[] {
+  return output.flatMap((item) => responseItemMessages(item, stripMarkers));
+}
+
+/** Render a non-streaming Responses request or response body. */
+function collectResponseMessages(source: JsonRecord): DisplayMessage[] {
+  const messages: DisplayMessage[] = [];
+  if (typeof source.instructions === "string" && source.instructions.trim()) {
+    messages.push({ role: "system", roleLabel: roleName("system"), content: source.instructions, toolCalls: [] });
+  }
+  if (typeof source.input === "string") {
+    if (source.input.trim()) {
+      messages.push({ role: "user", roleLabel: roleName("user"), content: source.input, toolCalls: [] });
+    }
+  } else if (Array.isArray(source.input)) {
+    messages.push(...source.input.flatMap((item) => responseItemMessages(item, true)));
+  }
+  if (Array.isArray(source.output)) {
+    messages.push(...responseOutputMessages(source.output, true));
+  }
+  const error = asObject(source.error);
+  if (error && typeof error.message === "string") {
+    messages.push({ role: "error", roleLabel: "错误", content: error.message, toolCalls: [] });
+  }
+  return messages;
+}
+
+/** The terminal response object of a Responses stream (completed / failed / incomplete). */
+function responseStreamTerminal(values: unknown[]): JsonRecord | null {
+  for (let index = values.length - 1; index >= 0; index -= 1) {
+    const event = asResponseEvent(values[index]);
+    if (event && (event.type === "response.completed" || event.type === "response.failed" || event.type === "response.incomplete")) {
+      return asObject(event.response) ?? null;
+    }
+  }
+  return null;
+}
+
+/** Merge Responses API stream events into 思考 / 助手 / 工具调用 boxes. */
+function aggregateResponseStreamEvents(values: unknown[], stripMarkers: boolean): DisplayMessage[] {
+  const events = values.map(asResponseEvent).filter((event): event is JsonRecord => event !== null);
+  if (events.length === 0) return [];
+  const terminal = responseStreamTerminal(values);
+  if (terminal && Array.isArray(terminal.output) && terminal.output.length > 0) {
+    const messages = responseOutputMessages(terminal.output, stripMarkers);
+    const error = asObject(terminal.error);
+    if (error && typeof error.message === "string") {
+      messages.push({ role: "error", roleLabel: "错误", content: error.message, toolCalls: [] });
+    }
+    return messages;
+  }
+  // The stream ended before response.completed: aggregate the deltas seen so far.
+  let reasoning = "";
+  let content = "";
+  let refusal = "";
+  const calls = new Map<string, DisplayToolCall>();
+  for (const event of events) {
+    const type = event.type as string;
+    if (type === "response.reasoning_summary_text.delta" && typeof event.delta === "string") {
+      reasoning += event.delta;
+    } else if (type === "response.output_text.delta" && typeof event.delta === "string") {
+      content += event.delta;
+    } else if (type === "response.refusal.delta" && typeof event.delta === "string") {
+      refusal += event.delta;
+    } else if (type === "response.output_item.added") {
+      const item = asObject(event.item);
+      if (item && (item.type === "function_call" || item.type === "custom_tool_call")) {
+        const id = typeof item.id === "string" ? item.id : `tool_${calls.size + 1}`;
+        calls.set(id, {
+          id: typeof item.call_id === "string" ? item.call_id : id,
+          name: typeof item.name === "string" ? item.name : "未命名工具",
+          arguments: "",
+        });
+      }
+    } else if (type === "response.function_call_arguments.delta" || type === "response.custom_tool_call_input.delta") {
+      const known = typeof event.item_id === "string" ? calls.get(event.item_id) : undefined;
+      if (known && typeof event.delta === "string") known.arguments += event.delta;
+    } else if (type === "response.output_item.done") {
+      const item = asObject(event.item);
+      if (item && (item.type === "function_call" || item.type === "custom_tool_call")) {
+        const known = typeof item.id === "string" ? calls.get(item.id) : undefined;
+        const payload = item.type === "custom_tool_call" ? item.input : item.arguments;
+        if (known && typeof payload === "string" && payload) known.arguments = payload;
+      }
+    }
+  }
+  return buildAggregatedMessages({
+    reasoning: stripMarkers ? cleanMarkers(reasoning) : reasoning.trim(),
+    content: stripMarkers ? cleanMarkers(content || refusal) : (content || refusal).trim(),
+    toolCalls: [...calls.values()],
+  });
+}
+
 /** Collect messages from a body, concatenating streaming chunks into one box per kind. */
 function collectBodyMessages(value: DebugRawBody | JsonRecord | undefined, stripMarkers: boolean): DisplayMessage[] {
   const values = parsedBodyValues(value);
@@ -965,11 +1137,20 @@ function collectBodyMessages(value: DebugRawBody | JsonRecord | undefined, strip
     const aggregated = aggregateStreamingMessages(values, stripMarkers);
     if (aggregated.length > 0) return aggregated;
   }
+  if (values.some(isResponseStreamEvent)) {
+    const aggregated = aggregateResponseStreamEvents(values, stripMarkers);
+    if (aggregated.length > 0) return aggregated;
+  }
   return values.flatMap(collectMessages);
 }
 
 function collectMessages(value: unknown): DisplayMessage[] {
   const source = asObject(value);
+  // Responses API payloads carry `input`/`output` item arrays (plus optional
+  // `instructions`) instead of chat `messages`/`choices`.
+  if (source && (source.object === "response" || source.input !== undefined || Array.isArray(source.output))) {
+    return collectResponseMessages(source);
+  }
   const candidates: unknown[] = [];
   if (Array.isArray(source?.messages)) candidates.push(...source.messages);
   if (Array.isArray(source?.choices)) {
@@ -989,14 +1170,27 @@ const fieldNames: Record<string, string> = {
   model: "模型",
   stream: "流式输出",
   temperature: "温度",
+  top_p: "Top P",
   max_tokens: "最大令牌数",
+  max_output_tokens: "最大输出令牌数",
   tool_choice: "工具选择",
+  tools: "工具",
   parallel_tool_calls: "并行工具调用",
   response_format: "响应格式",
   object: "对象类型",
   id: "请求 ID",
   created: "创建时间",
+  created_at: "创建时间",
   finish_reason: "结束原因",
+  status: "状态",
+  instructions: "指令",
+  previous_response_id: "上一响应 ID",
+  store: "存储",
+  reasoning: "推理",
+  text: "文本格式",
+  metadata: "元数据",
+  incomplete_details: "未完成详情",
+  background: "后台运行",
   usage: "用量",
   error: "错误",
 };
@@ -1133,10 +1327,16 @@ const upstreamCallCount = computed(() => records.value.reduce((total, record) =>
 
 function presentBody(value: DebugRawBody | JsonRecord | undefined, options?: { stripMarkers?: boolean }): BodyPresentation {
   const values = parsedBodyValues(value);
-  const streaming = values.some(isStreamingChunk);
+  const responseStreaming = values.some(isResponseStreamEvent);
+  const streaming = responseStreaming || values.some(isStreamingChunk);
   const messages = collectBodyMessages(value, options?.stripMarkers ?? true);
   const raw = rawBodyText(value);
-  const fields = values.flatMap(recordFields);
+  // Responses stream events are envelope noise; surface the terminal response
+  // object's metadata instead of per-event fields.
+  const terminal = responseStreaming ? responseStreamTerminal(values) : null;
+  const fields = responseStreaming
+    ? (terminal ? recordFields(terminal) : [])
+    : values.flatMap(recordFields);
   return {
     contentType: bodyContentType(value),
     raw,

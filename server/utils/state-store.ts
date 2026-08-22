@@ -153,15 +153,10 @@ function previewContentText(value: unknown): string {
   return "";
 }
 
-/** Short content preview: the last user message, else any last message. */
-function recordPreview(record: DebugRecord): string {
-  try {
-    if (record.clientRequest.contentType !== "application/json") {
-      return NO_PREVIEW_TEXT;
-    }
-    const parsed = JSON.parse(record.clientRequest.body) as { messages?: unknown };
-    const messages = Array.isArray(parsed.messages) ? parsed.messages : [];
-    const texts = messages
+/** Flatten chat messages or Responses input items into role/text pairs. */
+function previewEntries(parsed: { messages?: unknown; input?: unknown }): { role: unknown; text: string }[] {
+  if (Array.isArray(parsed.messages)) {
+    return parsed.messages
       .map((message) => {
         const item = message && typeof message === "object" && !Array.isArray(message)
           ? message as Record<string, unknown>
@@ -169,6 +164,42 @@ function recordPreview(record: DebugRecord): string {
         return { role: item.role, text: previewContentText(item.content ?? item.text) };
       })
       .filter((item) => item.text);
+  }
+  if (typeof parsed.input === "string") {
+    return parsed.input.trim() ? [{ role: "user", text: parsed.input }] : [];
+  }
+  if (Array.isArray(parsed.input)) {
+    return parsed.input.flatMap((entry) => {
+      const item = entry && typeof entry === "object" && !Array.isArray(entry)
+        ? entry as Record<string, unknown>
+        : {};
+      const type = typeof item.type === "string" ? item.type : typeof item.role === "string" ? "message" : "";
+      if (type === "message") {
+        const text = previewContentText(item.content);
+        return text ? [{ role: item.role, text }] : [];
+      }
+      if (type === "function_call_output" || type === "custom_tool_call_output") {
+        const output = item.output;
+        const record = output && typeof output === "object" && !Array.isArray(output)
+          ? output as Record<string, unknown>
+          : undefined;
+        const text = previewContentText(record ? record.content : output);
+        return text ? [{ role: "tool", text }] : [];
+      }
+      return [];
+    });
+  }
+  return [];
+}
+
+/** Short content preview: the last user message, else any last message. */
+function recordPreview(record: DebugRecord): string {
+  try {
+    if (record.clientRequest.contentType !== "application/json") {
+      return NO_PREVIEW_TEXT;
+    }
+    const parsed = JSON.parse(record.clientRequest.body) as { messages?: unknown; input?: unknown };
+    const texts = previewEntries(parsed);
     const lastUser = [...texts].reverse().find((item) => item.role === "user");
     const source = lastUser ?? texts[texts.length - 1];
     const text = source ? source.text.replace(/\s+/g, " ").trim() : "";

@@ -226,6 +226,43 @@ test("record summaries expose list metadata without bodies", async () => {
   });
 });
 
+test("record summaries preview Responses API input", async () => {
+  await withTempStore(async (store) => {
+    await store.updateSettings({ recordMessages: true });
+    await store.appendDebugRecord({
+      id: "dbg_resp_items",
+      at: timestamp(1),
+      endpoint: "/v1/responses",
+      clientRequest: {
+        contentType: "application/json",
+        body: JSON.stringify({
+          model: "gpt-5",
+          input: [
+            { type: "message", role: "user", content: [{ type: "input_text", text: "第一条 输入" }] },
+            { type: "function_call_output", call_id: "call_1", output: { content: [{ type: "output_text", text: "工具结果" }] } },
+            { type: "message", role: "user", content: [{ type: "input_text", text: "最后一条 输入" }] },
+          ],
+        }),
+      },
+      status: 200,
+    });
+    await store.appendDebugRecord({
+      id: "dbg_resp_string",
+      at: timestamp(2),
+      endpoint: "/v1/responses",
+      clientRequest: {
+        contentType: "application/json",
+        body: JSON.stringify({ model: "gpt-5", input: "字符串 输入" }),
+      },
+      status: 200,
+    });
+    const summaries = await store.listDebugRecordSummaries();
+    assert.equal(summaries[0]?.preview, "字符串 输入");
+    assert.equal(summaries[0]?.model, "gpt-5");
+    assert.equal(summaries[1]?.preview, "最后一条 输入");
+  });
+});
+
 test("getDebugRecord loads a single full record on demand", async () => {
   await withTempStore(async (store) => {
     await store.updateSettings({ recordMessages: true });
