@@ -1,4 +1,4 @@
-import type { Dispatcher } from "undici";
+import { fetch as undiciFetch, type Dispatcher } from "undici";
 import { stateStore } from "~/server/utils/state-store.ts";
 import { getProxyConfig } from "~/server/utils/config.ts";
 import { proxyDispatcher } from "~/server/utils/proxy.ts";
@@ -125,11 +125,11 @@ async function portalFetch(input: string, init: RequestInit, clientSignal?: Abor
   };
   armTimeout();
   try {
-    const response = await fetch(input, {
+    const response = await undiciFetch(input, {
       ...init,
       signal: controller.signal,
       ...(dispatcher ? { dispatcher } : {}),
-    } as RequestInit);
+    } as Parameters<typeof undiciFetch>[1]) as unknown as Response;
     clearTimeoutTimer();
     if (!response.body) {
       finish();
