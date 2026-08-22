@@ -166,7 +166,7 @@ const config = reactive({
   clientApiKeyRequired: false,
   defaultModel: "",
   toolCallFormat: "auto" as ToolCallFormat,
-  preambleVerbosity: "normal" as PreambleVerbosity,
+  preambleVerbosity: "milestone" as PreambleVerbosity,
 });
 const newAccount = reactive({ label: "", email: "", password: "", weight: 1, proxy: "" });
 const isLoading = ref(false);
@@ -1498,9 +1498,9 @@ onUnmounted(() => {
             <label class="toolcall-field">
               <span>进度播报（preamble）</span>
               <select :value="effectivePreambleVerbosity" @change="onPreambleVerbosityChange">
-                <option value="normal">normal · 关键步骤播报（推荐）</option>
+                <option value="milestone">milestone · 里程碑播报（推荐）</option>
+                <option value="normal">normal · 关键步骤播报</option>
                 <option value="verbose">verbose · 每步都播报</option>
-                <option value="milestone">milestone · 里程碑播报</option>
                 <option value="quiet">quiet · 默认静默</option>
               </select>
             </label>

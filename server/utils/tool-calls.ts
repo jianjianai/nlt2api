@@ -74,11 +74,14 @@ export type ToolCallFormat = "auto" | "json" | "xml";
 export type PreambleVerbosity = "quiet" | "normal" | "verbose" | "milestone";
 
 /**
- * Default preamble posture. "normal" fixes the failure mode of the previous
- * omit-by-default wording, which instruction-following models over-complied
- * with, producing no visible output until the final answer.
+ * Default preamble posture. "milestone" narrates only meaningful milestones
+ * (accepting the request, an important discovery, concrete progress, or a
+ * plan change), keeping routine steps silent while still fixing the failure
+ * mode of the old omit-by-default wording, which instruction-following
+ * models over-complied with, producing no visible output until the final
+ * answer.
  */
-export const DEFAULT_PREAMBLE_VERBOSITY: PreambleVerbosity = "normal";
+export const DEFAULT_PREAMBLE_VERBOSITY: PreambleVerbosity = "milestone";
 
 // The channel rule folds the no-native enumeration in as an appositive: the
 // gateway reading no other channel is exactly why native fields never work.

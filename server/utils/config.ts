@@ -48,7 +48,7 @@ export function getProxyConfig(): ProxyConfig {
   const rawMaxChatMessages = Number(process.env.NEURALWATT_MAX_CHAT_MESSAGES ?? "10000");
   const rawUpstreamTimeoutMs = Number(process.env.NEURALWATT_UPSTREAM_TIMEOUT_MS ?? "120000");
   const rawToolCallFormat = process.env.NEURALWATT_TOOL_CALL_FORMAT ?? "auto";
-  const rawPreambleVerbosity = process.env.NEURALWATT_PREAMBLE_VERBOSITY ?? "normal";
+  const rawPreambleVerbosity = process.env.NEURALWATT_PREAMBLE_VERBOSITY ?? "milestone";
   cachedConfig = {
     adminToken: process.env.NEURALWATT_ADMIN_TOKEN ?? "",
     apiKey: process.env.NEURALWATT_API_KEY ?? "",
@@ -56,7 +56,7 @@ export function getProxyConfig(): ProxyConfig {
     dataDir: resolve(process.env.NEURALWATT_DATA_DIR ?? ".data/neuralwatt"),
     defaultModel: process.env.NEURALWATT_DEFAULT_MODEL ?? "kimi-k3-fast",
     toolCallFormat: rawToolCallFormat === "json" || rawToolCallFormat === "xml" ? rawToolCallFormat : "auto",
-    preambleVerbosity: rawPreambleVerbosity === "quiet" || rawPreambleVerbosity === "verbose" || rawPreambleVerbosity === "milestone" ? rawPreambleVerbosity : "normal",
+    preambleVerbosity: rawPreambleVerbosity === "quiet" || rawPreambleVerbosity === "normal" || rawPreambleVerbosity === "verbose" ? rawPreambleVerbosity : "milestone",
     maxRequestBytes: Number.isFinite(rawMaxRequestBytes) && rawMaxRequestBytes > 0
       ? Math.floor(rawMaxRequestBytes)
       : 67_108_864,

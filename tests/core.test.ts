@@ -716,9 +716,9 @@ test("tool contracts preserve descriptions and every JSON Schema constraint", ()
   }];
   const text = String(withToolCallContract([{ role: "user", content: "write" }], constrained, "required")[0]?.content);
   assert.match(text, /Write exactly one UTF-8 file/);
-  // The default verbosity is normal: narrate non-trivial steps in one sentence.
+  // The default verbosity is milestone: narrate only meaningful milestones.
   assert.match(text, /Include a one-sentence preamble/);
-  assert.match(text, /trivially implied/);
+  assert.match(text, /only at meaningful milestones/);
   assert.match(text, /never claim a tool already succeeded/);
   assert.match(text, /"multipleOf":0\.25/);
   assert.match(text, /"dependentRequired"/);

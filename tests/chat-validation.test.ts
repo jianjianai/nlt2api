@@ -92,8 +92,8 @@ test("resolveToolCallPolicy prefers per-model, then global, then env defaults", 
   await withEmptyDataDir(async () => {
     stateStore.resetForTests();
     try {
-      // Env defaults: format auto, preamble verbosity normal.
-      assert.deepEqual(await resolveToolCallPolicy("model-a"), { format: "auto", preambleVerbosity: "normal" });
+      // Env defaults: format auto, preamble verbosity milestone.
+      assert.deepEqual(await resolveToolCallPolicy("model-a"), { format: "auto", preambleVerbosity: "milestone" });
 
       await stateStore.updateSettings({ toolCallFormat: "json", preambleVerbosity: "quiet" });
       assert.deepEqual(await resolveToolCallPolicy("model-a"), { format: "json", preambleVerbosity: "quiet" });
@@ -109,7 +109,7 @@ test("resolveToolCallPolicy prefers per-model, then global, then env defaults", 
 
       // Clearing returns to the env defaults.
       await stateStore.updateSettings({ toolCallFormat: null, preambleVerbosity: null, modelToolCallFormats: null, modelPreambleVerbosities: null });
-      assert.deepEqual(await resolveToolCallPolicy("model-a"), { format: "auto", preambleVerbosity: "normal" });
+      assert.deepEqual(await resolveToolCallPolicy("model-a"), { format: "auto", preambleVerbosity: "milestone" });
     } finally {
       stateStore.resetForTests();
     }
