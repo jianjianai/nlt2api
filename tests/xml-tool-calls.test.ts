@@ -569,6 +569,68 @@ test("sibling parameters still terminate at their own close tags", () => {
   assert.deepEqual(JSON.parse(result.envelope.toolCalls[0]!.function.arguments), { a: 1, b: 2 });
 });
 
+test("stray special-token artifacts after a close tag are ignored", () => {
+  // The observed failure mode: the model closes the parameter, then emits
+  // stray special-token artifacts (</｜DSML｜>) instead of the call close.
+  // The structural level accepts only known tags, so the artifacts are
+  // ignored and the value ends at its own close tag.
+  const result = parseControlledToolEnvelopeDetailed(
+    [
+      "<tool_calls>",
+      '<tool_call name="bash">',
+      '<parameter name="command">git ls-files | xargs grep -il "neuralwatt" | wc -l</parameter>',
+      "</｜DSML｜>",
+      "</｜DSML｜>",
+      "</｜DSML｜>",
+    ].join("\n"),
+    shellTools,
+    "seed",
+  );
+  assert.equal(result.error, undefined);
+  assert.equal(result.repaired, true);
+  assert.equal(result.envelope?.type, "tool_calls");
+  if (result.envelope?.type !== "tool_calls") return;
+  assert.deepEqual(JSON.parse(result.envelope.toolCalls[0]!.function.arguments), {
+    command: 'git ls-files | xargs grep -il "neuralwatt" | wc -l',
+  });
+
+  // The same artifacts before a real call close parse with no repair at all.
+  const clean = parseControlledToolEnvelopeDetailed(
+    '<tool_calls><tool_call name="bash"><parameter name="command">ls</parameter></｜DSML｜></tool_call></tool_calls>',
+    shellTools,
+    "seed",
+  );
+  assert.equal(clean.error, undefined);
+  assert.equal(clean.repaired, undefined);
+  if (clean.envelope?.type !== "tool_calls") return;
+  assert.deepEqual(JSON.parse(clean.envelope.toolCalls[0]!.function.arguments), { command: "ls" });
+});
+
+test("a close tag followed by trailing text terminates at the last close", () => {
+  // <B>aaa</B>bbb parses as aaa: the trailing text carries no later close
+  // tag, so it is ignored junk rather than value text.
+  const trailing = parseControlledToolEnvelopeDetailed(
+    '<tool_calls><tool_call name="bash"><parameter name="command">aaa</parameter>bbb</tool_call></tool_calls>',
+    shellTools,
+    "seed",
+  );
+  assert.equal(trailing.error, undefined);
+  assert.equal(trailing.envelope?.type, "tool_calls");
+  if (trailing.envelope?.type !== "tool_calls") return;
+  assert.deepEqual(JSON.parse(trailing.envelope.toolCalls[0]!.function.arguments), { command: "aaa" });
+
+  // <B>aa<B>aaa</B>bbb parses as aa<B>aaa: a nested open tag is value text.
+  const nested = parseControlledToolEnvelopeDetailed(
+    '<tool_calls><tool_call name="bash"><parameter name="command">aa<parameter name="x">aaa</parameter>bbb</tool_call></tool_calls>',
+    shellTools,
+    "seed",
+  );
+  assert.equal(nested.error, undefined);
+  assert.equal(nested.envelope?.type, "tool_calls");
+  if (nested.envelope?.type !== "tool_calls") return;
+  assert.deepEqual(JSON.parse(nested.envelope.toolCalls[0]!.function.arguments), { command: 'aa<parameter name="x">aaa' });
+});
+
 test("unclosed-tag diagnostics name the tags left open", () => {
   // A document the repair pass cannot balance: the root itself never opened.
   const result = parseRepairXml("plain prose with no tags at all");

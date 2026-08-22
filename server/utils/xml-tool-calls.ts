@@ -10,10 +10,15 @@ import type { JsonObject, JsonValue, ToolDefinition } from "~/server/utils/types
  * so the adapter contract offers both envelopes and lets the model pick.
  *
  * Parsing is verbatim by design: a <parameter> value is always a raw string,
- * ending at the first </parameter> that is followed by a structural
- * continuation (a sibling <parameter>, a closing </tool_call> or </invoke>,
- * the closing </tool_calls>, another </parameter>, or the end of the input).
- * Embedded markup, angle brackets and ampersands are value text — models
+ * ending at the </parameter> followed by a structural continuation (a
+ * sibling <parameter>, a closing </tool_call> or </invoke>, the closing
+ * </tool_calls>, another </parameter>, or the end of the input). Whitespace
+ * and unrecognized tag-like tokens between the close tag and the
+ * continuation are ignored — the structural level accepts only known tags —
+ * and a close tag followed by plain text terminates the value unless another
+ * </parameter> appears before the next ancestor close or the end of the
+ * input (the last closing tag wins). Embedded markup, angle brackets and
+ * ampersands are value text — models
  * never escape entities or wrap values in CDATA (CDATA written under older
  * contracts is still unwrapped). A purpose-built envelope scanner implements
  * these semantics directly; when it finds no call at all, the strict
@@ -258,9 +263,9 @@ function readXmlTagAttribute(raw: string, name: string): string | undefined {
  * purpose-built scanner recovers the malformations generic XML parsers
  * cannot: raw `<` or embedded markup inside parameter values (e.g. Vue/HTML
  * code being edited), stray duplicate close tags, and alias close tags like
- * </invoke>. Parameter content is read as raw text up to the first
- * </parameter>, which is unambiguous because parameters never legitimately
- * contain child elements.
+ * </invoke>. Parameter content is read as raw text up to its terminating
+ * </parameter> (see readParameterValue), which is unambiguous because
+ * parameters never legitimately contain child elements.
  *
  * When the strict pass finds no call at all and the declared tool names are
  * known, a second pass also accepts the function-name-as-element
@@ -281,28 +286,74 @@ function scanEnvelopePass(text: string, toolNames?: Set<string>): { value: unkno
   const changes = new Set<string>();
   const n = text.length;
 
-  // A parameter value is raw text, parsed verbatim: it ends at the first
+  // A parameter value is raw text, parsed verbatim. It ends at the
   // </parameter> followed by a structural continuation — a sibling
   // <parameter>, a closing </tool_call> or </invoke>, the closing
   // </tool_calls>, another </parameter> (the duplicate-close failure mode),
-  // or the end of the input. An embedded </parameter> followed by anything
-  // else is value text, so values never need CDATA sections or escaping.
+  // or the end of the input. The structural level accepts only known tags
+  // and ignores everything else, so whitespace and unrecognized tag-like
+  // tokens (stray special-token artifacts like </｜DSML｜>, unknown elements)
+  // between the close tag and the continuation never make the close literal.
+  // A close tag followed by plain text still terminates the value unless
+  // another </parameter> appears before the next ancestor close or the end
+  // of the input — the last closing tag wins: <B>aaa</B>bbb</B> parses as
+  // aaa</B>bbb, while <B>aaa</B>bbb parses as aaa (the trailing text is
+  // ignored junk). Values therefore never need CDATA sections or escaping.
   const ANCESTOR_TERMINATORS = ["</tool_call", "</invoke", "</tool_calls"];
   const PARAMETER_BOUNDARIES = ["<parameter", "</parameter", ...ANCESTOR_TERMINATORS];
   const boundaryAfter = (pos: number): boolean => {
     const ch = text[pos];
     return ch === undefined || ch === ">" || ch === "/" || ch === " " || ch === "\t" || ch === "\n" || ch === "\r";
   };
+  // A tag-like token the envelope grammar does not recognize. `<!` (CDATA or
+  // a comment) and a `<` not followed by a name character are not tags.
+  const JUNK_TAG = /<\/?[^\s>/!][^\s>]*>/y;
+  // Scan the plain text following a candidate close tag: another
+  // </parameter> before the next ancestor close or the end of the input
+  // makes the candidate value text; otherwise the candidate terminates the
+  // value and the trailing text is ignored junk.
+  const terminatesAfterText = (from: number, extraBoundary?: string): boolean => {
+    const terminators = extraBoundary === undefined ? ANCESTOR_TERMINATORS : [...ANCESTOR_TERMINATORS, extraBoundary];
+    let cursor = from;
+    while (cursor < n) {
+      let ancestorAt = n;
+      for (const terminator of terminators) {
+        const at = text.indexOf(terminator, cursor);
+        if (at >= 0 && at < ancestorAt) {
+          ancestorAt = at;
+        }
+      }
+      const closeAt = text.indexOf("</parameter", cursor);
+      if (closeAt < 0 || closeAt > ancestorAt) {
+        return true;
+      }
+      if (boundaryAfter(closeAt + 11)) {
+        return false;
+      }
+      cursor = closeAt + 11;
+    }
+    return true;
+  };
   const isValueBoundary = (after: number, extraBoundary?: string): boolean => {
     let cursor = after;
-    while (cursor < n && /\s/.test(text[cursor]!)) cursor += 1;
-    if (cursor >= n) {
-      return true;
+    for (;;) {
+      while (cursor < n && /\s/.test(text[cursor]!)) cursor += 1;
+      if (cursor >= n) {
+        return true;
+      }
+      if (extraBoundary !== undefined && text.startsWith(extraBoundary, cursor)) {
+        return true;
+      }
+      if (PARAMETER_BOUNDARIES.some((boundary) => text.startsWith(boundary, cursor))) {
+        return true;
+      }
+      JUNK_TAG.lastIndex = cursor;
+      const junk = JUNK_TAG.exec(text);
+      if (!junk) {
+        return terminatesAfterText(cursor, extraBoundary);
+      }
+      cursor = JUNK_TAG.lastIndex;
     }
-    if (extraBoundary !== undefined && text.startsWith(extraBoundary, cursor)) {
-      return true;
-    }
-    return PARAMETER_BOUNDARIES.some((boundary) => text.startsWith(boundary, cursor));
   };
   // callClose is the current call element's own close tag (e.g. </bash for
   // the function-name-as-element form); it terminates a value exactly like
@@ -330,8 +381,8 @@ function scanEnvelopePass(text: string, toolNames?: Set<string>): { value: unkno
         if (isValueBoundary(end, callClose)) {
           return { value, end };
         }
-        // An embedded </parameter> with no structural continuation after it
-        // is literal value text.
+        // An embedded </parameter> followed by plain text and a later close
+        // tag is literal value text.
         value += text.slice(cursor, end);
         cursor = end;
         continue;
