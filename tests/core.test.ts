@@ -15,7 +15,7 @@ import {
   parseControlledToolEnvelope,
   parseControlledToolEnvelopeDetailed,
   parseRepairJson,
-  toolCallContract,
+  legacyToolCallContract313,
   withToolCallContract,
 } from "../server/utils/tool-calls.ts";
 import {
@@ -726,9 +726,9 @@ test("tool contracts preserve descriptions and every JSON Schema constraint", ()
 
 test("contracts carrying legacy sentence wordings still strip cleanly", () => {
   // Simulate a history written before the XML-rules and no-prose rewording:
-  // build the current contract, swap in the legacy sentences, and verify
+  // build the 3.13.0 contract, swap in the older sentences, and verify
   // re-application strips it instead of stacking a second contract.
-  const legacy = toolCallContract("xml", "normal")
+  const legacy = legacyToolCallContract313("xml", "normal")
     .replace(
       "In the XML format, put the function name in the <tool_call> name attribute and write each argument as a <parameter name=\"...\"> element, typed against the declared XML schema (numbers and booleans without quotes, arrays and objects as JSON text). Parameter values are raw text parsed verbatim: never escape entities or wrap values in CDATA, even when they contain angle brackets, markup, or code.",
       "In the XML format, put the function name in the <tool_call> name attribute and write each argument as a <parameter name=\"...\"> element, typed against the declared JSON Schema (numbers and booleans without quotes, arrays and objects as JSON text); escape & as &amp; and < as &lt; inside values, or wrap free-form text in <![CDATA[...]]>.",
@@ -751,6 +751,25 @@ test("contracts carrying legacy sentence wordings still strip cleanly", () => {
   );
   const system = String(reapplied[0]?.content);
   assert.equal(system.split("IMPORTANT ADAPTER OVERRIDE").length - 1, 1);
+});
+
+test("a 3.13.0 contract in history strips cleanly on re-application", () => {
+  for (const format of ["auto", "json", "xml"] as const) {
+    for (const verbosity of ["quiet", "normal", "verbose"] as const) {
+      const legacySystem = `Be nice.\n\n${legacyToolCallContract313(format, verbosity)}`;
+      const contracted = withToolCallContract(
+        [{ role: "system" as const, content: legacySystem }, { role: "user" as const, content: "hi" }],
+        tools,
+        "auto",
+        true,
+        format,
+        verbosity,
+      );
+      const system = String(contracted[0]?.content);
+      assert.equal(system.split("IMPORTANT ADAPTER OVERRIDE").length - 1, 1, `${format}/${verbosity}`);
+      assert.equal(system.split("Be nice.").length - 1, 1, `${format}/${verbosity}`);
+    }
+  }
 });
 
 test("quiet verbosity keeps the legacy omit-by-default preamble wording", () => {
