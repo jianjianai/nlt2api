@@ -262,6 +262,8 @@ export interface ValidatedChatRequest {
   model: string;
   messages: ChatMessage[];
   tools: ToolDefinition[];
+  /** The policy the contract was applied with; repair re-encoding reuses it. */
+  toolCallPolicy: ToolCallPolicy;
   /**
    * Portal-ready messages built during validation (contract applied, system
    * messages merged, schemas serialized). Execution reuses them instead of
@@ -311,8 +313,9 @@ export function validateChatRequest(request: JsonObject, toolCallPolicy?: ToolCa
   if (request.n !== undefined && request.n !== 1) {
     throw new HttpError(400, "Only n=1 is supported by the portal adapter.", "invalid_request_error", "n");
   }
-  const built = upstreamBody(request, model, messages, tools, false, undefined, toolCallPolicy);
-  return { model, messages, tools, upstreamMessages: built.messages };
+  const policy = toolCallPolicy ?? envToolCallPolicy();
+  const built = upstreamBody(request, model, messages, tools, false, undefined, policy);
+  return { model, messages, tools, toolCallPolicy: policy, upstreamMessages: built.messages };
 }
 
 /**
@@ -331,7 +334,7 @@ export async function assertModelSupported(model: string): Promise<void> {
   }
 }
 
-function portalMessages(messages: ChatMessage[], markFinalReplies = false): ChatMessage[] {
+function portalMessages(messages: ChatMessage[], markFinalReplies = false, toolCallFormat: ToolCallFormat = "json"): ChatMessage[] {
   // The Playground currently rejects the OpenAI `developer` role. Map it to
   // system, then normalize all system instructions into one message at index 0.
   const mapped = messages.map((message) => {
@@ -355,7 +358,7 @@ function portalMessages(messages: ChatMessage[], markFinalReplies = false): Chat
     }
     return normalized;
   });
-  return mergeSystemMessages(serializeAssistantToolCallsForPortal(mapped));
+  return mergeSystemMessages(serializeAssistantToolCallsForPortal(mapped, toolCallFormat));
 }
 
 function upstreamBody(
@@ -390,7 +393,7 @@ function upstreamBody(
   const policy = toolCallPolicy ?? envToolCallPolicy();
   const upstreamMessages = prebuiltMessages ?? (toolTurn
     ? withToolCallContract(
-      portalMessages(messages, true),
+      portalMessages(messages, true, policy.format),
       tools,
       toolChoice,
       parallelToolCalls,
@@ -1101,7 +1104,7 @@ async function executeChatRequestOnce(
     toolCallPolicy?: ToolCallPolicy;
   },
 ): Promise<ChatExecution> {
-  const { model, messages, tools, upstreamMessages: prebuiltMessages } = options?.validated ?? validateChatRequest(request, options?.toolCallPolicy);
+  const { model, messages, tools, toolCallPolicy, upstreamMessages: prebuiltMessages } = options?.validated ?? validateChatRequest(request, options?.toolCallPolicy);
 
   const toolTurn = tools.length > 0 && request.tool_choice !== "none";
   const observedToolCallIds = messages
@@ -1205,7 +1208,7 @@ async function executeChatRequestOnce(
       const repairHistory = buildToolRepairHistory(
         contractedOriginalMessages,
         repairCandidate.message,
-        ...repairMessages({
+        repairMessages({
           error,
           attempt: toolCallAdapter.repairAttempts,
           candidate: repairCandidate.message,
@@ -1213,6 +1216,7 @@ async function executeChatRequestOnce(
           toolChoice: request.tool_choice,
           parallelToolCalls: request.parallel_tool_calls !== false,
         }),
+        toolCallPolicy.format,
       );
       const repairStream = Boolean(options?.onRepairReasoning);
       upstreamRequest = {

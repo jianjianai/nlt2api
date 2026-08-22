@@ -329,7 +329,7 @@ test("repair history replaces the failed candidate and retains initial reasoning
       content: '{"type":"tool_calls","tool_calls":[{"name":"read","arguments":{path:"package.json"}}]}',
       reasoning: "thinking 1",
     },
-    { role: "user", content: "JSON parse failed: Unexpected token p" },
+    [{ role: "user", content: "JSON parse failed: Unexpected token p" }],
   );
   const second = buildToolRepairHistory(
     original,
@@ -338,7 +338,7 @@ test("repair history replaces the failed candidate and retains initial reasoning
       content: '{"type":"tool_calls","tool_calls":[{"name":"read","arguments":{"path":"package.json"}}]',
       reasoning: "thinking 1",
     },
-    { role: "user", content: "JSON parse failed: Unexpected end of JSON input" },
+    [{ role: "user", content: "JSON parse failed: Unexpected end of JSON input" }],
   );
 
   assert.deepEqual(first.map((message) => message.role), ["user", "assistant", "user"]);
@@ -371,7 +371,7 @@ test("repair history retains prior tool output and structured candidate calls", 
       reasoning: "thinking 1",
       tool_calls: [candidateCall],
     },
-    { role: "user", content: "JSON parse failed: Unexpected end of JSON input" },
+    [{ role: "user", content: "JSON parse failed: Unexpected end of JSON input" }],
   );
 
   assert.deepEqual(history.map((message) => message.role), ["user", "assistant", "tool", "assistant", "user"]);
@@ -397,7 +397,7 @@ test("repair history serializes candidate native calls into the content envelope
   const history = buildToolRepairHistory(
     [{ role: "user" as const, content: "calculate" }],
     { role: "assistant" as const, content: "let me compute", tool_calls: [candidateCall] },
-    { role: "user" as const, content: "Validation error: arguments failed the schema" },
+    [{ role: "user" as const, content: "Validation error: arguments failed the schema" }],
   );
   const candidate = history[1];
   assert.equal(candidate?.role, "assistant");
@@ -417,7 +417,7 @@ test("repair history keeps the reminder before the failed candidate and error", 
   const history = buildToolRepairHistory(
     contracted,
     { role: "assistant" as const, content: '{"type":"tool_calls","tool_calls":[{"name":"calculator","arguments":{"a":1' },
-    { role: "user" as const, content: "JSON parse failed; retry" },
+    [{ role: "user" as const, content: "JSON parse failed; retry" }],
   );
   assert.deepEqual(history.map((message) => message.role), ["system", "user", "user", "assistant", "user"]);
   assert.equal(history[1]?.content, "read package.json");
@@ -436,8 +436,10 @@ test("repair history separates the rejection result from the correction instruct
   const history = buildToolRepairHistory(
     contracted,
     { role: "assistant" as const, content: '{"type":"tool_calls","tool_calls":[{"name":"calculator","arguments":{"a":1' },
-    { role: "tool" as const, tool_call_id: "call_repair_1", content: "The previous tool call failed validation.\n\nRejection details:\nJSON parse failed; retry" },
-    { role: "user" as const, content: "Tool-call repair attempt 1. Return only the corrected envelope JSON object.\nRules:\n- Use the required envelope and a declared function name." },
+    [
+      { role: "tool" as const, tool_call_id: "call_repair_1", content: "The previous tool call failed validation.\n\nRejection details:\nJSON parse failed; retry" },
+      { role: "user" as const, content: "Tool-call repair attempt 1. Return only the corrected envelope JSON object.\nRules:\n- Use the required envelope and a declared function name." },
+    ],
   );
   assert.deepEqual(history.map((message) => message.role), ["system", "user", "user", "assistant", "tool", "user"]);
   assert.equal(history[3]?.role, "assistant");

@@ -369,7 +369,8 @@ export class InvalidStructuredToolCallsError extends Error {
 export function buildToolRepairHistory(
   originalHistory: ChatMessage[],
   candidate: ChatMessage,
-  ...repairs: ChatMessage[]
+  repairs: ChatMessage[],
+  format: ToolCallFormat = "json",
 ): ChatMessage[] {
   // The failed candidate must model the same content-envelope format the
   // contract demands: native tool_calls fields never reach the portal, even
@@ -379,7 +380,7 @@ export function buildToolRepairHistory(
   let serialized = candidate;
   if (candidate.tool_calls?.length) {
     try {
-      serialized = serializeAssistantToolCallsForPortal([candidate])[0] ?? candidate;
+      serialized = serializeAssistantToolCallsForPortal([candidate], format)[0] ?? candidate;
     } catch {
       // Unserializable calls stay textual: repairCandidateFrom already folded
       // their raw form into the candidate content.
@@ -624,11 +625,52 @@ export function normaliseAssistantToolCalls(
   };
 }
 
+function xmlEscapeText(value: string): string {
+  return value.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+function xmlEscapeAttribute(value: string): string {
+  return xmlEscapeText(value).replace(/"/g, "&quot;");
+}
+
+/**
+ * Re-encode validated calls in the wire format the contract offers, so the
+ * history models the same format the model is asked to emit: a pinned XML
+ * contract with JSON envelopes in history would nudge the model back to JSON.
+ * "auto"/"json" use the canonical JSON envelope; "xml" uses the XML envelope.
+ */
+function toolCallsEnvelopeContent(
+  preamble: string,
+  toolCalls: { name: string; arguments: JsonObject }[],
+  format: ToolCallFormat,
+): string {
+  if (format === "xml") {
+    const calls = toolCalls.map((call) => {
+      const parameters = Object.entries(call.arguments)
+        .filter((entry): entry is [string, JsonValue] => entry[1] !== undefined)
+        .map(([key, value]) => {
+          // Mirror the contract's XML typing: strings as text, numbers and
+          // booleans bare, arrays and objects as JSON text.
+          const serialized = typeof value === "string" ? value : JSON.stringify(value);
+          return `<parameter name="${xmlEscapeAttribute(key)}">${xmlEscapeText(serialized)}</parameter>`;
+        })
+        .join("");
+      return `<tool_call name="${xmlEscapeAttribute(call.name)}">${parameters}</tool_call>`;
+    }).join("");
+    return `<tool_calls>${preamble ? `<preamble>${xmlEscapeText(preamble)}</preamble>` : ""}${calls}</tool_calls>`;
+  }
+  return JSON.stringify({
+    type: "tool_calls",
+    ...(preamble ? { preamble } : {}),
+    tool_calls: toolCalls,
+  });
+}
+
 /**
  * The portal does not need the client's native tool-call fields in history.
  * Re-encode them using the same content envelope the model is asked to emit.
  */
-export function serializeAssistantToolCallsForPortal(messages: ChatMessage[]): ChatMessage[] {
+export function serializeAssistantToolCallsForPortal(messages: ChatMessage[], format: ToolCallFormat = "json"): ChatMessage[] {
   return messages.map((message) => {
     if (message.role !== "assistant" || !message.tool_calls?.length) {
       return message;
@@ -649,11 +691,7 @@ export function serializeAssistantToolCallsForPortal(messages: ChatMessage[]): C
     const preamble = typeof message.content === "string" ? message.content.trim() : "";
     const converted = {
       ...message,
-      content: JSON.stringify({
-        type: "tool_calls",
-        ...(preamble ? { preamble } : {}),
-        tool_calls: toolCalls,
-      }),
+      content: toolCallsEnvelopeContent(preamble, toolCalls, format),
     };
     delete converted.tool_calls;
     return converted;
@@ -742,7 +780,7 @@ export function withToolCallContract(
     ...(forcedName ? [`You must call only the function named '${forcedName}'.`] : []),
     ...(!parallelToolCalls ? ["Return at most one tool call."] : []),
   ].join(" ");
-  const withoutOldContract = serializeAssistantToolCallsForPortal(messages)
+  const withoutOldContract = serializeAssistantToolCallsForPortal(messages, format)
     .filter((message) => !isToolTurnReminder(message))
     .map((message) => {
       if (message.role !== "system" && message.role !== "developer") {

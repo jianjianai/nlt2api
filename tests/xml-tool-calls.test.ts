@@ -422,6 +422,55 @@ test("the contract and reminder follow the configured preamble verbosity", () =>
   assert.match(verboseReminder, /Include a short `preamble` saying what you are doing next\./);
 });
 
+test("history tool calls are re-encoded in the contract's wire format", () => {
+  const history = [
+    { role: "user" as const, content: "calc" },
+    {
+      role: "assistant" as const,
+      content: "Computing now.",
+      tool_calls: [{ id: "call_1", type: "function" as const, function: { name: "calculator", arguments: '{"a":1,"b":2}' } }],
+    },
+    { role: "tool" as const, tool_call_id: "call_1", content: "3" },
+  ];
+
+  // A pinned XML contract must not leave JSON envelopes in the history: the
+  // model imitates the format it sees.
+  const xml = withToolCallContract(history, tools, "auto", true, "xml");
+  const xmlAssistant = xml.find((message) => message.role === "assistant");
+  assert.equal(
+    xmlAssistant?.content,
+    '<tool_calls><preamble>Computing now.</preamble><tool_call name="calculator"><parameter name="a">1</parameter><parameter name="b">2</parameter></tool_call></tool_calls>',
+  );
+  assert.equal(xmlAssistant?.tool_calls, undefined);
+
+  // JSON and auto keep the canonical JSON envelope.
+  for (const format of ["json", "auto"] as const) {
+    const contracted = withToolCallContract(history, tools, "auto", true, format);
+    const assistant = contracted.find((message) => message.role === "assistant");
+    const envelope = JSON.parse(String(assistant?.content));
+    assert.equal(envelope.type, "tool_calls", format);
+    assert.equal(envelope.preamble, "Computing now.", format);
+    assert.deepEqual(envelope.tool_calls, [{ name: "calculator", arguments: { a: 1, b: 2 } }], format);
+  }
+});
+
+test("XML history re-encoding escapes markup in names, keys and values", () => {
+  const history = [
+    { role: "user" as const, content: "calc" },
+    {
+      role: "assistant" as const,
+      content: "5 < 6 & 7 > 4",
+      tool_calls: [{ id: "call_1", type: "function" as const, function: { name: "calculator", arguments: '{"a":1,"b":2}' } }],
+    },
+  ];
+  const contracted = withToolCallContract(history, tools, "auto", true, "xml");
+  const assistant = contracted.find((message) => message.role === "assistant");
+  assert.equal(
+    assistant?.content,
+    '<tool_calls><preamble>5 &lt; 6 &amp; 7 &gt; 4</preamble><tool_call name="calculator"><parameter name="a">1</parameter><parameter name="b">2</parameter></tool_call></tool_calls>',
+  );
+});
+
 test("contract re-application strips every verbosity variant", () => {
   for (const verbosity of ["quiet", "normal", "verbose"] as const) {
     const first = withToolCallContract(
