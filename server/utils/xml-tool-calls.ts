@@ -908,6 +908,7 @@ function schemaNodeToXml(
   required: boolean,
   indent: string,
   childElement: string,
+  omitObjectType = false,
 ): string {
   const attributes: string[] = [];
   if (name !== undefined) {
@@ -916,7 +917,10 @@ function schemaNodeToXml(
   const children: string[] = [];
   if (schema) {
     const type = schemaType(schema);
-    if (type) {
+    // The root <parameters> element is always the function's argument object,
+    // so its type="object" is uniform boilerplate and elided; nested object
+    // properties keep the attribute because it distinguishes them from arrays.
+    if (type && !(omitObjectType && type === "object")) {
       attributes.push(`type="${type}"`);
     }
     if (required) {
@@ -991,7 +995,7 @@ export function toolDefinitionsToXml(tools: ToolDefinition[]): string {
       lines.push(`  <description>${escapeXmlText(tool.function.description.trim())}</description>`);
     }
     const parameters = objectValue(tool.function.parameters) ?? { type: "object" };
-    lines.push(schemaNodeToXml("parameters", undefined, parameters, false, "  ", "parameter"));
+    lines.push(schemaNodeToXml("parameters", undefined, parameters, false, "  ", "parameter", true));
     return `<function name="${escapeXmlAttribute(tool.function.name)}">\n${lines.join("\n")}\n</function>`;
   });
   return `<functions>\n${rendered.join("\n")}\n</functions>`;

@@ -797,7 +797,8 @@ test("tool definition XML keeps enums, constraints and map value types", () => {
     },
   }];
   const xml = toolDefinitionsToXml(complexTools);
-  assert.match(xml, /<parameters type="object" additionalProperties="false">/);
+  // The root <parameters> element elides the uniform type="object" boilerplate.
+  assert.match(xml, /<parameters additionalProperties="false">/);
   assert.match(xml, /<value>bash<\/value>/);
   assert.match(xml, /<parameter name="env" type="object" minProperties="2">/);
   assert.match(xml, /<additionalProperties type="string"\/>/);

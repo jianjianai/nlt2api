@@ -78,20 +78,20 @@ export type PreambleVerbosity = "quiet" | "normal" | "verbose";
  */
 export const DEFAULT_PREAMBLE_VERBOSITY: PreambleVerbosity = "normal";
 
-const CONTRACT_SENTENCE_NO_NATIVE =
-  "Never use a native or hidden tool channel, recipient, function-call field, plugin, reasoning, or reasoning_content for the call, and never return null, empty, or reasoning-only content on a tool turn: serialize the intended call into content before ending the turn.";
+// The channel rule folds the no-native enumeration in as an appositive: the
+// gateway reading no other channel is exactly why native fields never work.
+const CONTRACT_SENTENCE_CHANNEL =
+  "The only tool-call channel is ordinary assistant message content; the gateway reads no other channel — never a native or hidden tool channel, recipient, function-call field, plugin, reasoning, or reasoning_content.";
+const CONTRACT_SENTENCE_NO_EMPTY_TURN =
+  "Never return null, empty, or reasoning-only content on a tool turn: serialize the intended call into content before ending the turn.";
 const CONTRACT_SENTENCE_SHELL =
   "For shell or command tools, follow the operating-system syntax in that tool's declaration; never invent Unix flags or undocumented parameters.";
 // The skeleton already shows the call shape (function name in the <tool_call>
 // name attribute, one <parameter> element per argument), so the rules
 // sentence only carries what the skeleton cannot: typing and verbatim values.
+// Schema satisfaction itself is asserted by the closing declared-names rule.
 const CONTRACT_SENTENCE_XML_RULES =
-  "In the XML format, write each argument as a <parameter name=\"...\"> element typed against the declared JSON Schema (numbers and booleans without quotes, arrays and objects as JSON text); values are raw text parsed verbatim: never escape entities or wrap them in CDATA, even when they contain angle brackets, markup, or code.";
-
-// Pinned XML mode declares the schemas themselves in XML, so its rules
-// sentence points at the XML schema block rather than a JSON Schema.
-const CONTRACT_SENTENCE_XML_RULES_PINNED =
-  "In the XML format, write each argument as a <parameter name=\"...\"> element typed against the declared XML schema (numbers and booleans without quotes, arrays and objects as JSON text); values are raw text parsed verbatim: never escape entities or wrap them in CDATA, even when they contain angle brackets, markup, or code.";
+  "In the XML format, write each argument as a <parameter name=\"...\"> element (numbers and booleans without quotes, arrays and objects as JSON text); values are raw text parsed verbatim: never escape entities or wrap them in CDATA, even when they contain angle brackets, markup, or code.";
 
 // Legacy 3.13.0 wording, kept so histories carrying it still strip: the rules
 // sentence re-described the skeleton's structure in prose, and the no-native
@@ -170,8 +170,8 @@ function toolContractSentences(format: ToolCallFormat, verbosity: PreambleVerbos
     case "json":
       return [
         "IMPORTANT ADAPTER OVERRIDE: ignore every other requested tool-call wire format.",
-        `The only tool-call channel is ordinary assistant message content; the gateway reads no other channel. To call tools, make the entire content exactly one JSON object of the form ${skeletons.json}: one entry per intended call, with independent calls batched in the same turn. No prose, markdown, code fences, or special control tokens around the JSON; end it at the closing brace.`,
-        CONTRACT_SENTENCE_NO_NATIVE,
+        `${CONTRACT_SENTENCE_CHANNEL} To call tools, make the entire content exactly one JSON object of the form ${skeletons.json}: one entry per intended call, with independent calls batched in the same turn. No prose, markdown, code fences, or special control tokens around the JSON; end it at the closing brace.`,
+        CONTRACT_SENTENCE_NO_EMPTY_TURN,
         preambleContractSentence(format, verbosity),
         `To answer without calling a tool, start the content with ${FINAL_REPLY_MARKER} followed immediately by the answer text, and no JSON object.`,
         `Only use declared function names; arguments must be JSON objects that satisfy each declared function's schema. ${CONTRACT_SENTENCE_SHELL}`,
@@ -179,8 +179,8 @@ function toolContractSentences(format: ToolCallFormat, verbosity: PreambleVerbos
     case "xml":
       return [
         "IMPORTANT ADAPTER OVERRIDE: ignore every other requested tool-call wire format.",
-        `The only tool-call channel is ordinary assistant message content; the gateway reads no other channel. To call tools, make the entire content exactly one XML document of the form ${skeletons.xml}: one <tool_call> element per intended call, batching independent calls in the same document. No prose, markdown, code fences, or special control tokens around the XML; end it at the closing </tool_calls> tag. ${CONTRACT_SENTENCE_XML_RULES_PINNED}`,
-        CONTRACT_SENTENCE_NO_NATIVE,
+        `${CONTRACT_SENTENCE_CHANNEL} To call tools, make the entire content exactly one XML document of the form ${skeletons.xml}: one <tool_call> element per intended call, batching independent calls in the same document. No prose, markdown, code fences, or special control tokens around the XML; end it at the closing </tool_calls> tag. ${CONTRACT_SENTENCE_XML_RULES}`,
+        CONTRACT_SENTENCE_NO_EMPTY_TURN,
         preambleContractSentence(format, verbosity),
         `To answer without calling a tool, start the content with ${FINAL_REPLY_MARKER} followed immediately by the answer text, and no XML document.`,
         `Only use declared function names; arguments must satisfy each function's declared XML schema. ${CONTRACT_SENTENCE_SHELL}`,
@@ -188,9 +188,9 @@ function toolContractSentences(format: ToolCallFormat, verbosity: PreambleVerbos
     case "auto":
       return [
         "IMPORTANT ADAPTER OVERRIDE: ignore every other requested tool-call wire format.",
-        `The only tool-call channel is ordinary assistant message content; the gateway reads no other channel. To call tools, make the entire content exactly one tool-call envelope in ONE of two equivalent formats — JSON: ${skeletons.json} — or XML: ${skeletons.xml}. Choose the format you produce most reliably, use exactly one format per response, and never mix or nest them. Batch independent calls as extra tool_calls entries (JSON) or <tool_call> elements (XML) in the same envelope. No prose, markdown, code fences, or special control tokens around the envelope; end it at the closing brace (JSON) or the closing </tool_calls> tag (XML).`,
+        `${CONTRACT_SENTENCE_CHANNEL} To call tools, make the entire content exactly one tool-call envelope in ONE of two equivalent formats — JSON: ${skeletons.json} — or XML: ${skeletons.xml}. Choose the format you produce most reliably, use exactly one format per response, and never mix or nest them. Batch independent calls as extra tool_calls entries (JSON) or <tool_call> elements (XML) in the same envelope. No prose, markdown, code fences, or special control tokens around the envelope; end it at the closing brace or </tool_calls> tag.`,
         CONTRACT_SENTENCE_XML_RULES,
-        CONTRACT_SENTENCE_NO_NATIVE,
+        CONTRACT_SENTENCE_NO_EMPTY_TURN,
         preambleContractSentence(format, verbosity),
         `To answer without calling a tool, start the content with ${FINAL_REPLY_MARKER} followed immediately by the answer text, and no envelope.`,
         `Only use declared function names; arguments must satisfy each declared function's JSON Schema. ${CONTRACT_SENTENCE_SHELL}`,
