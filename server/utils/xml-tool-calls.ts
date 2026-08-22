@@ -1,4 +1,4 @@
-import { XMLValidator } from "fast-xml-parser";
+import { SyntaxValidator } from "fast-xml-validator";
 import { jsonrepair } from "jsonrepair";
 import { parse as parseTolerantXml } from "txml";
 import type { JsonObject, JsonValue, ToolDefinition } from "~/server/utils/types.ts";
@@ -69,11 +69,21 @@ interface XmlValidationError {
 }
 
 function validateXml(text: string): XmlValidationError | undefined {
-  const result = XMLValidator.validate(text);
-  if (result === true) {
+  try {
+    // multipleRoots: false preserves the legacy XMLValidator behavior of
+    // rejecting more than one root-level element; the validator throws a
+    // ValidationError (code/message/line/col) instead of returning it.
+    SyntaxValidator.validate(text, { multipleRoots: false });
     return undefined;
+  } catch (error) {
+    const validationError = error as Partial<{ code: string; message: string; line: number; col: number }>;
+    return {
+      code: validationError.code ?? "InvalidXml",
+      msg: validationError.message ?? String(error),
+      line: validationError.line ?? 1,
+      col: validationError.col ?? 1,
+    };
   }
-  return (result as { err: XmlValidationError }).err;
 }
 
 export type XmlParseResult =
