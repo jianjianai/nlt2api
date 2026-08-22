@@ -168,7 +168,8 @@ textarea { min-height: 120px; resize: vertical; font-family: ui-monospace, SFMon
 .trace-endpoint { min-width: 0; flex: 1; overflow: hidden; color: var(--navy); font-size: 12px; font-weight: 700; text-overflow: ellipsis; white-space: nowrap; }
 .trace-time { flex: 0 0 auto; color: var(--muted); font-size: 10.5px; font-variant-numeric: tabular-nums; }
 .trace-preview { display: -webkit-box; overflow: hidden; color: #4c5962; font-size: 12px; line-height: 1.45; overflow-wrap: anywhere; -webkit-box-orient: vertical; -webkit-line-clamp: 2; }
-.trace-record-sub { overflow: hidden; color: var(--muted); font-size: 10.5px; text-overflow: ellipsis; white-space: nowrap; }
+.trace-record-sub { display: flex; align-items: center; gap: 6px; overflow: hidden; color: var(--muted); font-size: 10.5px; text-overflow: ellipsis; white-space: nowrap; }
+.trace-model { flex: 0 1 auto; overflow: hidden; padding: 0 6px; border-radius: 5px; color: var(--navy); background: #e4ecf5; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 10px; font-weight: 700; text-overflow: ellipsis; white-space: nowrap; }
 .trace-children { display: grid; gap: 2px; margin: 4px 0 2px 12px; border-left: 2px solid #d5dedb; padding-left: 6px; }
 .trace-child { display: grid; gap: 2px; border: 0; border-radius: 6px; padding: 6px 8px; background: transparent; text-align: left; }
 .trace-child:hover { background: #fff; }

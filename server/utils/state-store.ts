@@ -181,6 +181,19 @@ function recordPreview(record: DebugRecord): string {
   }
 }
 
+/** Model id from the client request body, when present. */
+function recordModel(record: DebugRecord): string | undefined {
+  try {
+    if (record.clientRequest.contentType !== "application/json") {
+      return undefined;
+    }
+    const parsed = JSON.parse(record.clientRequest.body) as { model?: unknown };
+    return typeof parsed.model === "string" && parsed.model ? parsed.model : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 /** True when the client request forces tool use via `tool_choice`. */
 function recordForcesTool(record: DebugRecord): boolean {
   try {
@@ -206,6 +219,7 @@ function summarizeRecord(record: DebugRecord): DebugRecordSummary {
     endpoint: record.endpoint,
     status: record.status,
     preview: recordPreview(record),
+    ...(recordModel(record) ? { model: recordModel(record) } : {}),
     ...(record.accountId ? { accountId: record.accountId } : {}),
     ...(record.accountLabel ? { accountLabel: record.accountLabel } : {}),
     ...(record.error ? { error: record.error } : {}),
@@ -588,7 +602,9 @@ export class StateStore {
         version?: number;
         entries?: Array<{ summary?: DebugRecordSummary; name?: string }>;
       };
-      if (parsed.version !== 1 || !Array.isArray(parsed.entries)) {
+      // Version 2: summaries gained the request `model` field, so indexes
+      // written by older versions are rebuilt from the record files.
+      if (parsed.version !== 2 || !Array.isArray(parsed.entries)) {
         return undefined;
       }
       const entries: RecordIndexEntry[] = [];
@@ -612,7 +628,7 @@ export class StateStore {
       await mkdir(dirname(target), { recursive: true });
       const temporary = `${target}.${process.pid}.${randomBytes(6).toString("hex")}.tmp`;
       const body = JSON.stringify({
-        version: 1,
+        version: 2,
         entries: index.map((entry) => ({ summary: entry.summary, name: basename(entry.file) })),
       });
       await writeFile(temporary, body, { encoding: "utf8", mode: 0o600 });

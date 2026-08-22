@@ -243,7 +243,7 @@ test("a fresh store reuses the persisted record index while it matches disk", as
     await store.appendDebugRecord(makeRecord("dbg_p1", timestamp(1)));
     await store.appendDebugRecord(makeRecord("dbg_p2", timestamp(2)));
     const persisted = JSON.parse(await readFile(join(dir, "records-index.json"), "utf8")) as { version: number; entries: unknown[] };
-    assert.equal(persisted.version, 1);
+    assert.equal(persisted.version, 2);
     assert.equal(persisted.entries.length, 2);
 
     const rebuilt = new StateStore();

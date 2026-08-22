@@ -87,6 +87,7 @@ interface DebugRecordSummary {
   id: string;
   at: string;
   endpoint: string;
+  model?: string;
   status: number;
   accountId?: string;
   accountLabel?: string;
@@ -1581,6 +1582,7 @@ onUnmounted(() => {
                   </span>
                   <span class="trace-preview">{{ item.record.preview }}</span>
                   <span class="trace-record-sub">
+                    <span v-if="item.record.model" class="trace-model">{{ item.record.model }}</span>
                     {{ item.record.accountLabel || "未分配账号" }}<template v-if="item.upstream.length"> · {{ item.upstream.length }} 次上游调用</template>
                   </span>
                 </button>

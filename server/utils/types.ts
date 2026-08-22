@@ -213,6 +213,8 @@ export interface DebugRecordSummary {
   id: string;
   at: string;
   endpoint: DebugRecord["endpoint"];
+  /** Model id from the client request body, when present. */
+  model?: string;
   status: number;
   accountId?: string;
   accountLabel?: string;
