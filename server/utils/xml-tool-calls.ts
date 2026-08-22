@@ -1,4 +1,5 @@
 import { XMLValidator } from "fast-xml-parser";
+import { jsonrepair } from "jsonrepair";
 import { parse as parseTolerantXml } from "txml";
 import type { JsonObject, JsonValue, ToolDefinition } from "~/server/utils/types.ts";
 
@@ -552,6 +553,25 @@ export function parseRepairXml(input: string): XmlParseResult {
   return { error: friendlyXmlParseError(trimmed, validationError, tolerantError) };
 }
 
+/**
+ * JSON text inside a parameter value gets the same repair pass as the JSON
+ * envelope: plain JSON.parse first, then jsonrepair for the common LLM
+ * malformations (trailing commas, single quotes, unquoted keys, truncated
+ * structures). Returns undefined when neither pass yields a value, so the
+ * caller can apply its own fallback (list splitting, raw string, Ajv error).
+ */
+function parseParameterJson(text: string): { value: unknown } | undefined {
+  try {
+    return { value: JSON.parse(text) };
+  } catch {
+    try {
+      return { value: JSON.parse(jsonrepair(text)) };
+    } catch {
+      return undefined;
+    }
+  }
+}
+
 function schemaType(schema: JsonObject | undefined): string | undefined {
   if (!schema) {
     return undefined;
@@ -634,11 +654,11 @@ function coerceString(text: string, schema: JsonObject | undefined, depth: numbe
     case "array": {
       const trimmed = text.trim();
       if (trimmed.startsWith("[")) {
-        try {
-          return coerceXmlValue(JSON.parse(trimmed), schema, depth + 1);
-        } catch {
-          // Fall through to the line/comma split.
+        const parsed = parseParameterJson(trimmed);
+        if (parsed) {
+          return coerceXmlValue(parsed.value, schema, depth + 1);
         }
+        // Fall through to the line/comma split.
       }
       const itemSchema = itemsSchema(schema);
       const parts = trimmed.includes("\n")
@@ -650,11 +670,8 @@ function coerceString(text: string, schema: JsonObject | undefined, depth: numbe
     case "object": {
       const trimmed = text.trim();
       if (trimmed.startsWith("{")) {
-        try {
-          return coerceXmlValue(JSON.parse(trimmed), schema, depth + 1);
-        } catch {
-          return text;
-        }
+        const parsed = parseParameterJson(trimmed);
+        return parsed ? coerceXmlValue(parsed.value, schema, depth + 1) : text;
       }
       return text;
     }
@@ -665,11 +682,8 @@ function coerceString(text: string, schema: JsonObject | undefined, depth: numbe
       // strings (including numeric-looking commands like "007") stay strings.
       const trimmed = text.trim();
       if ((trimmed.startsWith("{") && trimmed.endsWith("}")) || (trimmed.startsWith("[") && trimmed.endsWith("]"))) {
-        try {
-          return JSON.parse(trimmed);
-        } catch {
-          return text;
-        }
+        const parsed = parseParameterJson(trimmed);
+        return parsed ? parsed.value : text;
       }
       if (trimmed === "true") return true;
       if (trimmed === "false") return false;
@@ -788,11 +802,11 @@ function xmlCallToCandidate(call: unknown, tools: ToolDefinition[]): unknown {
   if (typeof rawArguments === "string") {
     const trimmed = rawArguments.trim();
     if (trimmed.startsWith("{")) {
-      try {
-        rawArguments = JSON.parse(trimmed);
-      } catch {
-        // Leave the string; the schema validation error will name the field.
+      const parsed = parseParameterJson(trimmed);
+      if (parsed) {
+        rawArguments = parsed.value;
       }
+      // Unparseable text stays a string; the schema validation error names the field.
     }
   }
   const coerced = coerceXmlValue(rawArguments, schema);

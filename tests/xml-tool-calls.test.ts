@@ -201,6 +201,42 @@ test("XML coercion unwraps repeated-element arrays and splits scalar lists", () 
   assert.equal(coerceXmlValue("true", undefined), true);
 });
 
+test("malformed JSON inside parameter values is repaired like the JSON envelope", () => {
+  const arraySchema = { type: "array", items: { type: "integer" } };
+  // Trailing commas and single quotes are repaired, same as the JSON envelope.
+  assert.deepEqual(coerceXmlValue("[1, 2,]", arraySchema as never), [1, 2]);
+  assert.deepEqual(coerceXmlValue("['1', '2']", arraySchema as never), [1, 2]);
+  // A truncated array is closed by the repair pass.
+  assert.deepEqual(coerceXmlValue("[1, 2", arraySchema as never), [1, 2]);
+  // Unrepairable text still falls back to the line/comma split (brackets are
+  // not stripped by the split — that is the pre-existing fallback behavior).
+  assert.deepEqual(coerceXmlValue("[1, 2, 3] extra", arraySchema as never), ["[1", 2, "3] extra"]);
+
+  const objectSchema = {
+    type: "object",
+    properties: { verbose: { type: "boolean" }, retries: { type: "integer" } },
+  };
+  assert.deepEqual(coerceXmlValue("{verbose: true, retries: '3',}", objectSchema as never), { verbose: true, retries: 3 });
+  // jsonrepair aggressively recovers even non-JSON text into an object; any
+  // residual type mismatch is then reported by Ajv against the schema.
+  assert.deepEqual(coerceXmlValue("{not json at all", objectSchema as never), { "not json at all": null });
+
+  // Untyped schemas repair JSON-looking text too.
+  assert.deepEqual(coerceXmlValue("{x: 1,}", undefined), { x: 1 });
+  assert.equal(coerceXmlValue("007", undefined), "007");
+});
+
+test("malformed JSON text in <arguments> is repaired", () => {
+  const result = parseControlledToolEnvelopeDetailed(
+    "<tool_calls><tool_call><name>calculator</name><arguments>{a: 1, b: '2',}</arguments></tool_call></tool_calls>",
+    tools,
+    "seed",
+  );
+  assert.equal(result.envelope?.type, "tool_calls");
+  if (result.envelope?.type !== "tool_calls") return;
+  assert.deepEqual(JSON.parse(result.envelope.toolCalls[0]!.function.arguments), { a: 1, b: 2 });
+});
+
 test("markdown fences and surrounding prose are repaired away", () => {
   const fenced = [
     "Sure, here are the calls:",
