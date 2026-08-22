@@ -83,11 +83,19 @@ const CONTRACT_SENTENCE_NO_NATIVE =
 const CONTRACT_SENTENCE_SHELL =
   "For shell or command tools, follow the operating-system syntax in that tool's declaration; never invent Unix flags or undocumented parameters.";
 const CONTRACT_SENTENCE_XML_RULES =
-  "In the XML format, put the function name in the <tool_call> name attribute and write each argument as a <parameter name=\"...\"> element, typed against the declared JSON Schema (numbers and booleans without quotes, arrays and objects as JSON text). A value that contains angle brackets, markup, or code must be wrapped in a <![CDATA[...]]> section; otherwise escape & as &amp; and < as &lt; inside values.";
+  "In the XML format, put the function name in the <tool_call> name attribute and write each argument as a <parameter name=\"...\"> element, typed against the declared JSON Schema (numbers and booleans without quotes, arrays and objects as JSON text). Parameter values are raw text parsed verbatim: never escape entities or wrap values in CDATA, even when they contain angle brackets, markup, or code.";
 
 // Pinned XML mode declares the schemas themselves in XML, so its rules
 // sentence points at the XML schema block rather than a JSON Schema.
 const CONTRACT_SENTENCE_XML_RULES_PINNED =
+  "In the XML format, put the function name in the <tool_call> name attribute and write each argument as a <parameter name=\"...\"> element, typed against the declared XML schema (numbers and booleans without quotes, arrays and objects as JSON text). Parameter values are raw text parsed verbatim: never escape entities or wrap values in CDATA, even when they contain angle brackets, markup, or code.";
+
+// Legacy 3.11.1–3.12.0 wording required CDATA or escaping for markup values.
+const LEGACY_CONTRACT_SENTENCE_XML_RULES_CDATA =
+  "In the XML format, put the function name in the <tool_call> name attribute and write each argument as a <parameter name=\"...\"> element, typed against the declared JSON Schema (numbers and booleans without quotes, arrays and objects as JSON text). A value that contains angle brackets, markup, or code must be wrapped in a <![CDATA[...]]> section; otherwise escape & as &amp; and < as &lt; inside values.";
+
+// Legacy 3.12.0 pinned-XML wording paired the XML schema block with CDATA.
+const LEGACY_CONTRACT_SENTENCE_XML_RULES_PINNED_CDATA =
   "In the XML format, put the function name in the <tool_call> name attribute and write each argument as a <parameter name=\"...\"> element, typed against the declared XML schema (numbers and booleans without quotes, arrays and objects as JSON text). A value that contains angle brackets, markup, or code must be wrapped in a <![CDATA[...]]> section; otherwise escape & as &amp; and < as &lt; inside values.";
 
 // Legacy pre-3.11.1 wording, kept so histories carrying it still strip.
@@ -646,21 +654,6 @@ function xmlEscapeAttribute(value: string): string {
   return xmlEscapeText(value).replace(/"/g, "&quot;");
 }
 
-/** Wrap free-form text in CDATA, splitting any literal `]]>` across sections. */
-function cdataSection(value: string): string {
-  return `<![CDATA[${value.replaceAll("]]>", "]]]]><![CDATA[>")}]]>`;
-}
-
-/**
- * Encode a value for history re-encoding the way the contract asks the model
- * to write it: values containing angle brackets or ampersands travel in CDATA
- * so models imitating the history learn the robust pattern; simple values
- * stay plain text.
- */
-function xmlValueText(value: string): string {
-  return /[<>&]/.test(value) ? cdataSection(value) : value;
-}
-
 /**
  * Re-encode validated calls in the wire format the contract offers, so the
  * history models the same format the model is asked to emit: a pinned XML
@@ -678,14 +671,15 @@ function toolCallsEnvelopeContent(
         .filter((entry): entry is [string, JsonValue] => entry[1] !== undefined)
         .map(([key, value]) => {
           // Mirror the contract's XML typing: strings as text, numbers and
-          // booleans bare, arrays and objects as JSON text.
+          // booleans bare, arrays and objects as JSON text. Values are raw
+          // text parsed verbatim, so nothing is escaped or wrapped.
           const serialized = typeof value === "string" ? value : JSON.stringify(value);
-          return `<parameter name="${xmlEscapeAttribute(key)}">${xmlValueText(serialized)}</parameter>`;
+          return `<parameter name="${xmlEscapeAttribute(key)}">${serialized}</parameter>`;
         })
         .join("");
       return `<tool_call name="${xmlEscapeAttribute(call.name)}">${parameters}</tool_call>`;
     }).join("");
-    return `<tool_calls>${preamble ? `<preamble>${xmlValueText(preamble)}</preamble>` : ""}${calls}</tool_calls>`;
+    return `<tool_calls>${preamble ? `<preamble>${preamble}</preamble>` : ""}${calls}</tool_calls>`;
   }
   return JSON.stringify({
     type: "tool_calls",
@@ -743,11 +737,13 @@ function stripToolContract(content: string): string {
     // Pre-3.10.1 pinned contracts named the other wire format in the no-prose rule.
     ["code fences, or special control tokens around the JSON", "code fences, XML, or special control tokens around the JSON"],
     ["code fences, or special control tokens around the XML", "code fences, JSON, or special control tokens around the XML"],
+    // Pre-verbatim XML rules required CDATA or escaping (3.11.1–3.12.0).
+    [CONTRACT_SENTENCE_XML_RULES, LEGACY_CONTRACT_SENTENCE_XML_RULES_CDATA],
     // Pre-3.11.1 XML rules offered escaping and CDATA as equal options.
     [CONTRACT_SENTENCE_XML_RULES, LEGACY_CONTRACT_SENTENCE_XML_RULES],
-    // Pinned-XML contracts from before the schema block was translated named
-    // the JSON Schema and used the shared XML rules sentence.
-    [CONTRACT_SENTENCE_XML_RULES_PINNED, CONTRACT_SENTENCE_XML_RULES],
+    // Pinned-XML contracts from 3.12.0 and earlier carried these wordings.
+    [CONTRACT_SENTENCE_XML_RULES_PINNED, LEGACY_CONTRACT_SENTENCE_XML_RULES_PINNED_CDATA],
+    [CONTRACT_SENTENCE_XML_RULES_PINNED, LEGACY_CONTRACT_SENTENCE_XML_RULES_CDATA],
     [CONTRACT_SENTENCE_XML_RULES_PINNED, LEGACY_CONTRACT_SENTENCE_XML_RULES],
     ["arguments must satisfy each function's declared XML schema.", "arguments must satisfy each declared function's JSON Schema."],
   ];

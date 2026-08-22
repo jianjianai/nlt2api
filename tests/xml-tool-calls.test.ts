@@ -105,8 +105,8 @@ test("XML envelope accepts the name attribute and JSON arguments text", () => {
 });
 
 test("the model-preferred attribute+parameter format parses end to end", () => {
-  // The format XML-fluent models produce natively, including a bare && that
-  // strict validation rejects and the tolerant txml pass recovers.
+  // The format XML-fluent models produce natively; a bare && is verbatim
+  // value text, so the clean first pass needs no repair at all.
   const xml = [
     "<tool_calls>",
     '<tool_call name="bash">',
@@ -116,7 +116,7 @@ test("the model-preferred attribute+parameter format parses end to end", () => {
   ].join("\n");
   const result = parseControlledToolEnvelopeDetailed(xml, shellTools, "seed");
   assert.equal(result.envelope?.type, "tool_calls");
-  assert.equal(result.repaired, true);
+  assert.equal(result.repaired, undefined);
   if (result.envelope?.type !== "tool_calls") return;
   assert.equal(result.envelope.toolCalls[0]?.function.name, "bash");
   assert.deepEqual(JSON.parse(result.envelope.toolCalls[0]!.function.arguments), {
@@ -124,7 +124,10 @@ test("the model-preferred attribute+parameter format parses end to end", () => {
   });
 });
 
-test("parameter elements carry nested objects and JSON text", () => {
+test("parameter elements carry JSON text; nested markup stays a raw string", () => {
+  // Verbatim semantics: parameter content is always a raw string, so the old
+  // nested-element notation arrives verbatim (schema validation rejects it
+  // downstream and the repair loop corrects it to JSON text).
   const nested = parseControlledToolEnvelopeDetailed(
     '<tool_calls><tool_call name="bash"><parameter name="options"><verbose>true</verbose><retries>3</retries></parameter><parameter name="command">ls</parameter></tool_call></tool_calls>',
     shellTools,
@@ -133,7 +136,7 @@ test("parameter elements carry nested objects and JSON text", () => {
   assert.equal(nested.envelope?.type, "tool_calls");
   if (nested.envelope?.type !== "tool_calls") return;
   assert.deepEqual(JSON.parse(nested.envelope.toolCalls[0]!.function.arguments), {
-    options: { verbose: true, retries: 3 },
+    options: "<verbose>true</verbose><retries>3</retries>",
     command: "ls",
   });
 
@@ -222,14 +225,14 @@ test("truncated XML is auto-closed like truncated JSON", () => {
   assert.deepEqual(JSON.parse(result.envelope.toolCalls[0]!.function.arguments), { a: 1, b: 2 });
 });
 
-test("bare ampersands are escaped and CDATA content is preserved", () => {
+test("bare ampersands parse verbatim and CDATA content is still unwrapped", () => {
   const ampersand = parseControlledToolEnvelopeDetailed(
     "<tool_calls><tool_call><name>bash</name><arguments><command>echo a & b</command></arguments></tool_call></tool_calls>",
     shellTools,
     "seed",
   );
   assert.equal(ampersand.envelope?.type, "tool_calls");
-  assert.equal(ampersand.repaired, true);
+  assert.equal(ampersand.repaired, undefined);
   if (ampersand.envelope?.type !== "tool_calls") return;
   assert.deepEqual(JSON.parse(ampersand.envelope.toolCalls[0]!.function.arguments), { command: "echo a & b" });
 
@@ -265,17 +268,19 @@ test("bare tool_call fragments are wrapped in a root element", () => {
   assert.equal(wrapped.tool_calls.length, 2);
 });
 
-test("mis-nested tags fall back to the envelope scanner", () => {
-  // txml throws on mis-nesting; the envelope scanner recovers the call. The
-  // arguments are lossy here, so downstream schema validation reports the
-  // missing properties and the repair loop takes over.
+test("mis-nested tags are recovered with the stray close dropped", () => {
+  // The scanner reads the call, drops the stray close tag, and keeps going;
+  // the argument after the mis-nesting lands as a direct argument element.
   const result = parseRepairXml(
     "<tool_calls><tool_call><name>calculator</name><arguments><a>1</a></tool_call></arguments><b>2</b></tool_calls>",
   );
   assert.ok("value" in result);
   if (!("value" in result)) return;
   assert.equal(result.repaired, true);
-  assert.ok(result.changes.some((change) => change.includes("envelope scanner")));
+  assert.ok(result.changes.some((change) => change.includes("stray")));
+  const envelope = xmlDocToEnvelope(result.value, tools) as { tool_calls: { name: string; arguments: unknown }[] };
+  assert.equal(envelope.tool_calls[0]?.name, "calculator");
+  assert.deepEqual(envelope.tool_calls[0]?.arguments, { a: 1 });
 });
 
 test("undeclared functions and non-object arguments fail with the shared messages", () => {
@@ -301,7 +306,7 @@ test("unrepairable XML produces a located, AI-friendly diagnostic", () => {
   assert.match(result.error, /could not be parsed/);
   assert.match(result.error, /line \d+, column \d+/);
   assert.match(result.error, />>>/);
-  assert.match(result.error, /CDATA/);
+  assert.match(result.error, /raw text/);
   // Diagnostics never suggest switching wire formats.
   assert.ok(!result.error.includes("switch"));
   assert.ok(!result.error.includes("JSON form"));
@@ -400,7 +405,7 @@ test("a tolerant parse that corrupts markup-bearing parameters falls back to the
   assert.equal(args.edits[0].newText, '<parameter name="value">1</parameter>');
 });
 
-test("the envelope scanner decodes entities and keeps CDATA content verbatim", () => {
+test("the envelope scanner reads values verbatim and still unwraps CDATA", () => {
   const content = [
     "<tool_calls>",
     '<tool_call name="calculator">',
@@ -409,16 +414,45 @@ test("the envelope scanner decodes entities and keeps CDATA content verbatim", (
     "</tool_call>",
     "</tool_calls>",
   ].join("\n");
-  // Break it so the scanner (not the strict pass) does the work: a stray
-  // duplicate close tag makes the document invalid XML.
+  // A stray duplicate close tag is dropped, not absorbed into the value.
   const broken = content.replace("</tool_call>", "</parameter>\n</tool_call>");
   const result = parseControlledToolEnvelopeDetailed(broken, tools, "seed");
   assert.equal(result.error, undefined);
   assert.equal(result.envelope?.type, "tool_calls");
+  assert.equal(result.repaired, true);
   if (result.envelope?.type !== "tool_calls") return;
   const args = JSON.parse(result.envelope.toolCalls[0]!.function.arguments);
-  assert.equal(args.a, "1 < 2");
+  // Verbatim: entity references are literal text, never decoded.
+  assert.equal(args.a, "1 &lt; 2");
+  // CDATA from older contracts is still unwrapped (its content is verbatim).
   assert.equal(args.b, "3 > 2 && 1 < 4");
+});
+
+test("an embedded close tag without a structural continuation is value text", () => {
+  // <parameter name="command">aaa</parameter>bbb</parameter> parses as
+  // aaa</parameter>bbb: the first close is followed by plain text, so it is
+  // part of the value; the second is followed by the call close.
+  const result = parseControlledToolEnvelopeDetailed(
+    '<tool_calls><tool_call name="bash"><parameter name="command">aaa</parameter>bbb</parameter></tool_call></tool_calls>',
+    shellTools,
+    "seed",
+  );
+  assert.equal(result.error, undefined);
+  assert.equal(result.repaired, undefined);
+  if (result.envelope?.type !== "tool_calls") return;
+  assert.deepEqual(JSON.parse(result.envelope.toolCalls[0]!.function.arguments), { command: "aaa</parameter>bbb" });
+});
+
+test("sibling parameters still terminate at their own close tags", () => {
+  const result = parseControlledToolEnvelopeDetailed(
+    '<tool_calls><tool_call name="calculator"><parameter name="a">1</parameter><parameter name="b">2</parameter></tool_call></tool_calls>',
+    tools,
+    "seed",
+  );
+  assert.equal(result.error, undefined);
+  assert.equal(result.repaired, undefined);
+  if (result.envelope?.type !== "tool_calls") return;
+  assert.deepEqual(JSON.parse(result.envelope.toolCalls[0]!.function.arguments), { a: 1, b: 2 });
 });
 
 test("unclosed-tag diagnostics name the tags left open", () => {
@@ -576,7 +610,7 @@ test("history tool calls are re-encoded in the contract's wire format", () => {
   }
 });
 
-test("XML history re-encoding wraps markup-bearing values in CDATA", () => {
+test("XML history re-encoding writes markup-bearing values raw", () => {
   const history = [
     { role: "user" as const, content: "calc" },
     {
@@ -587,15 +621,15 @@ test("XML history re-encoding wraps markup-bearing values in CDATA", () => {
   ];
   const contracted = withToolCallContract(history, tools, "auto", true, "xml");
   const assistant = contracted.find((message) => message.role === "assistant");
-  // Markup-bearing preamble travels in CDATA (the pattern the contract asks
-  // the model to imitate); simple parameter values stay plain text.
+  // Values are raw text parsed verbatim: the history models exactly what the
+  // contract asks the model to emit — no CDATA, no escaping.
   assert.equal(
     assistant?.content,
-    '<tool_calls><preamble><![CDATA[5 < 6 & 7 > 4]]></preamble><tool_call name="calculator"><parameter name="a">1</parameter><parameter name="b">2</parameter></tool_call></tool_calls>',
+    '<tool_calls><preamble>5 < 6 & 7 > 4</preamble><tool_call name="calculator"><parameter name="a">1</parameter><parameter name="b">2</parameter></tool_call></tool_calls>',
   );
 });
 
-test("CDATA-wrapped history round-trips, including a literal ]]> split", () => {
+test("raw history values round-trip, including ]]> and an embedded close tag", () => {
   const editTools: ToolDefinition[] = [{
     type: "function",
     function: {
@@ -617,7 +651,7 @@ test("CDATA-wrapped history round-trips, including a literal ]]> split", () => {
       },
     },
   }];
-  const edits = [{ oldText: "a < b & c]]>d", newText: '<span v-if="x">{{ y }}</span>' }];
+  const edits = [{ oldText: "a < b & c]]>d</parameter>e", newText: '<span v-if="x">{{ y }}</span>' }];
   const history = [
     { role: "user" as const, content: "edit" },
     {
@@ -630,9 +664,8 @@ test("CDATA-wrapped history round-trips, including a literal ]]> split", () => {
   const contracted = withToolCallContract(history, editTools, "auto", true, "xml");
   const assistant = contracted.find((message) => message.role === "assistant");
   const content = String(assistant?.content);
-  assert.ok(content.includes("<![CDATA["));
-  // A literal ]]> inside a value is split across adjacent CDATA sections.
-  assert.ok(content.includes("]]]]><![CDATA[>"));
+  // No CDATA anywhere: values are written raw.
+  assert.ok(!content.includes("<![CDATA["));
   // The re-encoded history parses back to the exact original arguments.
   const parsed = parseControlledToolEnvelopeDetailed(content, editTools, "seed");
   assert.equal(parsed.error, undefined);

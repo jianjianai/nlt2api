@@ -1,5 +1,5 @@
-import { XMLParser, XMLValidator } from "fast-xml-parser";
-import { parse as parseTolerantXml, type TNode } from "txml";
+import { XMLValidator } from "fast-xml-parser";
+import { parse as parseTolerantXml } from "txml";
 import type { JsonObject, JsonValue, ToolDefinition } from "~/server/utils/types.ts";
 
 /**
@@ -7,18 +7,17 @@ import type { JsonObject, JsonValue, ToolDefinition } from "~/server/utils/types
  *
  * Some upstream models produce XML more reliably than JSON (and vice versa),
  * so the adapter contract offers both envelopes and lets the model pick.
- * This module mirrors the JSON path's two-pass strategy (JSON.parse then
- * jsonrepair) with two dedicated libraries:
  *
- * 1. Strict pass: fast-xml-parser validates and parses clean documents,
- *    giving precise line/column errors for diagnostics.
- * 2. Repair pass: txml parses tolerantly — it recovers the failure modes
- *    LLMs actually produce (truncation at the token cap, bare ampersands,
- *    markdown fences and surrounding prose, bare <tool_call> fragments)
- *    without any hand-written repair heuristics on our side.
- *
- * When both fail, the model gets an AI-friendly located diagnostic combining
- * the validator's position with txml's error, plus a format escape hatch.
+ * Parsing is verbatim by design: a <parameter> value is always a raw string,
+ * ending at the first </parameter> that is followed by a structural
+ * continuation (a sibling <parameter>, a closing </tool_call> or </invoke>,
+ * the closing </tool_calls>, another </parameter>, or the end of the input).
+ * Embedded markup, angle brackets and ampersands are value text — models
+ * never escape entities or wrap values in CDATA (CDATA written under older
+ * contracts is still unwrapped). A purpose-built envelope scanner implements
+ * these semantics directly; when it finds no call at all, the strict
+ * validator and the tolerant txml parser still run, but only to build a
+ * located diagnostic for the repair loop.
  */
 
 // The skeleton shows the shape models most reliably imitate: the function
@@ -61,17 +60,6 @@ function findOffset(text: string, line: number, column: number): number {
   return text.length;
 }
 
-const xmlParser = new XMLParser({
-  ignoreAttributes: false,
-  attributeNamePrefix: "@_",
-  // Leaf values stay strings; typing is applied against the declared JSON
-  // Schema afterwards, so a string-typed "123" is never silently coerced.
-  parseTagValue: false,
-  trimValues: true,
-  processEntities: true,
-  isArray: (tagName) => tagName === "tool_call" || tagName === "invoke" || tagName === "parameter",
-});
-
 interface XmlValidationError {
   code: string;
   msg: string;
@@ -85,100 +73,6 @@ function validateXml(text: string): XmlValidationError | undefined {
     return undefined;
   }
   return (result as { err: XmlValidationError }).err;
-}
-
-/**
- * Convert a txml element into the same plain-object shape the strict
- * fast-xml-parser pass produces (`@_` attribute keys, repeated children
- * grouped into arrays), so both passes share one envelope pipeline.
- */
-function txmlElementToValue(element: TNode): unknown {
-  const children = element.children ?? [];
-  const elementChildren = children.filter((child): child is TNode => typeof child !== "string");
-  const text = children.filter((child): child is string => typeof child === "string").join("");
-  const attributes = Object.entries(element.attributes ?? {});
-  if (elementChildren.length === 0 && attributes.length === 0) {
-    return text.trim();
-  }
-  const output: Record<string, unknown> = {};
-  for (const [key, value] of attributes) {
-    output[`@_${key}`] = value ?? "";
-  }
-  const trimmedText = text.trim();
-  if (trimmedText) {
-    output["#text"] = trimmedText;
-  }
-  for (const child of elementChildren) {
-    const value = txmlElementToValue(child);
-    const existing = output[child.tagName];
-    if (existing === undefined) {
-      output[child.tagName] = value;
-    } else if (Array.isArray(existing)) {
-      existing.push(value);
-    } else {
-      output[child.tagName] = [existing, value];
-    }
-  }
-  return output;
-}
-
-interface LocatedToolCalls {
-  value: unknown;
-  wrapped: boolean;
-  extraTopLevelContent: boolean;
-}
-
-/**
- * Locate the envelope in a tolerantly parsed DOM: the <tool_calls> root
- * (top-level, or nested inside a junk wrapper element), or bare <tool_call>
- * fragments that get wrapped in a synthetic root. Prose and markdown fences
- * parse as top-level string nodes and are ignored.
- */
-function locateToolCalls(dom: (TNode | string)[]): LocatedToolCalls | undefined {
-  const elements = dom.filter((node): node is TNode => typeof node !== "string");
-  const extraTopLevelContent = elements.length > 1
-    || dom.some((node) => typeof node === "string" && node.trim().length > 0);
-
-  const topLevel = elements.find((element) => element.tagName === "tool_calls");
-  if (topLevel) {
-    return { value: { tool_calls: txmlElementToValue(topLevel) }, wrapped: false, extraTopLevelContent };
-  }
-  // Breadth-first search for a document wrapped in an extra element layer.
-  const queue = [...elements];
-  while (queue.length > 0) {
-    const element = queue.shift()!;
-    if (element.tagName === "tool_calls") {
-      return { value: { tool_calls: txmlElementToValue(element) }, wrapped: false, extraTopLevelContent: true };
-    }
-    queue.push(...element.children.filter((child): child is TNode => typeof child !== "string"));
-  }
-  const bareCalls = elements.filter((element) => element.tagName === "tool_call" || element.tagName === "invoke");
-  if (bareCalls.length > 0) {
-    return {
-      value: { tool_calls: { tool_call: bareCalls.map(txmlElementToValue) } },
-      wrapped: true,
-      extraTopLevelContent,
-    };
-  }
-  return undefined;
-}
-
-/**
- * A lone <tool_call> root is valid XML but not an envelope. Normalize it
- * structurally (envelope glue, not text repair) so the strict pass offers
- * the same bare-fragment tolerance as the tolerant pass.
- */
-function wrapBareCallDocument(doc: unknown): { value: unknown; wrapped: boolean } {
-  const object = objectValue(doc);
-  if (!object || object.tool_calls !== undefined) {
-    return { value: doc, wrapped: false };
-  }
-  const bare = object.tool_call ?? object.invoke;
-  if (bare === undefined) {
-    return { value: doc, wrapped: false };
-  }
-  const calls = Array.isArray(bare) ? bare : [bare];
-  return { value: { tool_calls: { tool_call: calls } }, wrapped: true };
 }
 
 export type XmlParseResult =
@@ -232,7 +126,7 @@ function friendlyXmlParseError(
   }
   lines.push(
     "Common fixes: close every opened tag (the document must end with </tool_calls>); "
-    + "escape & as &amp; and < as &lt; inside argument values, or wrap free-form text in <![CDATA[...]]>; "
+    + "write parameter values as raw text with no escaping and no CDATA sections; "
     + "put every call inside one <tool_calls> root element.",
   );
   lines.push(
@@ -330,30 +224,33 @@ function scanToolCallEnvelope(text: string): { value: unknown; changes: string[]
   const changes = new Set<string>();
   const n = text.length;
 
-  // A parameter value ends at the first </parameter> that is not balanced by
-  // an embedded <parameter ...> open tag inside the value: values are raw
-  // text and may carry balanced markup (e.g. JSON text embedding XML code).
-  // A close tag of an ancestor element terminates an unclosed parameter
-  // without consuming it.
+  // A parameter value is raw text, parsed verbatim: it ends at the first
+  // </parameter> followed by a structural continuation — a sibling
+  // <parameter>, a closing </tool_call> or </invoke>, the closing
+  // </tool_calls>, another </parameter> (the duplicate-close failure mode),
+  // or the end of the input. An embedded </parameter> followed by anything
+  // else is value text, so values never need CDATA sections or escaping.
   const ANCESTOR_TERMINATORS = ["</tool_call", "</invoke", "</tool_calls"];
+  const PARAMETER_BOUNDARIES = ["<parameter", "</parameter", ...ANCESTOR_TERMINATORS];
   const boundaryAfter = (pos: number): boolean => {
     const ch = text[pos];
     return ch === undefined || ch === ">" || ch === "/" || ch === " " || ch === "\t" || ch === "\n" || ch === "\r";
   };
+  const isValueBoundary = (after: number): boolean => {
+    let cursor = after;
+    while (cursor < n && /\s/.test(text[cursor]!)) cursor += 1;
+    if (cursor >= n) {
+      return true;
+    }
+    return PARAMETER_BOUNDARIES.some((boundary) => text.startsWith(boundary, cursor));
+  };
   function readParameterValue(from: number): { value: string; end: number } {
     let value = "";
-    let plain = "";
     let cursor = from;
-    let depth = 0;
-    const flushPlain = () => {
-      if (plain) {
-        value += decodeXmlEntities(plain);
-        plain = "";
-      }
-    };
     while (cursor < n) {
       if (text.startsWith("<![CDATA[", cursor)) {
-        flushPlain();
+        // CDATA is never required, but sections written under older contracts
+        // are still unwrapped (their content is verbatim by definition).
         const cdataEnd = text.indexOf("]]>", cursor + 9);
         if (cdataEnd < 0) {
           value += text.slice(cursor + 9);
@@ -365,47 +262,76 @@ function scanToolCallEnvelope(text: string): { value: unknown; changes: string[]
         continue;
       }
       if (text.startsWith("</parameter", cursor) && boundaryAfter(cursor + 11)) {
-        if (depth === 0) {
-          flushPlain();
-          const gt = text.indexOf(">", cursor);
-          return { value, end: gt < 0 ? n : gt + 1 };
-        }
-        // A balanced embedded close stays part of the value text.
-        depth -= 1;
         const gt = text.indexOf(">", cursor);
         const end = gt < 0 ? n : gt + 1;
-        plain += text.slice(cursor, end);
+        if (isValueBoundary(end)) {
+          return { value, end };
+        }
+        // An embedded </parameter> with no structural continuation after it
+        // is literal value text.
+        value += text.slice(cursor, end);
         cursor = end;
-        continue;
-      }
-      if (text.startsWith("<parameter", cursor) && boundaryAfter(cursor + 10)) {
-        // An embedded open tag balances its close so the value does not end
-        // early; a self-closing one does not affect the depth.
-        const tag = nextXmlTag(text, cursor);
-        if (!tag) {
-          plain += text.slice(cursor);
-          cursor = n;
-          break;
-        }
-        if (!tag.selfClosing) {
-          depth += 1;
-        }
-        plain += text.slice(cursor, tag.end);
-        cursor = tag.end;
         continue;
       }
       const ancestor = ANCESTOR_TERMINATORS.find((candidate) => text.startsWith(candidate, cursor));
       if (ancestor) {
-        flushPlain();
         changes.add("recovered an unclosed parameter element");
         return { value, end: cursor };
       }
-      plain += text[cursor]!;
+      value += text[cursor]!;
       cursor += 1;
     }
-    flushPlain();
     changes.add("recovered a truncated parameter value");
     return { value, end: n };
+  }
+
+  // Read the raw text content of an element up to its matching close tag.
+  function readElementText(from: number, name: string): { value: string; end: number } {
+    const closer = `</${name}`;
+    const closeAt = text.indexOf(closer, from);
+    if (closeAt < 0) {
+      changes.add(`recovered a truncated <${name}> element`);
+      return { value: text.slice(from), end: n };
+    }
+    return { value: text.slice(from, closeAt), end: closeAt + closer.length };
+  }
+
+  // CDATA written under older contracts is still unwrapped; its content is
+  // verbatim by definition.
+  function unwrapCdataSections(value: string): string {
+    return value.replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, "$1");
+  }
+
+  // The legacy <arguments><a>1</a><b>2</b></arguments> notation is structural:
+  // child elements become argument keys, and a value itself composed of child
+  // elements becomes a nested object; anything else stays a raw string.
+  function legacyElementValue(raw: string): JsonValue {
+    const nested = raw.includes("<") ? parseArgumentElements(raw) : undefined;
+    return nested ?? unwrapCdataSections(raw);
+  }
+
+  function parseArgumentElements(content: string): JsonObject | undefined {
+    const output: Record<string, JsonValue> = {};
+    let cursor = 0;
+    let found = false;
+    while (cursor < content.length) {
+      const tag = nextXmlTag(content, cursor);
+      if (!tag) {
+        break;
+      }
+      if (tag.close) {
+        changes.add(`dropped a stray </${tag.name}> close tag`);
+        cursor = tag.end;
+        continue;
+      }
+      const closer = `</${tag.name}`;
+      const closeAt = content.indexOf(closer, tag.end);
+      const raw = closeAt < 0 ? content.slice(tag.end) : content.slice(tag.end, closeAt);
+      output[tag.name] = legacyElementValue(raw);
+      found = true;
+      cursor = closeAt < 0 ? content.length : closeAt + closer.length;
+    }
+    return found ? output : undefined;
   }
 
   function readToolCall(tag: ScannedTag): { call: JsonObject; end: number } | undefined {
@@ -414,7 +340,8 @@ function scanToolCallEnvelope(text: string): { value: unknown; changes: string[]
     }
     let name = readXmlTagAttribute(tag.raw, "name");
     const parameters: JsonObject[] = [];
-    let argumentsText: string | undefined;
+    let argumentsValue: JsonValue | undefined;
+    const direct: Record<string, JsonValue> = {};
     let cursor = tag.end;
     while (cursor < n) {
       const next = nextXmlTag(text, cursor);
@@ -451,23 +378,26 @@ function scanToolCallEnvelope(text: string): { value: unknown; changes: string[]
         cursor = value.end;
         continue;
       }
-      if (next.name === "name" || next.name === "arguments") {
-        // Child-element variant: <name>bash</name><arguments>{...}</arguments>.
-        const closer = `</${next.name}`;
-        const closeAt = text.indexOf(closer, next.end);
-        const rawText = closeAt < 0 ? text.slice(next.end) : text.slice(next.end, closeAt);
-        const decoded = decodeXmlEntities(rawText).trim();
-        if (next.name === "name") {
-          name = name ?? decoded;
-        } else {
-          argumentsText = decoded;
-        }
-        cursor = closeAt < 0 ? n : closeAt + closer.length;
+      if (next.name === "name") {
+        const content = readElementText(next.end, "name");
+        name = name ?? content.value.trim();
+        cursor = content.end;
         continue;
       }
-      // An unknown open tag inside a call is skipped; embedded markup that
-      // followed a truncated parameter value is recovered this way.
-      cursor = next.end;
+      if (next.name === "arguments") {
+        // <arguments>{"a":1}</arguments> carries JSON text; the element
+        // notation <arguments><a>1</a></arguments> carries child elements.
+        const content = readElementText(next.end, "arguments");
+        const trimmed = content.value.trim();
+        argumentsValue = trimmed.startsWith("{") ? trimmed : parseArgumentElements(content.value);
+        cursor = content.end;
+        continue;
+      }
+      // Tolerate argument elements placed directly on the call element:
+      // <tool_call><name>bash</name><command>ls</command></tool_call>.
+      const directValue = readElementText(next.end, next.name);
+      direct[next.name] = legacyElementValue(directValue.value);
+      cursor = directValue.end;
     }
     if (!name) {
       return undefined;
@@ -476,8 +406,11 @@ function scanToolCallEnvelope(text: string): { value: unknown; changes: string[]
     if (parameters.length > 0) {
       call.parameter = parameters;
     }
-    if (argumentsText !== undefined) {
-      call.arguments = argumentsText;
+    if (argumentsValue !== undefined) {
+      call.arguments = argumentsValue;
+    }
+    for (const [key, value] of Object.entries(direct)) {
+      call[key] = value;
     }
     return { call, end: cursor };
   }
@@ -489,6 +422,8 @@ function scanToolCallEnvelope(text: string): { value: unknown; changes: string[]
   const calls: JsonObject[] = [];
   let preamble: string | undefined;
   let skippedProse = false;
+  let sawRoot = false;
+  let sawCallElement = false;
   let cursor = 0;
   while (cursor < n) {
     const tag = nextXmlTag(text, cursor);
@@ -500,18 +435,23 @@ function scanToolCallEnvelope(text: string): { value: unknown; changes: string[]
       skippedProse = true;
     }
     if (tag.close) {
+      // The root's own close tag is expected; anything else is stray markup.
+      if (tag.name !== "tool_calls") {
+        changes.add(`dropped a stray </${tag.name}> close tag`);
+      }
       cursor = tag.end;
       continue;
     }
     if (tag.name === "tool_calls") {
+      sawRoot = true;
       cursor = tag.end;
       continue;
     }
     if (tag.name === "preamble") {
       const closeAt = text.indexOf("</preamble", tag.end);
       const rawText = closeAt < 0 ? text.slice(tag.end) : text.slice(tag.end, closeAt);
-      const decoded = decodeXmlEntities(rawText).trim();
-      if (decoded) preamble = decoded;
+      const value = rawText.trim();
+      if (value) preamble = value;
       if (closeAt < 0) {
         cursor = n;
       } else {
@@ -521,6 +461,7 @@ function scanToolCallEnvelope(text: string): { value: unknown; changes: string[]
       continue;
     }
     if (tag.name === "tool_call" || tag.name === "invoke") {
+      sawCallElement = true;
       const scanned = readToolCall(tag);
       if (scanned) {
         calls.push(scanned.call);
@@ -533,7 +474,29 @@ function scanToolCallEnvelope(text: string): { value: unknown; changes: string[]
     cursor = tag.end;
   }
   if (calls.length === 0) {
+    // An explicitly empty, otherwise clean root still produces an envelope so
+    // the shared "at least one call" validation message applies; a root with
+    // stray markup or text content falls through to the JSON-in-root
+    // tolerance or the located parse diagnostic instead.
+    if (sawRoot && changes.size === 0 && !skippedProse) {
+      return { value: { tool_calls: { tool_call: [] } }, changes: [] };
+    }
+    // Call fragments whose content carried no usable name still produce an
+    // (empty) envelope, so the repair loop gets the shared "at least one
+    // call" message rather than a parse diagnostic.
+    if (sawCallElement) {
+      if (!sawRoot) {
+        changes.add("wrapped bare <tool_call> elements in a <tool_calls> root");
+      }
+      if (skippedProse) {
+        changes.add("ignored prose or markdown fences outside the <tool_calls> document");
+      }
+      return { value: { tool_calls: { tool_call: [] } }, changes: [...changes] };
+    }
     return undefined;
+  }
+  if (!sawRoot) {
+    changes.add("wrapped bare <tool_call> elements in a <tool_calls> root");
   }
   if (skippedProse) {
     changes.add("ignored prose or markdown fences outside the <tool_calls> document");
@@ -546,132 +509,47 @@ function scanToolCallEnvelope(text: string): { value: unknown; changes: string[]
 }
 
 /**
- * Detect the mixed-content corruption signature: a <parameter> carrying both
- * element children and non-whitespace text. In the envelope grammar a
- * parameter is either raw text or a nested-object element list, never both;
- * both means the model embedded markup inside a JSON-text value and the
- * tolerant parser mistook the markup for real elements, which discards the
- * surrounding text and loses the argument.
- */
-function hasMixedParameterContent(value: unknown): boolean {
-  const root = objectValue(objectValue(value)?.tool_calls);
-  if (!root) {
-    return false;
-  }
-  const rawCalls = root.tool_call ?? root.invoke;
-  const callList = rawCalls === undefined ? [] : Array.isArray(rawCalls) ? rawCalls : [rawCalls];
-  for (const call of callList) {
-    const callObject = objectValue(call);
-    if (!callObject) {
-      continue;
-    }
-    const rawParams = callObject.parameter;
-    const paramList = rawParams === undefined ? [] : Array.isArray(rawParams) ? rawParams : [rawParams];
-    for (const param of paramList) {
-      const paramObject = objectValue(param);
-      if (!paramObject) {
-        continue;
-      }
-      const text = paramObject["#text"];
-      const hasElements = Object.keys(paramObject).some((key) => !key.startsWith("@_") && key !== "#text");
-      if (hasElements && typeof text === "string" && text.trim()) {
-        return true;
-      }
-    }
-  }
-  return false;
-}
-
-/**
- * Parse the XML envelope with a jsonrepair-style multi-pass strategy: strict
- * fast-xml-parser validation first, tolerant txml parsing as the repair
- * attempt, the domain-aware envelope scanner as the last resort, and a
- * located diagnostic combining the errors when nothing works.
+ * Parse the XML envelope with the domain-aware scanner, which implements the
+ * canonical verbatim semantics directly: parameter values are raw text, so
+ * embedded markup, bare ampersands and angle brackets need no escaping and
+ * no CDATA. When the scanner finds no call at all, the strict validator and
+ * the tolerant txml parser still run — but only to build a located,
+ * AI-friendly diagnostic for the repair loop.
  */
 export function parseRepairXml(input: string): XmlParseResult {
   const trimmed = input.trim();
-  const validationError = validateXml(trimmed);
-  if (!validationError) {
-    const wrapped = wrapBareCallDocument(xmlParser.parse(trimmed));
-    return {
-      value: wrapped.value,
-      repaired: wrapped.wrapped,
-      changes: wrapped.wrapped ? ["wrapped bare <tool_call> elements in a <tool_calls> root"] : [],
-    };
+  const scanned = scanToolCallEnvelope(trimmed);
+  if (scanned) {
+    return { value: scanned.value, repaired: scanned.changes.length > 0, changes: scanned.changes };
   }
-  let dom: (TNode | string)[];
+  // Mixed-format tolerance: <tool_calls>{"type":"tool_calls",...}</tool_calls>.
+  const jsonInRoot = /<tool_calls[^>]*>\s*(\{[\s\S]*\})\s*<\/tool_calls\s*>/.exec(trimmed);
+  if (jsonInRoot) {
+    try {
+      JSON.parse(jsonInRoot[1]!);
+      return {
+        value: { tool_calls: jsonInRoot[1] },
+        repaired: true,
+        changes: ["parsed JSON text inside the <tool_calls> root"],
+      };
+    } catch {
+      // Fall through to the diagnostic.
+    }
+  }
+  const validationError = validateXml(trimmed);
+  let tolerantError: unknown;
   try {
-    dom = parseTolerantXml(trimmed, {
+    parseTolerantXml(trimmed, {
       decodeEntities: true,
       skipXmlDeclaration: true,
       // The envelope has no HTML void elements; without this, an argument
       // named <link> or <input> would silently swallow following content.
       selfClosingTags: [],
     });
-  } catch (tolerantError) {
-    // Last resort: the domain-aware envelope scanner recovers value-level
-    // malformations generic XML parsers cannot (raw `<` or embedded markup in
-    // parameter values, stray duplicate close tags, alias </invoke> closes).
-    const scanned = scanToolCallEnvelope(trimmed);
-    if (scanned) {
-      return {
-        value: scanned.value,
-        repaired: true,
-        changes: [
-          "strict XML validation and the tolerant parser both failed; recovered with the envelope scanner",
-          ...scanned.changes,
-        ],
-      };
-    }
-    return { error: friendlyXmlParseError(trimmed, validationError, tolerantError) };
+  } catch (error) {
+    tolerantError = error;
   }
-  const located = locateToolCalls(dom);
-  if (!located) {
-    const scanned = scanToolCallEnvelope(trimmed);
-    if (scanned) {
-      return {
-        value: scanned.value,
-        repaired: true,
-        changes: [
-          "no <tool_calls> root was found by the tolerant parser; recovered with the envelope scanner",
-          ...scanned.changes,
-        ],
-      };
-    }
-    return {
-      error: friendlyXmlParseError(
-        trimmed,
-        validationError,
-        undefined,
-        "No <tool_calls> root element was found in the response.",
-      ),
-    };
-  }
-  // The tolerant parse can "succeed" while corrupting a parameter whose value
-  // embeds markup (the markup becomes real elements and the surrounding text
-  // is lost). The scanner reads parameter content as raw text, which is the
-  // correct interpretation for that signature.
-  if (hasMixedParameterContent(located.value)) {
-    const scanned = scanToolCallEnvelope(trimmed);
-    if (scanned) {
-      return {
-        value: scanned.value,
-        repaired: true,
-        changes: [
-          "the tolerant parser mistook markup embedded in a parameter value for real elements; recovered with the envelope scanner",
-          ...scanned.changes,
-        ],
-      };
-    }
-  }
-  const changes = ["strict XML validation failed; recovered with the tolerant txml parser"];
-  if (located.extraTopLevelContent) {
-    changes.push("ignored prose or markdown fences outside the <tool_calls> document");
-  }
-  if (located.wrapped) {
-    changes.push("wrapped bare <tool_call> elements in a <tool_calls> root");
-  }
-  return { value: located.value, repaired: true, changes };
+  return { error: friendlyXmlParseError(trimmed, validationError, tolerantError) };
 }
 
 function schemaType(schema: JsonObject | undefined): string | undefined {
@@ -1125,12 +1003,12 @@ export function buildXmlSkeleton(calls: { name: string; arguments: JsonObject }[
     const args = Object.entries(call.arguments)
       .filter((entry): entry is [string, JsonValue] => entry[1] !== undefined)
       .map(([key, value]) => {
-        // Parameter values are scalars or JSON text; nested structures have
-        // no element-level notation in the parameter style.
+        // Parameter values are raw text written verbatim; nested structures
+        // travel as JSON text.
         const text = value !== null && typeof value === "object"
           ? JSON.stringify(value)
           : String(value);
-        return `    <parameter name="${escapeXmlText(key)}">${escapeXmlText(text)}</parameter>`;
+        return `    <parameter name="${escapeXmlAttribute(key)}">${text}</parameter>`;
       })
       .join("\n");
     return [
