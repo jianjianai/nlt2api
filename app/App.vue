@@ -246,9 +246,8 @@ let autoRefreshTimer: number | undefined;
 // Long message collapse state. Keys are `request-${index}` / `response-${index}`
 // and are reset whenever the selected trace changes.
 const COLLAPSE_MAX_HEIGHT = 240;
+const COLLAPSE_MAX_CHARS = 4000;
 const expandedMessageKeys = ref(new Set<string>());
-const overflowMessageKeys = ref(new Set<string>());
-const messageContentEls = new Map<string, HTMLElement>();
 
 // Effective tool-call policy: per-model override > global setting > env default.
 const effectiveToolCallFormat = computed<ToolCallFormat>(() => settings.toolCallFormat ?? config.toolCallFormat);
@@ -1164,23 +1163,10 @@ function messageAlign(role: string): "left" | "right" {
   return ["user", "tool"].includes(role) ? "right" : "left";
 }
 
-function setMessageContentEl(key: string, el: unknown): void {
-  if (el instanceof HTMLElement) {
-    messageContentEls.set(key, el);
-    requestAnimationFrame(() => measureMessageContent(key));
-  } else {
-    messageContentEls.delete(key);
-  }
-}
-
-function measureMessageContent(key: string): void {
-  const el = messageContentEls.get(key);
-  if (!el) return;
-  if (el.scrollHeight > COLLAPSE_MAX_HEIGHT + 2) {
-    overflowMessageKeys.value.add(key);
-  } else {
-    overflowMessageKeys.value.delete(key);
-  }
+function messageOverflows(content: string, toolCalls: DisplayToolCall[]): boolean {
+  if (content.length > COLLAPSE_MAX_CHARS) return true;
+  const toolText = toolCalls.reduce((total, call) => total + call.name.length + call.arguments.length, 0);
+  return toolText > COLLAPSE_MAX_CHARS;
 }
 
 function toggleMessageExpanded(key: string): void {
@@ -1192,6 +1178,26 @@ function toggleMessageExpanded(key: string): void {
 
 function isMessageExpanded(key: string): boolean {
   return expandedMessageKeys.value.has(key);
+}
+
+function messageOverflowKey(key: string, message: DisplayMessage): string {
+  return messageOverflows(message.content, message.toolCalls) ? key : "";
+}
+
+function truncateText(value: string, max: number): string {
+  if (value.length <= max) return value;
+  return value.slice(0, max) + "\n…（内容过长，已截断）";
+}
+
+/** Render only a bounded prefix while collapsed so huge bodies stay cheap. */
+function messageDisplayContent(key: string, message: DisplayMessage): string {
+  if (isMessageExpanded(key)) return message.content;
+  return truncateText(message.content, COLLAPSE_MAX_CHARS);
+}
+
+function toolCallDisplayArguments(key: string, call: DisplayToolCall): string {
+  if (isMessageExpanded(key)) return call.arguments;
+  return truncateText(call.arguments, COLLAPSE_MAX_CHARS);
 }
 
 function traceRequest(trace: ConversationTrace): BodyPresentation {
@@ -1288,8 +1294,6 @@ const selectedResponse = computed(() => (selectedTrace.value ? traceResponse(sel
 
 watch(selectedTraceKey, () => {
   expandedMessageKeys.value = new Set();
-  overflowMessageKeys.value = new Set();
-  messageContentEls.clear();
 });
 
 watch(autoRefresh, (enabled) => {
@@ -1320,24 +1324,16 @@ function onKeydown(event: KeyboardEvent): void {
   gotoRecord(event.key === "ArrowLeft" ? -1 : 1);
 }
 
-function onWindowResize(): void {
-  for (const key of [...messageContentEls.keys()]) {
-    measureMessageContent(key);
-  }
-}
-
 onMounted(() => {
   if (token.value) {
     void loadDashboard();
   }
   window.addEventListener("keydown", onKeydown);
-  window.addEventListener("resize", onWindowResize);
 });
 
 onUnmounted(() => {
   window.clearInterval(autoRefreshTimer);
   window.removeEventListener("keydown", onKeydown);
-  window.removeEventListener("resize", onWindowResize);
 });
 </script>
 <template>
@@ -1645,14 +1641,14 @@ onUnmounted(() => {
                 >
                   <div class="chat-role">{{ message.roleLabel }}</div>
                   <div class="chat-bubble">
-                    <div class="message-collapse" :class="{ expanded: isMessageExpanded(`request-${index}`), 'has-overflow': overflowMessageKeys.has(`request-${index}`) }" :ref="(el) => setMessageContentEl(`request-${index}`, el)">
-                      <p v-if="message.content" class="message-content">{{ message.content }}</p>
+                    <div class="message-collapse" :class="{ expanded: isMessageExpanded(`request-${index}`), 'has-overflow': messageOverflowKey(`request-${index}`, message) }">
+                      <p v-if="message.content" class="message-content">{{ messageDisplayContent(`request-${index}`, message) }}</p>
                       <div v-for="call in message.toolCalls" :key="call.id" class="tool-call-item">
                         <span class="tool-call-name">工具：{{ call.name }}</span>
-                        <code>{{ call.arguments }}</code>
+                        <code>{{ toolCallDisplayArguments(`request-${index}`, call) }}</code>
                       </div>
                     </div>
-                    <button v-if="overflowMessageKeys.has(`request-${index}`)" class="expand-toggle" type="button" @click="toggleMessageExpanded(`request-${index}`)">
+                    <button v-if="messageOverflowKey(`request-${index}`, message)" class="expand-toggle" type="button" @click="toggleMessageExpanded(`request-${index}`)">
                       {{ isMessageExpanded(`request-${index}`) ? "收起" : "展开全部" }}
                     </button>
                   </div>
@@ -1669,14 +1665,14 @@ onUnmounted(() => {
                   >
                     <div class="chat-role">{{ message.roleLabel }}</div>
                     <div class="chat-bubble">
-                      <div class="message-collapse" :class="{ expanded: isMessageExpanded(`response-${index}`), 'has-overflow': overflowMessageKeys.has(`response-${index}`) }" :ref="(el) => setMessageContentEl(`response-${index}`, el)">
-                        <p v-if="message.content" class="message-content">{{ message.content }}</p>
+                      <div class="message-collapse" :class="{ expanded: isMessageExpanded(`response-${index}`), 'has-overflow': messageOverflowKey(`response-${index}`, message) }">
+                        <p v-if="message.content" class="message-content">{{ messageDisplayContent(`response-${index}`, message) }}</p>
                         <div v-for="call in message.toolCalls" :key="call.id" class="tool-call-item">
                           <span class="tool-call-name">工具：{{ call.name }}</span>
-                          <code>{{ call.arguments }}</code>
+                          <code>{{ toolCallDisplayArguments(`response-${index}`, call) }}</code>
                         </div>
                       </div>
-                      <button v-if="overflowMessageKeys.has(`response-${index}`)" class="expand-toggle" type="button" @click="toggleMessageExpanded(`response-${index}`)">
+                      <button v-if="messageOverflowKey(`response-${index}`, message)" class="expand-toggle" type="button" @click="toggleMessageExpanded(`response-${index}`)">
                         {{ isMessageExpanded(`response-${index}`) ? "收起" : "展开全部" }}
                       </button>
                     </div>
