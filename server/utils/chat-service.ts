@@ -749,6 +749,8 @@ export interface RepairPromptOptions {
   tools: ToolDefinition[];
   toolChoice: unknown;
   parallelToolCalls: boolean;
+  /** The pinned contract format; unknown-format candidates default to it. */
+  format?: ToolCallFormat;
 }
 
 /** Declared function names the failed candidate tried to call. */
@@ -784,15 +786,17 @@ function candidateCallNames(candidate: ChatMessage, tools: ToolDefinition[]): st
 }
 
 /**
- * Late-repair escalation: a skeleton envelope naming the failed functions
- * with schema-derived placeholder arguments. Static rules stop converging
- * after repeated failures; a concrete, structurally valid starting point
- * gives the model something to edit instead of regenerate.
+ * Format-matched skeleton example for the correction turn. Models imitate
+ * concrete structure far more reliably than prose rules, so every correction
+ * carries a detailed skeleton in the failed candidate's own wire format —
+ * an XML candidate gets an XML skeleton, a JSON candidate gets a JSON
+ * skeleton — naming the functions the candidate tried to call, with
+ * schema-derived example arguments. Late attempts escalate the wording from
+ * "reference" to "start from this". Corrections never suggest switching
+ * formats.
  */
-function repairEscalationLines(options: RepairPromptOptions): string[] {
-  if (options.attempt < REPAIR_ESCALATION_ATTEMPT) {
-    return [];
-  }
+function repairSkeletonLines(options: RepairPromptOptions): string[] {
+  const escalated = options.attempt >= REPAIR_ESCALATION_ATTEMPT;
   const forced = asRecord(options.toolChoice)?.type === "function"
     ? asRecord(asRecord(options.toolChoice)?.function)?.name
     : undefined;
@@ -800,10 +804,33 @@ function repairEscalationLines(options: RepairPromptOptions): string[] {
   if (names.length === 0 && typeof forced === "string") {
     names = [forced];
   }
+  // Match the failed candidate's wire format. An unknown format falls back
+  // to the pinned contract format, so a pinned conversation never shows the
+  // other format's notation; unpinned ("auto") defaults to JSON, the
+  // contract's primary format.
+  const detected = typeof options.candidate.content === "string"
+    ? detectEnvelopeFormat(options.candidate.content)
+    : "unknown";
+  const candidateFormat = detected !== "unknown"
+    ? detected
+    : options.format === "xml" || options.format === "json"
+      ? options.format
+      : "json";
   if (names.length === 0) {
+    // No recognizable call to name: show the generic envelope shape so the
+    // model still has concrete structure to imitate.
+    const generic = candidateFormat === "xml"
+      ? buildXmlSkeleton([{ name: "declared_function_name", arguments: { parameter_name: "value" } }])
+      : JSON.stringify({
+        type: "tool_calls",
+        tool_calls: [{ name: "declared_function_name", arguments: { parameter_name: "value" } }],
+      }, null, 2);
     return [
       "",
-      "Escalated repair: re-read the declared function list in the system message, copy each function name exactly, and build the envelope around those names.",
+      escalated
+        ? "Escalated repair: re-read the declared function list in the system message, copy each function name exactly, and build the envelope around those names. The envelope shape:"
+        : "The envelope shape (replace the placeholder name with a declared function name and the value with real arguments):",
+      generic,
     ];
   }
   const limited = (options.parallelToolCalls ? names : names.slice(0, 1)).slice(0, MAX_REPAIR_SKELETON_CALLS);
@@ -815,12 +842,9 @@ function repairEscalationLines(options: RepairPromptOptions): string[] {
       arguments: example && typeof example === "object" && !Array.isArray(example) ? example as JsonObject : {} as JsonObject,
     };
   });
-  // Escalate in the format the failed candidate used: a model that already
-  // struggles with one wire format converges faster editing a skeleton of
-  // that same format. Corrections never suggest switching formats.
-  const candidateFormat = typeof options.candidate.content === "string"
-    ? detectEnvelopeFormat(options.candidate.content)
-    : "unknown";
+  const intro = escalated
+    ? "Escalated repair: start from this skeleton envelope; keep its structure and function names unchanged and replace every placeholder value with the real arguments from the conversation:"
+    : "Reference skeleton (keep this structure and these function names; replace the example values with the real arguments from the conversation):";
   if (candidateFormat === "xml") {
     let xmlSkeleton = buildXmlSkeleton(skeletonCalls);
     if (xmlSkeleton.length > MAX_REPAIR_SKELETON_CHARS) {
@@ -828,21 +852,21 @@ function repairEscalationLines(options: RepairPromptOptions): string[] {
     }
     return [
       "",
-      "Escalated repair: start from this skeleton envelope; keep its structure and function names unchanged and replace every placeholder value with the real arguments from the conversation:",
+      intro,
       xmlSkeleton,
       "Return only the completed XML envelope.",
     ];
   }
-  let skeleton = JSON.stringify({ type: "tool_calls", tool_calls: skeletonCalls });
+  let skeleton = JSON.stringify({ type: "tool_calls", tool_calls: skeletonCalls }, null, 2);
   if (skeleton.length > MAX_REPAIR_SKELETON_CHARS) {
     skeleton = JSON.stringify({
       type: "tool_calls",
       tool_calls: limited.map((name) => ({ name, arguments: {} })),
-    });
+    }, null, 2);
   }
   return [
     "",
-    "Escalated repair: start from this skeleton envelope; keep its structure and function names unchanged and replace every placeholder value with the real arguments from the conversation:",
+    intro,
     skeleton,
     "Return only the completed envelope JSON object.",
   ];
@@ -943,7 +967,7 @@ export function repairMessages(options: RepairPromptOptions): ChatMessage[] {
       REPAIR_RULE_SCHEMA[variant]!,
       `- ${callRule}`,
       REPAIR_RULE_SINGLE[variant]!,
-      ...repairEscalationLines(options),
+      ...repairSkeletonLines(options),
     ].join("\n"),
   };
 
@@ -1256,6 +1280,7 @@ async function executeChatRequestOnce(
           tools,
           toolChoice: request.tool_choice,
           parallelToolCalls: request.parallel_tool_calls !== false,
+          format: toolCallPolicy.format,
         }),
         toolCallPolicy.format,
       );

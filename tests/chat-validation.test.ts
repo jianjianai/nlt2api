@@ -594,7 +594,7 @@ const otherTool: ToolDefinition = {
   function: { name: "other", parameters: { type: "object", properties: {} } },
 };
 
-test("repair messages stay static before the escalation attempt", () => {
+test("repair corrections include a format-matched skeleton from the first attempt", () => {
   const candidate: ChatMessage = {
     role: "assistant",
     content: '{"type":"tool_calls","tool_calls":[{"name":"lookup","arguments":{"query":123}}]}',
@@ -610,8 +610,36 @@ test("repair messages stay static before the escalation attempt", () => {
     });
     assert.equal(rejection?.role, "tool");
     assert.equal(correction?.role, "user");
-    assert.ok(!String(correction?.content).includes("Escalated repair"));
+    const content = String(correction?.content);
+    // The escalation wording is reserved for late attempts, but the
+    // format-matched skeleton example is present from the first attempt.
+    assert.ok(!content.includes("Escalated repair"));
+    assert.ok(content.includes("Reference skeleton"));
+    assert.ok(content.includes('"name": "lookup"'));
+    assert.ok(content.includes('"query": "string"'));
   }
+});
+
+test("repair corrections for XML candidates embed an XML skeleton", () => {
+  const candidate: ChatMessage = {
+    role: "assistant",
+    content: '<tool_calls><tool_call name="lookup"><parameter name="query">123</parameter></tool_call></tool_calls>',
+  };
+  const [, correction] = repairMessages({
+    error: "schema mismatch",
+    attempt: 1,
+    candidate,
+    tools: [lookupTool],
+    toolChoice: "auto",
+    parallelToolCalls: true,
+  });
+  const content = String(correction?.content);
+  assert.ok(content.includes("Reference skeleton"));
+  assert.ok(content.includes('<tool_call name="lookup">'));
+  assert.ok(content.includes('<parameter name="query">string</parameter>'));
+  assert.ok(content.includes("Return only the completed XML envelope."));
+  // The JSON skeleton must not leak into an XML-format correction.
+  assert.ok(!content.includes('"tool_calls"'));
 });
 
 test("repair corrections rotate paraphrases and never suggest switching formats", () => {
@@ -656,7 +684,9 @@ test("repair escalation embeds a schema-derived skeleton naming the failed funct
   });
   const content = String(correction?.content);
   assert.ok(content.includes("Escalated repair"));
-  assert.ok(content.includes('{"type":"tool_calls","tool_calls":[{"name":"lookup","arguments":{"query":"string"}}]}'));
+  assert.ok(content.includes(
+    JSON.stringify({ type: "tool_calls", tool_calls: [{ name: "lookup", arguments: { query: "string" } }] }, null, 2),
+  ));
 });
 
 test("repair escalation reads names from normalized tool_calls and honors parallel_tool_calls", () => {
@@ -676,11 +706,11 @@ test("repair escalation reads names from normalized tool_calls and honors parall
     toolChoice: "auto" as const,
   };
   const parallel = String(repairMessages({ ...base, parallelToolCalls: true })[1]?.content);
-  assert.ok(parallel.includes('"name":"lookup"'));
-  assert.ok(parallel.includes('"name":"other"'));
+  assert.ok(parallel.includes('"name": "lookup"'));
+  assert.ok(parallel.includes('"name": "other"'));
   const single = String(repairMessages({ ...base, parallelToolCalls: false })[1]?.content);
-  assert.ok(single.includes('"name":"lookup"'));
-  assert.ok(!single.includes('"name":"other"'));
+  assert.ok(single.includes('"name": "lookup"'));
+  assert.ok(!single.includes('"name": "other"'));
 });
 
 test("repair escalation falls back to the forced tool_choice and to generic guidance", () => {
@@ -693,7 +723,7 @@ test("repair escalation falls back to the forced tool_choice and to generic guid
     toolChoice: { type: "function", function: { name: "lookup" } },
     parallelToolCalls: true,
   });
-  assert.ok(String(forced[1]?.content).includes('"name":"lookup"'));
+  assert.ok(String(forced[1]?.content).includes('"name": "lookup"'));
 
   const proseCandidate: ChatMessage = { role: "assistant", content: "I could not decide." };
   const generic = repairMessages({
@@ -706,5 +736,46 @@ test("repair escalation falls back to the forced tool_choice and to generic guid
   });
   const content = String(generic[1]?.content);
   assert.ok(content.includes("Escalated repair: re-read the declared function list"));
-  assert.ok(!content.includes('"tool_calls":[{"name"'));
+  // With no recognizable call to name, the skeleton falls back to a generic
+  // placeholder envelope shape.
+  assert.ok(content.includes("declared_function_name"));
+  assert.ok(!content.includes('"name": "lookup"'));
+});
+
+test("repair skeletons for unknown-format candidates follow the pinned contract format", () => {
+  // A normalized tool_calls candidate carries no wire format, so the pinned
+  // contract format decides the skeleton notation.
+  const candidate: ChatMessage = {
+    role: "assistant",
+    content: null,
+    tool_calls: [{ id: "call_1", type: "function", function: { name: "lookup", arguments: "{}" } }],
+  };
+  const base = {
+    error: "schema mismatch",
+    attempt: 1,
+    candidate,
+    tools: [lookupTool],
+    toolChoice: "auto" as const,
+    parallelToolCalls: true,
+  };
+  const xml = String(repairMessages({ ...base, format: "xml" as const })[1]?.content);
+  assert.ok(xml.includes('<tool_call name="lookup">'));
+  assert.ok(xml.includes('<parameter name="query">string</parameter>'));
+  assert.ok(!xml.includes('"tool_calls"'));
+  // Pinned JSON, unpinned ("auto") and unspecified all default to JSON, the
+  // contract's primary format.
+  const json = String(repairMessages({ ...base, format: "json" as const })[1]?.content);
+  assert.ok(json.includes('"name": "lookup"'));
+  const unpinned = String(repairMessages({ ...base, format: "auto" as const })[1]?.content);
+  assert.ok(unpinned.includes('"name": "lookup"'));
+  const unspecified = String(repairMessages(base)[1]?.content);
+  assert.ok(unspecified.includes('"name": "lookup"'));
+  // A recognizable candidate format still wins over the pin: the model edits
+  // what it already wrote.
+  const jsonCandidate: ChatMessage = {
+    role: "assistant",
+    content: '{"type":"tool_calls","tool_calls":[{"name":"lookup","arguments":{}}]}',
+  };
+  const jsonInXml = String(repairMessages({ ...base, candidate: jsonCandidate, format: "xml" as const })[1]?.content);
+  assert.ok(jsonInXml.includes('"name": "lookup"'));
 });
