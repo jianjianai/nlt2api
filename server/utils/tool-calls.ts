@@ -67,9 +67,11 @@ export type ToolCallFormat = "auto" | "json" | "xml";
 /**
  * How readily the contract asks the upstream model for user-visible preamble
  * narration: "quiet" stays silent except for key moments, "normal" narrates
- * every non-trivial step in one sentence, "verbose" narrates every step.
+ * every non-trivial step in one sentence, "verbose" narrates every step, and
+ * "milestone" narrates only meaningful milestones (accepting the request, an
+ * important discovery, concrete progress, or a plan change).
  */
-export type PreambleVerbosity = "quiet" | "normal" | "verbose";
+export type PreambleVerbosity = "quiet" | "normal" | "verbose" | "milestone";
 
 /**
  * Default preamble posture. "normal" fixes the failure mode of the previous
@@ -144,6 +146,9 @@ function preambleContractSentence(format: ToolCallFormat, verbosity: PreambleVer
   if (verbosity === "verbose") {
     return `Always include a one-sentence preamble as ${carrier}, telling the user what you just learned or are about to do in plain language, even for routine steps (a brief "Checking X…" is fine). ${rules}`;
   }
+  if (verbosity === "milestone") {
+    return `Include a one-sentence preamble as ${carrier} only at meaningful milestones — when you accept the user's request, discover an important clue, make concrete progress, or change the plan — telling the user what you just learned or are about to do in plain language. ${rules} Stay silent for routine steps.`;
+  }
   return `Include a one-sentence preamble as ${carrier}, telling the user what you just learned or are about to do in plain language (${PREAMBLE_CONTRACT_EXAMPLES}). ${rules} Omit it only when the step is trivially implied by the previous message.`;
 }
 
@@ -160,6 +165,9 @@ function legacyPreambleContractSentence313(format: ToolCallFormat, verbosity: Pr
   const rules = "Keep it under 30 words, never claim a tool already succeeded, and never include tool syntax or internal markers.";
   if (verbosity === "verbose") {
     return `Always include a one-sentence preamble as ${carrier}, telling the user what you just learned or are about to do in plain language, even for routine steps (a brief "Checking X…" is fine). ${rules}`;
+  }
+  if (verbosity === "milestone") {
+    return `Include a one-sentence preamble as ${carrier} only at meaningful milestones — when you accept the user's request, discover an important clue, make concrete progress, or change the plan — telling the user what you just learned or are about to do in plain language. ${rules} Stay silent for routine steps.`;
   }
   return `Include a one-sentence preamble as ${carrier}, telling the user what you just learned or are about to do in plain language (${PREAMBLE_CONTRACT_EXAMPLES}). ${rules} Omit it only when the step is trivially implied by the previous message.`;
 }
@@ -292,9 +300,13 @@ function preambleReminderLine(format: ToolCallFormat, verbosity: PreambleVerbosi
     return PREAMBLE_REMINDER_QUIET[format];
   }
   const carrier = format === "json" ? "a short `preamble`" : format === "xml" ? "a short <preamble>" : "a short preamble";
-  return verbosity === "verbose"
-    ? `Include ${carrier} saying what you are doing next.`
-    : `Include ${carrier} saying what you are doing next, unless it is trivially implied.`;
+  if (verbosity === "verbose") {
+    return `Include ${carrier} saying what you are doing next.`;
+  }
+  if (verbosity === "milestone") {
+    return `Include ${carrier} only at a meaningful milestone (accepting the request, an important discovery, concrete progress, or a plan change); omit it for routine steps.`;
+  }
+  return `Include ${carrier} saying what you are doing next, unless it is trivially implied.`;
 }
 
 function toolTurnReminderSuffix(format: ToolCallFormat, verbosity: PreambleVerbosity): string {
@@ -315,7 +327,7 @@ function toolTurnReminderSuffix(format: ToolCallFormat, verbosity: PreambleVerbo
 // Every prefix variant ever emitted, so re-application dedupes reminders
 // across format and verbosity switches instead of stacking them.
 const TOOL_TURN_REMINDER_PREFIX_VARIANTS: string[] = (["auto", "json", "xml"] as const)
-  .flatMap((format) => (["quiet", "normal", "verbose"] as const).map((verbosity) => toolTurnReminderPrefix(format, verbosity)));
+  .flatMap((format) => (["quiet", "normal", "verbose", "milestone"] as const).map((verbosity) => toolTurnReminderPrefix(format, verbosity)));
 
 /**
  * The trailing user-turn reminder, echoing this request's binding constraints
@@ -808,7 +820,7 @@ function stripToolContract(content: string): string {
   // Every format × verbosity variant ever emitted, so a settings switch or a
   // version upgrade never strands a stale contract in the history.
   const variants = (["auto", "json", "xml"] as const)
-    .flatMap((format) => (["quiet", "normal", "verbose"] as const)
+    .flatMap((format) => (["quiet", "normal", "verbose", "milestone"] as const)
       .flatMap((verbosity) => [toolCallContract(format, verbosity), legacyToolCallContract313(format, verbosity)]));
   // Legacy contract variants: sentences whose wording changed across versions
   // are swapped back in every combination, so histories written by any older

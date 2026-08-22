@@ -103,7 +103,7 @@ interface DebugRecordSummary {
 }
 
 type ToolCallFormat = "auto" | "json" | "xml";
-type PreambleVerbosity = "quiet" | "normal" | "verbose";
+type PreambleVerbosity = "quiet" | "normal" | "verbose" | "milestone";
 
 interface ApiPayload {
   accounts?: Account[];
@@ -628,7 +628,7 @@ function setToolCallFormat(value: ToolCallFormat) {
 }
 
 function setPreambleVerbosity(value: PreambleVerbosity) {
-  const labels: Record<PreambleVerbosity, string> = { quiet: "静默", normal: "关键步骤播报", verbose: "逐步播报" };
+  const labels: Record<PreambleVerbosity, string> = { quiet: "静默", normal: "关键步骤播报", verbose: "逐步播报", milestone: "里程碑播报" };
   void patchToolCallSettings({ preambleVerbosity: value }, `进度播报已设为 ${labels[value]}`);
 }
 
@@ -651,7 +651,7 @@ function onToolCallFormatChange(event: Event) {
 
 function onPreambleVerbosityChange(event: Event) {
   const value = (event.target as HTMLSelectElement).value;
-  if (value === "quiet" || value === "normal" || value === "verbose") {
+  if (value === "quiet" || value === "normal" || value === "verbose" || value === "milestone") {
     setPreambleVerbosity(value);
   }
 }
@@ -662,7 +662,7 @@ function onModelToolCallFormatChange(model: string, event: Event) {
 
 function setModelPreambleVerbosity(model: string, value: string) {
   const next: Record<string, PreambleVerbosity> = { ...(settings.modelPreambleVerbosities ?? {}) };
-  if (value === "quiet" || value === "normal" || value === "verbose") {
+  if (value === "quiet" || value === "normal" || value === "verbose" || value === "milestone") {
     next[model] = value;
   } else {
     delete next[model];
@@ -1500,6 +1500,7 @@ onUnmounted(() => {
               <select :value="effectivePreambleVerbosity" @change="onPreambleVerbosityChange">
                 <option value="normal">normal · 关键步骤播报（推荐）</option>
                 <option value="verbose">verbose · 每步都播报</option>
+                <option value="milestone">milestone · 里程碑播报</option>
                 <option value="quiet">quiet · 默认静默</option>
               </select>
             </label>
@@ -1525,6 +1526,7 @@ onUnmounted(() => {
                   <option value="">跟随全局（{{ effectivePreambleVerbosity }}）</option>
                   <option value="normal">normal</option>
                   <option value="verbose">verbose</option>
+                  <option value="milestone">milestone</option>
                   <option value="quiet">quiet</option>
                 </select>
               </div>

@@ -675,7 +675,7 @@ test("raw history values round-trip, including ]]> and an embedded close tag", (
 });
 
 test("contract re-application strips every verbosity variant", () => {
-  for (const verbosity of ["quiet", "normal", "verbose"] as const) {
+  for (const verbosity of ["quiet", "normal", "verbose", "milestone"] as const) {
     const first = withToolCallContract(
       [{ role: "system" as const, content: "Be nice." }, { role: "user" as const, content: "hi" }],
       tools,

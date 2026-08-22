@@ -12,7 +12,7 @@ export type ToolCallFormat = "auto" | "json" | "xml";
  * preamble narration. Mirrors the type in tool-calls.ts (kept duplicate, like
  * ToolCallFormat, to avoid a config → contract import edge).
  */
-export type PreambleVerbosity = "quiet" | "normal" | "verbose";
+export type PreambleVerbosity = "quiet" | "normal" | "verbose" | "milestone";
 
 export interface ProxyConfig {
   adminToken: string;
@@ -56,7 +56,7 @@ export function getProxyConfig(): ProxyConfig {
     dataDir: resolve(process.env.NEURALWATT_DATA_DIR ?? ".data/neuralwatt"),
     defaultModel: process.env.NEURALWATT_DEFAULT_MODEL ?? "kimi-k3-fast",
     toolCallFormat: rawToolCallFormat === "json" || rawToolCallFormat === "xml" ? rawToolCallFormat : "auto",
-    preambleVerbosity: rawPreambleVerbosity === "quiet" || rawPreambleVerbosity === "verbose" ? rawPreambleVerbosity : "normal",
+    preambleVerbosity: rawPreambleVerbosity === "quiet" || rawPreambleVerbosity === "verbose" || rawPreambleVerbosity === "milestone" ? rawPreambleVerbosity : "normal",
     maxRequestBytes: Number.isFinite(rawMaxRequestBytes) && rawMaxRequestBytes > 0
       ? Math.floor(rawMaxRequestBytes)
       : 67_108_864,

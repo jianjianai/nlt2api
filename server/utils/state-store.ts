@@ -33,8 +33,8 @@ function normaliseToolCallFormat(value: unknown): "auto" | "json" | "xml" | unde
   return value === "auto" || value === "json" || value === "xml" ? value : undefined;
 }
 
-function normalisePreambleVerbosity(value: unknown): "quiet" | "normal" | "verbose" | undefined {
-  return value === "quiet" || value === "normal" || value === "verbose" ? value : undefined;
+function normalisePreambleVerbosity(value: unknown): "quiet" | "normal" | "verbose" | "milestone" | undefined {
+  return value === "quiet" || value === "normal" || value === "verbose" || value === "milestone" ? value : undefined;
 }
 
 function normaliseModelToolCallFormats(value: unknown): Record<string, "auto" | "json" | "xml"> | undefined {
@@ -52,11 +52,11 @@ function normaliseModelToolCallFormats(value: unknown): Record<string, "auto" | 
   return Object.keys(result).length > 0 ? result : undefined;
 }
 
-function normaliseModelPreambleVerbosities(value: unknown): Record<string, "quiet" | "normal" | "verbose"> | undefined {
+function normaliseModelPreambleVerbosities(value: unknown): Record<string, "quiet" | "normal" | "verbose" | "milestone"> | undefined {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     return undefined;
   }
-  const result: Record<string, "quiet" | "normal" | "verbose"> = {};
+  const result: Record<string, "quiet" | "normal" | "verbose" | "milestone"> = {};
   for (const [key, verbosity] of Object.entries(value)) {
     const model = key.trim();
     const normalised = normalisePreambleVerbosity(verbosity);
@@ -74,9 +74,9 @@ function normaliseModelPreambleVerbosities(value: unknown): Record<string, "quie
 export interface ProxySettingsUpdate {
   recordMessages?: boolean;
   toolCallFormat?: "auto" | "json" | "xml" | null;
-  preambleVerbosity?: "quiet" | "normal" | "verbose" | null;
+  preambleVerbosity?: "quiet" | "normal" | "verbose" | "milestone" | null;
   modelToolCallFormats?: Record<string, "auto" | "json" | "xml"> | null;
-  modelPreambleVerbosities?: Record<string, "quiet" | "normal" | "verbose"> | null;
+  modelPreambleVerbosities?: Record<string, "quiet" | "normal" | "verbose" | "milestone"> | null;
 }
 
 /** Drop unknown/invalid persisted settings while preserving every valid one. */

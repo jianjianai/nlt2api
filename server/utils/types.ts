@@ -97,12 +97,12 @@ export interface ProxySettings {
   /** Per-model tool-call wire-format overrides, keyed by model id. */
   modelToolCallFormats?: Record<string, "auto" | "json" | "xml">;
   /** Per-model preamble-verbosity overrides, keyed by model id. */
-  modelPreambleVerbosities?: Record<string, "quiet" | "normal" | "verbose">;
+  modelPreambleVerbosities?: Record<string, "quiet" | "normal" | "verbose" | "milestone">;
   /**
    * How readily the contract asks the model for user-visible preambles.
    * Falls back to NEURALWATT_PREAMBLE_VERBOSITY.
    */
-  preambleVerbosity?: "quiet" | "normal" | "verbose";
+  preambleVerbosity?: "quiet" | "normal" | "verbose" | "milestone";
 }
 
 export interface PersistentState {

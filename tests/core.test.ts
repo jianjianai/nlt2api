@@ -755,7 +755,7 @@ test("contracts carrying legacy sentence wordings still strip cleanly", () => {
 
 test("a 3.13.0 contract in history strips cleanly on re-application", () => {
   for (const format of ["auto", "json", "xml"] as const) {
-    for (const verbosity of ["quiet", "normal", "verbose"] as const) {
+    for (const verbosity of ["quiet", "normal", "verbose", "milestone"] as const) {
       const legacySystem = `Be nice.\n\n${legacyToolCallContract313(format, verbosity)}`;
       const contracted = withToolCallContract(
         [{ role: "system" as const, content: legacySystem }, { role: "user" as const, content: "hi" }],

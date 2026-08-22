@@ -4,7 +4,7 @@ import { adminHttpError } from "~/server/utils/route-helpers.ts";
 import { stateStore, type ProxySettingsUpdate } from "~/server/utils/state-store.ts";
 
 const TOOL_CALL_FORMATS = new Set(["auto", "json", "xml"]);
-const PREAMBLE_VERBOSITIES = new Set(["quiet", "normal", "verbose"]);
+const PREAMBLE_VERBOSITIES = new Set(["quiet", "normal", "verbose", "milestone"]);
 const MAX_MODEL_FORMAT_ENTRIES = 200;
 const MAX_MODEL_ID_LENGTH = 200;
 
@@ -18,14 +18,14 @@ function asToolCallFormat(value: unknown): "auto" | "json" | "xml" | null {
   throw new HttpError(400, "`toolCallFormat` must be one of \"auto\", \"json\" or \"xml\" (or null to inherit the env default).", "invalid_request_error", "toolCallFormat");
 }
 
-function asPreambleVerbosity(value: unknown): "quiet" | "normal" | "verbose" | null {
+function asPreambleVerbosity(value: unknown): "quiet" | "normal" | "verbose" | "milestone" | null {
   if (value === null) {
     return null;
   }
   if (typeof value === "string" && PREAMBLE_VERBOSITIES.has(value)) {
-    return value as "quiet" | "normal" | "verbose";
+    return value as "quiet" | "normal" | "verbose" | "milestone";
   }
-  throw new HttpError(400, "`preambleVerbosity` must be one of \"quiet\", \"normal\" or \"verbose\" (or null to inherit the env default).", "invalid_request_error", "preambleVerbosity");
+  throw new HttpError(400, "`preambleVerbosity` must be one of \"quiet\", \"normal\", \"verbose\" or \"milestone\" (or null to inherit the env default).", "invalid_request_error", "preambleVerbosity");
 }
 
 function asModelEnumMap<T extends string>(
