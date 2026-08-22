@@ -9,7 +9,6 @@ import {
 import { getProxyConfig } from "~/server/utils/config.ts";
 import { HttpError } from "~/server/utils/http.ts";
 import { responseStore } from "~/server/utils/response-store.ts";
-import { stringifyContent } from "~/server/utils/tool-calls.ts";
 import type {
   ChatMessage,
   JsonObject,
@@ -264,8 +263,14 @@ export function messagesFromResponseItems(items: JsonObject[], customTools: Set<
       const call = toolCallFromItem(item, customTools, index);
       const reasoning = takeReasoning();
       const previous = messages[messages.length - 1];
-      if (previous?.role === "assistant" && previous.tool_calls?.length && !stringifyContent(previous.content)) {
-        previous.tool_calls.push(call);
+      // A message item carrying the assistant's narration followed by
+      // function_call items is ONE turn: attach the call to that message so
+      // its text becomes the tool-call envelope's preamble when the history
+      // is re-encoded for the portal. Splitting them apart would mis-mark
+      // the text as a <|FINAL_REPLY|> message and teach the model to
+      // announce instead of calling tools.
+      if (previous?.role === "assistant") {
+        previous.tool_calls = [...(previous.tool_calls ?? []), call];
         if (reasoning.reasoning) {
           previous.reasoning = `${previous.reasoning ?? ""}${reasoning.reasoning}`;
         }

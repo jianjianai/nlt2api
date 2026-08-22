@@ -362,6 +362,29 @@ test("messagesFromResponseItems groups calls, outputs and reasoning", () => {
   assert.deepEqual(messages[4], { role: "tool", tool_call_id: "call_2", content: "cwd" });
 });
 
+test("messagesFromResponseItems keeps a message item's text on the call turn", () => {
+  // A message item followed by function_call items is ONE assistant turn:
+  // the text must stay on the same message as the calls, or the portal
+  // history re-encoder would mis-mark it as a <|FINAL_REPLY|> message and
+  // teach the model to announce instead of calling tools.
+  const messages = messagesFromResponseItems([
+    userInput("Run something"),
+    { type: "message", role: "assistant", content: [{ type: "output_text", text: "我先查看项目结构。" }] },
+    { type: "function_call", name: "shell_command", arguments: "{\"command\":\"ls\"}", call_id: "call_1" },
+    { type: "function_call", name: "shell_command", arguments: "{\"command\":\"pwd\"}", call_id: "call_2" },
+    { type: "function_call_output", call_id: "call_1", output: "files" },
+    { type: "function_call_output", call_id: "call_2", output: "cwd" },
+  ], new Set());
+  assert.equal(messages.length, 4);
+  const assistant = messages[1]!;
+  assert.equal(assistant.role, "assistant");
+  assert.equal(assistant.content, "我先查看项目结构。");
+  assert.equal(assistant.tool_calls?.length, 2);
+  assert.equal(assistant.tool_calls?.[0]?.id, "call_1");
+  assert.deepEqual(messages[2], { role: "tool", tool_call_id: "call_1", content: "files" });
+  assert.deepEqual(messages[3], { role: "tool", tool_call_id: "call_2", content: "cwd" });
+});
+
 test("messagesFromResponseItems unwraps custom tool calls and outputs", () => {
   const messages = messagesFromResponseItems([
     userInput("Patch it"),
