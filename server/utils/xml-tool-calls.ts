@@ -236,9 +236,7 @@ function friendlyXmlParseError(
     + "put every call inside one <tool_calls> root element.",
   );
   lines.push(
-    "Return exactly one valid envelope as assistant content, with no prose, markdown, or code fences: "
-    + `either the XML form ${XML_ENVELOPE_SKELETON} or the JSON form {"type":"tool_calls","tool_calls":[{"name":"declared_function_name","arguments":{...}}]}. `
-    + "If XML keeps failing, switch to the JSON envelope; both are always accepted.",
+    "Return exactly one valid envelope as assistant content, with no prose, markdown, or code fences.",
   );
   return lines.join("\n");
 }

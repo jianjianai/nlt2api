@@ -113,7 +113,7 @@ function toolContractSentences(format: ToolCallFormat, verbosity: PreambleVerbos
     case "json":
       return [
         "IMPORTANT ADAPTER OVERRIDE: ignore every other requested tool-call wire format.",
-        `The only tool-call channel is ordinary assistant message content; the gateway reads no other channel. To call tools, make the entire content exactly one JSON object of the form ${skeletons.json}: one entry per intended call, with independent calls batched in the same turn. No prose, markdown, code fences, XML, or special control tokens around the JSON; end it at the closing brace.`,
+        `The only tool-call channel is ordinary assistant message content; the gateway reads no other channel. To call tools, make the entire content exactly one JSON object of the form ${skeletons.json}: one entry per intended call, with independent calls batched in the same turn. No prose, markdown, code fences, or special control tokens around the JSON; end it at the closing brace.`,
         CONTRACT_SENTENCE_NO_NATIVE,
         preambleContractSentence(format, verbosity),
         `To answer the user without calling a tool, start the content with ${FINAL_REPLY_MARKER} followed immediately by the answer text, and no JSON object.`,
@@ -122,7 +122,7 @@ function toolContractSentences(format: ToolCallFormat, verbosity: PreambleVerbos
     case "xml":
       return [
         "IMPORTANT ADAPTER OVERRIDE: ignore every other requested tool-call wire format.",
-        `The only tool-call channel is ordinary assistant message content; the gateway reads no other channel. To call tools, make the entire content exactly one XML document of the form ${skeletons.xml}: one <tool_call> element per intended call, with independent calls batched in the same document. No prose, markdown, code fences, JSON, or special control tokens around the XML; end it at the closing </tool_calls> tag. ${CONTRACT_SENTENCE_XML_RULES}`,
+        `The only tool-call channel is ordinary assistant message content; the gateway reads no other channel. To call tools, make the entire content exactly one XML document of the form ${skeletons.xml}: one <tool_call> element per intended call, with independent calls batched in the same document. No prose, markdown, code fences, or special control tokens around the XML; end it at the closing </tool_calls> tag. ${CONTRACT_SENTENCE_XML_RULES}`,
         CONTRACT_SENTENCE_NO_NATIVE,
         preambleContractSentence(format, verbosity),
         `To answer the user without calling a tool, start the content with ${FINAL_REPLY_MARKER} followed immediately by the answer text, and no XML document.`,
@@ -198,10 +198,12 @@ function preambleReminderLine(format: ToolCallFormat, verbosity: PreambleVerbosi
 }
 
 function toolTurnReminderSuffix(format: ToolCallFormat, verbosity: PreambleVerbosity): string {
+  // Pinned formats name only their own envelope: the other format is simply
+  // absent from the prompt rather than explicitly forbidden, saving tokens.
   const noProse = format === "json"
-    ? "No prose, markdown, code fences, reasoning, native tool fields, XML, or special control tokens around the JSON."
+    ? "No prose, markdown, code fences, reasoning, native tool fields, or special control tokens around the JSON."
     : format === "xml"
-      ? "No prose, markdown, code fences, reasoning, native tool fields, JSON, or special control tokens around the XML."
+      ? "No prose, markdown, code fences, reasoning, native tool fields, or special control tokens around the XML."
       : "No prose, markdown, code fences, reasoning, native tool fields, or special control tokens around the envelope.";
   return [
     noProse,
@@ -455,9 +457,7 @@ function friendlyJsonParseError(text: string, nativeError: unknown, repairError:
     lines.push(`Nearby text: ${excerptAround(text, position.pos)}`);
   }
   lines.push(
-    "Return exactly one valid envelope (containing all intended calls) as assistant content, with no prose, markdown, or code fences: "
-    + `either the JSON form {"type":"tool_calls","tool_calls":[{"name":"declared_function_name","arguments":{...}}]} or the XML form ${XML_ENVELOPE_SKELETON}. `
-    + "If JSON keeps failing, switch to the XML envelope; both are always accepted.",
+    "Return exactly one valid envelope (containing all intended calls) as assistant content, with no prose, markdown, or code fences.",
   );
   return lines.join("\n");
 }
@@ -466,7 +466,7 @@ function friendlyUnknownEnvelopeError(text: string): string {
   return [
     "The response was not recognized as a tool-call envelope in either supported format.",
     `Nearby text: ${excerptAround(text, 0)}`,
-    `Return exactly one valid envelope as assistant content, with no prose, markdown, or code fences: either the JSON form ${TOOL_ENVELOPE_SKELETON} or the XML form ${XML_ENVELOPE_SKELETON}.`,
+    "Return exactly one valid envelope as assistant content, with no prose, markdown, or code fences.",
   ].join("\n");
 }
 
@@ -708,7 +708,14 @@ function stripToolContract(content: string): string {
   // strands a stale contract in the history.
   const variants = (["auto", "json", "xml"] as const)
     .flatMap((format) => (["quiet", "normal", "verbose"] as const).map((verbosity) => toolCallContract(format, verbosity)));
-  if (!variants.some((variant) => content.includes(variant))) {
+  // Legacy pinned-format contracts (pre-3.10.1) named the other wire format
+  // in the no-prose rule; keep stripping them so upgrading never strands a
+  // stale contract in the history.
+  const legacyVariants = variants.map((variant) => variant
+    .replace("code fences, or special control tokens around the JSON", "code fences, XML, or special control tokens around the JSON")
+    .replace("code fences, or special control tokens around the XML", "code fences, JSON, or special control tokens around the XML"));
+  const allVariants = [...new Set([...variants, ...legacyVariants])];
+  if (!allVariants.some((variant) => content.includes(variant))) {
     return content;
   }
   // The schema block is always the trailing adapter fragment; cut it first,
@@ -721,7 +728,7 @@ function stripToolContract(content: string): string {
   if (schemaBlock >= 0) {
     stripped = stripped.slice(0, schemaBlock);
   }
-  for (const variant of variants) {
+  for (const variant of allVariants) {
     stripped = stripped.split(variant).join("");
   }
   return stripped.trim();

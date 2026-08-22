@@ -614,6 +614,33 @@ test("repair messages stay static before the escalation attempt", () => {
   }
 });
 
+test("repair corrections rotate paraphrases and never suggest switching formats", () => {
+  const candidate: ChatMessage = {
+    role: "assistant",
+    content: '{"type":"tool_calls","tool_calls":[{"name":"lookup","arguments":{"query":123}}]}',
+  };
+  const corrections = [1, 2, 3, 4, 5].map((attempt) => String(repairMessages({
+    error: "schema mismatch",
+    attempt,
+    candidate,
+    tools: [lookupTool],
+    toolChoice: "auto",
+    parallelToolCalls: true,
+  })[1]?.content));
+  // Consecutive attempts use different wording; the rotation wraps after the
+  // variant count (attempts 1 and 4 share a paraphrase, modulo the number).
+  const opening = (text: string) => text.split("\n")[0]!.replace(/\d+/, "#");
+  assert.notEqual(opening(corrections[0]!), opening(corrections[1]!));
+  assert.notEqual(opening(corrections[1]!), opening(corrections[2]!));
+  assert.equal(opening(corrections[0]!), opening(corrections[3]!));
+  for (const text of corrections) {
+    assert.ok(!text.includes("JSON or XML"), text);
+    assert.ok(!text.includes("switch"), text);
+    assert.ok(!text.includes("other supported one"), text);
+    assert.ok(!text.includes("both are always accepted"), text);
+  }
+});
+
 test("repair escalation embeds a schema-derived skeleton naming the failed functions", () => {
   const candidate: ChatMessage = {
     role: "assistant",

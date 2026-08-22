@@ -298,7 +298,9 @@ test("unrepairable XML produces a located, AI-friendly diagnostic", () => {
   assert.match(result.error, /line \d+, column \d+/);
   assert.match(result.error, />>>/);
   assert.match(result.error, /CDATA/);
-  assert.match(result.error, /JSON/);
+  // Diagnostics never suggest switching wire formats.
+  assert.ok(!result.error.includes("switch"));
+  assert.ok(!result.error.includes("JSON form"));
 });
 
 test("unclosed-tag diagnostics name the tags left open", () => {
@@ -348,12 +350,14 @@ test("leading whitespace before the XML envelope keeps XML detection", () => {
   assert.deepEqual(JSON.parse(result.envelope.toolCalls[0]!.function.arguments), { command: "ls -la && pwd" });
 });
 
-test("unrecognized content gets a format-neutral error naming both envelopes", () => {
+test("unrecognized content gets a format-neutral error without switch hints", () => {
   const result = parseControlledToolEnvelopeDetailed("just plain prose, no envelope at all", tools, "seed");
   assert.equal(result.envelope, undefined);
   assert.match(result.error ?? "", /not recognized as a tool-call envelope/);
-  assert.match(result.error ?? "", /JSON/);
-  assert.match(result.error ?? "", /XML/);
+  // The error stays format-neutral: it names neither envelope skeleton and
+  // never suggests switching formats.
+  assert.ok(!result.error?.includes("JSON form"));
+  assert.ok(!result.error?.includes("switch"));
 });
 
 test("extractXmlCallNames lifts declared names from broken candidates", () => {

@@ -69,7 +69,7 @@ const MAX_TOOL_REPAIR_CANDIDATE_CHARS = 131_072;
 const REPAIR_ESCALATION_ATTEMPT = 3;
 const MAX_REPAIR_SKELETON_CALLS = 3;
 const MAX_REPAIR_SKELETON_CHARS = 4_000;
-const EMPTY_REPAIR_CANDIDATE = "[The previous assistant turn produced no tool-call envelope. Reconstruct the intended calls from the preceding conversation and return only a valid controlled tool-call envelope (JSON or XML).]";
+const EMPTY_REPAIR_CANDIDATE = "[The previous assistant turn produced no tool-call envelope. Reconstruct the intended calls from the preceding conversation and return only a valid controlled tool-call envelope.]";
 
 export interface ChatExecution {
   account: ManagedAccount;
@@ -817,8 +817,7 @@ function repairEscalationLines(options: RepairPromptOptions): string[] {
   });
   // Escalate in the format the failed candidate used: a model that already
   // struggles with one wire format converges faster editing a skeleton of
-  // that same format, while the correction rules offer the other format as
-  // the escape hatch.
+  // that same format. Corrections never suggest switching formats.
   const candidateFormat = typeof options.candidate.content === "string"
     ? detectEnvelopeFormat(options.candidate.content)
     : "unknown";
@@ -849,6 +848,49 @@ function repairEscalationLines(options: RepairPromptOptions): string[] {
   ];
 }
 
+// Paraphrase rotation for repair corrections: repeating the identical
+// correction text after a failed attempt invites the model to repeat the same
+// error (an error loop). Each attempt uses a different but semantically
+// equivalent wording; none of them suggests switching wire formats — the
+// parser always accepts both.
+const REPAIR_PARAPHRASE_VARIANTS = 3;
+const REPAIR_OPENING = [
+  (attempt: number) => `Tool-call repair attempt ${attempt}.`,
+  (attempt: number) => `Repair attempt ${attempt} for the rejected tool-call envelope.`,
+  (attempt: number) => `Tool-call correction round ${attempt}.`,
+];
+const REPAIR_CONTEXT_HAS_CANDIDATE = [
+  "The preceding assistant message is the failed tool-call candidate; replace it instead of explaining it.",
+  "The assistant message above is the rejected candidate; rewrite it rather than commenting on it.",
+  "The previous assistant turn is the failed candidate; produce its corrected replacement.",
+];
+const REPAIR_CONTEXT_NO_CANDIDATE = [
+  "The preceding assistant turn emitted no tool-call envelope. Continue from the preceding assistant/tool exchanges and produce the missing call; do not treat this repair request as a new user task.",
+  "The assistant turn above produced no tool-call envelope. Resume the preceding exchanges and emit the missing call; this correction is not a new user task.",
+  "No tool-call envelope appeared in the previous assistant turn. Continue the existing exchange and output the missing call without starting over.",
+];
+const REPAIR_DIRECTIVE = [
+  "The previous tool-call envelope was rejected. Return only the corrected envelope.",
+  "The gateway rejected that tool-call envelope. Reply with the corrected envelope and nothing else.",
+  "That envelope failed validation. Emit the fixed envelope as your entire reply.",
+];
+const REPAIR_RULES_INTRO = ["Rules:", "Checklist:", "Requirements:"];
+const REPAIR_RULE_ENVELOPE = [
+  "- Use the required envelope and a declared function name.",
+  "- The envelope must follow the required shape and call a declared function.",
+  "- Follow the required envelope structure; use only declared function names.",
+];
+const REPAIR_RULE_SCHEMA = [
+  "- Make arguments satisfy the declared JSON Schema.",
+  "- Every argument must validate against the function's declared JSON Schema.",
+  "- Arguments must conform to the declared JSON Schema.",
+];
+const REPAIR_RULE_SINGLE = [
+  "- Output exactly one envelope (with all intended calls inside) and no prose, markdown, or code fences.",
+  "- Return a single envelope containing all intended calls; no prose, markdown, or code fences around it.",
+  "- Exactly one envelope with every intended call inside; no surrounding prose, markdown, or code fences.",
+];
+
 export function repairMessages(options: RepairPromptOptions): ChatMessage[] {
   const { error, attempt, candidate, parallelToolCalls } = options;
   const hasCandidate = Boolean(
@@ -856,9 +898,14 @@ export function repairMessages(options: RepairPromptOptions): ChatMessage[] {
     || candidate.tool_calls?.length,
   );
   const candidateToolCallId = candidate.tool_calls?.find((call) => call.id)?.id;
+  // Paraphrase rotation: repeating the identical correction text after a
+  // failed attempt invites the model to repeat the same error (an error
+  // loop). Each attempt uses a different but semantically equivalent
+  // wording; none of them suggests switching wire formats.
+  const variant = (attempt - 1) % REPAIR_PARAPHRASE_VARIANTS;
   const context = hasCandidate
-    ? "The preceding assistant message is the failed tool-call candidate; replace it instead of explaining it."
-    : "The preceding assistant turn emitted no tool-call JSON. Continue from the preceding assistant/tool exchanges and produce the missing call; do not treat this repair request as a new user task.";
+    ? REPAIR_CONTEXT_HAS_CANDIDATE[variant]!
+    : REPAIR_CONTEXT_NO_CANDIDATE[variant]!;
   // Keep the call-count rule aligned with the caller's parallel_tool_calls
   // setting: demanding a single call when parallel calls are allowed makes the
   // model drop otherwise valid calls from the failed candidate. The rule must
@@ -886,22 +933,16 @@ export function repairMessages(options: RepairPromptOptions): ChatMessage[] {
   const correction: ChatMessage = {
     role: "user",
     content: [
-      `Tool-call repair attempt ${attempt}.`,
+      REPAIR_OPENING[variant]!(attempt),
       context,
       "",
-      "The previous tool-call envelope was rejected. Return only the corrected envelope, in the same format you used or the other supported one.",
+      REPAIR_DIRECTIVE[variant]!,
       "",
-      "Rules:",
-      "- Use the required envelope (JSON or XML) and a declared function name.",
-      "- Make arguments satisfy the declared JSON Schema.",
+      REPAIR_RULES_INTRO[variant]!,
+      REPAIR_RULE_ENVELOPE[variant]!,
+      REPAIR_RULE_SCHEMA[variant]!,
       `- ${callRule}`,
-      "- Output exactly one envelope (with all intended calls inside) and no prose, markdown, or code fences.",
-      // The format escape hatch: a model stuck on one wire format often
-      // succeeds immediately in the other, so name the option explicitly
-      // once the first correction has failed.
-      ...(attempt >= 2
-        ? ["- Both envelope formats are always accepted; if this format keeps failing, switch to the other one (JSON <-> XML)."]
-        : []),
+      REPAIR_RULE_SINGLE[variant]!,
       ...repairEscalationLines(options),
     ].join("\n"),
   };
