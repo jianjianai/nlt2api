@@ -620,7 +620,7 @@ export function parseControlledToolEnvelopeDetailed(
     return { error: friendlyUnknownEnvelopeError(trimmed) };
   }
   if (format === "xml") {
-    const parsedXml = parseRepairXml(trimmed);
+    const parsedXml = parseRepairXml(trimmed, declaredTools);
     if ("error" in parsedXml) {
       return { error: parsedXml.error };
     }

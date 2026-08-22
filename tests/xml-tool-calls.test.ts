@@ -348,6 +348,84 @@ test("unrepairable XML produces a located, AI-friendly diagnostic", () => {
   assert.ok(!result.error.includes("JSON form"));
 });
 
+test("function-name-as-element calls are recovered when the name is declared", () => {
+  // The observed deepseek-v4-pro failure mode: <bash>…</bash> instead of
+  // <tool_call name="bash">…</tool_call>, with a raw && inside the value.
+  // The old diagnostic blamed the & and the model looped on it forever.
+  const candidate = "<tool_calls>\n<bash>\n<parameter name=\"command\" string=\"true\">git status && echo \"---DIFF---\" && git diff --stat</parameter>\n</bash>\n</tool_calls>";
+  const result = parseRepairXml(candidate, new Set(["bash", "read"]));
+  assert.ok("value" in result);
+  if (!("value" in result)) return;
+  assert.equal(result.repaired, true);
+  assert.ok(result.changes.some((change) => change.includes('<tool_call name="bash">')));
+  const envelope = xmlDocToEnvelope(result.value, shellTools) as { tool_calls: { name: string; arguments: unknown }[] };
+  assert.equal(envelope.tool_calls[0]?.name, "bash");
+  assert.deepEqual(envelope.tool_calls[0]?.arguments, { command: 'git status && echo "---DIFF---" && git diff --stat' });
+
+  // The end-to-end path passes the declared tools through, so the repair
+  // loop never sees this malformation at all.
+  const detailed = parseControlledToolEnvelopeDetailed(candidate, shellTools, "seed");
+  assert.equal(detailed.envelope?.type, "tool_calls");
+  if (detailed.envelope?.type !== "tool_calls") return;
+  assert.equal(detailed.envelope.toolCalls[0]?.function.name, "bash");
+  assert.deepEqual(JSON.parse(detailed.envelope.toolCalls[0]!.function.arguments), {
+    command: 'git status && echo "---DIFF---" && git diff --stat',
+  });
+
+  // Multiple sibling calls named by their elements are all recovered.
+  const multiple = parseRepairXml(
+    "<tool_calls><bash><parameter name=\"command\">ls</parameter></bash><read><parameter name=\"path\">a.ts</parameter></read></tool_calls>",
+    new Set(["bash", "read"]),
+  );
+  assert.ok("value" in multiple);
+  if (!("value" in multiple)) return;
+  const wrapped = xmlDocToEnvelope(multiple.value, [...shellTools, ...tools]) as { tool_calls: { name: string }[] };
+  assert.deepEqual(wrapped.tool_calls.map((call) => call.name), ["bash", "read"]);
+});
+
+test("a declared tool name in prose does not hijack a valid envelope", () => {
+  // The second scanner pass only runs when the strict pass found no call, so
+  // angle-bracket prose beside a valid envelope is still ignored.
+  const candidate = "Using <bash> for this.\n<tool_calls><tool_call name=\"bash\"><parameter name=\"command\">ls</parameter></tool_call></tool_calls>";
+  const result = parseRepairXml(candidate, new Set(["bash"]));
+  assert.ok("value" in result);
+  if (!("value" in result)) return;
+  const envelope = xmlDocToEnvelope(result.value, shellTools) as { tool_calls: { name: string; arguments: unknown }[] };
+  assert.equal(envelope.tool_calls.length, 1);
+  assert.deepEqual(envelope.tool_calls[0]?.arguments, { command: "ls" });
+});
+
+test("the diagnostic names the function-name-as-element malformation", () => {
+  // Without declared names the scanner cannot recover <bash>…</bash>; the
+  // diagnostic must name the real problem instead of blaming the raw &.
+  const result = parseRepairXml("<tool_calls>\n<bash>\n<parameter name=\"command\">git status && git diff</parameter>\n</bash>\n</tool_calls>");
+  assert.ok(!("value" in result));
+  if ("value" in result) return;
+  assert.match(result.error, /<bash> is not a tool call/);
+  assert.match(result.error, /<tool_call name="bash">/);
+  assert.match(result.error, /raw & inside a <parameter> value needs no escaping/);
+});
+
+test("well-formed XML without a tool call is reported honestly", () => {
+  // The model's misguided "fix" (&& → ;) is valid XML, so the diagnostic
+  // must not claim a parse failure — the missing <tool_call> is the problem.
+  const result = parseRepairXml("<tool_calls>\n<bash>\n<parameter name=\"command\">git status; git diff</parameter>\n</bash>\n</tool_calls>");
+  assert.ok(!("value" in result));
+  if ("value" in result) return;
+  assert.match(result.error, /well-formed, but no tool call was found/);
+  assert.match(result.error, /<bash> is not a tool call/);
+  assert.ok(!result.error.includes("tolerant txml parser also failed"));
+});
+
+test("extractXmlCallNames lifts names used as element names", () => {
+  const declared = new Set(["bash", "read"]);
+  const names = extractXmlCallNames(
+    "<tool_calls><bash><parameter name=\"command\">ls</parameter></bash></tool_calls>",
+    declared,
+  );
+  assert.deepEqual(names, ["bash"]);
+});
+
 test("the envelope scanner recovers raw markup, stray close tags and alias closes", () => {
   // The observed DeepSeek failure mode: the edits value carries Vue template
   // code with raw `<` and embedded elements, followed by a duplicate

@@ -96,14 +96,44 @@ function friendlyXmlParseError(
   tolerantError: unknown,
   note?: string,
 ): string {
+  // When neither parser complains, the document is well-formed XML that
+  // simply holds no recognizable call — say so honestly instead of claiming
+  // a parse failure.
+  const wellFormed = validationError === undefined && tolerantError === undefined;
   const lines = [
-    "The tool-call XML could not be parsed, and the tolerant txml parser also failed.",
+    wellFormed
+      ? "The tool-call XML is well-formed, but no tool call was found inside it."
+      : "The tool-call XML could not be parsed, and the tolerant txml parser also failed.",
   ];
   if (note) {
     lines.push(note);
   }
+  // The most misleading malformation: the function name was used as an
+  // element name (<bash>…</bash>) instead of the name attribute of a
+  // <tool_call> element. Name it explicitly — a generic parse error sends
+  // the model "fixing" innocent characters (like a raw & in a value).
+  if (!/<(?:tool_call|invoke)[\s>]/.test(text)) {
+    const elementNamedCall = /<tool_calls[^>]*>\s*<([A-Za-z][\w.-]*)/.exec(text)?.[1]
+      ?? /^<([A-Za-z][\w.-]*)/.exec(text.trim())?.[1];
+    if (elementNamedCall && elementNamedCall !== "tool_calls" && elementNamedCall !== "preamble") {
+      lines.push(
+        `The element <${elementNamedCall}> is not a tool call: the function name must be the name attribute of a <tool_call> element. `
+        + `Write <tool_call name="${elementNamedCall}">…</tool_call>, not <${elementNamedCall}>…</${elementNamedCall}>.`,
+      );
+    } else {
+      lines.push(
+        "No <tool_call name=\"…\"> element was found: each call must be a <tool_call> element "
+        + "whose name attribute carries the declared function name, inside one <tool_calls> root.",
+      );
+    }
+  }
   if (validationError) {
     lines.push(`Strict validation error: ${validationError.msg} [${validationError.code}] at line ${validationError.line}, column ${validationError.col}.`);
+    if (validationError.code === "InvalidChar" && validationError.msg.includes("'&'")) {
+      lines.push(
+        "A raw & inside a <parameter> value needs no escaping, so do not rewrite the value text — fix the envelope structure instead.",
+      );
+    }
     // The validator reports unclosed tags as: Invalid ' [ "a", "b" ] ' found.
     const unclosed = /Invalid '\[([\s\S]*?)\]' found/.exec(validationError.msg);
     if (unclosed) {
@@ -136,9 +166,10 @@ function friendlyXmlParseError(
     lines.push(`Nearby text: ${excerpt}`);
   }
   lines.push(
-    "Common fixes: close every opened tag (the document must end with </tool_calls>); "
-    + "write parameter values as raw text with no escaping and no CDATA sections; "
-    + "put every call inside one <tool_calls> root element.",
+    "Common fixes: put every call inside one <tool_calls> root element; "
+    + "write each call as a <tool_call name=\"function_name\"> element (the function name is the name attribute, never the element name); "
+    + "close every opened tag (the document must end with </tool_calls>); "
+    + "write parameter values as raw text with no escaping and no CDATA sections.",
   );
   lines.push(
     "Return exactly one valid envelope as assistant content, with no prose, markdown, or code fences.",
@@ -230,8 +261,23 @@ function readXmlTagAttribute(raw: string, name: string): string | undefined {
  * </invoke>. Parameter content is read as raw text up to the first
  * </parameter>, which is unambiguous because parameters never legitimately
  * contain child elements.
+ *
+ * When the strict pass finds no call at all and the declared tool names are
+ * known, a second pass also accepts the function-name-as-element
+ * malformation (<bash>…</bash> instead of <tool_call name="bash">…</tool_call>).
+ * Restricting the second pass to declared names — and to the no-call case —
+ * keeps prose mentioning a tool in angle brackets next to a valid envelope
+ * from being misread as a call.
  */
-function scanToolCallEnvelope(text: string): { value: unknown; changes: string[] } | undefined {
+function scanToolCallEnvelope(text: string, declaredTools?: Set<string>): { value: unknown; changes: string[] } | undefined {
+  const scanned = scanEnvelopePass(text);
+  if (scanned || !declaredTools || declaredTools.size === 0) {
+    return scanned;
+  }
+  return scanEnvelopePass(text, declaredTools);
+}
+
+function scanEnvelopePass(text: string, toolNames?: Set<string>): { value: unknown; changes: string[] } | undefined {
   const changes = new Set<string>();
   const n = text.length;
 
@@ -247,15 +293,21 @@ function scanToolCallEnvelope(text: string): { value: unknown; changes: string[]
     const ch = text[pos];
     return ch === undefined || ch === ">" || ch === "/" || ch === " " || ch === "\t" || ch === "\n" || ch === "\r";
   };
-  const isValueBoundary = (after: number): boolean => {
+  const isValueBoundary = (after: number, extraBoundary?: string): boolean => {
     let cursor = after;
     while (cursor < n && /\s/.test(text[cursor]!)) cursor += 1;
     if (cursor >= n) {
       return true;
     }
+    if (extraBoundary !== undefined && text.startsWith(extraBoundary, cursor)) {
+      return true;
+    }
     return PARAMETER_BOUNDARIES.some((boundary) => text.startsWith(boundary, cursor));
   };
-  function readParameterValue(from: number): { value: string; end: number } {
+  // callClose is the current call element's own close tag (e.g. </bash for
+  // the function-name-as-element form); it terminates a value exactly like
+  // the fixed ancestor terminators do.
+  function readParameterValue(from: number, callClose?: string): { value: string; end: number } {
     let value = "";
     let cursor = from;
     while (cursor < n) {
@@ -275,7 +327,7 @@ function scanToolCallEnvelope(text: string): { value: unknown; changes: string[]
       if (text.startsWith("</parameter", cursor) && boundaryAfter(cursor + 11)) {
         const gt = text.indexOf(">", cursor);
         const end = gt < 0 ? n : gt + 1;
-        if (isValueBoundary(end)) {
+        if (isValueBoundary(end, callClose)) {
           return { value, end };
         }
         // An embedded </parameter> with no structural continuation after it
@@ -284,7 +336,8 @@ function scanToolCallEnvelope(text: string): { value: unknown; changes: string[]
         cursor = end;
         continue;
       }
-      const ancestor = ANCESTOR_TERMINATORS.find((candidate) => text.startsWith(candidate, cursor));
+      const ancestor = (callClose === undefined ? ANCESTOR_TERMINATORS : [...ANCESTOR_TERMINATORS, callClose])
+        .find((candidate) => text.startsWith(candidate, cursor));
       if (ancestor) {
         changes.add("recovered an unclosed parameter element");
         return { value, end: cursor };
@@ -345,11 +398,17 @@ function scanToolCallEnvelope(text: string): { value: unknown; changes: string[]
     return found ? output : undefined;
   }
 
-  function readToolCall(tag: ScannedTag): { call: JsonObject; end: number } | undefined {
+  function readToolCall(tag: ScannedTag, nameFromTag?: string): { call: JsonObject; end: number } | undefined {
     if (tag.name === "invoke") {
       changes.add("rewrote <invoke> as <tool_call>");
     }
-    let name = readXmlTagAttribute(tag.raw, "name");
+    if (nameFromTag !== undefined) {
+      changes.add(`rewrote the <${tag.name}> element as <tool_call name="${tag.name}">`);
+    }
+    let name = readXmlTagAttribute(tag.raw, "name") ?? nameFromTag;
+    if (tag.selfClosing) {
+      return name ? { call: { "@_name": name }, end: tag.end } : undefined;
+    }
     const parameters: JsonObject[] = [];
     let argumentsValue: JsonValue | undefined;
     const direct: Record<string, JsonValue> = {};
@@ -362,7 +421,9 @@ function scanToolCallEnvelope(text: string): { value: unknown; changes: string[]
         break;
       }
       if (next.close) {
-        if (next.name === "tool_call" || next.name === "invoke") {
+        // The element's own close tag ends the call — including the
+        // function-name-as-element form, where </bash> closes <bash>.
+        if (next.name === "tool_call" || next.name === "invoke" || next.name === tag.name) {
           cursor = next.end;
           break;
         }
@@ -382,7 +443,7 @@ function scanToolCallEnvelope(text: string): { value: unknown; changes: string[]
           cursor = next.end;
           continue;
         }
-        const value = readParameterValue(next.end);
+        const value = readParameterValue(next.end, `</${tag.name}`);
         if (paramName) {
           parameters.push({ "@_name": paramName, "#text": value.value });
         }
@@ -471,9 +532,12 @@ function scanToolCallEnvelope(text: string): { value: unknown; changes: string[]
       }
       continue;
     }
-    if (tag.name === "tool_call" || tag.name === "invoke") {
+    if (tag.name === "tool_call" || tag.name === "invoke" || toolNames?.has(tag.name) === true) {
       sawCallElement = true;
-      const scanned = readToolCall(tag);
+      const scanned = readToolCall(
+        tag,
+        tag.name === "tool_call" || tag.name === "invoke" ? undefined : tag.name,
+      );
       if (scanned) {
         calls.push(scanned.call);
         cursor = scanned.end;
@@ -527,9 +591,9 @@ function scanToolCallEnvelope(text: string): { value: unknown; changes: string[]
  * the tolerant txml parser still run — but only to build a located,
  * AI-friendly diagnostic for the repair loop.
  */
-export function parseRepairXml(input: string): XmlParseResult {
+export function parseRepairXml(input: string, declaredTools?: Set<string>): XmlParseResult {
   const trimmed = input.trim();
-  const scanned = scanToolCallEnvelope(trimmed);
+  const scanned = scanToolCallEnvelope(trimmed, declaredTools);
   if (scanned) {
     return { value: scanned.value, repaired: scanned.changes.length > 0, changes: scanned.changes };
   }
@@ -880,7 +944,18 @@ export function extractXmlCallNames(content: string, declared: Set<string>): str
       names.push(match[1]!);
     }
   }
+  // The function-name-as-element malformation (<bash>…</bash>) carries the
+  // name in the tag itself.
+  for (const name of declared) {
+    if (new RegExp(`<${escapeRegExp(name)}(?:\s[^>]*)?>`).test(content)) {
+      names.push(name);
+    }
+  }
   return [...new Set(names)];
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 function escapeXmlText(value: string): string {
