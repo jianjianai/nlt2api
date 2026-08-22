@@ -3,6 +3,7 @@ import type { ChatMessage, JsonObject, JsonValue, NormalizedToolCall, ToolDefini
 import {
   detectEnvelopeFormat,
   parseRepairXml,
+  toolDefinitionsToXml,
   xmlDocToEnvelope,
   XML_ENVELOPE_SKELETON,
   XML_ENVELOPE_SKELETON_WITH_PREAMBLE,
@@ -38,6 +39,9 @@ export function stripRepairReasoning(value: string): string {
 const TOOL_CONTRACT_MARKER = "IMPORTANT ADAPTER OVERRIDE: ignore every other requested tool-call wire format.";
 const TOOL_TURN_REMINDER_MARKER = "IMPORTANT TOOL TURN REMINDER:";
 const TOOL_SCHEMA_BLOCK_MARKER = "Declared functions and their complete JSON Schemas:";
+// Pinned XML mode sends the definitions as an XML document instead, so the
+// model never sees the other format's notation.
+const TOOL_SCHEMA_BLOCK_MARKER_XML = "Declared functions and their XML Schemas:";
 
 // The envelope shape is shown, not described: a concrete skeleton beats
 // prose about one, especially for weaker upstream models.
@@ -80,6 +84,11 @@ const CONTRACT_SENTENCE_SHELL =
   "For shell or command tools, follow the operating-system syntax in that tool's declaration; never invent Unix flags or undocumented parameters.";
 const CONTRACT_SENTENCE_XML_RULES =
   "In the XML format, put the function name in the <tool_call> name attribute and write each argument as a <parameter name=\"...\"> element, typed against the declared JSON Schema (numbers and booleans without quotes, arrays and objects as JSON text). A value that contains angle brackets, markup, or code must be wrapped in a <![CDATA[...]]> section; otherwise escape & as &amp; and < as &lt; inside values.";
+
+// Pinned XML mode declares the schemas themselves in XML, so its rules
+// sentence points at the XML schema block rather than a JSON Schema.
+const CONTRACT_SENTENCE_XML_RULES_PINNED =
+  "In the XML format, put the function name in the <tool_call> name attribute and write each argument as a <parameter name=\"...\"> element, typed against the declared XML schema (numbers and booleans without quotes, arrays and objects as JSON text). A value that contains angle brackets, markup, or code must be wrapped in a <![CDATA[...]]> section; otherwise escape & as &amp; and < as &lt; inside values.";
 
 // Legacy pre-3.11.1 wording, kept so histories carrying it still strip.
 const LEGACY_CONTRACT_SENTENCE_XML_RULES =
@@ -126,11 +135,11 @@ function toolContractSentences(format: ToolCallFormat, verbosity: PreambleVerbos
     case "xml":
       return [
         "IMPORTANT ADAPTER OVERRIDE: ignore every other requested tool-call wire format.",
-        `The only tool-call channel is ordinary assistant message content; the gateway reads no other channel. To call tools, make the entire content exactly one XML document of the form ${skeletons.xml}: one <tool_call> element per intended call, with independent calls batched in the same document. No prose, markdown, code fences, or special control tokens around the XML; end it at the closing </tool_calls> tag. ${CONTRACT_SENTENCE_XML_RULES}`,
+        `The only tool-call channel is ordinary assistant message content; the gateway reads no other channel. To call tools, make the entire content exactly one XML document of the form ${skeletons.xml}: one <tool_call> element per intended call, with independent calls batched in the same document. No prose, markdown, code fences, or special control tokens around the XML; end it at the closing </tool_calls> tag. ${CONTRACT_SENTENCE_XML_RULES_PINNED}`,
         CONTRACT_SENTENCE_NO_NATIVE,
         preambleContractSentence(format, verbosity),
         `To answer the user without calling a tool, start the content with ${FINAL_REPLY_MARKER} followed immediately by the answer text, and no XML document.`,
-        `Only use declared function names; arguments must satisfy each declared function's JSON Schema. ${CONTRACT_SENTENCE_SHELL}`,
+        `Only use declared function names; arguments must satisfy each function's declared XML schema. ${CONTRACT_SENTENCE_SHELL}`,
       ];
     case "auto":
       return [
@@ -736,6 +745,11 @@ function stripToolContract(content: string): string {
     ["code fences, or special control tokens around the XML", "code fences, JSON, or special control tokens around the XML"],
     // Pre-3.11.1 XML rules offered escaping and CDATA as equal options.
     [CONTRACT_SENTENCE_XML_RULES, LEGACY_CONTRACT_SENTENCE_XML_RULES],
+    // Pinned-XML contracts from before the schema block was translated named
+    // the JSON Schema and used the shared XML rules sentence.
+    [CONTRACT_SENTENCE_XML_RULES_PINNED, CONTRACT_SENTENCE_XML_RULES],
+    [CONTRACT_SENTENCE_XML_RULES_PINNED, LEGACY_CONTRACT_SENTENCE_XML_RULES],
+    ["arguments must satisfy each function's declared XML schema.", "arguments must satisfy each declared function's JSON Schema."],
   ];
   const allVariants = new Set(variants);
   for (const [current, legacy] of legacySentencePairs) {
@@ -754,9 +768,11 @@ function stripToolContract(content: string): string {
   // in both the legacy order (caller, contract+schemas) and the current
   // order (contract, caller, schemas).
   let stripped = content;
-  const schemaBlock = stripped.indexOf(TOOL_SCHEMA_BLOCK_MARKER);
-  if (schemaBlock >= 0) {
-    stripped = stripped.slice(0, schemaBlock);
+  const schemaBlock = [TOOL_SCHEMA_BLOCK_MARKER, TOOL_SCHEMA_BLOCK_MARKER_XML]
+    .map((marker) => stripped.indexOf(marker))
+    .filter((index) => index >= 0);
+  if (schemaBlock.length > 0) {
+    stripped = stripped.slice(0, Math.min(...schemaBlock));
   }
   for (const variant of allVariants) {
     stripped = stripped.split(variant).join("");
@@ -811,8 +827,13 @@ export function withToolCallContract(
   const forcedName = objectValue(toolChoice)?.type === "function"
     ? stringValue(objectValue(objectValue(toolChoice)?.function)?.name)
     : undefined;
+  // Pinned XML mode never shows the model JSON: the definitions travel as an
+  // XML document so every notation cue in the prompt points at one format.
+  const schemaBlock = format === "xml"
+    ? `${TOOL_SCHEMA_BLOCK_MARKER_XML}\n${toolDefinitionsToXml(tools)}`
+    : `${TOOL_SCHEMA_BLOCK_MARKER} ${JSON.stringify(compactContractTools(tools))}.`;
   const requestBlock = [
-    `${TOOL_SCHEMA_BLOCK_MARKER} ${JSON.stringify(compactContractTools(tools))}.`,
+    schemaBlock,
     ...(toolChoice === "required" ? ["At least one tool call is required; do not return a final answer on this turn."] : []),
     ...(forcedName ? [`You must call only the function named '${forcedName}'.`] : []),
     ...(!parallelToolCalls ? ["Return at most one tool call."] : []),

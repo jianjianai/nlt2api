@@ -710,7 +710,29 @@ function schemaType(schema: JsonObject | undefined): string | undefined {
 
 function propertySchema(schema: JsonObject | undefined, key: string): JsonObject | undefined {
   const properties = objectValue(schema?.properties);
-  return objectValue(properties?.[key]);
+  const direct = objectValue(properties?.[key]);
+  if (direct) {
+    return direct;
+  }
+  // Map-typed objects declare their value schema via patternProperties or
+  // additionalProperties; without this fallback their values hit the untyped
+  // branch, which coerces "true"/"false" strings into booleans.
+  const patterns = objectValue(schema?.patternProperties);
+  if (patterns) {
+    for (const [pattern, subschema] of Object.entries(patterns)) {
+      try {
+        if (new RegExp(pattern).test(key)) {
+          const matched = objectValue(subschema);
+          if (matched) {
+            return matched;
+          }
+        }
+      } catch {
+        // An invalid regex in a declared schema is ignored here; Ajv reports it.
+      }
+    }
+  }
+  return objectValue(schema?.additionalProperties);
 }
 
 function itemsSchema(schema: JsonObject | undefined): JsonObject | undefined {
@@ -964,6 +986,137 @@ function escapeXmlText(value: string): string {
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;");
+}
+
+function escapeXmlAttribute(value: string): string {
+  return escapeXmlText(value).replace(/"/g, "&quot;");
+}
+
+// Scalar constraints render as attributes; nested structures and enums get
+// dedicated elements; any other keyword falls back to a <constraint> element
+// carrying JSON text so no semantic rule is silently dropped (Ajv still
+// validates the original schema server-side).
+const XML_SCHEMA_SCALAR_KEYWORDS = new Set([
+  "minimum",
+  "maximum",
+  "exclusiveMinimum",
+  "exclusiveMaximum",
+  "minLength",
+  "maxLength",
+  "minItems",
+  "maxItems",
+  "minProperties",
+  "maxProperties",
+  "multipleOf",
+]);
+
+const XML_SCHEMA_HANDLED_KEYWORDS = new Set([
+  ...XML_SCHEMA_SCALAR_KEYWORDS,
+  "type",
+  "properties",
+  "required",
+  "items",
+  "additionalProperties",
+  "pattern",
+  "uniqueItems",
+  "description",
+  "enum",
+]);
+
+function schemaNodeToXml(
+  element: string,
+  name: string | undefined,
+  schema: JsonObject | undefined,
+  required: boolean,
+  indent: string,
+  childElement: string,
+): string {
+  const attributes: string[] = [];
+  if (name !== undefined) {
+    attributes.push(`name="${escapeXmlAttribute(name)}"`);
+  }
+  const children: string[] = [];
+  if (schema) {
+    const type = schemaType(schema);
+    if (type) {
+      attributes.push(`type="${type}"`);
+    }
+    if (required) {
+      attributes.push('required="true"');
+    }
+    for (const keyword of XML_SCHEMA_SCALAR_KEYWORDS) {
+      const value = schema[keyword];
+      if (typeof value === "number" || typeof value === "boolean") {
+        attributes.push(`${keyword}="${value}"`);
+      }
+    }
+    if (typeof schema.pattern === "string") {
+      attributes.push(`pattern="${escapeXmlAttribute(schema.pattern)}"`);
+    }
+    if (schema.uniqueItems === true) {
+      attributes.push('uniqueItems="true"');
+    }
+    if (schema.additionalProperties === false) {
+      attributes.push('additionalProperties="false"');
+    }
+    const childIndent = `${indent}  `;
+    if (typeof schema.description === "string" && schema.description.trim()) {
+      children.push(`${childIndent}<description>${escapeXmlText(schema.description.trim())}</description>`);
+    }
+    if (Array.isArray(schema.enum) && schema.enum.length > 0) {
+      const values = schema.enum
+        .map((value) => `${childIndent}  <value>${escapeXmlText(value === null ? "null" : String(value))}</value>`)
+        .join("\n");
+      children.push(`${childIndent}<enum>\n${values}\n${childIndent}</enum>`);
+    }
+    const properties = objectValue(schema.properties);
+    if (properties) {
+      const requiredKeys = new Set(
+        Array.isArray(schema.required) ? schema.required.filter((key): key is string => typeof key === "string") : [],
+      );
+      for (const [key, subschema] of Object.entries(properties)) {
+        children.push(schemaNodeToXml(childElement, key, objectValue(subschema), requiredKeys.has(key), childIndent, "property"));
+      }
+    }
+    if (type === "array" && objectValue(schema.items)) {
+      children.push(schemaNodeToXml("items", undefined, objectValue(schema.items), false, childIndent, "property"));
+    }
+    const additional = objectValue(schema.additionalProperties);
+    if (additional) {
+      children.push(schemaNodeToXml("additionalProperties", undefined, additional, false, childIndent, "property"));
+    }
+    for (const [keyword, value] of Object.entries(schema)) {
+      if (XML_SCHEMA_HANDLED_KEYWORDS.has(keyword) || keyword.startsWith("$") || keyword === "title") {
+        continue;
+      }
+      children.push(`${childIndent}<constraint name="${escapeXmlAttribute(keyword)}">${escapeXmlText(JSON.stringify(value))}</constraint>`);
+    }
+  } else if (required) {
+    attributes.push('required="true"');
+  }
+  const opening = attributes.length > 0 ? `<${element} ${attributes.join(" ")}>` : `<${element}>`;
+  if (children.length === 0) {
+    return `${indent}${opening.replace(/>$/, "/>")}`;
+  }
+  return `${indent}${opening}\n${children.join("\n")}\n${indent}</${element}>`;
+}
+
+/**
+ * Render the declared tool definitions as an XML document for pinned XML
+ * mode: models imitate the notation they see, and a JSON schema block would
+ * nudge them back toward the JSON envelope.
+ */
+export function toolDefinitionsToXml(tools: ToolDefinition[]): string {
+  const rendered = tools.map((tool) => {
+    const lines: string[] = [];
+    if (typeof tool.function.description === "string" && tool.function.description.trim()) {
+      lines.push(`  <description>${escapeXmlText(tool.function.description.trim())}</description>`);
+    }
+    const parameters = objectValue(tool.function.parameters) ?? { type: "object" };
+    lines.push(schemaNodeToXml("parameters", undefined, parameters, false, "  ", "parameter"));
+    return `<function name="${escapeXmlAttribute(tool.function.name)}">\n${lines.join("\n")}\n</function>`;
+  });
+  return `<functions>\n${rendered.join("\n")}\n</functions>`;
 }
 
 /** XML counterpart of the JSON repair-escalation skeleton. */

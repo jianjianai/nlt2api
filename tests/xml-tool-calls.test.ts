@@ -6,6 +6,7 @@ import {
   detectEnvelopeFormat,
   extractXmlCallNames,
   parseRepairXml,
+  toolDefinitionsToXml,
   xmlDocToEnvelope,
   XML_ENVELOPE_SKELETON,
 } from "../server/utils/xml-tool-calls.ts";
@@ -692,4 +693,110 @@ test("contract re-application strips every format variant", () => {
       message.role === "user" && String(message.content).startsWith("IMPORTANT TOOL TURN REMINDER:"));
     assert.equal(reminders.length, 1, `format ${format}`);
   }
+});
+
+test("map-typed parameters keep string values through XML conversion", () => {
+  const mapTools: ToolDefinition[] = [{
+    type: "function",
+    function: {
+      name: "run_command",
+      parameters: {
+        type: "object",
+        properties: {
+          env: { type: "object", minProperties: 2, additionalProperties: { type: "string" } },
+          timeout_ms: { type: "integer" },
+        },
+        required: ["env", "timeout_ms"],
+      },
+    },
+  }];
+  const xml = '<tool_calls><tool_call name="run_command">'
+    + '<parameter name="env">{"CI":"true","SUITE":"smoke"}</parameter>'
+    + '<parameter name="timeout_ms">15000</parameter>'
+    + '</tool_call></tool_calls>';
+  const parsed = parseRepairXml(xml);
+  assert.ok(!("error" in parsed));
+  const envelope = xmlDocToEnvelope(parsed.value, mapTools) as {
+    tool_calls: { name: string; arguments: Record<string, unknown> }[];
+  };
+  const args = envelope.tool_calls[0]?.arguments;
+  // additionalProperties declares the map value type: "true" stays a string
+  // instead of falling into the untyped boolean coercion.
+  assert.deepEqual(args?.env, { CI: "true", SUITE: "smoke" });
+  assert.equal(args?.timeout_ms, 15000);
+});
+
+test("XML coercion respects patternProperties value schemas", () => {
+  const schema = { type: "object", patternProperties: { "^x-": { type: "string" } } };
+  assert.deepEqual(coerceXmlValue({ "x-flag": "true" }, schema as never), { "x-flag": "true" });
+});
+
+test("tool definitions render as an XML schema document", () => {
+  const xml = toolDefinitionsToXml(shellTools);
+  assert.match(xml, /^<functions>/);
+  assert.match(xml, /<\/functions>$/);
+  assert.match(xml, /<function name="bash">/);
+  assert.match(xml, /<description>Run a shell command<\/description>/);
+  assert.match(xml, /<parameter name="command" type="string" required="true"\/>/);
+  assert.match(xml, /<parameter name="timeout" type="integer"\/>/);
+  assert.match(xml, /<parameter name="flags" type="array">/);
+  assert.match(xml, /<items type="string"\/>/);
+  assert.match(xml, /<property name="verbose" type="boolean"\/>/);
+  // No JSON schema notation leaks into the XML rendering.
+  assert.ok(!xml.includes('"type"'));
+});
+
+test("tool definition XML keeps enums, constraints and map value types", () => {
+  const complexTools: ToolDefinition[] = [{
+    type: "function",
+    function: {
+      name: "run_command",
+      parameters: {
+        type: "object",
+        properties: {
+          shell: { type: "string", enum: ["bash", "sh"] },
+          env: { type: "object", minProperties: 2, additionalProperties: { type: "string" } },
+          pattern: { type: "string", pattern: "^[a-z]+$" },
+        },
+        required: ["shell"],
+        additionalProperties: false,
+      },
+    },
+  }];
+  const xml = toolDefinitionsToXml(complexTools);
+  assert.match(xml, /<parameters type="object" additionalProperties="false">/);
+  assert.match(xml, /<value>bash<\/value>/);
+  assert.match(xml, /<parameter name="env" type="object" minProperties="2">/);
+  assert.match(xml, /<additionalProperties type="string"\/>/);
+  assert.ok(xml.includes('pattern="^[a-z]+$"'));
+});
+
+test("the pinned XML contract sends XML tool definitions, not JSON", () => {
+  const contracted = withToolCallContract([{ role: "user" as const, content: "hi" }], tools, "auto", true, "xml");
+  const system = String(contracted.find((message) => message.role === "system")?.content);
+  assert.ok(system.includes("Declared functions and their XML Schemas:"));
+  assert.ok(system.includes('<function name="calculator">'));
+  assert.ok(!system.includes("Declared functions and their complete JSON Schemas:"));
+  assert.ok(system.includes("declared XML schema"));
+
+  const json = withToolCallContract([{ role: "user" as const, content: "hi" }], tools, "auto", true, "json");
+  const jsonSystem = String(json.find((message) => message.role === "system")?.content);
+  assert.ok(jsonSystem.includes("Declared functions and their complete JSON Schemas:"));
+  assert.ok(!jsonSystem.includes("<functions>"));
+});
+
+test("re-application strips the XML schema block from history", () => {
+  const first = withToolCallContract(
+    [{ role: "system" as const, content: "Be nice." }, { role: "user" as const, content: "hi" }],
+    tools,
+    "auto",
+    true,
+    "xml",
+  );
+  const second = withToolCallContract(first, tools, "auto", true, "json");
+  const system = String(second[0]?.content);
+  assert.ok(!system.includes("Declared functions and their XML Schemas:"));
+  assert.ok(!system.includes("<functions>"));
+  assert.equal(system.split("IMPORTANT ADAPTER OVERRIDE").length - 1, 1);
+  assert.equal(system.split("Be nice.").length - 1, 1);
 });
