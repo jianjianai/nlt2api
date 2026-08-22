@@ -101,13 +101,23 @@ interface DebugRecordSummary {
   };
 }
 
+type ToolCallFormat = "auto" | "json" | "xml";
+type PreambleVerbosity = "quiet" | "normal" | "verbose";
+
 interface ApiPayload {
   accounts?: Account[];
-  settings?: { recordMessages: boolean };
+  settings?: {
+    recordMessages: boolean;
+    toolCallFormat?: ToolCallFormat;
+    preambleVerbosity?: PreambleVerbosity;
+    modelToolCallFormats?: Record<string, ToolCallFormat>;
+  };
   config?: {
     adminTokenConfigured: boolean;
     clientApiKeyRequired: boolean;
     defaultModel: string;
+    toolCallFormat?: ToolCallFormat;
+    preambleVerbosity?: PreambleVerbosity;
   };
   records?: DebugRecordSummary[];
   record?: DebugRecord;
@@ -142,11 +152,18 @@ const view = ref<"accounts" | "records">("accounts");
 // shallowRef: record/account payloads are large and immutable; avoid deep reactivity.
 const accounts = shallowRef<Account[]>([]);
 const records = shallowRef<DebugRecordSummary[]>([]);
-const settings = reactive({ recordMessages: false });
+const settings = reactive({
+  recordMessages: false,
+  toolCallFormat: undefined as ToolCallFormat | undefined,
+  preambleVerbosity: undefined as PreambleVerbosity | undefined,
+  modelToolCallFormats: {} as Record<string, ToolCallFormat>,
+});
 const config = reactive({
   adminTokenConfigured: false,
   clientApiKeyRequired: false,
   defaultModel: "",
+  toolCallFormat: "auto" as ToolCallFormat,
+  preambleVerbosity: "normal" as PreambleVerbosity,
 });
 const newAccount = reactive({ label: "", email: "", password: "", weight: 1, proxy: "" });
 const isLoading = ref(false);
@@ -229,6 +246,11 @@ const COLLAPSE_MAX_HEIGHT = 240;
 const expandedMessageKeys = ref(new Set<string>());
 const overflowMessageKeys = ref(new Set<string>());
 const messageContentEls = new Map<string, HTMLElement>();
+
+// Effective tool-call policy: per-model override > global setting > env default.
+const effectiveToolCallFormat = computed<ToolCallFormat>(() => settings.toolCallFormat ?? config.toolCallFormat);
+const effectivePreambleVerbosity = computed<PreambleVerbosity>(() => settings.preambleVerbosity ?? config.preambleVerbosity);
+const allModels = computed(() => [...new Set(accounts.value.flatMap((account) => account.models))].sort());
 
 const enabledCount = computed(() => accounts.value.filter((account) => account.enabled).length);
 const activeSessions = computed(() => accounts.value.filter((account) => account.hasSession).length);
@@ -338,7 +360,7 @@ async function loadDashboard(options?: { silent?: boolean }) {
   try {
     const payload = await api("/api/admin/status");
     accounts.value = payload.accounts ?? [];
-    Object.assign(settings, payload.settings ?? {});
+    applySettings(payload.settings);
     Object.assign(config, payload.config ?? {});
     if (view.value === "records") {
       await loadRecords();
@@ -361,7 +383,7 @@ async function loadDashboard(options?: { silent?: boolean }) {
 async function loadRecords() {
   const payload = await api("/api/admin/records?limit=100");
   records.value = payload.records ?? [];
-  Object.assign(settings, payload.settings ?? {});
+  applySettings(payload.settings);
   // Drop cached details for records that were pruned or cleared server-side.
   const ids = new Set(records.value.map((record) => record.id));
   for (const id of [...detailCache.keys()]) {
@@ -586,6 +608,62 @@ async function setRecording(value: boolean) {
   } catch (error) {
     pushToast("error", errorText(error, "无法更新消息记录设置。"));
   }
+}
+
+async function patchToolCallSettings(body: JsonRecord, successText: string) {
+  try {
+    const payload = await api("/api/admin/settings", { method: "PATCH", body: JSON.stringify(body) });
+    applySettings(payload.settings);
+    pushToast("success", successText);
+  } catch (error) {
+    pushToast("error", errorText(error, "无法更新工具调用设置。"));
+  }
+}
+
+function setToolCallFormat(value: ToolCallFormat) {
+  void patchToolCallSettings({ toolCallFormat: value }, `全局信封格式已设为 ${value}`);
+}
+
+function setPreambleVerbosity(value: PreambleVerbosity) {
+  const labels: Record<PreambleVerbosity, string> = { quiet: "静默", normal: "关键步骤播报", verbose: "逐步播报" };
+  void patchToolCallSettings({ preambleVerbosity: value }, `进度播报已设为 ${labels[value]}`);
+}
+
+function setModelToolCallFormat(model: string, value: string) {
+  const next: Record<string, ToolCallFormat> = { ...(settings.modelToolCallFormats ?? {}) };
+  if (value === "auto" || value === "json" || value === "xml") {
+    next[model] = value;
+  } else {
+    delete next[model];
+  }
+  void patchToolCallSettings({ modelToolCallFormats: next }, value ? `模型 ${model} 已固定为 ${value}` : `模型 ${model} 已恢复跟随全局`);
+}
+
+function onToolCallFormatChange(event: Event) {
+  const value = (event.target as HTMLSelectElement).value;
+  if (value === "auto" || value === "json" || value === "xml") {
+    setToolCallFormat(value);
+  }
+}
+
+function onPreambleVerbosityChange(event: Event) {
+  const value = (event.target as HTMLSelectElement).value;
+  if (value === "quiet" || value === "normal" || value === "verbose") {
+    setPreambleVerbosity(value);
+  }
+}
+
+function onModelToolCallFormatChange(model: string, event: Event) {
+  setModelToolCallFormat(model, (event.target as HTMLSelectElement).value);
+}
+
+// Replace (not merge) the optional fields: cleared keys are absent from the
+// server payload, and Object.assign would keep the stale local value.
+function applySettings(next: ApiPayload["settings"]) {
+  settings.recordMessages = next?.recordMessages ?? false;
+  settings.toolCallFormat = next?.toolCallFormat;
+  settings.preambleVerbosity = next?.preambleVerbosity;
+  settings.modelToolCallFormats = next?.modelToolCallFormats ?? {};
 }
 
 function askClearRecords() {
@@ -1379,6 +1457,49 @@ onUnmounted(() => {
                 <button class="text-button danger" type="button" :disabled="isAccountBusy(account.id)" @click="askRemoveAccount(account)">移除</button>
               </footer>
             </article>
+          </div>
+        </section>
+
+        <section class="panel toolcall-panel">
+          <div class="panel-heading">
+            <div>
+              <p class="section-kicker">工具调用协议</p>
+              <h2>信封格式与进度播报</h2>
+              <p class="panel-sub">按模型覆盖优先于全局默认 · 无论契约展示哪种格式，解析端始终同时接受 JSON 与 XML</p>
+            </div>
+          </div>
+          <div class="toolcall-grid">
+            <label class="toolcall-field">
+              <span>全局默认格式</span>
+              <select :value="effectiveToolCallFormat" @change="onToolCallFormatChange">
+                <option value="auto">auto · 模型自选（推荐）</option>
+                <option value="json">json · 固定 JSON 信封</option>
+                <option value="xml">xml · 固定 XML 信封</option>
+              </select>
+            </label>
+            <label class="toolcall-field">
+              <span>进度播报（preamble）</span>
+              <select :value="effectivePreambleVerbosity" @change="onPreambleVerbosityChange">
+                <option value="normal">normal · 关键步骤播报（推荐）</option>
+                <option value="verbose">verbose · 每步都播报</option>
+                <option value="quiet">quiet · 默认静默</option>
+              </select>
+            </label>
+          </div>
+          <div class="toolcall-models">
+            <span class="account-models-label">按模型覆盖格式</span>
+            <p v-if="allModels.length === 0" class="muted toolcall-empty">暂无已配置模型；请先在账号上配置可用模型。</p>
+            <div v-else class="toolcall-model-list">
+              <div v-for="model in allModels" :key="model" class="toolcall-model-row">
+                <span class="mono toolcall-model-name">{{ model }}</span>
+                <select :value="settings.modelToolCallFormats?.[model] ?? ''" @change="onModelToolCallFormatChange(model, $event)">
+                  <option value="">跟随全局（{{ effectiveToolCallFormat }}）</option>
+                  <option value="auto">auto</option>
+                  <option value="json">json</option>
+                  <option value="xml">xml</option>
+                </select>
+              </div>
+            </div>
           </div>
         </section>
       </template>

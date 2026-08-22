@@ -27,6 +27,8 @@ import {
   parseRepairJson,
   serializeAssistantToolCallsForPortal,
   withToolCallContract,
+  type PreambleVerbosity,
+  type ToolCallFormat,
 } from "~/server/utils/tool-calls.ts";
 import {
   buildXmlSkeleton,
@@ -216,7 +218,7 @@ function validateToolChoice(value: unknown, tools: ToolDefinition[]): void {
   }
 }
 
-function modelFromRequest(request: JsonObject): string {
+export function modelFromRequest(request: JsonObject): string {
   const model = request.model;
   if (model === undefined || model === null || model === "") {
     return getProxyConfig().defaultModel;
@@ -269,7 +271,35 @@ export interface ValidatedChatRequest {
   upstreamMessages: ChatMessage[];
 }
 
-export function validateChatRequest(request: JsonObject): ValidatedChatRequest {
+/**
+ * The effective tool-call contract policy for one request: which envelope
+ * wire format the contract offers and how readily it asks for preambles.
+ */
+export interface ToolCallPolicy {
+  format: ToolCallFormat;
+  preambleVerbosity: PreambleVerbosity;
+}
+
+/** The env-configured policy, used when no admin setting overrides it. */
+function envToolCallPolicy(): ToolCallPolicy {
+  const config = getProxyConfig();
+  return { format: config.toolCallFormat, preambleVerbosity: config.preambleVerbosity };
+}
+
+/**
+ * Resolve the effective policy for one model: per-model override first, then
+ * the global admin setting, then the env config.
+ */
+export async function resolveToolCallPolicy(model: string): Promise<ToolCallPolicy> {
+  const settings = await stateStore.getSettings();
+  const env = envToolCallPolicy();
+  return {
+    format: settings.modelToolCallFormats?.[model] ?? settings.toolCallFormat ?? env.format,
+    preambleVerbosity: settings.preambleVerbosity ?? env.preambleVerbosity,
+  };
+}
+
+export function validateChatRequest(request: JsonObject, toolCallPolicy?: ToolCallPolicy): ValidatedChatRequest {
   const model = modelFromRequest(request);
   if (request.stream !== undefined && typeof request.stream !== "boolean") {
     throw new HttpError(400, "`stream` must be a boolean.", "invalid_request_error", "stream");
@@ -281,7 +311,7 @@ export function validateChatRequest(request: JsonObject): ValidatedChatRequest {
   if (request.n !== undefined && request.n !== 1) {
     throw new HttpError(400, "Only n=1 is supported by the portal adapter.", "invalid_request_error", "n");
   }
-  const built = upstreamBody(request, model, messages, tools, false);
+  const built = upstreamBody(request, model, messages, tools, false, undefined, toolCallPolicy);
   return { model, messages, tools, upstreamMessages: built.messages };
 }
 
@@ -335,6 +365,7 @@ function upstreamBody(
   tools: ToolDefinition[],
   stream: boolean,
   prebuiltMessages?: ChatMessage[],
+  toolCallPolicy?: ToolCallPolicy,
 ): { body: JsonObject; messages: ChatMessage[] } {
   const tokenLimit = validateTokenLimit(request);
   const toolChoice = request.tool_choice;
@@ -356,13 +387,15 @@ function upstreamBody(
   // Validation already ran the message pipeline (contract application, system
   // merge, schema serialization); only the scalar body fields, including
   // `stream`, are rebuilt per execution.
+  const policy = toolCallPolicy ?? envToolCallPolicy();
   const upstreamMessages = prebuiltMessages ?? (toolTurn
     ? withToolCallContract(
       portalMessages(messages, true),
       tools,
       toolChoice,
       parallelToolCalls,
-      getProxyConfig().toolCallFormat,
+      policy.format,
+      policy.preambleVerbosity,
     )
     : portalMessages(messages, false));
   const body: JsonObject = {
@@ -1065,9 +1098,10 @@ async function executeChatRequestOnce(
     signal?: AbortSignal;
     upstreamCalls?: DebugUpstreamCall[];
     validated?: ValidatedChatRequest;
+    toolCallPolicy?: ToolCallPolicy;
   },
 ): Promise<ChatExecution> {
-  const { model, messages, tools, upstreamMessages: prebuiltMessages } = options?.validated ?? validateChatRequest(request);
+  const { model, messages, tools, upstreamMessages: prebuiltMessages } = options?.validated ?? validateChatRequest(request, options?.toolCallPolicy);
 
   const toolTurn = tools.length > 0 && request.tool_choice !== "none";
   const observedToolCallIds = messages
@@ -1389,12 +1423,13 @@ export async function executeChatRequest(
     onRepairReasoning?: (reasoning: ReasoningFields) => void | Promise<void>;
     signal?: AbortSignal;
     validated?: ValidatedChatRequest;
+    toolCallPolicy?: ToolCallPolicy;
   },
 ): Promise<ChatExecution> {
   const { validated: prevalidated, ...forwardedOptions } = options ?? {};
   // Validate once per client request; execution reuses the supplied result
   // instead of re-running the full validation pipeline.
-  const validated = prevalidated ?? validateChatRequest(request);
+  const validated = prevalidated ?? validateChatRequest(request, options?.toolCallPolicy);
   const upstreamCalls: DebugUpstreamCall[] = [];
   try {
     return await executeChatRequestOnce(request, {

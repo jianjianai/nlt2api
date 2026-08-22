@@ -541,10 +541,22 @@ test("the reminder echoes the request's binding tool constraints", () => {
   );
   const reminder = String(forced.at(-1)?.content);
   assert.match(reminder, /IMPORTANT TOOL TURN REMINDER:/);
-  assert.match(reminder, /\{"type":"tool_calls","tool_calls":\[\{"name":"declared_function_name"/);
+  // The default (normal) verbosity shows the preamble inside the skeleton.
+  assert.match(reminder, /\{"type":"tool_calls","preamble":"One short sentence[^"]*","tool_calls":\[\{"name":"declared_function_name"/);
   assert.match(reminder, /You must call only the function named 'calculator'\./);
   assert.match(reminder, /Return at most one tool call\./);
   assert.ok(!reminder.includes("At least one tool call is required"));
+
+  // Quiet mode keeps the bare skeleton without a preamble.
+  const quiet = withToolCallContract(
+    [{ role: "user" as const, content: "calc" }],
+    tools,
+    { type: "function", function: { name: "calculator" } },
+    false,
+    "auto",
+    "quiet",
+  );
+  assert.match(String(quiet.at(-1)?.content), /\{"type":"tool_calls","tool_calls":\[\{"name":"declared_function_name"/);
 
   const required = withToolCallContract([{ role: "user" as const, content: "calc" }], tools, "required");
   assert.match(String(required.at(-1)?.content), /At least one tool call is required; do not return a final answer on this turn\./);
@@ -701,11 +713,28 @@ test("tool contracts preserve descriptions and every JSON Schema constraint", ()
   }];
   const text = String(withToolCallContract([{ role: "user", content: "write" }], constrained, "required")[0]?.content);
   assert.match(text, /Write exactly one UTF-8 file/);
+  // The default verbosity is normal: narrate non-trivial steps in one sentence.
+  assert.match(text, /Include a one-sentence preamble/);
+  assert.match(text, /trivially implied/);
+  assert.match(text, /never claim a tool already succeeded/);
+  assert.match(text, /"multipleOf":0\.25/);
+  assert.match(text, /"dependentRequired"/);
+});
+
+test("quiet verbosity keeps the legacy omit-by-default preamble wording", () => {
+  const text = String(withToolCallContract(
+    [{ role: "user", content: "write" }],
+    tools,
+    "auto",
+    true,
+    "auto",
+    "quiet",
+  )[0]?.content);
   assert.match(text, /Omit the optional preamble by default/);
   assert.match(text, /key decision, discovery, phase change, or risky action/);
   assert.match(text, /never claim the tool already succeeded/);
-  assert.match(text, /"multipleOf":0\.25/);
-  assert.match(text, /"dependentRequired"/);
+  // Quiet mode shows the bare skeleton without a preamble.
+  assert.ok(!text.includes('"preamble":"One short sentence'));
 });
 
 test("debug redaction covers camelCase credential fields", () => {

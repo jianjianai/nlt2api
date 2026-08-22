@@ -29,6 +29,56 @@ function emptyState(): PersistentState {
   };
 }
 
+function normaliseToolCallFormat(value: unknown): "auto" | "json" | "xml" | undefined {
+  return value === "auto" || value === "json" || value === "xml" ? value : undefined;
+}
+
+function normalisePreambleVerbosity(value: unknown): "quiet" | "normal" | "verbose" | undefined {
+  return value === "quiet" || value === "normal" || value === "verbose" ? value : undefined;
+}
+
+function normaliseModelToolCallFormats(value: unknown): Record<string, "auto" | "json" | "xml"> | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return undefined;
+  }
+  const result: Record<string, "auto" | "json" | "xml"> = {};
+  for (const [key, format] of Object.entries(value)) {
+    const model = key.trim();
+    const normalised = normaliseToolCallFormat(format);
+    if (model && normalised) {
+      result[model] = normalised;
+    }
+  }
+  return Object.keys(result).length > 0 ? result : undefined;
+}
+
+/**
+ * Accepted settings mutations. `undefined` leaves a field untouched; `null`
+ * (or an empty map) clears it, returning to the env-configured default.
+ */
+export interface ProxySettingsUpdate {
+  recordMessages?: boolean;
+  toolCallFormat?: "auto" | "json" | "xml" | null;
+  preambleVerbosity?: "quiet" | "normal" | "verbose" | null;
+  modelToolCallFormats?: Record<string, "auto" | "json" | "xml"> | null;
+}
+
+/** Drop unknown/invalid persisted settings while preserving every valid one. */
+function normaliseSettings(value: unknown): ProxySettings {
+  const parsed = value && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : {};
+  const toolCallFormat = normaliseToolCallFormat(parsed.toolCallFormat);
+  const modelToolCallFormats = normaliseModelToolCallFormats(parsed.modelToolCallFormats);
+  const preambleVerbosity = normalisePreambleVerbosity(parsed.preambleVerbosity);
+  return {
+    recordMessages: Boolean(parsed.recordMessages),
+    ...(toolCallFormat ? { toolCallFormat } : {}),
+    ...(modelToolCallFormats ? { modelToolCallFormats } : {}),
+    ...(preambleVerbosity ? { preambleVerbosity } : {}),
+  };
+}
+
 function normaliseModels(value: unknown): string[] {
   if (!Array.isArray(value)) {
     return [];
@@ -203,7 +253,7 @@ export class StateStore {
 
       this.state = {
         version: 1,
-        settings: { recordMessages: Boolean(parsed.settings?.recordMessages) },
+        settings: normaliseSettings(parsed.settings),
         accounts: parsed.accounts.map(normaliseAccount),
       };
     } catch (error) {
@@ -328,10 +378,34 @@ export class StateStore {
     return { ...(await this.getState()).settings };
   }
 
-  async updateSettings(settings: Partial<ProxySettings>): Promise<ProxySettings> {
+  async updateSettings(settings: ProxySettingsUpdate): Promise<ProxySettings> {
     return this.mutate((state) => {
       if (typeof settings.recordMessages === "boolean") {
         state.settings.recordMessages = settings.recordMessages;
+      }
+      if (settings.toolCallFormat !== undefined) {
+        const format = normaliseToolCallFormat(settings.toolCallFormat);
+        if (format) {
+          state.settings.toolCallFormat = format;
+        } else {
+          delete state.settings.toolCallFormat;
+        }
+      }
+      if (settings.preambleVerbosity !== undefined) {
+        const verbosity = normalisePreambleVerbosity(settings.preambleVerbosity);
+        if (verbosity) {
+          state.settings.preambleVerbosity = verbosity;
+        } else {
+          delete state.settings.preambleVerbosity;
+        }
+      }
+      if (settings.modelToolCallFormats !== undefined) {
+        const formats = normaliseModelToolCallFormats(settings.modelToolCallFormats);
+        if (formats) {
+          state.settings.modelToolCallFormats = formats;
+        } else {
+          delete state.settings.modelToolCallFormats;
+        }
       }
       return { ...state.settings };
     });

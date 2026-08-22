@@ -20,6 +20,9 @@ export default defineHandler(async (event) => {
         adminTokenConfigured: Boolean(config.adminToken),
         clientApiKeyRequired: Boolean(config.apiKey),
         defaultModel: config.defaultModel,
+        // Env-level defaults the settings fall back to when unset.
+        toolCallFormat: config.toolCallFormat,
+        preambleVerbosity: config.preambleVerbosity,
       },
     });
   } catch (error) {

@@ -49,6 +49,44 @@ async function recordFiles(dir: string): Promise<string[]> {
   }
 }
 
+test("settings persist tool-call policy fields and clear on null or empty map", async () => {
+  await withTempStore(async (store) => {
+    await store.updateSettings({
+      toolCallFormat: "json",
+      preambleVerbosity: "verbose",
+      modelToolCallFormats: { "model-a": "xml", "model-b": "auto" },
+    });
+    const settings = await store.getSettings();
+    assert.equal(settings.toolCallFormat, "json");
+    assert.equal(settings.preambleVerbosity, "verbose");
+    assert.deepEqual(settings.modelToolCallFormats, { "model-a": "xml", "model-b": "auto" });
+
+    // Clearing with null / an empty map removes the overrides.
+    await store.updateSettings({ toolCallFormat: null, modelToolCallFormats: {} });
+    const cleared = await store.getSettings();
+    assert.equal(cleared.toolCallFormat, undefined);
+    assert.equal(cleared.modelToolCallFormats, undefined);
+    assert.equal(cleared.preambleVerbosity, "verbose");
+  });
+});
+
+test("persisted settings reload with invalid tool-call policy entries dropped", async () => {
+  await withTempStore(async (store, dir) => {
+    await store.updateSettings({ toolCallFormat: "xml", modelToolCallFormats: { "model-a": "json" } });
+    const file = join(dir, "accounts.json");
+    const parsed = JSON.parse(await readFile(file, "utf8")) as { settings: Record<string, unknown> };
+    parsed.settings.toolCallFormat = "yaml";
+    parsed.settings.preambleVerbosity = "loud";
+    parsed.settings.modelToolCallFormats = { "model-a": "json", "model-b": "yaml", "": "auto" };
+    await writeFile(file, JSON.stringify(parsed), "utf8");
+    const reloaded = new StateStore();
+    const settings = await reloaded.getSettings();
+    assert.equal(settings.toolCallFormat, undefined);
+    assert.equal(settings.preambleVerbosity, undefined);
+    assert.deepEqual(settings.modelToolCallFormats, { "model-a": "json" });
+  });
+});
+
 test("debug records are skipped while recordMessages is disabled", async () => {
   await withTempStore(async (store, dir) => {
     await store.appendDebugRecord(makeRecord("dbg_off", timestamp(0)));

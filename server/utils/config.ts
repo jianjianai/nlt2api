@@ -7,6 +7,13 @@ import { resolve } from "node:path";
  */
 export type ToolCallFormat = "auto" | "json" | "xml";
 
+/**
+ * How readily the injected contract asks the upstream model for user-visible
+ * preamble narration. Mirrors the type in tool-calls.ts (kept duplicate, like
+ * ToolCallFormat, to avoid a config → contract import edge).
+ */
+export type PreambleVerbosity = "quiet" | "normal" | "verbose";
+
 export interface ProxyConfig {
   adminToken: string;
   apiKey: string;
@@ -14,6 +21,7 @@ export interface ProxyConfig {
   dataDir: string;
   defaultModel: string;
   toolCallFormat: ToolCallFormat;
+  preambleVerbosity: PreambleVerbosity;
   maxRequestBytes: number;
   maxOutputTokens: number;
   maxUpstreamBytes: number;
@@ -40,6 +48,7 @@ export function getProxyConfig(): ProxyConfig {
   const rawMaxChatMessages = Number(process.env.NEURALWATT_MAX_CHAT_MESSAGES ?? "10000");
   const rawUpstreamTimeoutMs = Number(process.env.NEURALWATT_UPSTREAM_TIMEOUT_MS ?? "120000");
   const rawToolCallFormat = process.env.NEURALWATT_TOOL_CALL_FORMAT ?? "auto";
+  const rawPreambleVerbosity = process.env.NEURALWATT_PREAMBLE_VERBOSITY ?? "normal";
   cachedConfig = {
     adminToken: process.env.NEURALWATT_ADMIN_TOKEN ?? "",
     apiKey: process.env.NEURALWATT_API_KEY ?? "",
@@ -47,6 +56,7 @@ export function getProxyConfig(): ProxyConfig {
     dataDir: resolve(process.env.NEURALWATT_DATA_DIR ?? ".data/neuralwatt"),
     defaultModel: process.env.NEURALWATT_DEFAULT_MODEL ?? "kimi-k3-fast",
     toolCallFormat: rawToolCallFormat === "json" || rawToolCallFormat === "xml" ? rawToolCallFormat : "auto",
+    preambleVerbosity: rawPreambleVerbosity === "quiet" || rawPreambleVerbosity === "verbose" ? rawPreambleVerbosity : "normal",
     maxRequestBytes: Number.isFinite(rawMaxRequestBytes) && rawMaxRequestBytes > 0
       ? Math.floor(rawMaxRequestBytes)
       : 67_108_864,

@@ -10,8 +10,10 @@ import {
   isThinkingInterrupted,
   locatedSchemaErrorText,
   repairMessages,
+  resolveToolCallPolicy,
   validateChatRequest,
 } from "../server/utils/chat-service.ts";
+import { stateStore } from "../server/utils/state-store.ts";
 import { getProxyConfig, resetProxyConfigForTests } from "../server/utils/config.ts";
 import { HttpError } from "../server/utils/http.ts";
 import { FINAL_REPLY_MARKER, InvalidStructuredToolCallsError, withToolCallContract } from "../server/utils/tool-calls.ts";
@@ -85,6 +87,29 @@ async function withEmptyDataDir<T>(run: () => Promise<T>): Promise<T> {
     await rm(dir, { recursive: true, force: true });
   }
 }
+
+test("resolveToolCallPolicy prefers per-model, then global, then env defaults", async () => {
+  await withEmptyDataDir(async () => {
+    stateStore.resetForTests();
+    try {
+      // Env defaults: format auto, preamble verbosity normal.
+      assert.deepEqual(await resolveToolCallPolicy("model-a"), { format: "auto", preambleVerbosity: "normal" });
+
+      await stateStore.updateSettings({ toolCallFormat: "json", preambleVerbosity: "quiet" });
+      assert.deepEqual(await resolveToolCallPolicy("model-a"), { format: "json", preambleVerbosity: "quiet" });
+
+      await stateStore.updateSettings({ modelToolCallFormats: { "model-a": "xml" } });
+      assert.deepEqual(await resolveToolCallPolicy("model-a"), { format: "xml", preambleVerbosity: "quiet" });
+      assert.deepEqual(await resolveToolCallPolicy("model-b"), { format: "json", preambleVerbosity: "quiet" });
+
+      // Clearing returns to the env defaults.
+      await stateStore.updateSettings({ toolCallFormat: null, preambleVerbosity: null, modelToolCallFormats: null });
+      assert.deepEqual(await resolveToolCallPolicy("model-a"), { format: "auto", preambleVerbosity: "normal" });
+    } finally {
+      stateStore.resetForTests();
+    }
+  });
+});
 
 test("validateChatRequest returns the parsed model, messages and tools", () => {
   const request = validRequest({ tools: [tool] });

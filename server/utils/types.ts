@@ -89,6 +89,18 @@ export interface ManagedAccount {
 
 export interface ProxySettings {
   recordMessages: boolean;
+  /**
+   * Global default tool-call wire format offered to upstream models.
+   * Per-model overrides win; falls back to NEURALWATT_TOOL_CALL_FORMAT.
+   */
+  toolCallFormat?: "auto" | "json" | "xml";
+  /** Per-model tool-call wire-format overrides, keyed by model id. */
+  modelToolCallFormats?: Record<string, "auto" | "json" | "xml">;
+  /**
+   * How readily the contract asks the model for user-visible preambles.
+   * Falls back to NEURALWATT_PREAMBLE_VERBOSITY.
+   */
+  preambleVerbosity?: "quiet" | "normal" | "verbose";
 }
 
 export interface PersistentState {

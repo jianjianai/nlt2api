@@ -7,6 +7,8 @@ import {
   createChatStreamState,
   executeChatRequest,
   finishChatStream,
+  modelFromRequest,
+  resolveToolCallPolicy,
   startChatStream,
   stickyKeyFrom,
   validateChatRequest,
@@ -69,7 +71,8 @@ export default defineHandler(async (event) => {
     // Keep client-shape errors as ordinary HTTP 4xx responses. Once the SSE
     // headers are committed, only runtime/upstream failures can use SSE errors.
     // The validated artifacts are forwarded so execution does not re-validate.
-    const validated = validateChatRequest(requestBody);
+    const toolCallPolicy = await resolveToolCallPolicy(modelFromRequest(requestBody));
+    const validated = validateChatRequest(requestBody, toolCallPolicy);
     await assertModelSupported(validated.model);
     if (body.stream === true) {
       const includeUsage = streamOptions?.include_usage === true;

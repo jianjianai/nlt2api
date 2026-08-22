@@ -27,6 +27,11 @@ import type { JsonObject, JsonValue, ToolDefinition } from "~/server/utils/types
 export const XML_ENVELOPE_SKELETON =
   '<tool_calls><tool_call name="declared_function_name"><parameter name="parameter_name">value</parameter></tool_call></tool_calls>';
 
+// Preamble-carrying variant: shown by the contract in normal/verbose modes so
+// models imitate the narration instead of staying silent until the final answer.
+export const XML_ENVELOPE_SKELETON_WITH_PREAMBLE =
+  '<tool_calls><preamble>One short sentence telling the user what you are doing next.</preamble><tool_call name="declared_function_name"><parameter name="parameter_name">value</parameter></tool_call></tool_calls>';
+
 function objectValue(value: unknown): JsonObject | undefined {
   return value && typeof value === "object" && !Array.isArray(value) ? value as JsonObject : undefined;
 }

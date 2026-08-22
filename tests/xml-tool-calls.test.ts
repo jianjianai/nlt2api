@@ -382,7 +382,9 @@ test("buildXmlSkeleton renders schema-derived placeholders", () => {
 test("the auto contract offers both formats and lets the model choose", () => {
   assert.match(TOOL_CONTRACT, /IMPORTANT ADAPTER OVERRIDE/);
   assert.match(TOOL_CONTRACT, /\{"type":"tool_calls"/);
-  assert.match(TOOL_CONTRACT, /<tool_calls><tool_call name="declared_function_name">/);
+  // The default (normal) verbosity shows the preamble inside both skeletons.
+  assert.match(TOOL_CONTRACT, /<tool_calls><preamble>/);
+  assert.match(TOOL_CONTRACT, /<tool_call name="declared_function_name">/);
   assert.match(TOOL_CONTRACT, /Choose the format you produce most reliably/);
   assert.match(TOOL_CONTRACT, /never mix or nest them/);
   assert.match(TOOL_CONTRACT, /CDATA/);
@@ -394,6 +396,51 @@ test("the auto contract offers both formats and lets the model choose", () => {
   const xmlOnly = toolCallContract("xml");
   assert.match(xmlOnly, /exactly one XML document/);
   assert.ok(!xmlOnly.includes('{"type":"tool_calls"'));
+});
+
+test("the contract and reminder follow the configured preamble verbosity", () => {
+  const quiet = toolCallContract("auto", "quiet");
+  assert.match(quiet, /Omit the optional preamble by default/);
+  assert.ok(!quiet.includes('"preamble":"One short sentence'));
+  assert.ok(!quiet.includes("<preamble>One short sentence"));
+
+  const normal = toolCallContract("auto", "normal");
+  assert.match(normal, /Include a one-sentence preamble/);
+  assert.match(normal, /trivially implied/);
+  assert.ok(normal.includes('"preamble":"One short sentence telling the user what you are doing next."'));
+  assert.ok(normal.includes("<preamble>One short sentence telling the user what you are doing next.</preamble>"));
+
+  const verbose = toolCallContract("json", "verbose");
+  assert.match(verbose, /Always include a one-sentence preamble/);
+  assert.ok(verbose.includes('"preamble":"One short sentence'));
+
+  const quietReminder = toolTurnReminder({ format: "auto", preambleVerbosity: "quiet" });
+  assert.match(quietReminder, /omit it for routine steps/);
+  const normalReminder = toolTurnReminder({ format: "auto", preambleVerbosity: "normal" });
+  assert.match(normalReminder, /saying what you are doing next, unless it is trivially implied/);
+  const verboseReminder = toolTurnReminder({ format: "json", preambleVerbosity: "verbose" });
+  assert.match(verboseReminder, /Include a short `preamble` saying what you are doing next\./);
+});
+
+test("contract re-application strips every verbosity variant", () => {
+  for (const verbosity of ["quiet", "normal", "verbose"] as const) {
+    const first = withToolCallContract(
+      [{ role: "system" as const, content: "Be nice." }, { role: "user" as const, content: "hi" }],
+      tools,
+      "auto",
+      true,
+      "auto",
+      verbosity,
+    );
+    // Re-apply with a different verbosity: no stale contract or reminder survives.
+    const second = withToolCallContract(first, tools, "auto", true, "auto", verbosity === "quiet" ? "normal" : "quiet");
+    const system = String(second[0]?.content);
+    assert.equal(system.split("IMPORTANT ADAPTER OVERRIDE").length - 1, 1, `verbosity ${verbosity}`);
+    assert.equal(system.split("Be nice.").length - 1, 1, `verbosity ${verbosity}`);
+    const reminders = second.filter((message) =>
+      message.role === "user" && String(message.content).startsWith("IMPORTANT TOOL TURN REMINDER:"));
+    assert.equal(reminders.length, 1, `verbosity ${verbosity}`);
+  }
 });
 
 test("the reminder follows the configured format", () => {
