@@ -15,6 +15,7 @@ import {
   parseControlledToolEnvelope,
   parseControlledToolEnvelopeDetailed,
   parseRepairJson,
+  toolCallContract,
   withToolCallContract,
 } from "../server/utils/tool-calls.ts";
 import {
@@ -721,6 +722,31 @@ test("tool contracts preserve descriptions and every JSON Schema constraint", ()
   assert.match(text, /never claim a tool already succeeded/);
   assert.match(text, /"multipleOf":0\.25/);
   assert.match(text, /"dependentRequired"/);
+});
+
+test("contracts carrying legacy sentence wordings still strip cleanly", () => {
+  // Simulate a history written before the XML-rules and no-prose rewording:
+  // build the current contract, swap in the legacy sentences, and verify
+  // re-application strips it instead of stacking a second contract.
+  const legacy = toolCallContract("xml", "normal")
+    .replace(
+      "In the XML format, put the function name in the <tool_call> name attribute and write each argument as a <parameter name=\"...\"> element, typed against the declared JSON Schema (numbers and booleans without quotes, arrays and objects as JSON text). A value that contains angle brackets, markup, or code must be wrapped in a <![CDATA[...]]> section; otherwise escape & as &amp; and < as &lt; inside values.",
+      "In the XML format, put the function name in the <tool_call> name attribute and write each argument as a <parameter name=\"...\"> element, typed against the declared JSON Schema (numbers and booleans without quotes, arrays and objects as JSON text); escape & as &amp; and < as &lt; inside values, or wrap free-form text in <![CDATA[...]]>.",
+    )
+    .replace(
+      "code fences, or special control tokens around the XML",
+      "code fences, JSON, or special control tokens around the XML",
+    );
+  assert.ok(legacy.includes("wrap free-form text in <![CDATA[...]]>"));
+  const reapplied = withToolCallContract(
+    [{ role: "system" as const, content: legacy }, { role: "user" as const, content: "hi" }],
+    tools,
+    "auto",
+    true,
+    "xml",
+  );
+  const system = String(reapplied[0]?.content);
+  assert.equal(system.split("IMPORTANT ADAPTER OVERRIDE").length - 1, 1);
 });
 
 test("quiet verbosity keeps the legacy omit-by-default preamble wording", () => {

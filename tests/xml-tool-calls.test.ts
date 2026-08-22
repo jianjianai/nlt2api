@@ -358,6 +358,47 @@ test("the envelope scanner recovers raw markup, stray close tags and alias close
   assert.ok(args.edits[0].newText.includes('<span v-if="item.record.model"'));
 });
 
+test("a tolerant parse that corrupts markup-bearing parameters falls back to the scanner", () => {
+  // The observed DeepSeek first-pass failure: the edits value is JSON text
+  // embedding real-looking tags. txml parses it "successfully" but turns the
+  // embedded tags into elements and discards the surrounding JSON text; the
+  // mixed-content signature must reroute to the envelope scanner, which reads
+  // parameter content as raw text.
+  const editTools: ToolDefinition[] = [{
+    type: "function",
+    function: {
+      name: "edit_file",
+      parameters: {
+        type: "object",
+        properties: {
+          path: { type: "string" },
+          edits: {
+            type: "array",
+            items: {
+              type: "object",
+              properties: { oldText: { type: "string" }, newText: { type: "string" } },
+              required: ["oldText", "newText"],
+            },
+          },
+        },
+        required: ["path", "edits"],
+      },
+    },
+  }];
+  const content = '<tool_calls><tool_call name="edit_file"><parameter name="path">server/schema.xml</parameter>'
+    + '<parameter name="edits">[{"oldText": "<parameter name=\\"value\\">0</parameter>", "newText": "<parameter name=\\"value\\">1</parameter>"}]</parameter>'
+    + "</tool_call></tool_calls>";
+  const result = parseControlledToolEnvelopeDetailed(content, editTools, "seed");
+  assert.equal(result.error, undefined);
+  assert.equal(result.envelope?.type, "tool_calls");
+  if (result.envelope?.type !== "tool_calls") return;
+  const args = JSON.parse(result.envelope.toolCalls[0]!.function.arguments);
+  assert.equal(args.path, "server/schema.xml");
+  assert.equal(args.edits.length, 1);
+  assert.equal(args.edits[0].oldText, '<parameter name="value">0</parameter>');
+  assert.equal(args.edits[0].newText, '<parameter name="value">1</parameter>');
+});
+
 test("the envelope scanner decodes entities and keeps CDATA content verbatim", () => {
   const content = [
     "<tool_calls>",

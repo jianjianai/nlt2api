@@ -330,13 +330,21 @@ function scanToolCallEnvelope(text: string): { value: unknown; changes: string[]
   const changes = new Set<string>();
   const n = text.length;
 
-  // A parameter value ends at the first </parameter>; a close tag of an
-  // ancestor element terminates an unclosed parameter without consuming it.
-  const VALUE_TERMINATORS = ["</parameter", "</tool_call", "</invoke", "</tool_calls"];
+  // A parameter value ends at the first </parameter> that is not balanced by
+  // an embedded <parameter ...> open tag inside the value: values are raw
+  // text and may carry balanced markup (e.g. JSON text embedding XML code).
+  // A close tag of an ancestor element terminates an unclosed parameter
+  // without consuming it.
+  const ANCESTOR_TERMINATORS = ["</tool_call", "</invoke", "</tool_calls"];
+  const boundaryAfter = (pos: number): boolean => {
+    const ch = text[pos];
+    return ch === undefined || ch === ">" || ch === "/" || ch === " " || ch === "\t" || ch === "\n" || ch === "\r";
+  };
   function readParameterValue(from: number): { value: string; end: number } {
     let value = "";
     let plain = "";
     let cursor = from;
+    let depth = 0;
     const flushPlain = () => {
       if (plain) {
         value += decodeXmlEntities(plain);
@@ -356,13 +364,39 @@ function scanToolCallEnvelope(text: string): { value: unknown; changes: string[]
         cursor = cdataEnd + 3;
         continue;
       }
-      const terminator = VALUE_TERMINATORS.find((candidate) => text.startsWith(candidate, cursor));
-      if (terminator) {
-        flushPlain();
-        if (terminator === "</parameter") {
+      if (text.startsWith("</parameter", cursor) && boundaryAfter(cursor + 11)) {
+        if (depth === 0) {
+          flushPlain();
           const gt = text.indexOf(">", cursor);
           return { value, end: gt < 0 ? n : gt + 1 };
         }
+        // A balanced embedded close stays part of the value text.
+        depth -= 1;
+        const gt = text.indexOf(">", cursor);
+        const end = gt < 0 ? n : gt + 1;
+        plain += text.slice(cursor, end);
+        cursor = end;
+        continue;
+      }
+      if (text.startsWith("<parameter", cursor) && boundaryAfter(cursor + 10)) {
+        // An embedded open tag balances its close so the value does not end
+        // early; a self-closing one does not affect the depth.
+        const tag = nextXmlTag(text, cursor);
+        if (!tag) {
+          plain += text.slice(cursor);
+          cursor = n;
+          break;
+        }
+        if (!tag.selfClosing) {
+          depth += 1;
+        }
+        plain += text.slice(cursor, tag.end);
+        cursor = tag.end;
+        continue;
+      }
+      const ancestor = ANCESTOR_TERMINATORS.find((candidate) => text.startsWith(candidate, cursor));
+      if (ancestor) {
+        flushPlain();
         changes.add("recovered an unclosed parameter element");
         return { value, end: cursor };
       }
@@ -512,6 +546,43 @@ function scanToolCallEnvelope(text: string): { value: unknown; changes: string[]
 }
 
 /**
+ * Detect the mixed-content corruption signature: a <parameter> carrying both
+ * element children and non-whitespace text. In the envelope grammar a
+ * parameter is either raw text or a nested-object element list, never both;
+ * both means the model embedded markup inside a JSON-text value and the
+ * tolerant parser mistook the markup for real elements, which discards the
+ * surrounding text and loses the argument.
+ */
+function hasMixedParameterContent(value: unknown): boolean {
+  const root = objectValue(objectValue(value)?.tool_calls);
+  if (!root) {
+    return false;
+  }
+  const rawCalls = root.tool_call ?? root.invoke;
+  const callList = rawCalls === undefined ? [] : Array.isArray(rawCalls) ? rawCalls : [rawCalls];
+  for (const call of callList) {
+    const callObject = objectValue(call);
+    if (!callObject) {
+      continue;
+    }
+    const rawParams = callObject.parameter;
+    const paramList = rawParams === undefined ? [] : Array.isArray(rawParams) ? rawParams : [rawParams];
+    for (const param of paramList) {
+      const paramObject = objectValue(param);
+      if (!paramObject) {
+        continue;
+      }
+      const text = paramObject["#text"];
+      const hasElements = Object.keys(paramObject).some((key) => !key.startsWith("@_") && key !== "#text");
+      if (hasElements && typeof text === "string" && text.trim()) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+/**
  * Parse the XML envelope with a jsonrepair-style multi-pass strategy: strict
  * fast-xml-parser validation first, tolerant txml parsing as the repair
  * attempt, the domain-aware envelope scanner as the last resort, and a
@@ -575,6 +646,23 @@ export function parseRepairXml(input: string): XmlParseResult {
         "No <tool_calls> root element was found in the response.",
       ),
     };
+  }
+  // The tolerant parse can "succeed" while corrupting a parameter whose value
+  // embeds markup (the markup becomes real elements and the surrounding text
+  // is lost). The scanner reads parameter content as raw text, which is the
+  // correct interpretation for that signature.
+  if (hasMixedParameterContent(located.value)) {
+    const scanned = scanToolCallEnvelope(trimmed);
+    if (scanned) {
+      return {
+        value: scanned.value,
+        repaired: true,
+        changes: [
+          "the tolerant parser mistook markup embedded in a parameter value for real elements; recovered with the envelope scanner",
+          ...scanned.changes,
+        ],
+      };
+    }
   }
   const changes = ["strict XML validation failed; recovered with the tolerant txml parser"];
   if (located.extraTopLevelContent) {

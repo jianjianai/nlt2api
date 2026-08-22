@@ -79,6 +79,10 @@ const CONTRACT_SENTENCE_NO_NATIVE =
 const CONTRACT_SENTENCE_SHELL =
   "For shell or command tools, follow the operating-system syntax in that tool's declaration; never invent Unix flags or undocumented parameters.";
 const CONTRACT_SENTENCE_XML_RULES =
+  "In the XML format, put the function name in the <tool_call> name attribute and write each argument as a <parameter name=\"...\"> element, typed against the declared JSON Schema (numbers and booleans without quotes, arrays and objects as JSON text). A value that contains angle brackets, markup, or code must be wrapped in a <![CDATA[...]]> section; otherwise escape & as &amp; and < as &lt; inside values.";
+
+// Legacy pre-3.11.1 wording, kept so histories carrying it still strip.
+const LEGACY_CONTRACT_SENTENCE_XML_RULES =
   "In the XML format, put the function name in the <tool_call> name attribute and write each argument as a <parameter name=\"...\"> element, typed against the declared JSON Schema (numbers and booleans without quotes, arrays and objects as JSON text); escape & as &amp; and < as &lt; inside values, or wrap free-form text in <![CDATA[...]]>.";
 
 // The quiet-mode preamble sentences are byte-identical to the pre-verbosity
@@ -708,14 +712,25 @@ function stripToolContract(content: string): string {
   // strands a stale contract in the history.
   const variants = (["auto", "json", "xml"] as const)
     .flatMap((format) => (["quiet", "normal", "verbose"] as const).map((verbosity) => toolCallContract(format, verbosity)));
-  // Legacy pinned-format contracts (pre-3.10.1) named the other wire format
-  // in the no-prose rule; keep stripping them so upgrading never strands a
-  // stale contract in the history.
-  const legacyVariants = variants.map((variant) => variant
-    .replace("code fences, or special control tokens around the JSON", "code fences, XML, or special control tokens around the JSON")
-    .replace("code fences, or special control tokens around the XML", "code fences, JSON, or special control tokens around the XML"));
-  const allVariants = [...new Set([...variants, ...legacyVariants])];
-  if (!allVariants.some((variant) => content.includes(variant))) {
+  // Legacy contract variants: sentences whose wording changed across versions
+  // are swapped back in every combination, so histories written by any older
+  // version still strip cleanly instead of stacking contracts.
+  const legacySentencePairs: [string, string][] = [
+    // Pre-3.10.1 pinned contracts named the other wire format in the no-prose rule.
+    ["code fences, or special control tokens around the JSON", "code fences, XML, or special control tokens around the JSON"],
+    ["code fences, or special control tokens around the XML", "code fences, JSON, or special control tokens around the XML"],
+    // Pre-3.11.1 XML rules offered escaping and CDATA as equal options.
+    [CONTRACT_SENTENCE_XML_RULES, LEGACY_CONTRACT_SENTENCE_XML_RULES],
+  ];
+  const allVariants = new Set(variants);
+  for (const [current, legacy] of legacySentencePairs) {
+    for (const variant of [...allVariants]) {
+      if (variant.includes(current)) {
+        allVariants.add(variant.replace(current, legacy));
+      }
+    }
+  }
+  if (![...allVariants].some((variant) => content.includes(variant))) {
     return content;
   }
   // The schema block is always the trailing adapter fragment; cut it first,
