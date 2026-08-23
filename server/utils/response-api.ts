@@ -9,6 +9,7 @@ import {
 import { getProxyConfig } from "~/server/utils/config.ts";
 import { HttpError } from "~/server/utils/http.ts";
 import { responseStore } from "~/server/utils/response-store.ts";
+import { isValidToolCallId, stringifyContent } from "~/server/utils/tool-calls.ts";
 import type {
   ChatMessage,
   JsonObject,
@@ -168,7 +169,7 @@ function messageContentFromParts(item: Record<string, unknown>, role: string, in
 function toolCallFromItem(item: Record<string, unknown>, customTools: Set<string>, index: number): NormalizedToolCall {
   const callId = asStringValue(item.call_id);
   const name = asStringValue(item.name);
-  if (!callId || !/^[A-Za-z0-9_-]{1,128}$/.test(callId)) {
+  if (!isValidToolCallId(callId)) {
     throw invalid(`input[${index}].call_id must be a valid tool-call ID.`, "input");
   }
   if (!name) {
@@ -284,7 +285,7 @@ export function messagesFromResponseItems(items: JsonObject[], customTools: Set<
     }
     if (type === "function_call_output" || type === "custom_tool_call_output") {
       const callId = asStringValue(item.call_id);
-      if (!callId || !/^[A-Za-z0-9_-]{1,128}$/.test(callId)) {
+      if (!isValidToolCallId(callId)) {
         throw invalid(`input[${index}].call_id must be a valid tool-call ID.`, "input");
       }
       messages.push({ role: "tool", tool_call_id: callId, content: toolOutputText(item) });
@@ -617,7 +618,9 @@ export async function validateResponseRequest(body: JsonObject): Promise<Validat
     ...(body.top_p !== undefined ? { top_p: body.top_p } : {}),
     ...(typeof body.prompt_cache_key === "string" && body.prompt_cache_key
       ? { user: body.prompt_cache_key.slice(0, 256) }
-      : {}),
+      : typeof previousResponseId === "string" && previousResponseId
+        ? { user: `response:${previousResponseId}`.slice(0, 256) }
+        : {}),
   };
 
   return {

@@ -1,3 +1,4 @@
+import { ProxyTransportError } from "~/server/utils/proxy.ts";
 import type { ChatMessage, UpstreamChoice, UpstreamCompletion, UpstreamUsage } from "~/server/utils/types.ts";
 
 /** A structured error reported inside an HTTP-200 upstream SSE stream. */
@@ -214,6 +215,9 @@ export async function collectUpstreamStream(
     }
     return { completion: assemble(frames), frames, raw };
   } catch (error) {
+    if (error instanceof ProxyTransportError) {
+      throw error;
+    }
     if (error instanceof UpstreamStreamError) {
       if (!error.rawResponse) {
         throw new UpstreamStreamError(error.message, error.status, error.retryAfterSeconds, raw);

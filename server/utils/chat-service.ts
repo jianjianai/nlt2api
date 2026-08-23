@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { parse as parseJsonSourceMap } from "json-source-map";
-import { accountScheduler } from "~/server/utils/account-scheduler.ts";
+import { accountScheduler, type AccountLease } from "~/server/utils/account-scheduler.ts";
 import { getProxyConfig } from "~/server/utils/config.ts";
 import { HttpError } from "~/server/utils/http.ts";
 import {
@@ -10,6 +10,8 @@ import {
   type LocatedSchemaValidationResult,
 } from "~/server/utils/json-schema.ts";
 import { portalClient, PortalError, readPortalJsonBody, retryAfterSeconds } from "~/server/utils/portal-client.ts";
+import { proxyPoolService } from "~/server/utils/proxy-pool.ts";
+import { ProxyTransportError } from "~/server/utils/proxy.ts";
 import { ProxyRequestError, type RequestDebugContext } from "~/server/utils/request-errors.ts";
 import { stateStore } from "~/server/utils/state-store.ts";
 import { collectUpstreamStream, UpstreamStreamError, type UpstreamFrameHandler } from "~/server/utils/upstream-stream.ts";
@@ -21,6 +23,7 @@ import {
   tagRepairReasoning,
   buildToolRepairHistory,
   envelopeAllowedForToolChoice,
+  isValidToolCallId,
   normaliseAssistantToolCalls,
   mergeSystemMessages,
   parseControlledToolEnvelopeDetailed,
@@ -145,7 +148,7 @@ function parseMessages(value: unknown): ChatMessage[] {
       throw new HttpError(400, `messages[${index}] has an unsupported role.`, "invalid_request_error", "messages");
     }
     if (role === "tool") {
-      if (typeof message.tool_call_id !== "string" || !/^[A-Za-z0-9_-]{1,128}$/.test(message.tool_call_id)) {
+      if (!isValidToolCallId(message.tool_call_id)) {
         throw new HttpError(400, `messages[${index}].tool_call_id must be a valid tool-call ID.`, "invalid_request_error", "messages");
       }
       const content = message.content;
@@ -369,8 +372,8 @@ function upstreamBody(
   stream: boolean,
   prebuiltMessages?: ChatMessage[],
   toolCallPolicy?: ToolCallPolicy,
+  minimumOutputTokens = getProxyConfig().minimumOutputTokens,
 ): { body: JsonObject; messages: ChatMessage[] } {
-  const tokenLimit = validateTokenLimit(request);
   const toolChoice = request.tool_choice;
   const toolTurn = tools.length > 0 && toolChoice !== "none";
   const parallelToolCalls = request.parallel_tool_calls === undefined ? true : request.parallel_tool_calls;
@@ -417,14 +420,17 @@ function upstreamBody(
   if (toolTurn && request.temperature === undefined) {
     body.temperature = 0;
   }
-  body.max_tokens = Math.min(
-    tokenLimit ?? Math.min(DEFAULT_OUTPUT_TOKENS, getProxyConfig().maxOutputTokens),
-    PORTAL_MAX_OUTPUT_TOKENS,
-  );
+  body.max_tokens = resolvePortalOutputBudget(request, minimumOutputTokens);
   if (!toolTurn && request.response_format !== undefined) {
     body.response_format = request.response_format;
   }
   return { body, messages: upstreamMessages };
+}
+
+/** Resolve one portal round without changing the client-visible requested budget. */
+export function resolvePortalOutputBudget(request: JsonObject, minimumOutputTokens: number): number {
+  const requested = validateTokenLimit(request) ?? Math.min(DEFAULT_OUTPUT_TOKENS, getProxyConfig().maxOutputTokens);
+  return Math.min(Math.max(requested, minimumOutputTokens), PORTAL_MAX_OUTPUT_TOKENS);
 }
 
 async function parsePortalError(response: Response): Promise<{ error: PortalError; payload?: JsonObject; raw: string }> {
@@ -444,7 +450,7 @@ async function parsePortalError(response: Response): Promise<{ error: PortalErro
     : undefined;
   const retryAfter = retryAfterSeconds(response) ?? bodyRetryAfter;
   return {
-    error: new PortalError(message, response.status, retryAfter),
+    error: new PortalError(message, response.status, retryAfter, payload as JsonObject | undefined),
     raw: body.raw,
     ...(payload ? { payload: payload as JsonObject } : {}),
   };
@@ -452,6 +458,38 @@ async function parsePortalError(response: Response): Promise<{ error: PortalErro
 
 function countsAgainstAccount(status: number): boolean {
   return status === 401 || status === 403 || status === 408 || status === 425 || status === 429 || status >= 500;
+}
+
+const MODEL_CAPACITY_PATTERN = /(?:concurrent(?:cy)?[_ -]?(?:limit|slots?)|slots?\s+in\s+use|\d+\/\d+\s+slots?)/i;
+
+function structuredCapacitySignal(value: unknown): boolean {
+  if (typeof value === "string") return MODEL_CAPACITY_PATTERN.test(value);
+  if (Array.isArray(value)) return value.some(structuredCapacitySignal);
+  if (!value || typeof value !== "object") return false;
+  return Object.entries(value as Record<string, unknown>).some(([key, entry]) =>
+    MODEL_CAPACITY_PATTERN.test(key) || structuredCapacitySignal(entry));
+}
+
+export function isModelCapacityError(error: PortalError): boolean {
+  return structuredCapacitySignal(error.payload) || MODEL_CAPACITY_PATTERN.test(error.message);
+}
+
+function markCapacityFailure(accountId: string, model: string, error: PortalError, admissionSequence: number): void {
+  if (isModelCapacityError(error)) {
+    accountScheduler.markModelCapacityFailure(
+      accountId,
+      model,
+      error.message,
+      error.retryAfterSeconds,
+      admissionSequence,
+    );
+    return;
+  }
+  accountScheduler.markFailure(accountId, error.message, error.retryAfterSeconds, admissionSequence);
+}
+
+function isAbortError(error: unknown): boolean {
+  return error instanceof DOMException && error.name === "AbortError";
 }
 
 async function getCompletion(
@@ -469,43 +507,41 @@ async function getCompletion(
     upstreamRequest: body,
     ...(trace ? { upstreamCalls: trace.calls } : {}),
   };
-  const model = typeof body.model === "string" && body.model ? body.model : undefined;
-  // A required account is an affinity preference (repair pinning, tool-call
-  // binding), never a hard requirement: the full conversation state travels in
-  // the request messages, so when the preferred account is cooling down,
-  // disabled, or fails, fall back to normal scheduling over the remaining
-  // healthy accounts instead of failing the request.
-  const attempts = Math.max(1, (await stateStore.listAccounts()).filter((account) => account.enabled).length);
+  const model = typeof body.model === "string" && body.model ? body.model : getProxyConfig().defaultModel;
+  // Required accounts are affinity preferences. The scheduler spills to
+  // another eligible account when the preferred account lacks capacity.
+  let rotationAttempted = false;
+  let retryAccountSnapshot: ManagedAccount | undefined;
+  const enabledAccountCount = (await stateStore.listAccounts()).filter((account) => account.enabled).length;
+  // One extra outer attempt is reserved for a successful proxy rotation even
+  // when the deployment has only one account.
+  const attempts = Math.max(1, enabledAccountCount) + 1;
   for (let attempt = 0; attempt < attempts; attempt += 1) {
-    let account: ManagedAccount;
-    let pinnedAttempt = false;
+    let lease: AccountLease;
     try {
-      if (requiredAccountId && attempt === 0) {
-        const stored = await stateStore.getAccount(requiredAccountId);
-        if (stored?.enabled) {
-          pinnedAttempt = true;
-          account = await accountScheduler.acquire(stickyKey, new Set((await stateStore.listAccounts()).filter((item) => item.id !== requiredAccountId).map((item) => item.id)), model);
-        } else {
-          account = await accountScheduler.acquire(stickyKey, excluded, model);
-        }
-      } else {
-        account = await accountScheduler.acquire(stickyKey, excluded, model);
-      }
+      lease = await accountScheduler.acquire(retryAccountSnapshot
+        ? { model, accountSnapshot: retryAccountSnapshot, signal }
+        : {
+            model,
+            stickyKey,
+            ...(requiredAccountId && attempt === 0 ? { preferredAccountId: requiredAccountId } : {}),
+            excludedAccountIds: excluded,
+            signal,
+          });
+      retryAccountSnapshot = undefined;
     } catch (error) {
+      if (signal?.aborted || isAbortError(error)) {
+        throw new ClientDisconnectedError();
+      }
       if (error instanceof HttpError) {
         throw error;
-      }
-      if (pinnedAttempt && requiredAccountId) {
-        // The preferred account is cooling down or otherwise not acquirable;
-        // exclude it and fall back to normal scheduling on the next attempt.
-        excluded.add(requiredAccountId);
-        continue;
       }
       if (lastError) {
         throw new ProxyRequestError(lastError, lastContext);
       }
       throw new HttpError(503, "No enabled NeuralWatt account is currently available.", "server_error", undefined, "no_account_available");
     }
+    const account = lease.account;
 
     const currentContext: RequestDebugContext = {
       accountId: account.id,
@@ -529,7 +565,7 @@ async function getCompletion(
         body as Record<string, unknown>,
         signal,
         trace
-          ? (retry) => {
+          ? async (retry) => {
             if (debugCall && trace) {
               if (retry.status > 0) {
                 debugCall.responseStatus = retry.status;
@@ -543,8 +579,20 @@ async function getCompletion(
               debugCall = createDebugCall(trace, account, body);
               trace.calls.push(debugCall);
             }
+            // The failed attempt consumed RPM but no longer needs a
+            // concurrency slot while the portal backs off or refreshes auth.
+            lease.release();
           }
-          : undefined,
+          : async () => {
+            lease.release();
+          },
+        async () => {
+          lease = await accountScheduler.acquire({
+            model,
+            accountSnapshot: account,
+            signal,
+          });
+        },
       );
       const contentType = response.headers.get("content-type")?.toLowerCase() ?? "";
       debugCall && (debugCall.responseStatus = response.status);
@@ -602,7 +650,10 @@ async function getCompletion(
             ? embeddedError.message
             : "Portal returned a streaming-style error payload.";
         const embeddedStatus = typeof completion.status === "number" ? completion.status : 502;
-        throw new PortalError(message, embeddedStatus);
+        const errorPayload: JsonObject = embeddedError
+          ? { error: embeddedError as JsonObject }
+          : { error: String(completion.error) };
+        throw new PortalError(message, embeddedStatus, undefined, errorPayload);
       }
       const choices = Array.isArray(completion.choices) ? completion.choices : [];
       const choice = asRecord(choices[0]);
@@ -613,9 +664,36 @@ async function getCompletion(
       if (!choice || !message || (typeof content !== "string" && !hasStructuredCalls && !hasRepairableEmptyContent)) {
         throw new PortalError("The NeuralWatt portal returned an invalid completion shape.", 502);
       }
-      accountScheduler.markSuccess(account.id);
+      accountScheduler.markSuccess(account.id, lease.admissionSequence);
       return { account, completion, receivedSse };
     } catch (error) {
+      if (error instanceof HttpError) {
+        throw error;
+      }
+      if (isAbortError(error)) {
+        throw new ClientDisconnectedError();
+      }
+      if (error instanceof ProxyTransportError) {
+        if (debugCall && !debugCall.error) debugCall.error = error.message;
+        if (rotationAttempted) {
+          await proxyPoolService.markBoundProxyError(account, error);
+          throw new ProxyRequestError(error, currentContext);
+        }
+        const rotated = account.proxyPoolEntryId
+          ? await proxyPoolService.rotate(account.id, account.proxyPoolEntryId, error, signal)
+          : account.proxy
+            ? await proxyPoolService.rotateCustom(account, error, signal)
+            : undefined;
+        rotationAttempted = Boolean(account.proxy);
+        const retryAfterRotation = rotated
+          && !streamedOutput
+          && (await stateStore.getSettings()).proxyPool.retryCurrentRequestAfterRotation;
+        if (retryAfterRotation) {
+          retryAccountSnapshot = rotated.account;
+          continue;
+        }
+        throw new ProxyRequestError(error, currentContext);
+      }
       if (debugCall && !debugCall.error) {
         if (error instanceof UpstreamStreamError && error.rawResponse !== undefined && !debugCall.response) {
           debugCall.response = responseDebugBody(error.rawResponse, "text/event-stream");
@@ -635,7 +713,7 @@ async function getCompletion(
             ? new PortalError(error.message, error.status, error.retryAfterSeconds)
             : new PortalError(error instanceof Error ? error.message : "Unknown portal streaming error.", 502);
         if (countsAgainstAccount(failure.status)) {
-          accountScheduler.markFailure(account.id, failure.message, failure.retryAfterSeconds);
+          markCapacityFailure(account.id, model, failure, lease.admissionSequence);
         }
         if (error instanceof ProxyRequestError) {
           throw error;
@@ -652,7 +730,7 @@ async function getCompletion(
         if (!countsAgainstAccount(portalError.status)) {
           throw new ProxyRequestError(portalError, currentContext);
         }
-        accountScheduler.markFailure(account.id, portalError.message, portalError.retryAfterSeconds);
+        markCapacityFailure(account.id, model, portalError, lease.admissionSequence);
         excluded.add(account.id);
         continue;
       }
@@ -662,17 +740,17 @@ async function getCompletion(
         if (!countsAgainstAccount(error.status)) {
           throw new ProxyRequestError(error, currentContext);
         }
-        accountScheduler.markFailure(account.id, error.message, error.retryAfterSeconds);
+        markCapacityFailure(account.id, model, error, lease.admissionSequence);
         excluded.add(account.id);
       } else {
         const message = error instanceof Error ? error.message : "Unknown portal transport error.";
-        accountScheduler.markFailure(account.id, message);
+        accountScheduler.markFailure(account.id, message, undefined, lease.admissionSequence);
         lastError = new PortalError(message, 502);
         lastContext = currentContext;
         excluded.add(account.id);
       }
     } finally {
-      accountScheduler.release(account.id);
+      lease.release();
     }
   }
 
@@ -1179,7 +1257,9 @@ async function executeChatRequestOnce(
     ? undefined
     : accountScheduler.accountForToolCalls(observedToolCallIds);
   const streamUpstream = options?.stream ?? request.stream === true;
-  const builtUpstream = upstreamBody(request, model, messages, tools, streamUpstream, prebuiltMessages);
+  const settings = await stateStore.getSettings();
+  const minimumOutputTokens = settings.minimumOutputTokens ?? getProxyConfig().minimumOutputTokens;
+  const builtUpstream = upstreamBody(request, model, messages, tools, streamUpstream, prebuiltMessages, toolCallPolicy, minimumOutputTokens);
   let upstreamRequest = builtUpstream.body;
   // A client budget above the per-round portal cap enables thinking
   // continuation: when the upstream stops with finish_reason "length" while

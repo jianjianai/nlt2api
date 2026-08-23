@@ -49,15 +49,144 @@ async function recordFiles(dir: string): Promise<string[]> {
   }
 }
 
+test("proxy pool settings and empty pool default for legacy state", async () => {
+  await withTempStore(async (store) => {
+    const settings = await store.getSettings();
+    assert.deepEqual(settings.proxyPool, {
+      autoAssignOnAccountCreate: false,
+      autoRotateOnTransportError: false,
+      retryCurrentRequestAfterRotation: true,
+      directFallbackWhenExhausted: false,
+      defaultImportProtocol: "http",
+      healthCheckTimeoutSeconds: 10,
+      errorRetryCooldownSeconds: 300,
+    });
+    assert.deepEqual(await store.listProxyPool(), []);
+  });
+});
+
+test("proxy pool import, binding, health and deletion preserve account session", async () => {
+  await withTempStore(async (store) => {
+    const [created, duplicate] = await store.importProxyPool([
+      { url: "socks5://user:pass@proxy.local:1080", kind: "socks5" },
+      { url: "socks5://user:pass@proxy.local:1080", kind: "socks5" },
+    ]);
+    assert.equal(created?.created, true);
+    assert.equal(duplicate?.created, false);
+    assert.equal(created?.entry.id, duplicate?.entry.id);
+    assert.equal((await store.listProxyPool()).length, 1);
+
+    const account = await store.addAccount({ email: "pool@example.com", password: "secret" });
+    await store.updateSession(account.id, { cookie: "nw_session=kept", expiresAt: null, updatedAt: timestamp(0) });
+    const bound = await store.bindProxyPoolEntry(account.id, created!.entry.id);
+    assert.equal(bound.proxyPoolEntryId, created?.entry.id);
+    assert.equal(bound.proxy, created?.entry.url);
+    assert.equal(bound.session?.cookie, "nw_session=kept");
+    await assert.rejects(store.deleteProxyPoolEntry(created!.entry.id), /assigned/);
+
+    const failed = await store.updateProxyPoolHealth(created!.entry.id, {
+      healthy: false,
+      checkedAt: timestamp(1),
+      error: "connect failed",
+      retryAfter: Date.parse(timestamp(1)) + 300_000,
+    });
+    assert.equal(failed.lastError, "connect failed");
+    const healthy = await store.updateProxyPoolHealth(created!.entry.id, { healthy: true, checkedAt: timestamp(2) });
+    assert.equal(healthy.lastError, undefined);
+
+    const unbound = await store.unbindProxyPoolEntry(account.id, created!.entry.id);
+    assert.equal(unbound.proxy, undefined);
+    assert.equal(unbound.proxyPoolEntryId, undefined);
+    assert.equal(unbound.session?.cookie, "nw_session=kept");
+    await store.deleteProxyPoolEntry(created!.entry.id);
+    assert.deepEqual(await store.listProxyPool(), []);
+  });
+});
+
+test("manual proxy updates clear pool ownership but preserve session", async () => {
+  await withTempStore(async (store) => {
+    const [pool] = await store.importProxyPool([{ url: "http://pool.local:8080/", kind: "http" }]);
+    const account = await store.addAccount({ email: "manual@example.com", password: "secret" });
+    await store.updateSession(account.id, { cookie: "nw_session=kept", expiresAt: null, updatedAt: timestamp(0) });
+    await store.bindProxyPoolEntry(account.id, pool!.entry.id);
+    const updated = await store.updateAccount(account.id, { proxy: "http://manual.local:8080/" });
+    assert.equal(updated.proxyPoolEntryId, undefined);
+    assert.equal(updated.proxy, "http://manual.local:8080/");
+    assert.equal(updated.session?.cookie, "nw_session=kept");
+  });
+});
+
+test("scheduler settings default, persist and normalize invalid legacy values", async () => {
+  await withTempStore(async (store, dir) => {
+    assert.deepEqual((await store.getSettings()).scheduler, {
+      accountModelConcurrency: 5,
+      accountRpm: 20,
+      proxyRpm: 30,
+      directEgressLimitEnabled: false,
+      directEgressRpm: 30,
+      stickyTtlSeconds: 1_800,
+      queueTimeoutSeconds: 0,
+      maxQueueSize: 0,
+    });
+
+    await store.updateSettings({ scheduler: {
+      accountModelConcurrency: 7,
+      accountRpm: 25,
+      proxyRpm: 40,
+      directEgressLimitEnabled: true,
+      directEgressRpm: 35,
+      stickyTtlSeconds: 900,
+      queueTimeoutSeconds: 45,
+      maxQueueSize: 250,
+    } });
+    assert.equal((await store.getSettings()).scheduler.accountRpm, 25);
+
+    const file = join(dir, "accounts.json");
+    const parsed = JSON.parse(await readFile(file, "utf8")) as { settings: { scheduler: Record<string, unknown> } };
+    parsed.settings.scheduler.accountRpm = -1;
+    parsed.settings.scheduler.proxyRpm = "unlimited";
+    parsed.settings.scheduler.queueTimeoutSeconds = -2;
+    await writeFile(file, JSON.stringify(parsed), "utf8");
+    const reloaded = await new StateStore().getSettings();
+    assert.equal(reloaded.scheduler.accountRpm, 20);
+    assert.equal(reloaded.scheduler.proxyRpm, 30);
+    assert.equal(reloaded.scheduler.queueTimeoutSeconds, 0);
+    assert.equal(reloaded.scheduler.accountModelConcurrency, 7);
+  });
+});
+
+test("account scheduler overrides persist, clear, and prune removed models", async () => {
+  await withTempStore(async (store) => {
+    const account = await store.addAccount({ email: "limits@example.com", password: "secret", models: ["m1", "m2"] });
+    const updated = await store.updateAccount(account.id, { schedulerOverrides: {
+      accountRpm: 12,
+      accountModelConcurrency: 4,
+      modelConcurrency: { m1: 2, m2: 3, stale: 99 },
+    } });
+    assert.deepEqual(updated.schedulerOverrides, {
+      accountRpm: 12,
+      accountModelConcurrency: 4,
+      modelConcurrency: { m1: 2, m2: 3 },
+    });
+
+    const pruned = await store.updateAccount(account.id, { models: ["m2"] });
+    assert.deepEqual(pruned.schedulerOverrides?.modelConcurrency, { m2: 3 });
+    const cleared = await store.updateAccount(account.id, { schedulerOverrides: null });
+    assert.equal(cleared.schedulerOverrides, undefined);
+  });
+});
+
 test("settings persist tool-call policy fields and clear on null or empty map", async () => {
   await withTempStore(async (store) => {
     await store.updateSettings({
+      minimumOutputTokens: 0,
       toolCallFormat: "json",
       preambleVerbosity: "verbose",
       modelToolCallFormats: { "model-a": "xml", "model-b": "auto" },
       modelPreambleVerbosities: { "model-a": "quiet" },
     });
     const settings = await store.getSettings();
+    assert.equal(settings.minimumOutputTokens, 0);
     assert.equal(settings.toolCallFormat, "json");
     assert.equal(settings.preambleVerbosity, "verbose");
     assert.deepEqual(settings.modelToolCallFormats, { "model-a": "xml", "model-b": "auto" });
@@ -78,6 +207,7 @@ test("persisted settings reload with invalid tool-call policy entries dropped", 
     await store.updateSettings({ toolCallFormat: "xml", modelToolCallFormats: { "model-a": "json" } });
     const file = join(dir, "accounts.json");
     const parsed = JSON.parse(await readFile(file, "utf8")) as { settings: Record<string, unknown> };
+    parsed.settings.minimumOutputTokens = 8193;
     parsed.settings.toolCallFormat = "yaml";
     parsed.settings.preambleVerbosity = "loud";
     parsed.settings.modelToolCallFormats = { "model-a": "json", "model-b": "yaml", "": "auto" };
@@ -85,6 +215,7 @@ test("persisted settings reload with invalid tool-call policy entries dropped", 
     await writeFile(file, JSON.stringify(parsed), "utf8");
     const reloaded = new StateStore();
     const settings = await reloaded.getSettings();
+    assert.equal(settings.minimumOutputTokens, undefined);
     assert.equal(settings.toolCallFormat, undefined);
     assert.equal(settings.preambleVerbosity, undefined);
     assert.deepEqual(settings.modelToolCallFormats, { "model-a": "json" });

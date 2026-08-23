@@ -18,6 +18,7 @@ export default defineHandler(async (event) => {
     }
     await portalClient.verifyAccount(account);
     accountScheduler.markSuccess(id);
+    accountScheduler.notifyStateChanged();
     const saved = await stateStore.getAccount(id);
     return jsonResponse({ account: saved ? accountScheduler.publicState(saved) : null });
   } catch (error) {

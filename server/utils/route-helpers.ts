@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { HttpError } from "~/server/utils/http.ts";
 import { redact } from "~/server/utils/redaction.ts";
 import { PortalError } from "~/server/utils/portal-client.ts";
+import { ProxyTransportError } from "~/server/utils/proxy.ts";
 import { requestCause } from "~/server/utils/request-errors.ts";
 import { stateStore } from "~/server/utils/state-store.ts";
 import type { DebugRawBody, DebugRecord, DebugUpstreamCall, JsonObject } from "~/server/utils/types.ts";
@@ -10,6 +11,9 @@ export function upstreamHttpError(error: unknown): HttpError {
   error = requestCause(error);
   if (error instanceof HttpError) {
     return error;
+  }
+  if (error instanceof ProxyTransportError) {
+    return new HttpError(502, "The configured proxy could not reach the NeuralWatt portal.", "api_error", undefined, "proxy_transport_error");
   }
   if (error instanceof PortalError) {
     if (error.status === 400 || error.status === 404 || error.status === 422) {
@@ -29,6 +33,9 @@ export function upstreamHttpError(error: unknown): HttpError {
 export function adminHttpError(error: unknown): HttpError {
   if (error instanceof HttpError) {
     return error;
+  }
+  if (error instanceof ProxyTransportError) {
+    return new HttpError(502, "The proxy health check could not reach the target.", "api_error", undefined, "proxy_transport_error");
   }
   if (error instanceof PortalError) {
     return upstreamHttpError(error);

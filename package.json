@@ -13,7 +13,7 @@
     "preview": "vite preview",
     "probe:cli": "node scripts/probe-cli-agents.mjs",
     "probe:tools": "node scripts/probe-tool-first-pass.mjs",
-    "test": "node --experimental-transform-types --import ./tests/register-alias.mjs --test tests/core.test.ts tests/xml-tool-calls.test.ts tests/state-store.test.ts tests/chat-validation.test.ts tests/proxy.test.ts tests/response-api.test.ts tests/models.test.ts",
+    "test": "node --experimental-transform-types --import ./tests/register-alias.mjs --test tests/core.test.ts tests/xml-tool-calls.test.ts tests/state-store.test.ts tests/chat-validation.test.ts tests/proxy.test.ts tests/proxy-pool.test.ts tests/response-api.test.ts tests/models.test.ts tests/account-scheduler.test.ts tests/admin-ui.test.ts",
     "typecheck": "tsc --noEmit"
   },
   "devDependencies": {

@@ -21,6 +21,7 @@ export default defineHandler(async (event) => {
     const models = await portalClient.listAccountModels(account);
     const saved = await stateStore.mergeAccountModels(id, models);
     accountScheduler.markSuccess(id);
+    accountScheduler.notifyStateChanged();
     return jsonResponse({ account: accountScheduler.publicState(saved), models });
   } catch (error) {
     return openAIErrorResponse(adminHttpError(error));

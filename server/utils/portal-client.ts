@@ -1,14 +1,14 @@
 import { fetch as undiciFetch, type Dispatcher } from "undici";
 import { stateStore } from "~/server/utils/state-store.ts";
 import { getProxyConfig } from "~/server/utils/config.ts";
-import { proxyDispatcher } from "~/server/utils/proxy.ts";
+import { asProxyTransportError, proxyDispatcher, ProxyTransportError } from "~/server/utils/proxy.ts";
 import {
   MAX_PORTAL_CHAT_ATTEMPTS,
   portalRetryDelayMs,
   retryablePortalError,
   retryablePortalStatus,
 } from "~/server/utils/upstream-retry.ts";
-import type { ManagedAccount, PortalSession } from "~/server/utils/types.ts";
+import type { JsonObject, ManagedAccount, PortalSession } from "~/server/utils/types.ts";
 
 const PORTAL_ORIGIN = "https://portal.neuralwatt.com";
 const CHAT_URL = `${PORTAL_ORIGIN}/api/chat`;
@@ -17,6 +17,10 @@ const PLAYGROUND_URL = `${PORTAL_ORIGIN}/playground`;
 // `/api/usage` also responds for an anonymous portal trial. `/dashboard` is the
 // authenticated surface and redirects to `/auth/login` when the session expires.
 const SESSION_PROBE_URL = `${PORTAL_ORIGIN}/dashboard`;
+type PortalFetchInit = RequestInit & { dispatcher?: Dispatcher };
+// Undici and DOM publish structurally equivalent Fetch types through separate
+// declarations; keep the compatibility cast at this one runtime boundary.
+const compatibleFetch = undiciFetch as unknown as (input: string, init?: PortalFetchInit) => Promise<Response>;
 const responseFinishes = new WeakMap<Response, () => void>();
 
 export class PortalError extends Error {
@@ -24,6 +28,7 @@ export class PortalError extends Error {
     message: string,
     readonly status: number,
     readonly retryAfterSeconds?: number,
+    readonly payload?: JsonObject,
   ) {
     super(message);
     this.name = "PortalError";
@@ -125,12 +130,16 @@ async function portalFetch(input: string, init: RequestInit, clientSignal?: Abor
   };
   armTimeout();
   try {
-    const response = await undiciFetch(input, {
+    const response = await compatibleFetch(input, {
       ...init,
       signal: controller.signal,
       ...(dispatcher ? { dispatcher } : {}),
-    } as Parameters<typeof undiciFetch>[1]) as unknown as Response;
+    });
     clearTimeoutTimer();
+    if (dispatcher && response.status === 407) {
+      await discardPortalResponse(response);
+      throw new ProxyTransportError("Proxy authentication failed.");
+    }
     if (!response.body) {
       finish();
       return response;
@@ -159,9 +168,11 @@ async function portalFetch(input: string, init: RequestInit, clientSignal?: Abor
           if (clientAborted || clientSignal?.aborted) {
             streamController.error(clientAbortError());
           } else if (timedOut) {
-            streamController.error(new PortalError("The NeuralWatt portal response timed out while waiting for data.", 504));
+            streamController.error(dispatcher
+              ? new ProxyTransportError("Proxy response timed out while waiting for data.")
+              : new PortalError("The NeuralWatt portal response timed out while waiting for data.", 504));
           } else {
-            streamController.error(error);
+            streamController.error(dispatcher ? asProxyTransportError(error) : error);
           }
         }
       },
@@ -188,9 +199,11 @@ async function portalFetch(input: string, init: RequestInit, clientSignal?: Abor
       if (clientAborted || clientSignal?.aborted) {
         throw new PortalError("The client disconnected before the portal response completed.", 499);
       }
-      throw new PortalError("The NeuralWatt portal request timed out while waiting for response headers.", 504);
+      throw dispatcher
+        ? new ProxyTransportError("Proxy request timed out while waiting for response headers.", { cause: error })
+        : new PortalError("The NeuralWatt portal request timed out while waiting for response headers.", 504);
     }
-    throw error;
+    throw dispatcher ? asProxyTransportError(error) : error;
   }
 }
 
@@ -431,7 +444,8 @@ export class PortalClient {
     account: ManagedAccount,
     body: Record<string, unknown>,
     signal?: AbortSignal,
-    onRetry?: (attempt: PortalChatRetry) => void,
+    onRetry?: (attempt: PortalChatRetry) => void | Promise<void>,
+    beforeRetryAttempt?: () => void | Promise<void>,
   ): Promise<Response> {
     let session = await this.ensureSession(account, signal);
     let sessionRetried = false;
@@ -450,13 +464,14 @@ export class PortalClient {
         if (attempt >= MAX_PORTAL_CHAT_ATTEMPTS || !retryablePortalError(error)) {
           throw error;
         }
-        onRetry?.({
+        await onRetry?.({
           status: 0,
           contentType: "",
           body: "",
           error: error instanceof Error ? error.message : "Unknown portal transport error.",
         });
         await waitForChatRetry(portalRetryDelayMs(attempt), signal);
+        await beforeRetryAttempt?.();
         continue;
       }
 
@@ -468,12 +483,13 @@ export class PortalClient {
           // The session refresh remains useful even when the expired-session
           // response is malformed.
         }
-        onRetry?.({
+        await onRetry?.({
           status: response.status,
           contentType: response.headers.get("content-type")?.toLowerCase() ?? "",
           body: responseBody,
         });
         session = await this.refreshSession(account, signal);
+        await beforeRetryAttempt?.();
         sessionRetried = true;
         continue;
       }
@@ -485,12 +501,13 @@ export class PortalClient {
         } catch {
           // The next attempt should still proceed when the error body is invalid.
         }
-        onRetry?.({
+        await onRetry?.({
           status: response.status,
           contentType: response.headers.get("content-type")?.toLowerCase() ?? "",
           body: responseBody,
         });
         await waitForChatRetry(portalRetryDelayMs(attempt), signal);
+        await beforeRetryAttempt?.();
         continue;
       }
 
@@ -498,6 +515,20 @@ export class PortalClient {
     }
 
     throw new PortalError("The NeuralWatt portal request exhausted its retry budget.", 502);
+  }
+
+  async checkProxy(proxy: string, signal?: AbortSignal): Promise<void> {
+    const response = await portalFetch(`${PORTAL_ORIGIN}/api/models`, {
+      headers: { Accept: "application/json" },
+      redirect: "manual",
+    }, signal, proxyDispatcher(proxy));
+    try {
+      // Any valid portal HTTP response proves proxy transport. Authentication,
+      // rate limits and portal availability are not proxy-health failures.
+      await discardPortalResponse(response);
+    } catch (error) {
+      throw error instanceof ProxyTransportError ? error : asProxyTransportError(error);
+    }
   }
 
   finishResponse(response: Response): void {

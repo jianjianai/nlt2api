@@ -71,6 +71,72 @@ export interface PortalSession {
   updatedAt: string;
 }
 
+export interface SchedulerSettings {
+  accountModelConcurrency: number;
+  accountRpm: number;
+  proxyRpm: number;
+  directEgressLimitEnabled: boolean;
+  directEgressRpm: number;
+  stickyTtlSeconds: number;
+  /** Zero waits without a scheduler-imposed timeout. */
+  queueTimeoutSeconds: number;
+  /** Zero leaves the pending queue unbounded. */
+  maxQueueSize: number;
+}
+
+export const DEFAULT_SCHEDULER_SETTINGS: Readonly<SchedulerSettings> = Object.freeze({
+  accountModelConcurrency: 5,
+  accountRpm: 20,
+  proxyRpm: 30,
+  directEgressLimitEnabled: false,
+  directEgressRpm: 30,
+  stickyTtlSeconds: 30 * 60,
+  queueTimeoutSeconds: 0,
+  maxQueueSize: 0,
+});
+
+export interface AccountSchedulerOverrides {
+  accountRpm?: number;
+  accountModelConcurrency?: number;
+  modelConcurrency?: Record<string, number>;
+}
+
+export type ProxyKind = "http" | "socks4" | "socks5";
+
+export interface ProxyPoolSettings {
+  autoAssignOnAccountCreate: boolean;
+  autoRotateOnTransportError: boolean;
+  retryCurrentRequestAfterRotation: boolean;
+  directFallbackWhenExhausted: boolean;
+  defaultImportProtocol: ProxyKind;
+  healthCheckTimeoutSeconds: number;
+  errorRetryCooldownSeconds: number;
+}
+
+export const DEFAULT_PROXY_POOL_SETTINGS: Readonly<ProxyPoolSettings> = Object.freeze({
+  autoAssignOnAccountCreate: false,
+  autoRotateOnTransportError: false,
+  retryCurrentRequestAfterRotation: true,
+  directFallbackWhenExhausted: false,
+  defaultImportProtocol: "http",
+  healthCheckTimeoutSeconds: 10,
+  errorRetryCooldownSeconds: 300,
+});
+
+export interface ProxyPoolEntry {
+  id: string;
+  url: string;
+  kind: ProxyKind;
+  label?: string;
+  createdAt: string;
+  updatedAt: string;
+  lastCheckedAt?: string;
+  lastHealthyAt?: string;
+  lastError?: string;
+  failedAt?: string;
+  retryAfter?: number;
+}
+
 export interface ManagedAccount {
   id: string;
   label: string;
@@ -80,8 +146,11 @@ export interface ManagedAccount {
   weight: number;
   /** Optional per-account egress proxy URL (http/https/socks4/socks5). */
   proxy?: string;
+  /** Pool owner for `proxy`; absent for direct or custom manually-entered proxies. */
+  proxyPoolEntryId?: string;
   /** Model ids this account can serve, fetched from the portal playground. */
   models: string[];
+  schedulerOverrides?: AccountSchedulerOverrides;
   session?: PortalSession;
   createdAt: string;
   updatedAt: string;
@@ -89,6 +158,10 @@ export interface ManagedAccount {
 
 export interface ProxySettings {
   recordMessages: boolean;
+  scheduler: SchedulerSettings;
+  proxyPool: ProxyPoolSettings;
+  /** Minimum per-round portal output budget; zero respects the client value. */
+  minimumOutputTokens?: number;
   /**
    * Global default tool-call wire format offered to upstream models.
    * Per-model overrides win; falls back to NEURALWATT_TOOL_CALL_FORMAT.
@@ -109,10 +182,15 @@ export interface PersistentState {
   version: 1;
   settings: ProxySettings;
   accounts: ManagedAccount[];
+  proxyPool: ProxyPoolEntry[];
 }
 
 export interface AccountRuntimeState {
   inFlight: number;
+  modelInFlight: Record<string, number>;
+  requestsLastMinute: number;
+  nextRateAvailableAt?: number;
+  modelCooldownUntil: Record<string, number>;
   consecutiveFailures: number;
   cooldownUntil: number;
   lastError?: string;
@@ -123,16 +201,34 @@ export interface AccountRuntimeState {
 export interface PublicAccount {
   id: string;
   label: string;
-  emailHint: string;
+  email: string;
+  password: string;
   enabled: boolean;
   weight: number;
-  proxyHint: string | null;
+  proxy: string | null;
+  proxyPoolEntryId?: string;
   models: string[];
+  schedulerOverrides?: AccountSchedulerOverrides;
   hasSession: boolean;
   sessionExpiresAt: number | null;
   createdAt: string;
   updatedAt: string;
   runtime: AccountRuntimeState;
+}
+
+export interface EgressRuntimeState {
+  id: string;
+  accountCount: number;
+  requestsLastMinute: number;
+  nextRateAvailableAt?: number;
+  limited: boolean;
+  rpm: number;
+}
+
+export interface SchedulerRuntimeSnapshot {
+  pending: number;
+  oldestWaitMs: number;
+  egresses: EgressRuntimeState[];
 }
 
 export interface ToolCallAdapterTrace {

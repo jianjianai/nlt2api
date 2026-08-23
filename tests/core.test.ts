@@ -158,13 +158,20 @@ test("structured tool calls fail closed and unsafe IDs are regenerated", () => {
     InvalidStructuredToolCallsError,
   );
 
+  const opaque = normaliseAssistantToolCalls({
+    role: "assistant",
+    content: null,
+    tool_calls: [{ id: "api_search:0", type: "function", function: { name: "calculator", arguments: '{"a":1,"b":2}' } }],
+  }, tools, "chatcmpl-opaque-id");
+  assert.equal(opaque.tool_calls?.[0]?.id, "api_search:0");
+
   const normalized = normaliseAssistantToolCalls({
     role: "assistant",
     content: null,
     tool_calls: [{ id: "x".repeat(10_000), type: "function", function: { name: "calculator", arguments: '{"a":1,"b":2}' } }],
   }, tools, "chatcmpl-long-id");
   assert.match(normalized.tool_calls?.[0]?.id ?? "", /^call_[A-Za-z0-9]+_1$/);
-  assert.ok((normalized.tool_calls?.[0]?.id.length ?? 0) <= 128);
+  assert.ok((normalized.tool_calls?.[0]?.id.length ?? 0) <= 64);
 });
 
 test("valid native tool calls remain usable beside malformed text content", () => {

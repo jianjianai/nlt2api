@@ -1,161 +1,53 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, onUnmounted, reactive, ref, shallowRef, watch } from "vue";
-
-interface RuntimeState {
-  inFlight: number;
-  consecutiveFailures: number;
-  cooldownUntil: number;
-  lastError?: string;
-  lastUsedAt?: string;
-  lastSuccessAt?: string;
-}
-
-interface Account {
-  id: string;
-  label: string;
-  emailHint: string;
-  enabled: boolean;
-  weight: number;
-  proxyHint: string | null;
-  models: string[];
-  hasSession: boolean;
-  sessionExpiresAt: number | null;
-  createdAt: string;
-  updatedAt: string;
-  runtime: RuntimeState;
-}
-
-interface DebugRawBody {
-  contentType: "application/json" | "text/event-stream" | "text/plain";
-  body: string;
-}
-
-interface DebugUpstreamCall {
-  sequence: number;
-  type: "initial" | "repair" | "continuation";
-  round: number;
-  attempt: number;
-  accountId?: string;
-  accountLabel?: string;
-  request: DebugRawBody;
-  response?: DebugRawBody;
-  responseStatus?: number;
-  error?: string;
-}
-
-interface DebugRecord {
-  id: string;
-  at: string;
-  endpoint: string;
-  accountId?: string;
-  accountLabel?: string;
-  clientRequest: DebugRawBody | Record<string, unknown>;
-  clientResponse?: DebugRawBody | Record<string, unknown>;
-  upstreamCalls?: DebugUpstreamCall[];
-  // Read records written by previous gateway versions as well.
-  upstreamRequest?: Record<string, unknown>;
-  upstreamResponse?: Record<string, unknown>;
-  toolCallAdapter?: {
-    toolCallExpected: "auto" | "required" | "forced";
-    initialParseSucceeded: boolean;
-    finalParseSucceeded: boolean;
-    initialParseRepaired?: boolean;
-    finalParseRepaired?: boolean;
-    initialOutcome: "tool_calls" | "final" | "invalid";
-    finalOutcome: "tool_calls" | "final" | "invalid";
-    repairAttempts: number;
-    maxRepairAttempts: number;
-    errors: string[];
-  };
-  status: number;
-  error?: string;
-}
-
-interface DebugUpstreamCallSummary {
-  sequence: number;
-  type: "initial" | "repair" | "continuation";
-  round: number;
-  attempt: number;
-  accountId?: string;
-  accountLabel?: string;
-  responseStatus?: number;
-  error?: string;
-}
-
-/** Lightweight list metadata; full bodies load on demand per record. */
-interface DebugRecordSummary {
-  id: string;
-  at: string;
-  endpoint: string;
-  model?: string;
-  status: number;
-  accountId?: string;
-  accountLabel?: string;
-  error?: string;
-  preview: string;
-  upstreamCalls?: DebugUpstreamCallSummary[];
-  legacyUpstream?: boolean;
-  toolCall?: {
-    forces: boolean;
-    initialOutcome: "tool_calls" | "final" | "invalid";
-    finalOutcome: "tool_calls" | "final" | "invalid";
-  };
-}
-
-type ToolCallFormat = "auto" | "json" | "xml";
-type PreambleVerbosity = "quiet" | "normal" | "verbose" | "milestone";
-
-interface ApiPayload {
-  accounts?: Account[];
-  settings?: {
-    recordMessages: boolean;
-    toolCallFormat?: ToolCallFormat;
-    preambleVerbosity?: PreambleVerbosity;
-    modelToolCallFormats?: Record<string, ToolCallFormat>;
-    modelPreambleVerbosities?: Record<string, PreambleVerbosity>;
-  };
-  config?: {
-    adminTokenConfigured: boolean;
-    clientApiKeyRequired: boolean;
-    defaultModel: string;
-    toolCallFormat?: ToolCallFormat;
-    preambleVerbosity?: PreambleVerbosity;
-  };
-  records?: DebugRecordSummary[];
-  record?: DebugRecord;
-  account?: Account | null;
-  models?: string[];
-}
+import AccountsWorkspace from "./components/AccountsWorkspace.vue";
+import GatewaySettingsWorkspace from "./components/GatewaySettingsWorkspace.vue";
+import OverviewWorkspace from "./components/OverviewWorkspace.vue";
+import ProxyPoolWorkspace from "./components/ProxyPoolWorkspace.vue";
+import RecordsWorkspace from "./components/RecordsWorkspace.vue";
+import SchedulerWorkspace from "./components/SchedulerWorkspace.vue";
+import WorkspaceShell from "./components/WorkspaceShell.vue";
+import { DEFAULT_THEME, deriveOverview, parseTheme, parseWorkspace, THEME_STORAGE_KEY, WORKSPACE_STORAGE_KEY } from "./utils/admin-ui.ts";
+import type {
+  Account, ApiPayload, BodyPresentation, ConversationTrace, DebugRawBody, DebugRecord, DebugRecordSummary,
+  DebugUpstreamCall, DisplayField, DisplayMessage, DisplayToolCall, GatewayConfig, GatewaySettings,
+  PreambleVerbosity, ProxyImportLineResult, ThemeId, ProxyPoolEntry, ProxyPoolSettings, ProxyPoolStatus,
+  SchedulerRuntime, SchedulerSettings, SidebarItem, SidebarUpstreamItem, ToolCallFormat, WorkspaceId,
+} from "./types/admin.ts";
 
 type JsonRecord = Record<string, unknown>;
-
-interface DisplayToolCall {
-  id: string;
-  name: string;
-  arguments: string;
-}
-
-interface DisplayMessage {
-  role: string;
-  roleLabel: string;
-  content: string;
-  toolCalls: DisplayToolCall[];
-}
-
-interface DisplayField {
-  label: string;
-  value: string;
-}
 
 const tokenStorageKey = "neuralwatt-admin-token";
 const token = ref(typeof window === "undefined" ? "" : sessionStorage.getItem(tokenStorageKey) ?? "");
 const tokenDraft = ref(token.value);
-const view = ref<"accounts" | "records">("accounts");
+const view = ref<WorkspaceId>(typeof window === "undefined" ? "overview" : parseWorkspace(localStorage.getItem(WORKSPACE_STORAGE_KEY)));
+const theme = ref<ThemeId>(typeof window === "undefined" ? DEFAULT_THEME : parseTheme(localStorage.getItem(THEME_STORAGE_KEY)));
+const expandedAccountId = ref<string | null>(null);
+const secretResetToken = ref(0);
 // shallowRef: record/account payloads are large and immutable; avoid deep reactivity.
 const accounts = shallowRef<Account[]>([]);
+const proxies = shallowRef<ProxyPoolEntry[]>([]);
 const records = shallowRef<DebugRecordSummary[]>([]);
+const defaultSchedulerSettings: SchedulerSettings = {
+  accountModelConcurrency: 5,
+  accountRpm: 20,
+  proxyRpm: 30,
+  directEgressLimitEnabled: false,
+  directEgressRpm: 30,
+  stickyTtlSeconds: 1_800,
+  queueTimeoutSeconds: 0,
+  maxQueueSize: 0,
+};
+const defaultProxyPoolSettings: ProxyPoolSettings = {
+  autoAssignOnAccountCreate: false, autoRotateOnTransportError: false,
+  retryCurrentRequestAfterRotation: true, directFallbackWhenExhausted: false,
+  defaultImportProtocol: "http", healthCheckTimeoutSeconds: 10, errorRetryCooldownSeconds: 300,
+};
 const settings = reactive({
   recordMessages: false,
+  scheduler: { ...defaultSchedulerSettings },
+  proxyPool: { ...defaultProxyPoolSettings },
+  minimumOutputTokens: undefined as number | undefined,
   toolCallFormat: undefined as ToolCallFormat | undefined,
   preambleVerbosity: undefined as PreambleVerbosity | undefined,
   modelToolCallFormats: {} as Record<string, ToolCallFormat>,
@@ -164,13 +56,28 @@ const settings = reactive({
 const config = reactive({
   adminTokenConfigured: false,
   clientApiKeyRequired: false,
+  clientApiKey: "",
   defaultModel: "",
+  minimumOutputTokens: 8_192,
   toolCallFormat: "auto" as ToolCallFormat,
   preambleVerbosity: "milestone" as PreambleVerbosity,
 });
 const newAccount = reactive({ label: "", email: "", password: "", weight: 1, proxy: "" });
 const isLoading = ref(false);
 const isSaving = ref(false);
+const minimumOutputTokensDraft = ref(8_192);
+const isSavingMinimumOutputTokens = ref(false);
+const schedulerDraft = reactive<SchedulerSettings>({ ...defaultSchedulerSettings });
+const schedulerRuntime = reactive<SchedulerRuntime>({ pending: 0, oldestWaitMs: 0, egresses: [] });
+const isSavingScheduler = ref(false);
+const proxyPoolDraft = reactive<ProxyPoolSettings>({ ...defaultProxyPoolSettings });
+const proxyImportText = ref("");
+const proxyImportResults = ref<ProxyImportLineResult[]>([]);
+const proxyFilter = ref<"all" | ProxyPoolStatus>("all");
+const isImportingProxies = ref(false);
+const isCheckingProxies = ref(false);
+const busyProxyIds = ref(new Set<string>());
+const isSavingProxyPool = ref(false);
 const isClearingRecords = ref(false);
 const selectedRecordId = ref<string | null>(null);
 const selectedTraceKey = ref<string | null>(null);
@@ -216,12 +123,37 @@ function errorText(error: unknown, fallback: string): string {
   return error instanceof Error ? error.message : fallback;
 }
 
+async function copyCredential(value: string, label: string): Promise<void> {
+  if (!value) return;
+  try {
+    await navigator.clipboard.writeText(value);
+    pushToast("success", `已复制${label}`);
+  } catch {
+    pushToast("error", `无法复制${label}，请手动选择文本。`);
+  }
+}
+
 // ---- Modals & per-account busy state ----
 const showAddAccount = ref(false);
 const proxyEditor = ref<{ account: Account; value: string } | null>(null);
 const modelEditor = ref<{ account: Account; value: string } | null>(null);
+const limitEditor = ref<{
+  account: Account;
+  accountRpm: string;
+  accountModelConcurrency: string;
+  modelConcurrency: Record<string, string>;
+} | null>(null);
 const pendingRemoval = ref<Account | null>(null);
 const showClearConfirm = ref(false);
+const dialogOpen = computed(() => Boolean(showAddAccount.value || proxyEditor.value || modelEditor.value || limitEditor.value || pendingRemoval.value || showClearConfirm.value));
+let dialogOpener: HTMLElement | null = null;
+function captureDialogOpener(): void {
+  dialogOpener = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+}
+function openAddAccount(): void {
+  captureDialogOpener();
+  showAddAccount.value = true;
+}
 const busyAccountIds = ref(new Set<string>());
 
 function setAccountBusy(id: string, busy: boolean): void {
@@ -243,29 +175,10 @@ const recordFilter = ref<"all" | "success" | "failed">("all");
 const autoRefresh = ref(false);
 let autoRefreshTimer: number | undefined;
 
-// Long message collapse state. Keys are `request-${index}` / `response-${index}`
-// and are reset whenever the selected trace changes.
-const COLLAPSE_MAX_HEIGHT = 240;
-const COLLAPSE_MAX_CHARS = 4000;
-const expandedMessageKeys = ref(new Set<string>());
-
-// Effective tool-call policy: per-model override > global setting > env default.
-const effectiveToolCallFormat = computed<ToolCallFormat>(() => settings.toolCallFormat ?? config.toolCallFormat);
-const effectivePreambleVerbosity = computed<PreambleVerbosity>(() => settings.preambleVerbosity ?? config.preambleVerbosity);
+// Effective output budget: persisted setting > environment default.
+const effectiveMinimumOutputTokens = computed(() => settings.minimumOutputTokens ?? config.minimumOutputTokens);
 const allModels = computed(() => [...new Set(accounts.value.flatMap((account) => account.models))].sort());
-
-const enabledCount = computed(() => accounts.value.filter((account) => account.enabled).length);
-const activeSessions = computed(() => accounts.value.filter((account) => account.hasSession).length);
-const cooldownCount = computed(() => accounts.value.filter((account) => account.runtime.cooldownUntil > Date.now()).length);
-
-const filteredAccounts = computed(() => {
-  const query = accountQuery.value.trim().toLowerCase();
-  if (!query) return accounts.value;
-  return accounts.value.filter((account) =>
-    account.label.toLowerCase().includes(query)
-    || account.emailHint.toLowerCase().includes(query)
-    || (account.proxyHint ?? "").toLowerCase().includes(query));
-});
+const overviewSnapshot = computed(() => deriveOverview(accounts.value, proxies.value, schedulerRuntime, config, Date.now()));
 
 function recordFailed(record: DebugRecordSummary): boolean {
   return record.status >= 400 || Boolean(record.error);
@@ -334,10 +247,14 @@ function useToken() {
 }
 
 function signOut() {
+  secretResetToken.value += 1;
+  expandedAccountId.value = null;
   token.value = "";
   tokenDraft.value = "";
   sessionStorage.removeItem(tokenStorageKey);
   accounts.value = [];
+  proxies.value = [];
+  proxyImportResults.value = [];
   records.value = [];
   detailCache.clear();
   selectedRecordId.value = null;
@@ -349,6 +266,7 @@ function signOut() {
   showAddAccount.value = false;
   proxyEditor.value = null;
   modelEditor.value = null;
+  limitEditor.value = null;
   pendingRemoval.value = null;
   showClearConfirm.value = false;
   autoRefresh.value = false;
@@ -362,8 +280,11 @@ async function loadDashboard(options?: { silent?: boolean }) {
   try {
     const payload = await api("/api/admin/status");
     accounts.value = payload.accounts ?? [];
+    proxies.value = payload.proxyPool ?? payload.proxies ?? [];
     applySettings(payload.settings);
+    Object.assign(schedulerRuntime, payload.scheduler ?? { pending: 0, oldestWaitMs: 0, egresses: [] });
     Object.assign(config, payload.config ?? {});
+    minimumOutputTokensDraft.value = effectiveMinimumOutputTokens.value;
     if (view.value === "records") {
       await loadRecords();
     }
@@ -437,8 +358,32 @@ async function selectRecord(recordId: string, traceKey?: string): Promise<void> 
   }
 }
 
-async function selectView(next: "accounts" | "records") {
+function changeTheme(next: ThemeId): void {
+  theme.value = next;
+  localStorage.setItem(THEME_STORAGE_KEY, next);
+}
+
+function navigateFromOverview(next: "accounts" | "proxies" | "scheduler" | "settings", targetId?: string): void {
+  void selectView(next);
+  if (next === "accounts" && targetId) expandedAccountId.value = targetId;
+  if (targetId) {
+    void nextTick(() => document.getElementById(`${next === "accounts" ? "account" : "proxy"}-${targetId}`)?.scrollIntoView({ block: "center" }));
+  }
+}
+
+function updateProxyPolicy(field: keyof ProxyPoolSettings, value: boolean | number | string): void {
+  (proxyPoolDraft as unknown as Record<string, unknown>)[field] = value;
+}
+
+function updateSchedulerField(field: keyof SchedulerSettings, value: number | boolean): void {
+  (schedulerDraft as unknown as Record<string, unknown>)[field] = value;
+}
+
+async function selectView(next: WorkspaceId) {
   view.value = next;
+  expandedAccountId.value = null;
+  secretResetToken.value += 1;
+  localStorage.setItem(WORKSPACE_STORAGE_KEY, next);
   if (next === "records") {
     try {
       await loadRecords();
@@ -488,11 +433,63 @@ async function verifyAccount(account: Account) {
 }
 
 function openProxyEditor(account: Account) {
+  captureDialogOpener();
   proxyEditor.value = { account, value: "" };
 }
 
 function openModelEditor(account: Account) {
+  captureDialogOpener();
   modelEditor.value = { account, value: account.models.join("\n") };
+}
+
+function openLimitEditor(account: Account) {
+  captureDialogOpener();
+  limitEditor.value = {
+    account,
+    accountRpm: account.schedulerOverrides?.accountRpm?.toString() ?? "",
+    accountModelConcurrency: account.schedulerOverrides?.accountModelConcurrency?.toString() ?? "",
+    modelConcurrency: Object.fromEntries(account.models.map((model) => [model, account.schedulerOverrides?.modelConcurrency?.[model]?.toString() ?? ""])),
+  };
+}
+
+function optionalPositiveInteger(value: string, label: string, maximum: number): number | undefined {
+  if (!value.trim()) return undefined;
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed < 1 || parsed > maximum) {
+    throw new Error(`${label}必须是 1 到 ${maximum} 的整数。`);
+  }
+  return parsed;
+}
+
+async function saveAccountLimits() {
+  const editor = limitEditor.value;
+  if (!editor || isAccountBusy(editor.account.id)) return;
+  try {
+    const accountRpm = optionalPositiveInteger(editor.accountRpm, "账号 RPM", 100_000);
+    const accountModelConcurrency = optionalPositiveInteger(editor.accountModelConcurrency, "账号模型并发", 1_000);
+    const modelConcurrency: Record<string, number> = {};
+    for (const model of editor.account.models) {
+      const value = optionalPositiveInteger(editor.modelConcurrency[model] ?? "", `模型 ${model} 并发`, 1_000);
+      if (value !== undefined) modelConcurrency[model] = value;
+    }
+    const schedulerOverrides = {
+      ...(accountRpm !== undefined ? { accountRpm } : {}),
+      ...(accountModelConcurrency !== undefined ? { accountModelConcurrency } : {}),
+      ...(Object.keys(modelConcurrency).length > 0 ? { modelConcurrency } : {}),
+    };
+    setAccountBusy(editor.account.id, true);
+    const payload = await api(`/api/admin/accounts/${encodeURIComponent(editor.account.id)}`, {
+      method: "PATCH",
+      body: JSON.stringify({ schedulerOverrides: Object.keys(schedulerOverrides).length > 0 ? schedulerOverrides : null }),
+    });
+    if (payload.account) replaceAccount(payload.account);
+    limitEditor.value = null;
+    pushToast("success", `${editor.account.label} 的调度限额已更新`);
+  } catch (error) {
+    pushToast("error", errorText(error, "无法更新账号调度限额。"));
+  } finally {
+    setAccountBusy(editor.account.id, false);
+  }
 }
 
 async function fetchAccountModels(account: Account) {
@@ -551,7 +548,7 @@ async function saveProxy() {
     if (payload.account) {
       replaceAccount(payload.account);
     }
-    pushToast("success", value === "" ? `${editor.account.label} 的代理已清除` : `${editor.account.label} 的代理已更新，会话将重新登录`);
+    pushToast("success", value === "" ? `${editor.account.label} 的代理已清除` : `${editor.account.label} 的代理已更新；登录态仅在门户拒绝后刷新`);
     proxyEditor.value = null;
   } catch (error) {
     pushToast("error", errorText(error, "无法更新代理。"));
@@ -580,6 +577,7 @@ async function toggleAccount(account: Account) {
 }
 
 function askRemoveAccount(account: Account) {
+  captureDialogOpener();
   pendingRemoval.value = account;
 }
 
@@ -619,6 +617,95 @@ async function patchToolCallSettings(body: JsonRecord, successText: string) {
     pushToast("success", successText);
   } catch (error) {
     pushToast("error", errorText(error, "无法更新工具调用设置。"));
+  }
+}
+
+function setProxyBusy(id: string, busy: boolean): void {
+  const next = new Set(busyProxyIds.value); if (busy) next.add(id); else next.delete(id); busyProxyIds.value = next;
+}
+
+async function importProxies() {
+  if (!proxyImportText.value.trim() || isImportingProxies.value) return;
+  isImportingProxies.value = true;
+  try {
+    const payload = await api("/api/admin/proxies/import", { method: "POST", body: JSON.stringify({ text: proxyImportText.value, defaultProtocol: proxyPoolDraft.defaultImportProtocol }) });
+    proxies.value = payload.proxies ?? proxies.value; proxyImportResults.value = payload.results ?? [];
+    const created = proxyImportResults.value.filter((item) => item.status === "created").length;
+    const invalid = proxyImportResults.value.filter((item) => item.status === "invalid").length;
+    pushToast(invalid ? "error" : "success", `代理导入完成：新增 ${created}，错误 ${invalid}`);
+  } catch (error) { pushToast("error", errorText(error, "无法导入代理。")); } finally { isImportingProxies.value = false; }
+}
+
+async function checkProxyEntry(proxy: ProxyPoolEntry) {
+  if (busyProxyIds.value.has(proxy.id)) return; setProxyBusy(proxy.id, true);
+  try { const payload = await api(`/api/admin/proxies/${encodeURIComponent(proxy.id)}/check`, { method: "POST" }); proxies.value = payload.proxies ?? proxies.value; pushToast("success", `${proxy.maskedUrl} 测活成功`); }
+  catch (error) { pushToast("error", errorText(error, "代理测活失败。")); await loadDashboard({ silent: true }); }
+  finally { setProxyBusy(proxy.id, false); }
+}
+
+async function checkProxyPool(scope: "error" | "all") {
+  if (isCheckingProxies.value) return; isCheckingProxies.value = true;
+  try { const payload = await api("/api/admin/proxies/check", { method: "POST", body: JSON.stringify({ scope }) }); proxies.value = payload.proxies ?? proxies.value; pushToast("success", "批量测活完成"); }
+  catch (error) { pushToast("error", errorText(error, "无法批量测活。")); } finally { isCheckingProxies.value = false; }
+}
+
+async function deleteProxyEntry(proxy: ProxyPoolEntry) {
+  if (busyProxyIds.value.has(proxy.id)) return; setProxyBusy(proxy.id, true);
+  try { await api(`/api/admin/proxies/${encodeURIComponent(proxy.id)}`, { method: "DELETE" }); proxies.value = proxies.value.filter((entry) => entry.id !== proxy.id); pushToast("success", `${proxy.maskedUrl} 已删除`); }
+  catch (error) { pushToast("error", errorText(error, "无法删除代理。")); } finally { setProxyBusy(proxy.id, false); }
+}
+
+async function saveProxyPoolSettings() {
+  isSavingProxyPool.value = true;
+  try { const payload = await api("/api/admin/settings", { method: "PATCH", body: JSON.stringify({ proxyPool: proxyPoolDraft }) }); applySettings(payload.settings); pushToast("success", "代理池策略已生效"); }
+  catch (error) { pushToast("error", errorText(error, "无法更新代理池策略。")); } finally { isSavingProxyPool.value = false; }
+}
+
+async function assignProxy(account: Account) {
+  if (account.proxy || isAccountBusy(account.id)) return; setAccountBusy(account.id, true);
+  try { const payload = await api(`/api/admin/accounts/${encodeURIComponent(account.id)}/assign-proxy`, { method: "POST" }); if (payload.account) replaceAccount(payload.account); await loadDashboard({ silent: true }); pushToast("success", `${account.label} 已分配空闲代理`); }
+  catch (error) { pushToast("error", errorText(error, "无法分配空闲代理。")); } finally { setAccountBusy(account.id, false); }
+}
+
+async function saveSchedulerSettings() {
+  for (const [field, value] of Object.entries(schedulerDraft)) {
+    const allowsZero = field === "queueTimeoutSeconds" || field === "maxQueueSize";
+    if (typeof value !== "boolean" && (!Number.isInteger(value) || value < (allowsZero ? 0 : 1))) {
+      pushToast("error", "调度设置必须使用有效整数；排队超时和队列上限可设为 0。");
+      return;
+    }
+  }
+  isSavingScheduler.value = true;
+  try {
+    const payload = await api("/api/admin/settings", { method: "PATCH", body: JSON.stringify({ scheduler: schedulerDraft }) });
+    applySettings(payload.settings);
+    pushToast("success", "调度与队列设置已生效");
+  } catch (error) {
+    pushToast("error", errorText(error, "无法更新调度设置。"));
+  } finally {
+    isSavingScheduler.value = false;
+  }
+}
+
+async function saveMinimumOutputTokens() {
+  const value = Number(minimumOutputTokensDraft.value);
+  if (!Number.isInteger(value) || value < 0 || value > 8_192) {
+    pushToast("error", "最小上游输出预算必须是 0 到 8192 的整数。");
+    return;
+  }
+  isSavingMinimumOutputTokens.value = true;
+  try {
+    const payload = await api("/api/admin/settings", {
+      method: "PATCH",
+      body: JSON.stringify({ minimumOutputTokens: value }),
+    });
+    applySettings(payload.settings);
+    minimumOutputTokensDraft.value = effectiveMinimumOutputTokens.value;
+    pushToast("success", value === 0 ? "已关闭最小上游输出预算" : `最小上游输出预算已设为 ${value}`);
+  } catch (error) {
+    pushToast("error", errorText(error, "无法更新最小上游输出预算。"));
+  } finally {
+    isSavingMinimumOutputTokens.value = false;
   }
 }
 
@@ -677,6 +764,11 @@ function onModelPreambleVerbosityChange(model: string, event: Event) {
 // server payload, and Object.assign would keep the stale local value.
 function applySettings(next: ApiPayload["settings"]) {
   settings.recordMessages = next?.recordMessages ?? false;
+  settings.scheduler = { ...defaultSchedulerSettings, ...(next?.scheduler ?? {}) };
+  settings.proxyPool = { ...defaultProxyPoolSettings, ...(next?.proxyPool ?? {}) };
+  Object.assign(schedulerDraft, settings.scheduler);
+  Object.assign(proxyPoolDraft, settings.proxyPool);
+  settings.minimumOutputTokens = next?.minimumOutputTokens;
   settings.toolCallFormat = next?.toolCallFormat;
   settings.preambleVerbosity = next?.preambleVerbosity;
   settings.modelToolCallFormats = next?.modelToolCallFormats ?? {};
@@ -685,6 +777,7 @@ function applySettings(next: ApiPayload["settings"]) {
 
 function askClearRecords() {
   if (records.value.length === 0 || isClearingRecords.value) return;
+  captureDialogOpener();
   showClearConfirm.value = true;
 }
 
@@ -717,38 +810,6 @@ function replaceAccount(next: Account) {
   }
 }
 
-function formatDate(value: string | number | null | undefined): string {
-  if (!value) {
-    return "-";
-  }
-  return new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "short" }).format(new Date(value));
-}
-
-type BadgeTone = "good" | "warn" | "bad" | "muted";
-
-function sessionBadge(account: Account): { text: string; tone: BadgeTone } {
-  if (!account.hasSession) {
-    return { text: "未登录", tone: "muted" };
-  }
-  if (account.sessionExpiresAt && account.sessionExpiresAt < Date.now()) {
-    return { text: "已过期", tone: "bad" };
-  }
-  return { text: "会话有效", tone: "good" };
-}
-
-function runtimeBadge(account: Account): { text: string; tone: BadgeTone } {
-  if (account.runtime.cooldownUntil > Date.now()) {
-    return { text: "冷却中", tone: "warn" };
-  }
-  if (!account.enabled) {
-    return { text: "已禁用", tone: "muted" };
-  }
-  if (account.runtime.inFlight > 0) {
-    return { text: `${account.runtime.inFlight} 个请求处理中`, tone: "good" };
-  }
-  return { text: "就绪", tone: "good" };
-}
-
 function pretty(value: unknown): string {
   return JSON.stringify(value, null, 2) ?? "";
 }
@@ -772,14 +833,6 @@ function roleName(role: unknown, type?: unknown): string {
   };
   const key = typeof role === "string" ? role : typeof type === "string" ? type : "message";
   return names[key] ?? key;
-}
-
-function toolModeLabel(value: string): string {
-  return ({ auto: "自动", required: "必须调用", forced: "指定函数" } as Record<string, string>)[value] ?? value;
-}
-
-function toolOutcomeLabel(value: string): string {
-  return ({ tool_calls: "工具调用", final: "最终回复", invalid: "解析失败" } as Record<string, string>)[value] ?? value;
 }
 
 function contentText(value: unknown): string {
@@ -1242,25 +1295,6 @@ function bodyContentType(value: DebugRawBody | JsonRecord | undefined): string {
   return isDebugRawBody(value) ? value.contentType : "application/json";
 }
 
-interface ConversationTrace {
-  key: string;
-  record: DebugRecord;
-  direction: "client" | "upstream";
-  title: string;
-  subtitle: string;
-  request: DebugRawBody | JsonRecord;
-  response?: DebugRawBody | JsonRecord;
-  status: number;
-  error?: string;
-}
-
-interface BodyPresentation {
-  contentType: string;
-  raw: string;
-  fields: DisplayField[];
-  messages: DisplayMessage[];
-}
-
 function callTitle(call: Pick<DebugUpstreamCall, "type" | "round" | "attempt">): string {
   const base = call.type === "repair"
     ? `纠错轮 ${call.round}`
@@ -1358,48 +1392,6 @@ function dedupeFields(fields: DisplayField[]): DisplayField[] {
   return result;
 }
 
-/** Bubble alignment: model/system/tool calls on the left, user input on the right. */
-function messageAlign(role: string): "left" | "right" {
-  return ["user", "tool"].includes(role) ? "right" : "left";
-}
-
-function messageOverflows(content: string, toolCalls: DisplayToolCall[]): boolean {
-  if (content.length > COLLAPSE_MAX_CHARS) return true;
-  const toolText = toolCalls.reduce((total, call) => total + call.name.length + call.arguments.length, 0);
-  return toolText > COLLAPSE_MAX_CHARS;
-}
-
-function toggleMessageExpanded(key: string): void {
-  const next = new Set(expandedMessageKeys.value);
-  if (next.has(key)) next.delete(key);
-  else next.add(key);
-  expandedMessageKeys.value = next;
-}
-
-function isMessageExpanded(key: string): boolean {
-  return expandedMessageKeys.value.has(key);
-}
-
-function messageOverflowKey(key: string, message: DisplayMessage): string {
-  return messageOverflows(message.content, message.toolCalls) ? key : "";
-}
-
-function truncateText(value: string, max: number): string {
-  if (value.length <= max) return value;
-  return value.slice(0, max) + "\n…（内容过长，已截断）";
-}
-
-/** Render only a bounded prefix while collapsed so huge bodies stay cheap. */
-function messageDisplayContent(key: string, message: DisplayMessage): string {
-  if (isMessageExpanded(key)) return message.content;
-  return truncateText(message.content, COLLAPSE_MAX_CHARS);
-}
-
-function toolCallDisplayArguments(key: string, call: DisplayToolCall): string {
-  if (isMessageExpanded(key)) return call.arguments;
-  return truncateText(call.arguments, COLLAPSE_MAX_CHARS);
-}
-
 function traceRequest(trace: ConversationTrace): BodyPresentation {
   return presentBody(trace.request, { stripMarkers: trace.direction === "client" });
 }
@@ -1408,26 +1400,7 @@ function traceResponse(trace: ConversationTrace): BodyPresentation | undefined {
   return trace.response ? presentBody(trace.response, { stripMarkers: trace.direction === "client" }) : undefined;
 }
 
-function traceRawKey(trace: ConversationTrace): string {
-  return `raw:${trace.key}`;
-}
-
-function traceRecordLabel(trace: ConversationTrace): string {
-  return `${formatDate(trace.record.at)} · ${trace.record.endpoint}`;
-}
-
-/** Compact timestamp for the sidebar: HH:MM:SS today, MM-DD HH:MM otherwise. */
-function compactTime(value: string): string {
-  const date = new Date(value);
-  const pad = (n: number) => String(n).padStart(2, "0");
-  const time = `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
-  return date.toDateString() === new Date().toDateString()
-    ? time
-    : `${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${time}`;
-}
-
 // ---- Prev / next record navigation ----
-const detailEl = ref<HTMLElement | null>(null);
 const selectedRecordIndex = computed(() => {
   if (!selectedRecordId.value) return -1;
   return filteredRecords.value.findIndex((record) => record.id === selectedRecordId.value);
@@ -1437,27 +1410,11 @@ function gotoRecord(offset: number): void {
   const next = filteredRecords.value[selectedRecordIndex.value + offset] ?? (selectedRecordIndex.value === -1 ? filteredRecords.value[0] : undefined);
   if (!next) return;
   void selectRecord(next.id);
-  void nextTick(() => {
-    detailEl.value?.scrollIntoView({ block: "start" });
-    document.querySelector(".trace-group.active")?.scrollIntoView({ block: "nearest" });
-  });
+  void nextTick(() => document.querySelector(".trace-group.active")?.scrollIntoView({ block: "nearest" }));
 }
 
 // Sidebar rows are precomputed once per records/filter change so rendering
 // never rebuilds upstream items per item per render.
-interface SidebarUpstreamItem {
-  key: string;
-  title: string;
-  subtitle: string;
-  status: number;
-  failed: boolean;
-}
-
-interface SidebarItem {
-  record: DebugRecordSummary;
-  upstream: SidebarUpstreamItem[];
-}
-
 function summaryUpstreamItems(record: DebugRecordSummary): SidebarUpstreamItem[] {
   if (record.upstreamCalls?.length) {
     return record.upstreamCalls.map((call) => {
@@ -1492,8 +1449,19 @@ const sidebarItems = computed<SidebarItem[]>(() => filteredRecords.value.map((re
 const selectedRequest = computed(() => (selectedTrace.value ? traceRequest(selectedTrace.value) : null));
 const selectedResponse = computed(() => (selectedTrace.value ? traceResponse(selectedTrace.value) : null));
 
-watch(selectedTraceKey, () => {
-  expandedMessageKeys.value = new Set();
+watch(dialogOpen, (open, wasOpen) => {
+  if (open && !wasOpen) {
+    void nextTick(() => {
+      const dialog = document.querySelector<HTMLElement>(".modal-backdrop .modal");
+      const input = dialog?.querySelector<HTMLElement>("input:not([disabled]), textarea:not([disabled]), select:not([disabled])");
+      const action = dialog?.querySelector<HTMLElement>("button:not([disabled]), [tabindex]:not([tabindex='-1'])");
+      (input ?? action ?? dialog)?.focus();
+    });
+  } else if (!open && wasOpen) {
+    const opener = dialogOpener;
+    dialogOpener = null;
+    void nextTick(() => opener?.focus());
+  }
 });
 
 watch(autoRefresh, (enabled) => {
@@ -1507,9 +1475,26 @@ watch(autoRefresh, (enabled) => {
 });
 
 function onKeydown(event: KeyboardEvent): void {
+  if (event.key === "Tab" && dialogOpen.value) {
+    const dialog = document.querySelector<HTMLElement>(".modal-backdrop .modal");
+    const focusable = dialog ? [...dialog.querySelectorAll<HTMLElement>("button:not([disabled]), input:not([disabled]), textarea:not([disabled]), select:not([disabled]), [tabindex]:not([tabindex='-1'])")] : [];
+    if (focusable.length > 0) {
+      const first = focusable[0]!;
+      const last = focusable[focusable.length - 1]!;
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
+    }
+    return;
+  }
   if (event.key === "Escape") {
     if (proxyEditor.value) proxyEditor.value = null;
     else if (modelEditor.value) modelEditor.value = null;
+    else if (limitEditor.value) limitEditor.value = null;
     else if (pendingRemoval.value) pendingRemoval.value = null;
     else if (showClearConfirm.value) showClearConfirm.value = false;
     else if (showAddAccount.value) showAddAccount.value = false;
@@ -1537,17 +1522,11 @@ onUnmounted(() => {
 });
 </script>
 <template>
-  <div class="app-shell">
-    <header class="topbar">
+  <div class="app-shell" :data-theme="theme">
+    <header v-if="!token" class="topbar">
       <div class="wordmark">
         <span class="wordmark-mark">NW</span>
         <span>NeuralWatt 网关</span>
-      </div>
-      <div v-if="token" class="topbar-actions">
-        <span class="connection-dot" :class="{ busy: isLoading }"></span>
-        <span class="topbar-status">{{ isLoading ? "刷新中" : "已连接" }}</span>
-        <button class="button button-quiet" type="button" :disabled="isLoading" @click="loadDashboard()">刷新</button>
-        <button class="button button-quiet" type="button" @click="signOut">退出登录</button>
       </div>
     </header>
 
@@ -1565,373 +1544,17 @@ onUnmounted(() => {
       </section>
     </main>
 
-    <main v-else class="dashboard">
-      <section class="dashboard-heading">
-        <div>
-          <p class="section-kicker">运行概览</p>
-          <h1>网关控制台</h1>
-        </div>
-        <label class="auto-refresh" for="auto-refresh-toggle">
-          <button id="auto-refresh-toggle" class="switch" :class="{ on: autoRefresh }" type="button" :aria-pressed="autoRefresh" @click="autoRefresh = !autoRefresh">
-            <span></span>
-          </button>
-          自动刷新（30 秒）
-        </label>
-      </section>
-
-      <section class="metric-grid" aria-label="网关状态">
-        <article class="metric">
-          <span class="metric-label">已启用账号</span>
-          <strong>{{ enabledCount }}<small>/{{ accounts.length }}</small></strong>
-        </article>
-        <article class="metric">
-          <span class="metric-label">有效会话</span>
-          <strong>{{ activeSessions }}</strong>
-        </article>
-        <article class="metric">
-          <span class="metric-label">冷却账号</span>
-          <strong>{{ cooldownCount }}</strong>
-        </article>
-        <article class="metric metric-wide">
-          <span class="metric-label">默认模型</span>
-          <strong class="metric-model">{{ config.defaultModel || "-" }}</strong>
-        </article>
-      </section>
-
-      <nav class="view-tabs" aria-label="网关视图">
-        <button type="button" :class="{ active: view === 'accounts' }" @click="selectView('accounts')">账号管理</button>
-        <button type="button" :class="{ active: view === 'records' }" @click="selectView('records')">聊天记录</button>
-      </nav>
-
-      <template v-if="view === 'accounts'">
-        <section class="panel accounts-panel">
-          <div class="panel-heading">
-            <div>
-              <p class="section-kicker">连接池</p>
-              <h2>账号管理</h2>
-              <p class="panel-sub">粘性会话 · 加权负载 · {{ enabledCount }}/{{ accounts.length }} 已启用</p>
-            </div>
-            <div class="panel-actions">
-              <input v-model="accountQuery" class="search-input" type="search" placeholder="搜索账号、邮箱或代理…" aria-label="搜索账号" />
-              <button class="button button-primary" type="button" @click="showAddAccount = true">+ 添加账号</button>
-            </div>
-          </div>
-
-          <div v-if="accounts.length === 0" class="empty-state">
-            <p>尚未配置账号。</p>
-            <button class="button button-primary" type="button" @click="showAddAccount = true">添加第一个账号</button>
-          </div>
-          <div v-else-if="filteredAccounts.length === 0" class="empty-state">
-            <p>没有匹配「{{ accountQuery }}」的账号。</p>
-          </div>
-          <div v-else class="account-cards">
-            <article v-for="account in filteredAccounts" :key="account.id" class="account-card" :class="{ 'card-disabled': !account.enabled }">
-              <header class="account-card-head">
-                <div class="account-identity">
-                  <strong>{{ account.label }}</strong>
-                  <span class="muted">{{ account.emailHint }}</span>
-                </div>
-                <span class="badge" :class="runtimeBadge(account).tone">{{ runtimeBadge(account).text }}</span>
-              </header>
-              <dl class="account-facts">
-                <div>
-                  <dt>会话</dt>
-                  <dd>
-                    <span class="badge" :class="sessionBadge(account).tone">{{ sessionBadge(account).text }}</span>
-                    <span v-if="account.hasSession && account.sessionExpiresAt" class="muted">至 {{ formatDate(account.sessionExpiresAt) }}</span>
-                  </dd>
-                </div>
-                <div>
-                  <dt>权重</dt>
-                  <dd>{{ account.weight }}</dd>
-                </div>
-                <div>
-                  <dt>代理</dt>
-                  <dd class="mono">{{ account.proxyHint ?? "直连" }}</dd>
-                </div>
-                <div>
-                  <dt>更新</dt>
-                  <dd>{{ formatDate(account.updatedAt) }}</dd>
-                </div>
-              </dl>
-              <div class="account-models">
-                <span class="account-models-label">可用模型（{{ account.models.length }}）</span>
-                <div class="model-chips">
-                  <span v-for="model in account.models" :key="model" class="model-chip">{{ model }}</span>
-                  <span v-if="account.models.length === 0" class="muted">未配置</span>
-                </div>
-              </div>
-              <p v-if="account.runtime.lastError" class="account-error" :title="account.runtime.lastError">{{ account.runtime.lastError }}</p>
-              <footer class="account-actions">
-                <button class="text-button" type="button" :disabled="isAccountBusy(account.id)" @click="verifyAccount(account)">验证</button>
-                <button class="text-button" type="button" :disabled="isAccountBusy(account.id)" @click="openProxyEditor(account)">代理</button>
-                <button class="text-button" type="button" :disabled="isAccountBusy(account.id)" @click="fetchAccountModels(account)">自动获取</button>
-                <button class="text-button" type="button" :disabled="isAccountBusy(account.id)" @click="openModelEditor(account)">模型</button>
-                <button class="text-button" type="button" :disabled="isAccountBusy(account.id)" @click="toggleAccount(account)">{{ account.enabled ? "禁用" : "启用" }}</button>
-                <button class="text-button danger" type="button" :disabled="isAccountBusy(account.id)" @click="askRemoveAccount(account)">移除</button>
-              </footer>
-            </article>
-          </div>
-        </section>
-
-        <section class="panel toolcall-panel">
-          <div class="panel-heading">
-            <div>
-              <p class="section-kicker">工具调用协议</p>
-              <h2>信封格式与进度播报</h2>
-              <p class="panel-sub">按模型覆盖优先于全局默认 · 无论契约展示哪种格式，解析端始终同时接受 JSON 与 XML</p>
-            </div>
-          </div>
-          <div class="toolcall-grid">
-            <label class="toolcall-field">
-              <span>全局默认格式</span>
-              <select :value="effectiveToolCallFormat" @change="onToolCallFormatChange">
-                <option value="auto">auto · 模型自选（推荐）</option>
-                <option value="json">json · 固定 JSON 信封</option>
-                <option value="xml">xml · 固定 XML 信封</option>
-              </select>
-            </label>
-            <label class="toolcall-field">
-              <span>进度播报（preamble）</span>
-              <select :value="effectivePreambleVerbosity" @change="onPreambleVerbosityChange">
-                <option value="milestone">milestone · 里程碑播报（推荐）</option>
-                <option value="normal">normal · 关键步骤播报</option>
-                <option value="verbose">verbose · 每步都播报</option>
-                <option value="quiet">quiet · 默认静默</option>
-              </select>
-            </label>
-          </div>
-          <div class="toolcall-models">
-            <span class="account-models-label">按模型覆盖</span>
-            <p v-if="allModels.length === 0" class="muted toolcall-empty">暂无已配置模型；请先在账号上配置可用模型。</p>
-            <div v-else class="toolcall-model-list">
-              <div class="toolcall-model-row toolcall-model-head">
-                <span></span>
-                <span class="toolcall-col-label">信封格式</span>
-                <span class="toolcall-col-label">播报档位</span>
-              </div>
-              <div v-for="model in allModels" :key="model" class="toolcall-model-row">
-                <span class="mono toolcall-model-name">{{ model }}</span>
-                <select :value="settings.modelToolCallFormats?.[model] ?? ''" @change="onModelToolCallFormatChange(model, $event)">
-                  <option value="">跟随全局（{{ effectiveToolCallFormat }}）</option>
-                  <option value="auto">auto</option>
-                  <option value="json">json</option>
-                  <option value="xml">xml</option>
-                </select>
-                <select :value="settings.modelPreambleVerbosities?.[model] ?? ''" @change="onModelPreambleVerbosityChange(model, $event)">
-                  <option value="">跟随全局（{{ effectivePreambleVerbosity }}）</option>
-                  <option value="normal">normal</option>
-                  <option value="verbose">verbose</option>
-                  <option value="milestone">milestone</option>
-                  <option value="quiet">quiet</option>
-                </select>
-              </div>
-            </div>
-          </div>
-        </section>
-      </template>
-
-
-      <template v-else>
-        <section class="panel records-panel">
-          <div class="panel-heading records-heading">
-            <div>
-              <p class="section-kicker">调试记录</p>
-              <h2>请求对话</h2>
-            </div>
-            <div class="record-control">
-              <label class="switch-label" for="record-toggle">记录消息</label>
-              <button id="record-toggle" class="switch" :class="{ on: settings.recordMessages }" type="button" :aria-pressed="settings.recordMessages" @click="setRecording(!settings.recordMessages)">
-                <span></span>
-              </button>
-              <button class="button button-quiet" type="button" @click="loadRecords">刷新</button>
-              <button class="button button-danger" type="button" :disabled="records.length === 0 || isClearingRecords" @click="askClearRecords">清空全部</button>
-            </div>
-          </div>
-          <div class="records-toolbar">
-            <input v-model="recordQuery" class="search-input" type="search" placeholder="按端点或账号搜索…" aria-label="搜索记录" />
-            <div class="filter-chips" role="group" aria-label="按状态过滤">
-              <button type="button" :class="{ active: recordFilter === 'all' }" @click="recordFilter = 'all'">全部 {{ records.length }}</button>
-              <button type="button" :class="{ active: recordFilter === 'success' }" @click="recordFilter = 'success'">成功 {{ records.length - failedRecordCount }}</button>
-              <button type="button" :class="{ active: recordFilter === 'failed' }" @click="recordFilter = 'failed'">失败 {{ failedRecordCount }}</button>
-            </div>
-          </div>
-          <p class="records-meta">
-            {{ settings.recordMessages ? "消息记录已开启" : "消息记录已关闭" }} · {{ records.length }} 个客户端请求 · {{ upstreamCallCount }} 次上游调用
-            <template v-if="toolFirstPassRate !== null"> · 工具 JSON 首次解析成功率 {{ toolFirstPassRate }}%（{{ toolAdapterRecords.length }} 轮）</template>
-          </p>
-          <div v-if="filteredRecords.length === 0" class="empty-state">
-            <p>{{ records.length === 0 ? "暂无聊天记录。" : "没有匹配当前过滤条件的记录。" }}</p>
-          </div>
-          <div v-else class="conversation-workbench">
-            <aside class="trace-sidebar" aria-label="请求发送列表">
-              <section
-                v-for="item in sidebarItems"
-                :key="item.record.id"
-                v-memo="[item.record.id === selectedRecordId, item.upstream.some((child) => child.key === selectedTraceKey)]"
-                class="trace-group"
-                :class="{ active: selectedRecordId === item.record.id }"
-              >
-                <button class="trace-record" type="button" @click="selectRecord(item.record.id)">
-                  <span class="trace-record-top">
-                    <span class="status-chip" :class="item.record.status < 400 ? 'ok' : 'err'">{{ item.record.status }}</span>
-                    <span class="trace-endpoint">{{ item.record.endpoint }}</span>
-                    <time class="trace-time">{{ compactTime(item.record.at) }}</time>
-                  </span>
-                  <span class="trace-preview">{{ item.record.preview }}</span>
-                  <span class="trace-record-sub">
-                    <span v-if="item.record.model" class="trace-model">{{ item.record.model }}</span>
-                    {{ item.record.accountLabel || "未分配账号" }}<template v-if="item.upstream.length"> · {{ item.upstream.length }} 次上游调用</template>
-                  </span>
-                </button>
-                <div v-if="item.upstream.length" class="trace-children">
-                  <button
-                    v-for="child in item.upstream"
-                    :key="child.key"
-                    class="trace-child"
-                    :class="{ active: selectedTraceKey === child.key, failed: child.failed }"
-                    type="button"
-                    @click="selectRecord(item.record.id, child.key)"
-                  >
-                    <span class="trace-child-title">{{ child.title }}</span>
-                    <span class="trace-child-sub">{{ child.subtitle }} · HTTP {{ child.status }}</span>
-                  </button>
-                </div>
-              </section>
-            </aside>
-
-            <section v-if="selectedTrace" ref="detailEl" class="conversation-detail" :key="selectedTrace.key">
-              <header class="conversation-header">
-                <div class="conversation-heading">
-                  <div class="conversation-title-row">
-                    <span class="status-chip" :class="selectedTrace.status < 400 ? 'ok' : 'err'">{{ selectedTrace.status }}</span>
-                    <h3>{{ selectedTrace.title }}</h3>
-                    <span class="conversation-dir">{{ selectedTrace.direction === "client" ? "客户端会话" : "上游调用" }}</span>
-                  </div>
-                  <p class="conversation-meta">{{ traceRecordLabel(selectedTrace) }} · {{ selectedTrace.subtitle }}</p>
-                </div>
-                <div class="conversation-actions">
-                  <div class="record-nav">
-                    <button type="button" aria-label="上一条记录" :disabled="selectedRecordIndex <= 0" @click="gotoRecord(-1)">←</button>
-                    <button type="button" aria-label="下一条记录" :disabled="selectedRecordIndex === -1 || selectedRecordIndex >= filteredRecords.length - 1" @click="gotoRecord(1)">→</button>
-                  </div>
-                  <button class="button button-quiet" type="button" @click="rawTraceKey = rawTraceKey === traceRawKey(selectedTrace) ? null : traceRawKey(selectedTrace)">
-                    {{ rawTraceKey === traceRawKey(selectedTrace) ? "查看对话" : "原始数据" }}
-                  </button>
-                </div>
-              </header>
-
-              <div v-if="rawTraceKey === traceRawKey(selectedTrace)" class="raw-trace">
-                <section>
-                  <h4>请求正文 · {{ selectedRequest?.contentType }}</h4>
-                  <pre>{{ selectedRequest?.raw }}</pre>
-                </section>
-                <section v-if="selectedResponse">
-                  <h4>响应正文 · {{ selectedResponse?.contentType }}</h4>
-                  <pre>{{ selectedResponse?.raw }}</pre>
-                </section>
-              </div>
-
-              <div v-else class="chat-flow">
-                <article
-                  v-for="(message, index) in selectedRequest?.messages ?? []"
-                  :key="`request-${index}`"
-                  class="chat-msg"
-                  :class="[messageAlign(message.role) === 'right' ? 'right' : 'left', { thinking: message.roleLabel === '思考' }]"
-                >
-                  <div class="chat-role">{{ message.roleLabel }}</div>
-                  <div class="chat-bubble">
-                    <div class="message-collapse" :class="{ expanded: isMessageExpanded(`request-${index}`), 'has-overflow': messageOverflowKey(`request-${index}`, message) }">
-                      <p v-if="message.content" class="message-content">{{ messageDisplayContent(`request-${index}`, message) }}</p>
-                      <div v-for="call in message.toolCalls" :key="call.id" class="tool-call-item">
-                        <span class="tool-call-name">工具：{{ call.name }}</span>
-                        <code>{{ toolCallDisplayArguments(`request-${index}`, call) }}</code>
-                      </div>
-                    </div>
-                    <button v-if="messageOverflowKey(`request-${index}`, message)" class="expand-toggle" type="button" @click="toggleMessageExpanded(`request-${index}`)">
-                      {{ isMessageExpanded(`request-${index}`) ? "收起" : "展开全部" }}
-                    </button>
-                  </div>
-                </article>
-
-                <div class="chat-divider"><span>{{ selectedTrace.direction === "client" ? "客户端响应" : "上游响应" }} · HTTP {{ selectedTrace.status }}</span></div>
-
-                <template v-if="selectedResponse">
-                  <article
-                    v-for="(message, index) in selectedResponse?.messages"
-                    :key="`response-${index}`"
-                    class="chat-msg"
-                    :class="[messageAlign(message.role) === 'right' ? 'right' : 'left', { thinking: message.roleLabel === '思考' }]"
-                  >
-                    <div class="chat-role">{{ message.roleLabel }}</div>
-                    <div class="chat-bubble">
-                      <div class="message-collapse" :class="{ expanded: isMessageExpanded(`response-${index}`), 'has-overflow': messageOverflowKey(`response-${index}`, message) }">
-                        <p v-if="message.content" class="message-content">{{ messageDisplayContent(`response-${index}`, message) }}</p>
-                        <div v-for="call in message.toolCalls" :key="call.id" class="tool-call-item">
-                          <span class="tool-call-name">工具：{{ call.name }}</span>
-                          <code>{{ toolCallDisplayArguments(`response-${index}`, call) }}</code>
-                        </div>
-                      </div>
-                      <button v-if="messageOverflowKey(`response-${index}`, message)" class="expand-toggle" type="button" @click="toggleMessageExpanded(`response-${index}`)">
-                        {{ isMessageExpanded(`response-${index}`) ? "收起" : "展开全部" }}
-                      </button>
-                    </div>
-                  </article>
-                  <p v-if="!selectedResponse?.messages.length" class="parsed-empty">响应无消息内容。</p>
-                </template>
-                <p v-else class="parsed-empty">尚未收到响应正文。</p>
-
-                <p v-if="selectedTrace.error" class="trace-error">{{ selectedTrace.error }}</p>
-
-                <details v-if="selectedRequest?.fields.length" class="fold-section">
-                  <summary>请求参数 <span class="fold-count">{{ selectedRequest?.fields.length }}</span></summary>
-                  <dl class="record-fields">
-                    <template v-for="(field, index) in selectedRequest?.fields" :key="`request-field-${index}`">
-                      <dt>{{ field.label }}</dt><dd>{{ field.value }}</dd>
-                    </template>
-                  </dl>
-                </details>
-
-                <details v-if="selectedResponse?.fields.length" class="fold-section">
-                  <summary>响应元数据 <span class="fold-count">{{ selectedResponse?.fields.length }}</span></summary>
-                  <dl class="record-fields">
-                    <template v-for="(field, index) in selectedResponse?.fields" :key="`response-field-${index}`">
-                      <dt>{{ field.label }}</dt><dd>{{ field.value }}</dd>
-                    </template>
-                  </dl>
-                </details>
-
-                <details v-if="selectedTrace.record.toolCallAdapter" class="fold-section">
-                  <summary>
-                    工具调用转换
-                    <span class="fold-count">{{ toolOutcomeLabel(selectedTrace.record.toolCallAdapter.finalOutcome) }}</span>
-                    <span v-if="selectedTrace.record.toolCallAdapter.errors.length" class="fold-count fold-count-err">{{ selectedTrace.record.toolCallAdapter.errors.length }} 个错误</span>
-                  </summary>
-                  <dl class="record-fields">
-                    <dt>预期模式</dt><dd>{{ toolModeLabel(selectedTrace.record.toolCallAdapter.toolCallExpected) }}</dd>
-                    <dt>首次结果</dt><dd>{{ toolOutcomeLabel(selectedTrace.record.toolCallAdapter.initialOutcome) }}</dd>
-                    <dt>最终结果</dt><dd>{{ toolOutcomeLabel(selectedTrace.record.toolCallAdapter.finalOutcome) }}</dd>
-                    <dt>修复次数</dt><dd>{{ selectedTrace.record.toolCallAdapter.repairAttempts }} / {{ selectedTrace.record.toolCallAdapter.maxRepairAttempts }}</dd>
-                    <dt>首次解析</dt><dd>{{ selectedTrace.record.toolCallAdapter.initialParseSucceeded ? (selectedTrace.record.toolCallAdapter.initialParseRepaired ? "成功（自动修复）" : "成功") : "失败" }}</dd>
-                    <dt>最终解析</dt><dd>{{ selectedTrace.record.toolCallAdapter.finalParseSucceeded ? (selectedTrace.record.toolCallAdapter.finalParseRepaired ? "成功（自动修复）" : "成功") : "失败" }}</dd>
-                  </dl>
-                  <ul v-if="selectedTrace.record.toolCallAdapter.errors.length" class="error-list">
-                    <li v-for="error in selectedTrace.record.toolCallAdapter.errors" :key="error">{{ error }}</li>
-                  </ul>
-                </details>
-              </div>
-            </section>
-
-            <section v-else-if="isLoadingRecord" class="conversation-detail">
-              <p class="parsed-empty">正在加载记录详情…</p>
-            </section>
-          </div>
-        </section>
-      </template>
-    </main>
+    <WorkspaceShell v-else :theme="theme" :workspace="view" :loading="isLoading" :connected="Boolean(token)" :auto-refresh="autoRefresh" @select="selectView" @refresh="loadDashboard()" @toggle-auto-refresh="autoRefresh = !autoRefresh" @change-theme="changeTheme" @sign-out="signOut">
+      <OverviewWorkspace v-if="view === 'overview'" :snapshot="overviewSnapshot" :accounts="accounts" :proxies="proxies" :egresses="schedulerRuntime.egresses" @navigate="navigateFromOverview" />
+      <AccountsWorkspace v-else-if="view === 'accounts'" v-model:query="accountQuery" v-model:expanded-id="expandedAccountId" :accounts="accounts" :proxies="proxies" :scheduler="settings.scheduler" :busy-ids="busyAccountIds" :secret-reset-token="secretResetToken" :copy-secret="copyCredential" @add="openAddAccount" @verify="verifyAccount" @manage-proxy="openProxyEditor" @assign-proxy="assignProxy" @fetch-models="fetchAccountModels" @edit-models="openModelEditor" @edit-limits="openLimitEditor" @toggle="toggleAccount" @remove="askRemoveAccount" />
+      <ProxyPoolWorkspace v-else-if="view === 'proxies'" v-model:import-text="proxyImportText" v-model:filter="proxyFilter" :proxies="proxies" :draft="proxyPoolDraft" :import-results="proxyImportResults" :busy-ids="busyProxyIds" :importing="isImportingProxies" :checking-all="isCheckingProxies" :saving="isSavingProxyPool" @update-policy="updateProxyPolicy" @import="importProxies" @check="checkProxyEntry" @check-many="checkProxyPool" @delete="deleteProxyEntry" @save-policies="saveProxyPoolSettings" />
+      <SchedulerWorkspace v-else-if="view === 'scheduler'" :draft="schedulerDraft" :runtime="schedulerRuntime" :saving="isSavingScheduler" @update-field="updateSchedulerField" @save="saveSchedulerSettings" />
+      <RecordsWorkspace v-else-if="view === 'records'" v-model:query="recordQuery" v-model:filter="recordFilter" v-model:raw-trace-key="rawTraceKey" :records="records" :filtered-records="filteredRecords" :sidebar-items="sidebarItems" :selected-record-id="selectedRecordId" :selected-trace-key="selectedTraceKey" :selected-trace="selectedTrace" :selected-request="selectedRequest" :selected-response="selectedResponse" :loading-detail="isLoadingRecord" :recording="settings.recordMessages" :failed-count="failedRecordCount" :upstream-call-count="upstreamCallCount" :tool-first-pass-rate="toolFirstPassRate" :tool-adapter-count="toolAdapterRecords.length" :selected-record-index="selectedRecordIndex" :clearing="isClearingRecords" @toggle-recording="setRecording" @refresh="loadRecords" @clear="askClearRecords" @select-record="selectRecord" @goto="gotoRecord" />
+      <GatewaySettingsWorkspace v-else :settings="settings" :config="config" :all-models="allModels" v-model:minimum-output-tokens-draft="minimumOutputTokensDraft" :saving-budget="isSavingMinimumOutputTokens" :secret-reset-token="secretResetToken" :copy-secret="copyCredential" @save-budget="saveMinimumOutputTokens" @set-tool-format="setToolCallFormat" @set-preamble="setPreambleVerbosity" @set-model-tool-format="setModelToolCallFormat" @set-model-preamble="setModelPreambleVerbosity" @sign-out="signOut" />
+    </WorkspaceShell>
 
     <div v-if="showAddAccount" class="modal-backdrop" @click.self="showAddAccount = false">
-      <form class="modal" @submit.prevent="addAccount">
+      <form class="modal" role="dialog" aria-modal="true" aria-label="添加账号" @submit.prevent="addAccount">
         <header class="modal-head">
           <h2>添加账号</h2>
           <button class="modal-close" type="button" aria-label="关闭" @click="showAddAccount = false">×</button>
@@ -1963,16 +1586,16 @@ onUnmounted(() => {
     </div>
 
     <div v-if="proxyEditor" class="modal-backdrop" @click.self="proxyEditor = null">
-      <form class="modal" @submit.prevent="saveProxy">
+      <form class="modal" role="dialog" aria-modal="true" aria-label="设置出口代理" @submit.prevent="saveProxy">
         <header class="modal-head">
           <h2>设置出口代理</h2>
           <button class="modal-close" type="button" aria-label="关闭" @click="proxyEditor = null">×</button>
         </header>
-        <p class="modal-note">账号「{{ proxyEditor.account.label }}」 · 当前：{{ proxyEditor.account.proxyHint ?? "直连" }}</p>
+        <p class="modal-note">账号「{{ proxyEditor.account.label }}」 · 当前：{{ proxyEditor.account.proxy ?? "直连" }}</p>
         <div class="modal-body">
           <label for="proxy-input">代理地址</label>
           <input id="proxy-input" v-model="proxyEditor.value" type="text" maxlength="2048" autocomplete="off" spellcheck="false" placeholder="http://host:8080 或 socks5://user:pass@host:1080" />
-          <p class="field-hint">支持 http / https / socks4 / socks5，可带认证。留空并保存将清除代理；修改后会话将重新登录。</p>
+          <p class="field-hint">支持 http / https / socks4 / socks5，可带认证。留空并保存将清除代理；更换出口不会主动退出账号，门户拒绝现有会话时才重新登录。</p>
         </div>
         <footer class="modal-foot">
           <button class="button button-quiet" type="button" @click="proxyEditor = null">取消</button>
@@ -1982,7 +1605,7 @@ onUnmounted(() => {
     </div>
 
     <div v-if="modelEditor" class="modal-backdrop" @click.self="modelEditor = null">
-      <form class="modal" @submit.prevent="saveModels">
+      <form class="modal" role="dialog" aria-modal="true" aria-label="编辑模型列表" @submit.prevent="saveModels">
         <header class="modal-head">
           <h2>编辑模型列表</h2>
           <button class="modal-close" type="button" aria-label="关闭" @click="modelEditor = null">×</button>
@@ -2000,8 +1623,26 @@ onUnmounted(() => {
       </form>
     </div>
 
+    <div v-if="limitEditor" class="modal-backdrop" @click.self="limitEditor = null">
+      <form class="modal limit-modal" role="dialog" aria-modal="true" aria-label="账号调度限额" @submit.prevent="saveAccountLimits">
+        <header class="modal-head"><h2>账号调度限额</h2><button class="modal-close" type="button" aria-label="关闭" @click="limitEditor = null">×</button></header>
+        <p class="modal-note">账号「{{ limitEditor.account.label }}」 · 留空继承全局配置</p>
+        <div class="modal-body">
+          <div class="field-row">
+            <div><label for="account-rpm-override">账号 RPM</label><input id="account-rpm-override" v-model="limitEditor.accountRpm" type="number" min="1" max="100000" placeholder="继承全局" /></div>
+            <div><label for="account-concurrency-override">账号模型并发</label><input id="account-concurrency-override" v-model="limitEditor.accountModelConcurrency" type="number" min="1" max="1000" placeholder="继承全局" /></div>
+          </div>
+          <div v-if="limitEditor.account.models.length" class="limit-model-list">
+            <span class="account-models-label">按模型覆盖</span>
+            <label v-for="model in limitEditor.account.models" :key="model" class="limit-model-row"><span class="mono">{{ model }}</span><input v-model="limitEditor.modelConcurrency[model]" type="number" min="1" max="1000" :placeholder="`继承 ${limitEditor.account.schedulerOverrides?.accountModelConcurrency ?? settings.scheduler.accountModelConcurrency}`" /></label>
+          </div>
+        </div>
+        <footer class="modal-foot"><button class="button button-quiet" type="button" @click="limitEditor = null">取消</button><button class="button button-primary" type="submit" :disabled="isAccountBusy(limitEditor.account.id)">保存</button></footer>
+      </form>
+    </div>
+
     <div v-if="pendingRemoval" class="modal-backdrop" @click.self="pendingRemoval = null">
-      <div class="modal modal-confirm" role="alertdialog" aria-labelledby="remove-title">
+      <div class="modal modal-confirm" role="alertdialog" aria-modal="true" aria-labelledby="remove-title" tabindex="-1">
         <header class="modal-head">
           <h2 id="remove-title">移除账号</h2>
         </header>
@@ -2014,7 +1655,7 @@ onUnmounted(() => {
     </div>
 
     <div v-if="showClearConfirm" class="modal-backdrop" @click.self="showClearConfirm = false">
-      <div class="modal modal-confirm" role="alertdialog" aria-labelledby="clear-title">
+      <div class="modal modal-confirm" role="alertdialog" aria-modal="true" aria-labelledby="clear-title" tabindex="-1">
         <header class="modal-head">
           <h2 id="clear-title">清空聊天记录</h2>
         </header>

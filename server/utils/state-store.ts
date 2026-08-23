@@ -2,13 +2,20 @@ import { randomBytes, randomUUID } from "node:crypto";
 import { mkdir, readFile, readdir, rename, unlink, writeFile } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
 import { getProxyConfig } from "~/server/utils/config.ts";
+import { canonicalProxy } from "~/server/utils/proxy.ts";
+import { DEFAULT_PROXY_POOL_SETTINGS, DEFAULT_SCHEDULER_SETTINGS } from "~/server/utils/types.ts";
 import type {
+  AccountSchedulerOverrides,
   DebugRecord,
   DebugRecordSummary,
   ManagedAccount,
   PersistentState,
   PortalSession,
+  ProxyKind,
+  ProxyPoolEntry,
+  ProxyPoolSettings,
   ProxySettings,
+  SchedulerSettings,
 } from "~/server/utils/types.ts";
 
 const STORE_FILE = "accounts.json";
@@ -24,8 +31,13 @@ interface RecordIndexEntry {
 function emptyState(): PersistentState {
   return {
     version: 1,
-    settings: { recordMessages: false },
+    settings: {
+      recordMessages: false,
+      scheduler: { ...DEFAULT_SCHEDULER_SETTINGS },
+      proxyPool: { ...DEFAULT_PROXY_POOL_SETTINGS },
+    },
     accounts: [],
+    proxyPool: [],
   };
 }
 
@@ -35,6 +47,12 @@ function normaliseToolCallFormat(value: unknown): "auto" | "json" | "xml" | unde
 
 function normalisePreambleVerbosity(value: unknown): "quiet" | "normal" | "verbose" | "milestone" | undefined {
   return value === "quiet" || value === "normal" || value === "verbose" || value === "milestone" ? value : undefined;
+}
+
+function normaliseMinimumOutputTokens(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isInteger(value) && value >= 0 && value <= 8_192
+    ? value
+    : undefined;
 }
 
 function normaliseModelToolCallFormats(value: unknown): Record<string, "auto" | "json" | "xml"> | undefined {
@@ -73,6 +91,9 @@ function normaliseModelPreambleVerbosities(value: unknown): Record<string, "quie
  */
 export interface ProxySettingsUpdate {
   recordMessages?: boolean;
+  scheduler?: Partial<SchedulerSettings>;
+  proxyPool?: Partial<ProxyPoolSettings>;
+  minimumOutputTokens?: number;
   toolCallFormat?: "auto" | "json" | "xml" | null;
   preambleVerbosity?: "quiet" | "normal" | "verbose" | "milestone" | null;
   modelToolCallFormats?: Record<string, "auto" | "json" | "xml"> | null;
@@ -80,16 +101,136 @@ export interface ProxySettingsUpdate {
 }
 
 /** Drop unknown/invalid persisted settings while preserving every valid one. */
+function normaliseBoundedInteger(value: unknown, fallback: number, minimum: number, maximum: number): number {
+  return typeof value === "number" && Number.isInteger(value) && value >= minimum && value <= maximum
+    ? value
+    : fallback;
+}
+
+function normaliseSchedulerSettings(value: unknown): SchedulerSettings {
+  const parsed = value && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : {};
+  return {
+    accountModelConcurrency: normaliseBoundedInteger(parsed.accountModelConcurrency, DEFAULT_SCHEDULER_SETTINGS.accountModelConcurrency, 1, 1_000),
+    accountRpm: normaliseBoundedInteger(parsed.accountRpm, DEFAULT_SCHEDULER_SETTINGS.accountRpm, 1, 100_000),
+    proxyRpm: normaliseBoundedInteger(parsed.proxyRpm, DEFAULT_SCHEDULER_SETTINGS.proxyRpm, 1, 100_000),
+    directEgressLimitEnabled: typeof parsed.directEgressLimitEnabled === "boolean"
+      ? parsed.directEgressLimitEnabled
+      : DEFAULT_SCHEDULER_SETTINGS.directEgressLimitEnabled,
+    directEgressRpm: normaliseBoundedInteger(parsed.directEgressRpm, DEFAULT_SCHEDULER_SETTINGS.directEgressRpm, 1, 100_000),
+    stickyTtlSeconds: normaliseBoundedInteger(parsed.stickyTtlSeconds, DEFAULT_SCHEDULER_SETTINGS.stickyTtlSeconds, 1, 604_800),
+    queueTimeoutSeconds: normaliseBoundedInteger(parsed.queueTimeoutSeconds, DEFAULT_SCHEDULER_SETTINGS.queueTimeoutSeconds, 0, 86_400),
+    maxQueueSize: normaliseBoundedInteger(parsed.maxQueueSize, DEFAULT_SCHEDULER_SETTINGS.maxQueueSize, 0, 100_000),
+  };
+}
+
+function normaliseAccountSchedulerOverrides(value: unknown, models: string[]): AccountSchedulerOverrides | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return undefined;
+  }
+  const parsed = value as Record<string, unknown>;
+  const result: AccountSchedulerOverrides = {};
+  if (typeof parsed.accountRpm === "number" && Number.isInteger(parsed.accountRpm) && parsed.accountRpm >= 1 && parsed.accountRpm <= 100_000) {
+    result.accountRpm = parsed.accountRpm;
+  }
+  if (typeof parsed.accountModelConcurrency === "number" && Number.isInteger(parsed.accountModelConcurrency)
+    && parsed.accountModelConcurrency >= 1 && parsed.accountModelConcurrency <= 1_000) {
+    result.accountModelConcurrency = parsed.accountModelConcurrency;
+  }
+  if (parsed.modelConcurrency && typeof parsed.modelConcurrency === "object" && !Array.isArray(parsed.modelConcurrency)) {
+    const supported = new Set(models);
+    const modelConcurrency: Record<string, number> = {};
+    for (const [rawModel, entry] of Object.entries(parsed.modelConcurrency)) {
+      const model = rawModel.trim();
+      if (supported.has(model) && typeof entry === "number" && Number.isInteger(entry) && entry >= 1 && entry <= 1_000) {
+        modelConcurrency[model] = entry;
+      }
+    }
+    if (Object.keys(modelConcurrency).length > 0) {
+      result.modelConcurrency = modelConcurrency;
+    }
+  }
+  return Object.keys(result).length > 0 ? result : undefined;
+}
+
+function normaliseProxyPoolSettings(value: unknown): ProxyPoolSettings {
+  const parsed = value && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : {};
+  const protocol = parsed.defaultImportProtocol;
+  return {
+    autoAssignOnAccountCreate: typeof parsed.autoAssignOnAccountCreate === "boolean"
+      ? parsed.autoAssignOnAccountCreate
+      : DEFAULT_PROXY_POOL_SETTINGS.autoAssignOnAccountCreate,
+    autoRotateOnTransportError: typeof parsed.autoRotateOnTransportError === "boolean"
+      ? parsed.autoRotateOnTransportError
+      : DEFAULT_PROXY_POOL_SETTINGS.autoRotateOnTransportError,
+    retryCurrentRequestAfterRotation: typeof parsed.retryCurrentRequestAfterRotation === "boolean"
+      ? parsed.retryCurrentRequestAfterRotation
+      : DEFAULT_PROXY_POOL_SETTINGS.retryCurrentRequestAfterRotation,
+    directFallbackWhenExhausted: typeof parsed.directFallbackWhenExhausted === "boolean"
+      ? parsed.directFallbackWhenExhausted
+      : DEFAULT_PROXY_POOL_SETTINGS.directFallbackWhenExhausted,
+    defaultImportProtocol: protocol === "http" || protocol === "socks4" || protocol === "socks5"
+      ? protocol
+      : DEFAULT_PROXY_POOL_SETTINGS.defaultImportProtocol,
+    healthCheckTimeoutSeconds: normaliseBoundedInteger(parsed.healthCheckTimeoutSeconds, DEFAULT_PROXY_POOL_SETTINGS.healthCheckTimeoutSeconds, 1, 120),
+    errorRetryCooldownSeconds: normaliseBoundedInteger(parsed.errorRetryCooldownSeconds, DEFAULT_PROXY_POOL_SETTINGS.errorRetryCooldownSeconds, 1, 86_400),
+  };
+}
+
+function normaliseProxyPool(value: unknown): ProxyPoolEntry[] {
+  if (!Array.isArray(value)) return [];
+  const result: ProxyPoolEntry[] = [];
+  const ids = new Set<string>();
+  const urls = new Set<string>();
+  for (const raw of value) {
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) continue;
+    const entry = raw as Record<string, unknown>;
+    if (typeof entry.id !== "string" || typeof entry.url !== "string") continue;
+    try {
+      const canonical = canonicalProxy(entry.url);
+      if (ids.has(entry.id) || urls.has(canonical.url)) continue;
+      const createdAt = typeof entry.createdAt === "string" ? entry.createdAt : new Date(0).toISOString();
+      const updatedAt = typeof entry.updatedAt === "string" ? entry.updatedAt : createdAt;
+      const normalized: ProxyPoolEntry = {
+        id: entry.id,
+        url: canonical.url,
+        kind: canonical.kind,
+        createdAt,
+        updatedAt,
+        ...(typeof entry.label === "string" && entry.label.trim() ? { label: entry.label.trim().slice(0, 120) } : {}),
+        ...(typeof entry.lastCheckedAt === "string" ? { lastCheckedAt: entry.lastCheckedAt } : {}),
+        ...(typeof entry.lastHealthyAt === "string" ? { lastHealthyAt: entry.lastHealthyAt } : {}),
+        ...(typeof entry.lastError === "string" && entry.lastError ? { lastError: entry.lastError.slice(0, 300) } : {}),
+        ...(typeof entry.failedAt === "string" ? { failedAt: entry.failedAt } : {}),
+        ...(typeof entry.retryAfter === "number" && Number.isFinite(entry.retryAfter) && entry.retryAfter > 0 ? { retryAfter: entry.retryAfter } : {}),
+      };
+      ids.add(normalized.id);
+      urls.add(normalized.url);
+      result.push(normalized);
+    } catch {
+      // Invalid persisted proxies are dropped without affecting valid accounts.
+    }
+  }
+  return result;
+}
+
 function normaliseSettings(value: unknown): ProxySettings {
   const parsed = value && typeof value === "object" && !Array.isArray(value)
     ? value as Record<string, unknown>
     : {};
+  const minimumOutputTokens = normaliseMinimumOutputTokens(parsed.minimumOutputTokens);
   const toolCallFormat = normaliseToolCallFormat(parsed.toolCallFormat);
   const modelToolCallFormats = normaliseModelToolCallFormats(parsed.modelToolCallFormats);
   const preambleVerbosity = normalisePreambleVerbosity(parsed.preambleVerbosity);
   const modelPreambleVerbosities = normaliseModelPreambleVerbosities(parsed.modelPreambleVerbosities);
   return {
     recordMessages: Boolean(parsed.recordMessages),
+    scheduler: normaliseSchedulerSettings(parsed.scheduler),
+    proxyPool: normaliseProxyPoolSettings(parsed.proxyPool),
+    ...(minimumOutputTokens !== undefined ? { minimumOutputTokens } : {}),
     ...(toolCallFormat ? { toolCallFormat } : {}),
     ...(modelToolCallFormats ? { modelToolCallFormats } : {}),
     ...(preambleVerbosity ? { preambleVerbosity } : {}),
@@ -115,14 +256,22 @@ function normaliseModels(value: unknown): string[] {
 
 function normaliseAccount(account: ManagedAccount): ManagedAccount {
   const proxy = typeof account.proxy === "string" && account.proxy.trim() ? account.proxy.trim() : undefined;
+  const models = normaliseModels(account.models);
+  const schedulerOverrides = normaliseAccountSchedulerOverrides(account.schedulerOverrides, models);
+  const proxyPoolEntryId = typeof account.proxyPoolEntryId === "string" && account.proxyPoolEntryId
+    ? account.proxyPoolEntryId
+    : undefined;
+  const { schedulerOverrides: _discardedOverrides, proxyPoolEntryId: _discardedPoolId, ...accountWithoutOverrides } = account;
   return {
-    ...account,
+    ...accountWithoutOverrides,
     label: account.label.trim() || account.email,
     email: account.email.trim().toLowerCase(),
     weight: Math.max(1, Math.min(100, Math.floor(account.weight || 1))),
     enabled: account.enabled !== false,
-    models: normaliseModels(account.models),
+    models,
+    ...(schedulerOverrides ? { schedulerOverrides } : {}),
     ...(proxy ? { proxy } : {}),
+    ...(proxy && proxyPoolEntryId ? { proxyPoolEntryId } : {}),
   };
 }
 
@@ -314,10 +463,19 @@ export class StateStore {
         throw new Error("The account store has an unsupported schema.");
       }
 
+      const proxyPool = normaliseProxyPool(parsed.proxyPool);
+      const poolById = new Map(proxyPool.map((entry) => [entry.id, entry]));
+      const accounts = parsed.accounts.map(normaliseAccount).map((account) => {
+        const entry = account.proxyPoolEntryId ? poolById.get(account.proxyPoolEntryId) : undefined;
+        if (entry && account.proxy === entry.url) return account;
+        const { proxyPoolEntryId: _invalidPoolBinding, ...withoutBinding } = account;
+        return withoutBinding;
+      });
       this.state = {
         version: 1,
         settings: normaliseSettings(parsed.settings),
-        accounts: parsed.accounts.map(normaliseAccount),
+        accounts,
+        proxyPool,
       };
     } catch (error) {
       const code = error instanceof Error && "code" in error ? (error as NodeJS.ErrnoException).code : undefined;
@@ -374,7 +532,14 @@ export class StateStore {
     });
   }
 
-  async updateAccount(id: string, input: Partial<Pick<ManagedAccount, "label" | "enabled" | "weight"> & { proxy: string | null; models: string[] }>): Promise<ManagedAccount> {
+  async updateAccount(
+    id: string,
+    input: Partial<Pick<ManagedAccount, "label" | "enabled" | "weight"> & {
+      proxy: string | null;
+      models: string[];
+      schedulerOverrides: AccountSchedulerOverrides | null;
+    }>,
+  ): Promise<ManagedAccount> {
     return this.mutate((state) => {
       const account = state.accounts.find((candidate) => candidate.id === id);
       if (!account) {
@@ -392,12 +557,20 @@ export class StateStore {
       }
       if (typeof input.proxy === "string") {
         account.proxy = input.proxy;
+        delete account.proxyPoolEntryId;
       } else if (input.proxy === null) {
         delete account.proxy;
+        delete account.proxyPoolEntryId;
       }
       if (Array.isArray(input.models)) {
         account.models = normaliseModels(input.models);
       }
+      if (input.schedulerOverrides === null) {
+        delete account.schedulerOverrides;
+      } else if (input.schedulerOverrides !== undefined) {
+        account.schedulerOverrides = normaliseAccountSchedulerOverrides(input.schedulerOverrides, account.models);
+      }
+      account.schedulerOverrides = normaliseAccountSchedulerOverrides(account.schedulerOverrides, account.models);
       account.updatedAt = new Date().toISOString();
       return account;
     });
@@ -437,6 +610,144 @@ export class StateStore {
     });
   }
 
+  async listProxyPool(): Promise<ProxyPoolEntry[]> {
+    return structuredClone((await this.getState()).proxyPool);
+  }
+
+  async getProxyPoolEntry(id: string): Promise<ProxyPoolEntry | undefined> {
+    const entry = (await this.getState()).proxyPool.find((candidate) => candidate.id === id);
+    return entry ? structuredClone(entry) : undefined;
+  }
+
+  async importProxyPool(entries: Array<{ url: string; kind: ProxyKind; label?: string }>): Promise<Array<{ entry: ProxyPoolEntry; created: boolean }>> {
+    return this.mutate((state) => {
+      const byUrl = new Map(state.proxyPool.map((entry) => [entry.url, entry]));
+      const now = new Date().toISOString();
+      return entries.map((input) => {
+        const existing = byUrl.get(input.url);
+        if (existing) return { entry: structuredClone(existing), created: false };
+        const entry: ProxyPoolEntry = {
+          id: randomUUID(),
+          url: input.url,
+          kind: input.kind,
+          createdAt: now,
+          updatedAt: now,
+          ...(input.label?.trim() ? { label: input.label.trim().slice(0, 120) } : {}),
+        };
+        state.proxyPool.push(entry);
+        byUrl.set(entry.url, entry);
+        return { entry: structuredClone(entry), created: true };
+      });
+    });
+  }
+
+  async updateProxyPoolHealth(
+    id: string,
+    health: { healthy: true; checkedAt: string } | { healthy: false; checkedAt: string; error: string; retryAfter: number },
+  ): Promise<ProxyPoolEntry> {
+    return this.mutate((state) => {
+      const entry = state.proxyPool.find((candidate) => candidate.id === id);
+      if (!entry) throw new Error("Proxy pool entry not found.");
+      entry.lastCheckedAt = health.checkedAt;
+      entry.updatedAt = health.checkedAt;
+      if (health.healthy) {
+        entry.lastHealthyAt = health.checkedAt;
+        delete entry.lastError;
+        delete entry.failedAt;
+        delete entry.retryAfter;
+      } else {
+        entry.lastError = health.error.slice(0, 300);
+        entry.failedAt = health.checkedAt;
+        entry.retryAfter = health.retryAfter;
+      }
+      return structuredClone(entry);
+    });
+  }
+
+  async deleteProxyPoolEntry(id: string): Promise<void> {
+    await this.mutate((state) => {
+      if (state.accounts.some((account) => account.proxyPoolEntryId === id)) throw new Error("Proxy pool entry is assigned to an account.");
+      const index = state.proxyPool.findIndex((entry) => entry.id === id);
+      if (index < 0) throw new Error("Proxy pool entry not found.");
+      state.proxyPool.splice(index, 1);
+    });
+  }
+
+  async assignProxyPoolEntryFromProxy(accountId: string, entryId: string, expectedProxy: string): Promise<ManagedAccount> {
+    return this.mutate((state) => {
+      const account = state.accounts.find((candidate) => candidate.id === accountId);
+      if (!account) throw new Error("Account not found.");
+      if (account.proxy !== expectedProxy || account.proxyPoolEntryId) {
+        throw new Error("Account proxy binding changed before assignment completed.");
+      }
+      const entry = state.proxyPool.find((candidate) => candidate.id === entryId);
+      if (!entry) throw new Error("Proxy pool entry not found.");
+      if (state.accounts.some((candidate) => candidate.id !== accountId && candidate.proxyPoolEntryId === entryId)) {
+        throw new Error("Proxy pool entry is already assigned.");
+      }
+      account.proxy = entry.url;
+      account.proxyPoolEntryId = entry.id;
+      account.updatedAt = new Date().toISOString();
+      return structuredClone(account);
+    });
+  }
+
+  async clearCustomProxyIfMatches(accountId: string, expectedProxy: string): Promise<ManagedAccount> {
+    return this.mutate((state) => {
+      const account = state.accounts.find((candidate) => candidate.id === accountId);
+      if (!account) throw new Error("Account not found.");
+      if (account.proxy !== expectedProxy || account.proxyPoolEntryId) {
+        throw new Error("Account proxy binding changed before direct fallback completed.");
+      }
+      delete account.proxy;
+      account.updatedAt = new Date().toISOString();
+      return structuredClone(account);
+    });
+  }
+
+  async assignProxyPoolEntry(
+    accountId: string,
+    entryId: string,
+    expectedCurrentEntryId: string | null,
+  ): Promise<ManagedAccount> {
+    return this.mutate((state) => {
+      const account = state.accounts.find((candidate) => candidate.id === accountId);
+      if (!account) throw new Error("Account not found.");
+      if (expectedCurrentEntryId === null) {
+        if (account.proxy || account.proxyPoolEntryId) throw new Error("Account already has a proxy.");
+      } else if (account.proxyPoolEntryId !== expectedCurrentEntryId) {
+        throw new Error("Account proxy binding changed before assignment completed.");
+      }
+      const entry = state.proxyPool.find((candidate) => candidate.id === entryId);
+      if (!entry) throw new Error("Proxy pool entry not found.");
+      if (state.accounts.some((candidate) => candidate.id !== accountId && candidate.proxyPoolEntryId === entryId)) {
+        throw new Error("Proxy pool entry is already assigned.");
+      }
+      account.proxy = entry.url;
+      account.proxyPoolEntryId = entry.id;
+      account.updatedAt = new Date().toISOString();
+      return structuredClone(account);
+    });
+  }
+
+  async bindProxyPoolEntry(accountId: string, entryId: string): Promise<ManagedAccount> {
+    return this.assignProxyPoolEntry(accountId, entryId, null);
+  }
+
+  async unbindProxyPoolEntry(accountId: string, expectedEntryId?: string): Promise<ManagedAccount> {
+    return this.mutate((state) => {
+      const account = state.accounts.find((candidate) => candidate.id === accountId);
+      if (!account) throw new Error("Account not found.");
+      if (expectedEntryId && account.proxyPoolEntryId !== expectedEntryId) return structuredClone(account);
+      const boundId = account.proxyPoolEntryId;
+      const boundEntry = boundId ? state.proxyPool.find((entry) => entry.id === boundId) : undefined;
+      if (boundEntry && account.proxy === boundEntry.url) delete account.proxy;
+      delete account.proxyPoolEntryId;
+      account.updatedAt = new Date().toISOString();
+      return structuredClone(account);
+    });
+  }
+
   async getSettings(): Promise<ProxySettings> {
     return { ...(await this.getState()).settings };
   }
@@ -445,6 +756,18 @@ export class StateStore {
     return this.mutate((state) => {
       if (typeof settings.recordMessages === "boolean") {
         state.settings.recordMessages = settings.recordMessages;
+      }
+      if (settings.scheduler !== undefined) {
+        state.settings.scheduler = normaliseSchedulerSettings({ ...state.settings.scheduler, ...settings.scheduler });
+      }
+      if (settings.proxyPool !== undefined) {
+        state.settings.proxyPool = normaliseProxyPoolSettings({ ...state.settings.proxyPool, ...settings.proxyPool });
+      }
+      if (settings.minimumOutputTokens !== undefined) {
+        const minimumOutputTokens = normaliseMinimumOutputTokens(settings.minimumOutputTokens);
+        if (minimumOutputTokens !== undefined) {
+          state.settings.minimumOutputTokens = minimumOutputTokens;
+        }
       }
       if (settings.toolCallFormat !== undefined) {
         const format = normaliseToolCallFormat(settings.toolCallFormat);

@@ -109,9 +109,9 @@ test("scheduler routes only to accounts supporting the requested model", async (
   await withTempStore(async () => {
     const a = await stateStore.addAccount(accountInput("a@example.com", ["m1"]));
     const b = await stateStore.addAccount(accountInput("b@example.com", ["m2"]));
-    const selected = await accountScheduler.acquire(undefined, new Set(), "m2");
-    assert.equal(selected.id, b.id);
-    accountScheduler.release(selected.id);
+    const lease = await accountScheduler.acquire({ model: "m2" });
+    assert.equal(lease.account.id, b.id);
+    lease.release();
     accountScheduler.remove(a.id);
     accountScheduler.remove(b.id);
   });
@@ -121,20 +121,20 @@ test("scheduler fails when no account supports the requested model", async () =>
   await withTempStore(async () => {
     const a = await stateStore.addAccount(accountInput("a@example.com", ["m1"]));
     await assert.rejects(
-      accountScheduler.acquire(undefined, new Set(), "m2"),
+      accountScheduler.acquire({ model: "m2" }),
       /No enabled NeuralWatt account is currently available/,
     );
     accountScheduler.remove(a.id);
   });
 });
 
-test("scheduler without a model still routes across all accounts", async () => {
+test("scheduler routes across accounts that support the requested model", async () => {
   await withTempStore(async () => {
     const a = await stateStore.addAccount(accountInput("a@example.com", ["m1"]));
-    const b = await stateStore.addAccount(accountInput("b@example.com", ["m2"]));
-    const selected = await accountScheduler.acquire();
-    assert.ok([a.id, b.id].includes(selected.id));
-    accountScheduler.release(selected.id);
+    const b = await stateStore.addAccount(accountInput("b@example.com", ["m1"]));
+    const lease = await accountScheduler.acquire({ model: "m1" });
+    assert.ok([a.id, b.id].includes(lease.account.id));
+    lease.release();
     accountScheduler.remove(a.id);
     accountScheduler.remove(b.id);
   });

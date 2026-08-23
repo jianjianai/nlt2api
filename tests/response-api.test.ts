@@ -173,6 +173,7 @@ test("validateResponseRequest maps instructions, tools, tool_choice and budgets"
     }]);
     assert.deepEqual(chatRequest.tool_choice, { type: "function", function: { name: "shell_command" } });
     assert.equal(chatRequest.max_completion_tokens, 500);
+    assert.equal(context.maxOutputTokens, 500);
     assert.equal(chatRequest.reasoning_effort, "high");
     assert.equal(chatRequest.parallel_tool_calls, false);
     assert.equal(chatRequest.user, "session-123");
@@ -345,9 +346,9 @@ test("messagesFromResponseItems groups calls, outputs and reasoning", () => {
     { type: "message", role: "developer", content: [{ type: "input_text", text: "Rules" }] },
     userInput("Run something"),
     { type: "reasoning", summary: [{ type: "summary_text", text: "thinking..." }] },
-    { type: "function_call", name: "shell_command", arguments: "{\"command\":\"ls\"}", call_id: "call_1" },
+    { type: "function_call", name: "shell_command", arguments: "{\"command\":\"ls\"}", call_id: "api_search:0" },
     { type: "function_call", name: "shell_command", arguments: "{\"command\":\"pwd\"}", call_id: "call_2" },
-    { type: "function_call_output", call_id: "call_1", output: "files" },
+    { type: "function_call_output", call_id: "api_search:0", output: "files" },
     { type: "function_call_output", call_id: "call_2", output: "cwd" },
   ], new Set());
   assert.deepEqual(messages[0], { role: "developer", content: "Rules" });
@@ -356,9 +357,9 @@ test("messagesFromResponseItems groups calls, outputs and reasoning", () => {
   assert.equal(assistant.role, "assistant");
   assert.equal(assistant.reasoning, "thinking...");
   assert.equal(assistant.tool_calls?.length, 2);
-  assert.equal(assistant.tool_calls?.[0]?.id, "call_1");
+  assert.equal(assistant.tool_calls?.[0]?.id, "api_search:0");
   assert.equal(assistant.tool_calls?.[1]?.function.name, "shell_command");
-  assert.deepEqual(messages[3], { role: "tool", tool_call_id: "call_1", content: "files" });
+  assert.deepEqual(messages[3], { role: "tool", tool_call_id: "api_search:0", content: "files" });
   assert.deepEqual(messages[4], { role: "tool", tool_call_id: "call_2", content: "cwd" });
 });
 
@@ -592,6 +593,7 @@ test("ResponseStore persists and serves previous_response_id chains", async () =
     assert.deepEqual(messages[0], { role: "user", content: "first turn" });
     assert.deepEqual(messages[1]!, { role: "assistant", content: "answer" });
     assert.deepEqual(messages[2], { role: "user", content: "second turn" });
+    assert.equal(chatRequest.user, "response:resp_first");
     assert.equal(context.previousResponseId, "resp_first");
     assert.equal(context.store, true);
   });

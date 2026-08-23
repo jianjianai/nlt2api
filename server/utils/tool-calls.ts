@@ -11,6 +11,12 @@ import {
 
 export const FINAL_REPLY_MARKER = "<|FINAL_REPLY|>";
 export const REPAIR_REASONING_START = "<|REPAIR_REASONING|>";
+export const MAX_TOOL_CALL_ID_LENGTH = 64;
+
+/** Tool-call IDs are opaque protocol values; only presence and wire length are constrained. */
+export function isValidToolCallId(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0 && value.length <= MAX_TOOL_CALL_ID_LENGTH;
+}
 
 export interface ReasoningFields {
   reasoning?: string;
@@ -394,7 +400,7 @@ function stableCallId(seed: string, index: number): string {
 }
 
 function safeCallId(value: unknown): string | undefined {
-  return typeof value === "string" && /^[A-Za-z0-9_-]{1,128}$/.test(value) ? value : undefined;
+  return isValidToolCallId(value) ? value : undefined;
 }
 
 function deduplicateCallIds(calls: NormalizedToolCall[], seed: string): NormalizedToolCall[] {

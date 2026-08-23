@@ -8,3 +8,6 @@ dist
 .env.local
 .codegraph
 .env
+
+# Local Breezell handoff notes
+breezell/

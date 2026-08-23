@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { accountScheduler } from "~/server/utils/account-scheduler.ts";
 import { defineHandler } from "nitro";
 import {
   assertModelSupported,
@@ -120,6 +121,7 @@ export default defineHandler(async (event) => {
             await trackedEmit({ event: streamEvent.event, data: streamEvent.data });
           }
 
+          accountScheduler.bindStickyKey(execution.account.id, `response:${streamState.id}`);
           await persistResponseState(streamState.id, execution, context);
           await recordDebug({
             endpoint: "/v1/responses",
@@ -166,6 +168,7 @@ export default defineHandler(async (event) => {
       validated,
     });
     const responseId = `resp_${randomUUID().replaceAll("-", "")}`;
+    accountScheduler.bindStickyKey(execution.account.id, `response:${responseId}`);
     const response = responseFromExecution(execution, context, responseId, Math.floor(Date.now() / 1_000));
     await persistResponseState(responseId, execution, context);
 

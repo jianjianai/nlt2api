@@ -1,4 +1,7 @@
 import assert from "node:assert/strict";
+import { accountScheduler } from "../server/utils/account-scheduler.ts";
+import { proxyPoolService } from "../server/utils/proxy-pool.ts";
+import { ProxyTransportError } from "../server/utils/proxy.ts";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -10,14 +13,28 @@ import {
   isThinkingInterrupted,
   locatedSchemaErrorText,
   repairMessages,
+  resolvePortalOutputBudget,
   resolveToolCallPolicy,
   validateChatRequest,
+  isModelCapacityError,
 } from "../server/utils/chat-service.ts";
 import { stateStore } from "../server/utils/state-store.ts";
 import { getProxyConfig, resetProxyConfigForTests } from "../server/utils/config.ts";
 import { HttpError } from "../server/utils/http.ts";
+import { portalClient, PortalError } from "../server/utils/portal-client.ts";
 import { FINAL_REPLY_MARKER, InvalidStructuredToolCallsError, withToolCallContract } from "../server/utils/tool-calls.ts";
 import type { ChatMessage, JsonObject, JsonValue, ToolDefinition, UpstreamCompletion } from "../server/utils/types.ts";
+
+test("model capacity classification prefers structured signals and is status-independent", () => {
+  assert.equal(isModelCapacityError(new PortalError(
+    "busy",
+    503,
+    undefined,
+    { error: { code: "concurrent_limit", used: 5, limit: 5 } },
+  )), true);
+  assert.equal(isModelCapacityError(new PortalError("5/5 slots in use", 503)), true);
+  assert.equal(isModelCapacityError(new PortalError("The selected portal account is rate limited.", 429)), false);
+});
 
 const tool = {
   type: "function",
@@ -128,6 +145,14 @@ test("validateChatRequest returns the parsed model, messages and tools", () => {
   assert.equal(validated.tools[0]?.function.name, "lookup");
 });
 
+test("validateChatRequest accepts opaque tool-call IDs", () => {
+  const validated = validateChatRequest(validRequest({
+    messages: [{ role: "tool", tool_call_id: "Bash:7", content: "done" }] as unknown as JsonValue,
+  }));
+
+  assert.equal(validated.messages[0]?.tool_call_id, "Bash:7");
+});
+
 test("validateChatRequest normalizes tool definitions", () => {
   const validated = validateChatRequest(validRequest({
     tools: [{
@@ -164,6 +189,14 @@ test("validateChatRequest falls back to the configured default model", () => {
     }
     assert.equal(validateChatRequest(request).model, getProxyConfig().defaultModel);
   }
+});
+
+test("portal output budget applies the configured floor without exceeding the round cap", () => {
+  assert.equal(resolvePortalOutputBudget(validRequest({ max_tokens: 128 }), 8_192), 8_192);
+  assert.equal(resolvePortalOutputBudget(validRequest({ max_completion_tokens: 128 }), 0), 128);
+  assert.equal(resolvePortalOutputBudget(validRequest({ max_tokens: 4_096 }), 1_024), 4_096);
+  assert.equal(resolvePortalOutputBudget(validRequest({ max_tokens: 100_000 }), 8_192), 8_192);
+  assert.equal(resolvePortalOutputBudget(validRequest(), 8_192), 8_192);
 });
 
 test("validateChatRequest accepts valid tool_choice and sampling variants", () => {
@@ -431,6 +464,141 @@ test("executeChatRequest validates when no validation result is supplied", async
         return true;
       },
     );
+  });
+});
+
+test("executeChatRequest rotates a failed custom proxy into the pool", async () => {
+  await withEmptyDataDir(async () => {
+    stateStore.resetForTests(); accountScheduler.resetForTests();
+    const account = await stateStore.addAccount({ email: "custom-request@example.com", password: "secret", models: ["test-model"], proxy: "http://custom.local:8080/" });
+    const originalProxy = account.proxy;
+    const [replacement] = await stateStore.importProxyPool([{ url: "http://replacement.local:8080/", kind: "http" }]);
+    await stateStore.updateSettings({ proxyPool: { autoRotateOnTransportError: true, retryCurrentRequestAfterRotation: true } });
+    const originalRequestChat = portalClient.requestChat; const originalCheckProxy = portalClient.checkProxy;
+    const proxies: Array<string | undefined> = [];
+    portalClient.checkProxy = async () => {};
+    portalClient.requestChat = (async (candidate) => {
+      proxies.push(candidate.proxy);
+      if (proxies.length === 1) throw new ProxyTransportError("offline");
+      return new Response(JSON.stringify({ choices: [{ index: 0, message: { role: "assistant", content: "ok" }, finish_reason: "stop" }] }), { status: 200, headers: { "Content-Type": "application/json" } });
+    }) as typeof portalClient.requestChat;
+    try {
+      const execution = await executeChatRequest(validRequest());
+      assert.equal(execution.message.content, "ok");
+      assert.deepEqual(proxies, [originalProxy, replacement?.entry.url]);
+      assert.equal((await stateStore.getAccount(account.id))?.proxyPoolEntryId, replacement?.entry.id);
+    } finally {
+      portalClient.requestChat = originalRequestChat; portalClient.checkProxy = originalCheckProxy;
+      accountScheduler.resetForTests(); stateStore.resetForTests();
+    }
+  });
+});
+
+test("executeChatRequest rotates one failed pool proxy and retries with the replacement", async () => {
+  await withEmptyDataDir(async () => {
+    stateStore.resetForTests();
+    accountScheduler.resetForTests();
+    const account = await stateStore.addAccount({ email: "rotate@example.com", password: "secret", models: ["test-model"] });
+    const [oldPool, newPool] = await stateStore.importProxyPool([
+      { url: "http://old.local:8080/", kind: "http" },
+      { url: "http://new.local:8080/", kind: "http" },
+    ]);
+    const bound = await stateStore.bindProxyPoolEntry(account.id, oldPool!.entry.id);
+    await stateStore.updateSettings({ proxyPool: { autoRotateOnTransportError: true, retryCurrentRequestAfterRotation: true } });
+
+    const originalRequestChat = portalClient.requestChat;
+    const originalCheckProxy = portalClient.checkProxy;
+    const originalRotate = proxyPoolService.rotate;
+    const proxies: Array<string | undefined> = [];
+    let rotations = 0;
+    portalClient.checkProxy = async () => {};
+    portalClient.requestChat = (async (candidate) => {
+      proxies.push(candidate.proxy);
+      if (proxies.length === 1) throw new ProxyTransportError("proxy offline");
+      return new Response(JSON.stringify({
+        choices: [{ index: 0, message: { role: "assistant", content: "ok" }, finish_reason: "stop" }],
+      }), { status: 200, headers: { "Content-Type": "application/json" } });
+    }) as typeof portalClient.requestChat;
+    proxyPoolService.rotate = (async (...args) => {
+      rotations += 1;
+      return originalRotate.apply(proxyPoolService, args);
+    }) as typeof proxyPoolService.rotate;
+    try {
+      const execution = await executeChatRequest(validRequest());
+      assert.equal(execution.message.content, "ok");
+      assert.deepEqual(proxies, [oldPool?.entry.url, newPool?.entry.url]);
+      assert.equal(rotations, 1);
+      assert.equal((await stateStore.getAccount(account.id))?.proxyPoolEntryId, newPool?.entry.id);
+    } finally {
+      portalClient.requestChat = originalRequestChat;
+      portalClient.checkProxy = originalCheckProxy;
+      proxyPoolService.rotate = originalRotate;
+      accountScheduler.resetForTests();
+      stateStore.resetForTests();
+    }
+  });
+});
+
+test("executeChatRequest marks the replacement error without a second rotation", async () => {
+  await withEmptyDataDir(async () => {
+    stateStore.resetForTests();
+    accountScheduler.resetForTests();
+    const account = await stateStore.addAccount({ email: "twice@example.com", password: "secret", models: ["test-model"] });
+    const [oldPool, newPool] = await stateStore.importProxyPool([
+      { url: "http://old.local:8080/", kind: "http" },
+      { url: "http://new.local:8080/", kind: "http" },
+    ]);
+    await stateStore.bindProxyPoolEntry(account.id, oldPool!.entry.id);
+    await stateStore.updateSettings({ proxyPool: { autoRotateOnTransportError: true, retryCurrentRequestAfterRotation: true } });
+    const originalRequestChat = portalClient.requestChat;
+    const originalCheckProxy = portalClient.checkProxy;
+    const originalRotate = proxyPoolService.rotate;
+    let rotations = 0;
+    portalClient.checkProxy = async () => {};
+    portalClient.requestChat = (async () => { throw new ProxyTransportError("proxy offline"); }) as typeof portalClient.requestChat;
+    proxyPoolService.rotate = (async (...args) => { rotations += 1; return originalRotate.apply(proxyPoolService, args); }) as typeof proxyPoolService.rotate;
+    try {
+      await assert.rejects(executeChatRequest(validRequest()));
+      assert.equal(rotations, 1);
+      const current = await stateStore.getAccount(account.id);
+      assert.equal(current?.proxyPoolEntryId, newPool?.entry.id);
+      assert.equal((await stateStore.getProxyPoolEntry(newPool!.entry.id))?.lastError, "proxy offline");
+    } finally {
+      portalClient.requestChat = originalRequestChat;
+      portalClient.checkProxy = originalCheckProxy;
+      proxyPoolService.rotate = originalRotate;
+      accountScheduler.resetForTests();
+      stateStore.resetForTests();
+    }
+  });
+});
+
+test("executeChatRequest does not rotate for a portal rate limit", async () => {
+  await withEmptyDataDir(async () => {
+    stateStore.resetForTests();
+    accountScheduler.resetForTests();
+    const account = await stateStore.addAccount({ email: "rate@example.com", password: "secret", models: ["test-model"] });
+    const [pool] = await stateStore.importProxyPool([{ url: "http://pool.local:8080/", kind: "http" }]);
+    await stateStore.bindProxyPoolEntry(account.id, pool!.entry.id);
+    await stateStore.updateSettings({ proxyPool: { autoRotateOnTransportError: true } });
+
+    const originalRequestChat = portalClient.requestChat;
+    const originalRotate = proxyPoolService.rotate;
+    let rotations = 0;
+    portalClient.requestChat = (async () => { throw new PortalError("rate limited", 429); }) as typeof portalClient.requestChat;
+    proxyPoolService.rotate = (async (...args) => {
+      rotations += 1;
+      return originalRotate.apply(proxyPoolService, args);
+    }) as typeof proxyPoolService.rotate;
+    try {
+      await assert.rejects(executeChatRequest(validRequest()));
+      assert.equal(rotations, 0);
+    } finally {
+      portalClient.requestChat = originalRequestChat;
+      proxyPoolService.rotate = originalRotate;
+      accountScheduler.resetForTests();
+      stateStore.resetForTests();
+    }
   });
 });
 

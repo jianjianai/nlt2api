@@ -5,7 +5,7 @@ import { join } from "node:path";
 import test from "node:test";
 import { resetProxyConfigForTests } from "../server/utils/config.ts";
 import { HttpError } from "../server/utils/http.ts";
-import { maskProxyUrl, normalizeProxyUrl, proxyDispatcher } from "../server/utils/proxy.ts";
+import { maskProxyUrl, normalizeProxyUrl, parseProxyImportLine, proxyDispatcher, proxyDispatcherCacheSize, resetProxyDispatcherCacheForTests } from "../server/utils/proxy.ts";
 import { StateStore } from "../server/utils/state-store.ts";
 
 async function withTempStore<T>(run: (store: StateStore) => Promise<T>): Promise<T> {
@@ -25,6 +25,24 @@ async function withTempStore<T>(run: (store: StateStore) => Promise<T>): Promise
     await rm(dir, { recursive: true, force: true });
   }
 }
+
+test("parseProxyImportLine accepts URLs, shorthand authentication and bracketed IPv6", () => {
+  assert.deepEqual(parseProxyImportLine("proxy.local:8080", "http"), {
+    source: "proxy.local:8080",
+    url: "http://proxy.local:8080/",
+    kind: "http",
+  });
+  assert.equal(parseProxyImportLine("proxy.local:1080:user name:p@ss", "socks5").url, "socks5://user%20name:p%40ss@proxy.local:1080");
+  assert.equal(parseProxyImportLine("alice:secret@proxy.local:1080", "socks5").url, "socks5://alice:secret@proxy.local:1080");
+  assert.equal(parseProxyImportLine("[2001:db8::1]:1080", "socks4").url, "socks4://[2001:db8::1]:1080");
+  assert.equal(parseProxyImportLine("socks5h://user:pass@proxy.local:1080", "http").kind, "socks5");
+});
+
+test("parseProxyImportLine rejects malformed shorthand", () => {
+  for (const value of ["host", "host:nope", "user@host:80", "2001:db8::1:1080", "[2001:db8::1]"]) {
+    assert.throws(() => parseProxyImportLine(value, "http"), HttpError);
+  }
+});
 
 test("normalizeProxyUrl accepts http and socks proxies with optional auth", () => {
   assert.equal(normalizeProxyUrl("http://proxy.local:8080"), "http://proxy.local:8080/");
@@ -57,6 +75,16 @@ test("maskProxyUrl hides credentials but keeps scheme, host and port", () => {
   assert.equal(maskProxyUrl("http://proxy.local:8080/"), "http://proxy.local:8080");
   assert.equal(maskProxyUrl("socks5://alice:secret@10.0.0.2:1080"), "socks5://al***@10.0.0.2:1080");
   assert.equal(maskProxyUrl("not-a-url"), "***");
+});
+
+test("proxyDispatcher cache is bounded and clearable", async () => {
+  await resetProxyDispatcherCacheForTests();
+  for (let index = 0; index < 140; index += 1) {
+    proxyDispatcher(`http://user${index}:pass@proxy-${index}.local:8080`);
+  }
+  assert.equal(proxyDispatcherCacheSize(), 128);
+  await resetProxyDispatcherCacheForTests();
+  assert.equal(proxyDispatcherCacheSize(), 0);
 });
 
 test("proxyDispatcher returns a cached dispatcher per proxy URL", () => {

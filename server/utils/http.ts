@@ -31,6 +31,12 @@ export function openAIErrorResponse(error: unknown): Response {
   const known = error instanceof HttpError
     ? error
     : new HttpError(500, "Internal proxy error.", "server_error");
+  const retryAfterSeconds = "retryAfterSeconds" in known
+    && typeof known.retryAfterSeconds === "number"
+    && Number.isFinite(known.retryAfterSeconds)
+    && known.retryAfterSeconds > 0
+    ? Math.ceil(known.retryAfterSeconds)
+    : undefined;
   return jsonResponse({
     error: {
       message: known.message,
@@ -38,7 +44,7 @@ export function openAIErrorResponse(error: unknown): Response {
       ...(known.param ? { param: known.param } : {}),
       ...(known.code ? { code: known.code } : {}),
     },
-  }, known.status);
+  }, known.status, retryAfterSeconds ? { "Retry-After": String(retryAfterSeconds) } : undefined);
 }
 
 export function jsonResponse(body: JsonValue | Record<string, unknown>, status = 200, headers?: HeadersInit): Response {
