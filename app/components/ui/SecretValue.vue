@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, ref, watch } from "vue";
+import AppIcon from "./AppIcon.vue";
 
 const props = withDefaults(defineProps<{
   value: string;
@@ -43,8 +44,8 @@ onBeforeUnmount(() => {
   <div class="secret-value">
     <code :aria-label="`${label}：${revealed ? '已显示' : '已遮罩'}`">{{ revealed ? value || "未配置" : masked }}</code>
     <div class="secret-actions">
-      <button class="inline-action" type="button" :disabled="!value" :aria-label="revealed ? `隐藏${label}` : `显示${label}，30秒后自动隐藏`" @click="toggle">{{ revealed ? "隐藏" : "显示" }}</button>
-      <button class="inline-action" type="button" :disabled="!value" :aria-label="`复制${label}`" @click="copy?.(value, label)">复制</button>
+      <button class="inline-action" type="button" :disabled="!value" :aria-label="revealed ? `隐藏${label}` : `显示${label}，30秒后自动隐藏`" :title="revealed ? '隐藏' : '显示'" @click="toggle"><AppIcon :name="revealed ? 'eye-off' : 'eye'" :size="13" />{{ revealed ? "隐藏" : "显示" }}</button>
+      <button class="inline-action" type="button" :disabled="!value" :aria-label="`复制${label}`" title="复制" @click="copy?.(value, label)"><AppIcon name="copy" :size="13" />复制</button>
     </div>
   </div>
 </template>

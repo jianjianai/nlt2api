@@ -5,6 +5,7 @@ import { join } from "node:path";
 import test from "node:test";
 import { resetProxyConfigForTests } from "../server/utils/config.ts";
 import { stateStore } from "../server/utils/state-store.ts";
+import { usageAnalytics } from "../server/utils/usage-analytics.ts";
 import { accountScheduler } from "../server/utils/account-scheduler.ts";
 import { assertModelSupported } from "../server/utils/chat-service.ts";
 import { HttpError } from "../server/utils/http.ts";
@@ -18,6 +19,7 @@ async function withTempStore<T>(run: () => Promise<T>): Promise<T> {
   try {
     return await run();
   } finally {
+    await usageAnalytics.resetForTests();
     if (previous === undefined) {
       delete process.env.NEURALWATT_DATA_DIR;
     } else {

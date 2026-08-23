@@ -1,4 +1,6 @@
 import { createHash } from "node:crypto";
+import type { ForecastConstraint, SchedulerAnalyticsEvent } from "~/server/utils/analytics-types.ts";
+import { usageAnalytics } from "~/server/utils/usage-analytics.ts";
 import { HttpError } from "~/server/utils/http.ts";
 import { egressIdentity, type EgressIdentity } from "~/server/utils/proxy.ts";
 import { stateStore } from "~/server/utils/state-store.ts";
@@ -43,6 +45,9 @@ interface InternalEgressRuntime {
 export interface AccountLease {
   /** Immutable account/egress snapshot used for this real portal attempt. */
   account: ManagedAccount;
+  model: string;
+  egressId: string;
+  admittedAt: number;
   admissionSequence: number;
   release(): void;
 }
@@ -63,6 +68,7 @@ export interface AccountSchedulerDependencies {
   now(): number;
   setTimer(callback: () => void, delayMs: number): TimerHandle;
   clearTimer(handle: TimerHandle): void;
+  emitAnalytics?(event: SchedulerAnalyticsEvent): void;
 }
 
 interface Waiter {
@@ -72,11 +78,13 @@ interface Waiter {
   resolve: (lease: AccountLease) => void;
   reject: (error: unknown) => void;
   abort?: () => void;
+  blockedReported: boolean;
 }
 
 interface AdmissionBlocked {
   kind: "blocked";
   nextEligibleAt?: number;
+  constraint: ForecastConstraint;
 }
 
 interface AdmissionGranted {
@@ -97,6 +105,7 @@ const productionDependencies: AccountSchedulerDependencies = {
   now: () => Date.now(),
   setTimer: (callback, delayMs) => setTimeout(callback, delayMs),
   clearTimer: (handle) => clearTimeout(handle),
+  emitAnalytics: (event) => usageAnalytics.recordSchedulerEvent(event),
 };
 
 function assignmentKey(value: string): string {
@@ -159,13 +168,15 @@ export class AccountScheduler {
     this.lastSettings = settings;
 
     const sequence = this.sequence++;
+    const enqueuedAt = this.dependencies.now();
     return new Promise<AccountLease>((resolve, reject) => {
       const waiter: Waiter = {
         sequence,
-        enqueuedAt: this.dependencies.now(),
+        enqueuedAt,
         options: { ...options, excludedAccountIds: new Set(options.excludedAccountIds ?? []) },
         resolve,
         reject,
+        blockedReported: false,
       };
       if (options.signal) {
         waiter.abort = () => {
@@ -408,6 +419,13 @@ export class AccountScheduler {
         if (settings.queueTimeoutSeconds > 0) {
           const timeoutAt = waiter.enqueuedAt + settings.queueTimeoutSeconds * 1_000;
           if (timeoutAt <= now) {
+            this.emitAnalytics({
+              type: "rejected",
+              at: now,
+              model: waiter.options.model,
+              waitMs: Math.max(0, now - waiter.enqueuedAt),
+              constraint: "queue_policy",
+            });
             this.settleWaiter(waiter, () => waiter.reject(new SchedulerAdmissionError(
               "Timed out while waiting for upstream capacity.",
               "queue_timeout",
@@ -421,12 +439,37 @@ export class AccountScheduler {
 
         const result = this.tryAdmit(waiter, accounts, settings, now);
         if (result.kind === "granted") {
+          this.emitAnalytics({
+            type: "admitted",
+            at: now,
+            model: waiter.options.model,
+            accountId: result.lease.account.id,
+            egressId: result.lease.egressId,
+            waitMs: Math.max(0, now - waiter.enqueuedAt),
+          });
           this.settleWaiter(waiter, () => waiter.resolve(result.lease));
           progress = true;
         } else if (result.kind === "impossible") {
+          this.emitAnalytics({
+            type: "rejected",
+            at: now,
+            model: waiter.options.model,
+            waitMs: Math.max(0, now - waiter.enqueuedAt),
+            constraint: "no_healthy_account",
+          });
           this.settleWaiter(waiter, () => waiter.reject(result.error));
           progress = true;
         } else {
+          if (!waiter.blockedReported) {
+            waiter.blockedReported = true;
+            this.emitAnalytics({
+              type: "blocked",
+              at: now,
+              model: waiter.options.model,
+              waitMs: Math.max(0, now - waiter.enqueuedAt),
+              constraint: result.constraint,
+            });
+          }
           earliestWake = minDefined(earliestWake, result.nextEligibleAt);
         }
       }
@@ -435,6 +478,13 @@ export class AccountScheduler {
     if (settings.maxQueueSize > 0 && this.waiters.length > settings.maxQueueSize) {
       const overflow = this.waiters.slice(settings.maxQueueSize);
       for (const waiter of overflow) {
+        this.emitAnalytics({
+          type: "rejected",
+          at: this.dependencies.now(),
+          model: waiter.options.model,
+          waitMs: Math.max(0, this.dependencies.now() - waiter.enqueuedAt),
+          constraint: "queue_policy",
+        });
         this.settleWaiter(waiter, () => waiter.reject(new SchedulerAdmissionError(
           "The upstream capacity queue is full.",
           "queue_full",
@@ -486,16 +536,19 @@ export class AccountScheduler {
     ranked.push(...remaining);
 
     let nextEligibleAt: number | undefined;
+    const constraints = new Set<ForecastConstraint>();
     for (const account of ranked) {
       const runtime = this.runtimeFor(account.id);
       this.pruneTimes(runtime.requestTimes, now);
       this.pruneModelCooldowns(runtime, now);
       if (runtime.cooldownUntil > now) {
+        constraints.add("account_cooldown");
         nextEligibleAt = minDefined(nextEligibleAt, runtime.cooldownUntil);
         continue;
       }
       const modelCooldown = runtime.modelCooldownUntil.get(waiter.options.model) ?? 0;
       if (modelCooldown > now) {
+        constraints.add("model_cooldown");
         nextEligibleAt = minDefined(nextEligibleAt, modelCooldown);
         continue;
       }
@@ -503,10 +556,12 @@ export class AccountScheduler {
         ?? account.schedulerOverrides?.accountModelConcurrency
         ?? settings.accountModelConcurrency;
       if ((runtime.modelInFlight.get(waiter.options.model) ?? 0) >= concurrency) {
+        constraints.add("model_concurrency");
         continue;
       }
       const accountRpm = account.schedulerOverrides?.accountRpm ?? settings.accountRpm;
       if (runtime.requestTimes.length >= accountRpm) {
+        constraints.add("account_rpm");
         nextEligibleAt = minDefined(nextEligibleAt, this.rateAvailableAt(runtime.requestTimes, accountRpm));
         continue;
       }
@@ -516,6 +571,7 @@ export class AccountScheduler {
       const egressLimited = !identity.direct || settings.directEgressLimitEnabled;
       const egressRpm = identity.direct ? settings.directEgressRpm : settings.proxyRpm;
       if (egressLimited && egress.requestTimes.length >= egressRpm) {
+        constraints.add("shared_egress_rpm");
         nextEligibleAt = minDefined(nextEligibleAt, this.rateAvailableAt(egress.requestTimes, egressRpm));
         continue;
       }
@@ -533,17 +589,37 @@ export class AccountScheduler {
         lease: this.lease(accountSnapshot, waiter.options.model, this.nextAdmissionSequence++),
       };
     }
-    return { kind: "blocked", nextEligibleAt };
+    const constraint = [
+      "shared_egress_rpm",
+      "account_rpm",
+      "model_concurrency",
+      "model_cooldown",
+      "account_cooldown",
+    ].find((value) => constraints.has(value as ForecastConstraint)) as ForecastConstraint | undefined;
+    return { kind: "blocked", nextEligibleAt, constraint: constraint ?? "no_healthy_account" };
   }
 
   private lease(account: ManagedAccount, model: string, admissionSequence: number): AccountLease {
     let released = false;
+    const admittedAt = this.dependencies.now();
+    const egressId = egressIdentity(account.proxy).id;
     return {
       account,
+      model,
+      egressId,
+      admittedAt,
       admissionSequence,
       release: () => {
         if (released) return;
         released = true;
+        this.emitAnalytics({
+          type: "released",
+          at: this.dependencies.now(),
+          model,
+          accountId: account.id,
+          egressId,
+          durationMs: Math.max(0, this.dependencies.now() - admittedAt),
+        });
         const runtime = this.runtimeFor(account.id);
         const count = runtime.modelInFlight.get(model) ?? 0;
         if (count <= 1) runtime.modelInFlight.delete(model);
@@ -551,6 +627,14 @@ export class AccountScheduler {
         this.requestDrain();
       },
     };
+  }
+
+  private emitAnalytics(event: SchedulerAnalyticsEvent): void {
+    try {
+      this.dependencies.emitAnalytics?.(event);
+    } catch {
+      // Capacity observation must never affect scheduler admission.
+    }
   }
 
   private runtimeFor(accountId: string): InternalAccountRuntime {

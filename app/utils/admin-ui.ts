@@ -143,6 +143,36 @@ export function deriveOverview(
   };
 }
 
+export function formatMicroUsd(value: number): string {
+  const dollars = Math.max(0, value) / 1_000_000;
+  if (dollars >= 1_000) return `$${dollars.toLocaleString("en-US", { maximumFractionDigits: 0 })}`;
+  if (dollars >= 1) return `$${dollars.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+  if (dollars > 0) return `$${dollars.toLocaleString("en-US", { minimumFractionDigits: 4, maximumFractionDigits: 6 })}`;
+  return "$0.00";
+}
+
+export function forecastConstraintLabel(value: import("../types/admin.ts").ForecastConstraint): string {
+  return {
+    account_rpm: "账号 RPM",
+    model_concurrency: "模型并发",
+    shared_egress_rpm: "共享出口 RPM",
+    no_healthy_account: "无健康账号",
+    model_cooldown: "模型冷却",
+    account_cooldown: "账号冷却",
+    queue_policy: "队列策略",
+    insufficient_samples: "样本不足",
+  }[value];
+}
+
+export function confidenceLabel(value: "high" | "medium" | "low"): string {
+  return value === "high" ? "高置信度" : value === "medium" ? "中置信度" : "低置信度";
+}
+
+export function signedPercent(value: number): string {
+  if (!Number.isFinite(value) || Math.abs(value) < 0.0005) return "0%";
+  return `${value > 0 ? "+" : ""}${Math.round(value * 100)}%`;
+}
+
 export function proxyPolicySummary(settings: ProxyPoolSettings): string {
   const enabled: string[] = [];
   if (settings.autoAssignOnAccountCreate) enabled.push("新增账号自动匹配");

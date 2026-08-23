@@ -44,6 +44,10 @@ export interface UpstreamUsage {
     cached_tokens?: number;
     [key: string]: JsonValue | undefined;
   };
+  completion_tokens_details?: {
+    reasoning_tokens?: number;
+    [key: string]: JsonValue | undefined;
+  };
   [key: string]: JsonValue | undefined;
 }
 

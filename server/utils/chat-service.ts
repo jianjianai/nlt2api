@@ -1,4 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
+import type { UsageAttemptHandle, UsageExecutionTracker } from "~/server/utils/usage-analytics.ts";
+import { usageAnalytics } from "~/server/utils/usage-analytics.ts";
 import { parse as parseJsonSourceMap } from "json-source-map";
 import { accountScheduler, type AccountLease } from "~/server/utils/account-scheduler.ts";
 import { getProxyConfig } from "~/server/utils/config.ts";
@@ -11,7 +13,7 @@ import {
 } from "~/server/utils/json-schema.ts";
 import { portalClient, PortalError, readPortalJsonBody, retryAfterSeconds } from "~/server/utils/portal-client.ts";
 import { proxyPoolService } from "~/server/utils/proxy-pool.ts";
-import { ProxyTransportError } from "~/server/utils/proxy.ts";
+import { egressIdentity, ProxyTransportError } from "~/server/utils/proxy.ts";
 import { ProxyRequestError, type RequestDebugContext } from "~/server/utils/request-errors.ts";
 import { stateStore } from "~/server/utils/state-store.ts";
 import { collectUpstreamStream, UpstreamStreamError, type UpstreamFrameHandler } from "~/server/utils/upstream-stream.ts";
@@ -500,6 +502,7 @@ async function getCompletion(
   onFrame?: UpstreamFrameHandler,
   signal?: AbortSignal,
   trace?: UpstreamTrace,
+  analytics?: UsageExecutionTracker,
 ): Promise<{ account: ManagedAccount; completion: UpstreamCompletion; receivedSse: boolean }> {
   const excluded = new Set<string>();
   let lastError: PortalError | undefined;
@@ -554,6 +557,25 @@ async function getCompletion(
       : undefined;
     debugCall && trace!.calls.push(debugCall);
     let streamedOutput = false;
+    let observedAttemptUsage: UpstreamUsage | undefined;
+    let analyticsAttempt: UsageAttemptHandle | undefined = analytics?.startAttempt({
+      type: trace?.type ?? "initial",
+      model,
+      accountId: account.id,
+      egressHash: egressIdentity(account.proxy).id,
+    });
+    const finishAnalyticsAttempt = (status: number, outcome: "success" | "failure" | "aborted", usage?: UpstreamUsage): void => {
+      analytics?.finishAttempt(analyticsAttempt, { status, outcome, usage });
+      analyticsAttempt = undefined;
+    };
+    const startRetryAnalyticsAttempt = (): void => {
+      analyticsAttempt = analytics?.startAttempt({
+        type: "retry",
+        model,
+        accountId: account.id,
+        egressHash: egressIdentity(account.proxy).id,
+      });
+    };
     let receivedSse = false;
 
     try {
@@ -566,6 +588,7 @@ async function getCompletion(
         signal,
         trace
           ? async (retry) => {
+            finishAnalyticsAttempt(retry.status, "failure");
             if (debugCall && trace) {
               if (retry.status > 0) {
                 debugCall.responseStatus = retry.status;
@@ -583,7 +606,8 @@ async function getCompletion(
             // concurrency slot while the portal backs off or refreshes auth.
             lease.release();
           }
-          : async () => {
+          : async (retry) => {
+            finishAnalyticsAttempt(retry.status, "failure");
             lease.release();
           },
         async () => {
@@ -592,6 +616,7 @@ async function getCompletion(
             accountSnapshot: account,
             signal,
           });
+          startRetryAnalyticsAttempt();
         },
       );
       const contentType = response.headers.get("content-type")?.toLowerCase() ?? "";
@@ -639,6 +664,7 @@ async function getCompletion(
         completion = payload as unknown as UpstreamCompletion;
       }
       currentContext.upstreamResponse = payload as JsonObject | undefined;
+      observedAttemptUsage = completion?.usage;
       if (!payload) {
         throw new PortalError("The NeuralWatt portal returned a non-object completion.", 502);
       }
@@ -664,9 +690,18 @@ async function getCompletion(
       if (!choice || !message || (typeof content !== "string" && !hasStructuredCalls && !hasRepairableEmptyContent)) {
         throw new PortalError("The NeuralWatt portal returned an invalid completion shape.", 502);
       }
+      finishAnalyticsAttempt(response.status, "success", observedAttemptUsage);
       accountScheduler.markSuccess(account.id, lease.admissionSequence);
       return { account, completion, receivedSse };
     } catch (error) {
+      const attemptStatus = error instanceof PortalError || error instanceof UpstreamStreamError
+        ? error.status
+        : error instanceof ClientDisconnectedError || signal?.aborted || isAbortError(error)
+          ? 499
+          : error instanceof HttpError
+            ? error.status
+            : 500;
+      finishAnalyticsAttempt(attemptStatus, attemptStatus === 499 ? "aborted" : "failure", observedAttemptUsage);
       if (error instanceof HttpError) {
         throw error;
       }
@@ -1245,6 +1280,7 @@ async function executeChatRequestOnce(
     upstreamCalls?: DebugUpstreamCall[];
     validated?: ValidatedChatRequest;
     toolCallPolicy?: ToolCallPolicy;
+    analytics?: UsageExecutionTracker;
   },
 ): Promise<ChatExecution> {
   const { model, messages, tools, toolCallPolicy, upstreamMessages: prebuiltMessages } = options?.validated ?? validateChatRequest(request, options?.toolCallPolicy);
@@ -1280,6 +1316,7 @@ async function executeChatRequestOnce(
     options?.upstreamCalls
       ? { calls: options.upstreamCalls, type: "initial", round: 1 }
       : undefined,
+    options?.analytics,
   );
   if (mayContinueThinking && thinkingBudget !== undefined && isThinkingInterrupted(result.completion)) {
     result = await continueThinking(upstreamRequest, result, thinkingBudget, {
@@ -1288,6 +1325,7 @@ async function executeChatRequestOnce(
       onUpstreamFrame: clientFrameHandler,
       signal: options?.signal,
       upstreamCalls: options?.upstreamCalls,
+      analytics: options?.analytics,
     });
   }
   let message: ChatMessage;
@@ -1397,6 +1435,7 @@ async function executeChatRequestOnce(
           options?.upstreamCalls
             ? { calls: options.upstreamCalls, type: "repair", round: toolCallAdapter.repairAttempts }
             : undefined,
+          options?.analytics,
         );
       } catch (error) {
         if (error instanceof ClientDisconnectedError || options?.signal?.aborted) {
@@ -1560,6 +1599,20 @@ function addUsageTotals(
     const right = typeof usage?.[key] === "number" ? usage[key] : 0;
     if (left || right) merged[key] = left + right;
   }
+  const mergedDetails = {
+    ...(total?.prompt_tokens_details ?? {}),
+    ...(usage?.prompt_tokens_details ?? {}),
+    cached_tokens: (typeof total?.prompt_tokens_details?.cached_tokens === "number" ? total.prompt_tokens_details.cached_tokens : 0)
+      + (typeof usage?.prompt_tokens_details?.cached_tokens === "number" ? usage.prompt_tokens_details.cached_tokens : 0),
+  };
+  const completionDetails = {
+    ...(total?.completion_tokens_details ?? {}),
+    ...(usage?.completion_tokens_details ?? {}),
+    reasoning_tokens: (typeof total?.completion_tokens_details?.reasoning_tokens === "number" ? total.completion_tokens_details.reasoning_tokens : 0)
+      + (typeof usage?.completion_tokens_details?.reasoning_tokens === "number" ? usage.completion_tokens_details.reasoning_tokens : 0),
+  };
+  merged.prompt_tokens_details = mergedDetails;
+  merged.completion_tokens_details = completionDetails;
   return merged;
 }
 
@@ -1574,20 +1627,34 @@ export async function executeChatRequest(
     signal?: AbortSignal;
     validated?: ValidatedChatRequest;
     toolCallPolicy?: ToolCallPolicy;
+    endpoint?: "/v1/chat/completions" | "/v1/responses";
   },
 ): Promise<ChatExecution> {
-  const { validated: prevalidated, ...forwardedOptions } = options ?? {};
+  const { validated: prevalidated, endpoint = "/v1/chat/completions", ...forwardedOptions } = options ?? {};
   // Validate once per client request; execution reuses the supplied result
   // instead of re-running the full validation pipeline.
   const validated = prevalidated ?? validateChatRequest(request, options?.toolCallPolicy);
+  const analytics = usageAnalytics.beginExecution(endpoint, validated.model);
   const upstreamCalls: DebugUpstreamCall[] = [];
   try {
-    return await executeChatRequestOnce(request, {
+    const execution = await executeChatRequestOnce(request, {
       ...forwardedOptions,
       upstreamCalls,
       validated,
+      analytics,
     });
+    void analytics.settle({ status: 200, outcome: "success" }).catch(() => undefined);
+    return execution;
   } catch (error) {
+    const original = error instanceof ProxyRequestError ? error.originalError : error;
+    const status = original instanceof HttpError
+      ? original.status
+      : original instanceof PortalError || original instanceof UpstreamStreamError
+        ? original.status
+        : original instanceof ClientDisconnectedError
+          ? 499
+          : 500;
+    void analytics.settle({ status, outcome: status === 499 ? "aborted" : "failure" }).catch(() => undefined);
     if (error instanceof ProxyRequestError) {
       error.debugContext.upstreamCalls = upstreamCalls;
       throw error;
@@ -1605,6 +1672,7 @@ interface ThinkingContinuationOptions {
   onUpstreamFrame?: UpstreamFrameHandler;
   signal?: AbortSignal;
   upstreamCalls?: DebugUpstreamCall[];
+  analytics?: UsageExecutionTracker;
 }
 
 /**
@@ -1671,6 +1739,7 @@ async function continueThinking(
       options.upstreamCalls
         ? { calls: options.upstreamCalls, type: "continuation", round }
         : undefined,
+      options.analytics,
     );
     round += 1;
     account = next.account;

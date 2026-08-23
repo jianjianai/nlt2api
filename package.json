@@ -13,7 +13,7 @@
     "preview": "vite preview",
     "probe:cli": "node scripts/probe-cli-agents.mjs",
     "probe:tools": "node scripts/probe-tool-first-pass.mjs",
-    "test": "node --experimental-transform-types --import ./tests/register-alias.mjs --test tests/core.test.ts tests/xml-tool-calls.test.ts tests/state-store.test.ts tests/chat-validation.test.ts tests/proxy.test.ts tests/proxy-pool.test.ts tests/response-api.test.ts tests/models.test.ts tests/account-scheduler.test.ts tests/admin-ui.test.ts",
+    "test": "node --experimental-transform-types --import ./tests/register-alias.mjs --test tests/core.test.ts tests/xml-tool-calls.test.ts tests/state-store.test.ts tests/analytics-database.test.ts tests/analytics-api.test.ts tests/model-pricing.test.ts tests/capacity-forecast.test.ts tests/chat-validation.test.ts tests/proxy.test.ts tests/proxy-pool.test.ts tests/response-api.test.ts tests/models.test.ts tests/account-scheduler.test.ts tests/admin-ui.test.ts",
     "typecheck": "tsc --noEmit"
   },
   "devDependencies": {
@@ -28,6 +28,7 @@
     "fast-xml-validator": "^1.4.2",
     "json-source-map": "^0.6.1",
     "jsonrepair": "^3.15.0",
+    "reka-ui": "^2.10.3",
     "socks": "^2.8.9",
     "txml": "^6.0.1",
     "undici": "^8.10.0",

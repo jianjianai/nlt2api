@@ -1,15 +1,20 @@
 <script setup lang="ts">
-import { computed, nextTick, onMounted, onUnmounted, reactive, ref, shallowRef, watch } from "vue";
-import AccountsWorkspace from "./components/AccountsWorkspace.vue";
-import GatewaySettingsWorkspace from "./components/GatewaySettingsWorkspace.vue";
+import { computed, defineAsyncComponent, nextTick, onMounted, onUnmounted, reactive, ref, shallowRef, watch } from "vue";
+import AppConfirmDialog from "./components/ui/AppConfirmDialog.vue";
+import AppDialog from "./components/ui/AppDialog.vue";
+import AppIcon from "./components/ui/AppIcon.vue";
 import OverviewWorkspace from "./components/OverviewWorkspace.vue";
-import ProxyPoolWorkspace from "./components/ProxyPoolWorkspace.vue";
-import RecordsWorkspace from "./components/RecordsWorkspace.vue";
-import SchedulerWorkspace from "./components/SchedulerWorkspace.vue";
 import WorkspaceShell from "./components/WorkspaceShell.vue";
+// Workspaces are lazy-loaded so the first paint only ships the shell and the
+// default overview; heavier views (records, accounts) load on first visit.
+const AccountsWorkspace = defineAsyncComponent(() => import("./components/AccountsWorkspace.vue"));
+const GatewaySettingsWorkspace = defineAsyncComponent(() => import("./components/GatewaySettingsWorkspace.vue"));
+const ProxyPoolWorkspace = defineAsyncComponent(() => import("./components/ProxyPoolWorkspace.vue"));
+const RecordsWorkspace = defineAsyncComponent(() => import("./components/RecordsWorkspace.vue"));
+const SchedulerWorkspace = defineAsyncComponent(() => import("./components/SchedulerWorkspace.vue"));
 import { DEFAULT_THEME, deriveOverview, parseTheme, parseWorkspace, THEME_STORAGE_KEY, WORKSPACE_STORAGE_KEY } from "./utils/admin-ui.ts";
 import type {
-  Account, ApiPayload, BodyPresentation, ConversationTrace, DebugRawBody, DebugRecord, DebugRecordSummary,
+  Account, AnalyticsGranularity, AnalyticsOverview, AnalyticsQueryResult, AnalyticsRetention, AnalyticsSort, ApiPayload, BodyPresentation, CleanupPreview, ConversationTrace, DebugRawBody, DebugRecord, DebugRecordSummary,
   DebugUpstreamCall, DisplayField, DisplayMessage, DisplayToolCall, GatewayConfig, GatewaySettings,
   PreambleVerbosity, ProxyImportLineResult, ThemeId, ProxyPoolEntry, ProxyPoolSettings, ProxyPoolStatus,
   SchedulerRuntime, SchedulerSettings, SidebarItem, SidebarUpstreamItem, ToolCallFormat, WorkspaceId,
@@ -28,6 +33,24 @@ const secretResetToken = ref(0);
 const accounts = shallowRef<Account[]>([]);
 const proxies = shallowRef<ProxyPoolEntry[]>([]);
 const records = shallowRef<DebugRecordSummary[]>([]);
+const analytics = shallowRef<AnalyticsOverview | null>(null);
+const analyticsResult = shallowRef<AnalyticsQueryResult | null>(null);
+const analyticsRetention = reactive<AnalyticsRetention>({ executionDays: null, minuteDays: null });
+const analyticsRange = ref<"today" | "month" | "custom">("today");
+const analyticsGranularity = ref<AnalyticsGranularity>("minute");
+const analyticsSort = ref<AnalyticsSort>("cost");
+const analyticsModel = ref("");
+const analyticsCustomFrom = ref("");
+const analyticsCustomTo = ref("");
+const isLoadingAnalytics = ref(false);
+const isRefreshingPrices = ref(false);
+const isSavingRetention = ref(false);
+const cleanupCutoff = ref("");
+const cleanupPreview = ref<CleanupPreview | null>(null);
+const showCleanupConfirm = ref(false);
+const isPreviewingCleanup = ref(false);
+const isCleaningAnalytics = ref(false);
+let analyticsRequestSequence = 0;
 const defaultSchedulerSettings: SchedulerSettings = {
   accountModelConcurrency: 5,
   accountRpm: 20,
@@ -145,13 +168,8 @@ const limitEditor = ref<{
 } | null>(null);
 const pendingRemoval = ref<Account | null>(null);
 const showClearConfirm = ref(false);
-const dialogOpen = computed(() => Boolean(showAddAccount.value || proxyEditor.value || modelEditor.value || limitEditor.value || pendingRemoval.value || showClearConfirm.value));
-let dialogOpener: HTMLElement | null = null;
-function captureDialogOpener(): void {
-  dialogOpener = document.activeElement instanceof HTMLElement ? document.activeElement : null;
-}
+const dialogOpen = computed(() => Boolean(showAddAccount.value || proxyEditor.value || modelEditor.value || limitEditor.value || pendingRemoval.value || showClearConfirm.value || showCleanupConfirm.value));
 function openAddAccount(): void {
-  captureDialogOpener();
   showAddAccount.value = true;
 }
 const busyAccountIds = ref(new Set<string>());
@@ -172,13 +190,17 @@ const recordQuery = ref("");
 const recordFilter = ref<"all" | "success" | "failed">("all");
 
 // ---- Auto refresh ----
-const autoRefresh = ref(false);
+const autoRefresh = ref(true);
 let autoRefreshTimer: number | undefined;
 
 // Effective output budget: persisted setting > environment default.
 const effectiveMinimumOutputTokens = computed(() => settings.minimumOutputTokens ?? config.minimumOutputTokens);
 const allModels = computed(() => [...new Set(accounts.value.flatMap((account) => account.models))].sort());
 const overviewSnapshot = computed(() => deriveOverview(accounts.value, proxies.value, schedulerRuntime, config, Date.now()));
+const cleanupDescription = computed(() => cleanupPreview.value
+  ? `将删除 ${cleanupPreview.value.executions} 条执行、${cleanupPreview.value.attempts} 次上游尝试和 ${cleanupPreview.value.minuteBuckets} 个分钟桶。日/月总账与价格版本保持不变。`
+  : "请先生成清理预览。",
+);
 
 function recordFailed(record: DebugRecordSummary): boolean {
   return record.status >= 400 || Boolean(record.error);
@@ -254,6 +276,11 @@ function signOut() {
   sessionStorage.removeItem(tokenStorageKey);
   accounts.value = [];
   proxies.value = [];
+  analytics.value = null;
+  analyticsResult.value = null;
+  cleanupPreview.value = null;
+  showCleanupConfirm.value = false;
+  analyticsRequestSequence += 1;
   proxyImportResults.value = [];
   records.value = [];
   detailCache.clear();
@@ -283,8 +310,12 @@ async function loadDashboard(options?: { silent?: boolean }) {
     proxies.value = payload.proxyPool ?? payload.proxies ?? [];
     applySettings(payload.settings);
     Object.assign(schedulerRuntime, payload.scheduler ?? { pending: 0, oldestWaitMs: 0, egresses: [] });
+    analytics.value = payload.analytics ?? null;
     Object.assign(config, payload.config ?? {});
     minimumOutputTokensDraft.value = effectiveMinimumOutputTokens.value;
+    if ((view.value === "overview" || view.value === "settings") && !analyticsResult.value) {
+      void loadAnalytics();
+    }
     if (view.value === "records") {
       await loadRecords();
     }
@@ -384,6 +415,9 @@ async function selectView(next: WorkspaceId) {
   expandedAccountId.value = null;
   secretResetToken.value += 1;
   localStorage.setItem(WORKSPACE_STORAGE_KEY, next);
+  if ((next === "overview" || next === "settings") && !analyticsResult.value) {
+    await loadAnalytics();
+  }
   if (next === "records") {
     try {
       await loadRecords();
@@ -433,17 +467,14 @@ async function verifyAccount(account: Account) {
 }
 
 function openProxyEditor(account: Account) {
-  captureDialogOpener();
   proxyEditor.value = { account, value: "" };
 }
 
 function openModelEditor(account: Account) {
-  captureDialogOpener();
   modelEditor.value = { account, value: account.models.join("\n") };
 }
 
 function openLimitEditor(account: Account) {
-  captureDialogOpener();
   limitEditor.value = {
     account,
     accountRpm: account.schedulerOverrides?.accountRpm?.toString() ?? "",
@@ -577,7 +608,6 @@ async function toggleAccount(account: Account) {
 }
 
 function askRemoveAccount(account: Account) {
-  captureDialogOpener();
   pendingRemoval.value = account;
 }
 
@@ -760,6 +790,132 @@ function onModelPreambleVerbosityChange(model: string, event: Event) {
   setModelPreambleVerbosity(model, (event.target as HTMLSelectElement).value);
 }
 
+async function loadAnalytics(): Promise<void> {
+  const sequence = ++analyticsRequestSequence;
+  const now = new Date();
+  let from: Date;
+  let to = now;
+  if (analyticsRange.value === "month") {
+    from = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1));
+  } else if (analyticsRange.value === "custom") {
+    from = new Date(`${analyticsCustomFrom.value}T00:00:00.000Z`);
+    to = new Date(`${analyticsCustomTo.value}T00:00:00.000Z`);
+    to.setUTCDate(to.getUTCDate() + 1);
+    if (!Number.isFinite(from.getTime()) || !Number.isFinite(to.getTime()) || from >= to) {
+      pushToast("error", "请选择有效的分析时间范围。");
+      return;
+    }
+  } else {
+    from = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
+  }
+  isLoadingAnalytics.value = true;
+  try {
+    const query = new URLSearchParams({
+      from: from.toISOString(),
+      to: to.toISOString(),
+      granularity: analyticsGranularity.value,
+      sort: analyticsSort.value,
+      direction: "desc",
+    });
+    if (analyticsModel.value) query.set("model", analyticsModel.value);
+    const payload = await api(`/api/admin/analytics?${query}`);
+    if (sequence !== analyticsRequestSequence) return;
+    analyticsResult.value = payload.result ?? null;
+    Object.assign(analyticsRetention, payload.retention ?? { executionDays: null, minuteDays: null });
+  } catch (error) {
+    if (sequence === analyticsRequestSequence) pushToast("error", errorText(error, "无法加载分析明细。"));
+  } finally {
+    if (sequence === analyticsRequestSequence) isLoadingAnalytics.value = false;
+  }
+}
+
+function setAnalyticsRange(value: "today" | "month" | "custom"): void {
+  analyticsRange.value = value;
+  if (value === "today") analyticsGranularity.value = "minute";
+  if (value === "month") analyticsGranularity.value = "day";
+  if (value !== "custom") void loadAnalytics();
+}
+
+function setAnalyticsGranularity(value: AnalyticsGranularity): void {
+  analyticsGranularity.value = value;
+  void loadAnalytics();
+}
+
+function setAnalyticsSort(value: AnalyticsSort): void {
+  analyticsSort.value = value;
+  void loadAnalytics();
+}
+
+function setAnalyticsModel(value: string): void {
+  analyticsModel.value = value;
+  void loadAnalytics();
+}
+
+async function refreshAnalyticsPrices(): Promise<void> {
+  if (isRefreshingPrices.value) return;
+  isRefreshingPrices.value = true;
+  try {
+    await api("/api/admin/analytics/prices/refresh", { method: "POST" });
+    await loadDashboard({ silent: true });
+    pushToast("success", "模型价格目录已刷新");
+  } catch (error) {
+    pushToast("error", errorText(error, "无法刷新模型价格目录。"));
+  } finally {
+    isRefreshingPrices.value = false;
+  }
+}
+
+async function saveAnalyticsRetention(value: AnalyticsRetention): Promise<void> {
+  if (isSavingRetention.value) return;
+  isSavingRetention.value = true;
+  try {
+    const payload = await api("/api/admin/analytics/retention", { method: "PATCH", body: JSON.stringify(value) });
+    Object.assign(analyticsRetention, payload.retention ?? value);
+    pushToast("success", "分析数据保留策略已保存");
+  } catch (error) {
+    pushToast("error", errorText(error, "无法保存分析数据保留策略。"));
+  } finally {
+    isSavingRetention.value = false;
+  }
+}
+
+async function previewAnalyticsCleanup(): Promise<void> {
+  if (isPreviewingCleanup.value || !cleanupCutoff.value) return;
+  isPreviewingCleanup.value = true;
+  try {
+    const payload = await api("/api/admin/analytics/cleanup/preview", {
+      method: "POST",
+      body: JSON.stringify({ cutoff: new Date(cleanupCutoff.value).toISOString() }),
+    });
+    cleanupPreview.value = payload.preview ?? null;
+    showCleanupConfirm.value = Boolean(cleanupPreview.value);
+  } catch (error) {
+    pushToast("error", errorText(error, "无法生成分析数据清理预览。"));
+  } finally {
+    isPreviewingCleanup.value = false;
+  }
+}
+
+async function confirmAnalyticsCleanup(): Promise<void> {
+  if (!cleanupPreview.value || isCleaningAnalytics.value) return;
+  isCleaningAnalytics.value = true;
+  try {
+    const payload = await api("/api/admin/analytics/cleanup", {
+      method: "POST",
+      body: JSON.stringify({ token: cleanupPreview.value.token }),
+    });
+    const deleted = payload.deleted;
+    showCleanupConfirm.value = false;
+    cleanupPreview.value = null;
+    await Promise.all([loadDashboard({ silent: true }), loadAnalytics()]);
+    pushToast("success", `已清理 ${deleted?.executions ?? 0} 条执行明细，历史总账保持不变`);
+  } catch (error) {
+    pushToast("error", errorText(error, "无法清理分析数据。"));
+  } finally {
+    isCleaningAnalytics.value = false;
+  }
+}
+
 // Replace (not merge) the optional fields: cleared keys are absent from the
 // server payload, and Object.assign would keep the stale local value.
 function applySettings(next: ApiPayload["settings"]) {
@@ -777,7 +933,6 @@ function applySettings(next: ApiPayload["settings"]) {
 
 function askClearRecords() {
   if (records.value.length === 0 || isClearingRecords.value) return;
-  captureDialogOpener();
   showClearConfirm.value = true;
 }
 
@@ -1449,62 +1604,23 @@ const sidebarItems = computed<SidebarItem[]>(() => filteredRecords.value.map((re
 const selectedRequest = computed(() => (selectedTrace.value ? traceRequest(selectedTrace.value) : null));
 const selectedResponse = computed(() => (selectedTrace.value ? traceResponse(selectedTrace.value) : null));
 
-watch(dialogOpen, (open, wasOpen) => {
-  if (open && !wasOpen) {
-    void nextTick(() => {
-      const dialog = document.querySelector<HTMLElement>(".modal-backdrop .modal");
-      const input = dialog?.querySelector<HTMLElement>("input:not([disabled]), textarea:not([disabled]), select:not([disabled])");
-      const action = dialog?.querySelector<HTMLElement>("button:not([disabled]), [tabindex]:not([tabindex='-1'])");
-      (input ?? action ?? dialog)?.focus();
-    });
-  } else if (!open && wasOpen) {
-    const opener = dialogOpener;
-    dialogOpener = null;
-    void nextTick(() => opener?.focus());
-  }
-});
-
 watch(autoRefresh, (enabled) => {
+  if (typeof window === "undefined") return;
   window.clearInterval(autoRefreshTimer);
   autoRefreshTimer = undefined;
   if (enabled) {
     autoRefreshTimer = window.setInterval(() => {
       void loadDashboard({ silent: true });
-    }, 30_000);
+    }, 5_000);
   }
-});
+}, { immediate: true });
 
 function onKeydown(event: KeyboardEvent): void {
-  if (event.key === "Tab" && dialogOpen.value) {
-    const dialog = document.querySelector<HTMLElement>(".modal-backdrop .modal");
-    const focusable = dialog ? [...dialog.querySelectorAll<HTMLElement>("button:not([disabled]), input:not([disabled]), textarea:not([disabled]), select:not([disabled]), [tabindex]:not([tabindex='-1'])")] : [];
-    if (focusable.length > 0) {
-      const first = focusable[0]!;
-      const last = focusable[focusable.length - 1]!;
-      if (event.shiftKey && document.activeElement === first) {
-        event.preventDefault();
-        last.focus();
-      } else if (!event.shiftKey && document.activeElement === last) {
-        event.preventDefault();
-        first.focus();
-      }
-    }
-    return;
-  }
-  if (event.key === "Escape") {
-    if (proxyEditor.value) proxyEditor.value = null;
-    else if (modelEditor.value) modelEditor.value = null;
-    else if (limitEditor.value) limitEditor.value = null;
-    else if (pendingRemoval.value) pendingRemoval.value = null;
-    else if (showClearConfirm.value) showClearConfirm.value = false;
-    else if (showAddAccount.value) showAddAccount.value = false;
-    return;
-  }
   if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
-  if (view.value !== "records" || !token.value) return;
-  if (showAddAccount.value || proxyEditor.value || pendingRemoval.value || showClearConfirm.value) return;
-  const target = event.target as HTMLElement | null;
-  if (target && ["INPUT", "TEXTAREA", "SELECT"].includes(target.tagName)) return;
+  if (view.value !== "records" || !token.value || dialogOpen.value) return;
+  if (document.querySelector('[role="dialog"][data-state="open"], [role="alertdialog"][data-state="open"]')) return;
+  const target = event.target instanceof Element ? event.target : null;
+  if (target?.closest("input, textarea, select, button, [contenteditable='true'], [role='tab'], [role='menu'], [role='listbox'], [role='option']")) return;
   event.preventDefault();
   gotoRecord(event.key === "ArrowLeft" ? -1 : 1);
 }
@@ -1525,7 +1641,7 @@ onUnmounted(() => {
   <div class="app-shell" :data-theme="theme">
     <header v-if="!token" class="topbar">
       <div class="wordmark">
-        <span class="wordmark-mark">NW</span>
+        <span class="wordmark-mark"><AppIcon name="activity" :size="16" /></span>
         <span>NeuralWatt 网关</span>
       </div>
     </header>
@@ -1545,21 +1661,18 @@ onUnmounted(() => {
     </main>
 
     <WorkspaceShell v-else :theme="theme" :workspace="view" :loading="isLoading" :connected="Boolean(token)" :auto-refresh="autoRefresh" @select="selectView" @refresh="loadDashboard()" @toggle-auto-refresh="autoRefresh = !autoRefresh" @change-theme="changeTheme" @sign-out="signOut">
-      <OverviewWorkspace v-if="view === 'overview'" :snapshot="overviewSnapshot" :accounts="accounts" :proxies="proxies" :egresses="schedulerRuntime.egresses" @navigate="navigateFromOverview" />
-      <AccountsWorkspace v-else-if="view === 'accounts'" v-model:query="accountQuery" v-model:expanded-id="expandedAccountId" :accounts="accounts" :proxies="proxies" :scheduler="settings.scheduler" :busy-ids="busyAccountIds" :secret-reset-token="secretResetToken" :copy-secret="copyCredential" @add="openAddAccount" @verify="verifyAccount" @manage-proxy="openProxyEditor" @assign-proxy="assignProxy" @fetch-models="fetchAccountModels" @edit-models="openModelEditor" @edit-limits="openLimitEditor" @toggle="toggleAccount" @remove="askRemoveAccount" />
-      <ProxyPoolWorkspace v-else-if="view === 'proxies'" v-model:import-text="proxyImportText" v-model:filter="proxyFilter" :proxies="proxies" :draft="proxyPoolDraft" :import-results="proxyImportResults" :busy-ids="busyProxyIds" :importing="isImportingProxies" :checking-all="isCheckingProxies" :saving="isSavingProxyPool" @update-policy="updateProxyPolicy" @import="importProxies" @check="checkProxyEntry" @check-many="checkProxyPool" @delete="deleteProxyEntry" @save-policies="saveProxyPoolSettings" />
-      <SchedulerWorkspace v-else-if="view === 'scheduler'" :draft="schedulerDraft" :runtime="schedulerRuntime" :saving="isSavingScheduler" @update-field="updateSchedulerField" @save="saveSchedulerSettings" />
-      <RecordsWorkspace v-else-if="view === 'records'" v-model:query="recordQuery" v-model:filter="recordFilter" v-model:raw-trace-key="rawTraceKey" :records="records" :filtered-records="filteredRecords" :sidebar-items="sidebarItems" :selected-record-id="selectedRecordId" :selected-trace-key="selectedTraceKey" :selected-trace="selectedTrace" :selected-request="selectedRequest" :selected-response="selectedResponse" :loading-detail="isLoadingRecord" :recording="settings.recordMessages" :failed-count="failedRecordCount" :upstream-call-count="upstreamCallCount" :tool-first-pass-rate="toolFirstPassRate" :tool-adapter-count="toolAdapterRecords.length" :selected-record-index="selectedRecordIndex" :clearing="isClearingRecords" @toggle-recording="setRecording" @refresh="loadRecords" @clear="askClearRecords" @select-record="selectRecord" @goto="gotoRecord" />
-      <GatewaySettingsWorkspace v-else :settings="settings" :config="config" :all-models="allModels" v-model:minimum-output-tokens-draft="minimumOutputTokensDraft" :saving-budget="isSavingMinimumOutputTokens" :secret-reset-token="secretResetToken" :copy-secret="copyCredential" @save-budget="saveMinimumOutputTokens" @set-tool-format="setToolCallFormat" @set-preamble="setPreambleVerbosity" @set-model-tool-format="setModelToolCallFormat" @set-model-preamble="setModelPreambleVerbosity" @sign-out="signOut" />
+      <Transition name="page-fade" mode="out-in">
+      <OverviewWorkspace v-if="view === 'overview'" key="overview" :snapshot="overviewSnapshot" :analytics="analytics" :detail="analyticsResult" :analytics-range="analyticsRange" :analytics-granularity="analyticsGranularity" :analytics-sort="analyticsSort" :analytics-model="analyticsModel" :custom-from="analyticsCustomFrom" :custom-to="analyticsCustomTo" :loading-analytics="isLoadingAnalytics" :accounts="accounts" :proxies="proxies" :egresses="schedulerRuntime.egresses" @navigate="navigateFromOverview" @set-range="setAnalyticsRange" @set-granularity="setAnalyticsGranularity" @set-sort="setAnalyticsSort" @set-model="setAnalyticsModel" @update:custom-from="analyticsCustomFrom = $event" @update:custom-to="analyticsCustomTo = $event" @load-custom="loadAnalytics" />
+      <AccountsWorkspace v-else-if="view === 'accounts'" key="accounts" v-model:query="accountQuery" v-model:expanded-id="expandedAccountId" :accounts="accounts" :proxies="proxies" :scheduler="settings.scheduler" :busy-ids="busyAccountIds" :secret-reset-token="secretResetToken" :copy-secret="copyCredential" @add="openAddAccount" @verify="verifyAccount" @manage-proxy="openProxyEditor" @assign-proxy="assignProxy" @fetch-models="fetchAccountModels" @edit-models="openModelEditor" @edit-limits="openLimitEditor" @toggle="toggleAccount" @remove="askRemoveAccount" />
+      <ProxyPoolWorkspace v-else-if="view === 'proxies'" key="proxies" v-model:import-text="proxyImportText" v-model:filter="proxyFilter" :proxies="proxies" :draft="proxyPoolDraft" :import-results="proxyImportResults" :busy-ids="busyProxyIds" :importing="isImportingProxies" :checking-all="isCheckingProxies" :saving="isSavingProxyPool" @update-policy="updateProxyPolicy" @import="importProxies" @check="checkProxyEntry" @check-many="checkProxyPool" @delete="deleteProxyEntry" @save-policies="saveProxyPoolSettings" />
+      <SchedulerWorkspace v-else-if="view === 'scheduler'" key="scheduler" :draft="schedulerDraft" :runtime="schedulerRuntime" :saving="isSavingScheduler" @update-field="updateSchedulerField" @save="saveSchedulerSettings" />
+      <RecordsWorkspace v-else-if="view === 'records'" key="records" v-model:query="recordQuery" v-model:filter="recordFilter" v-model:raw-trace-key="rawTraceKey" :records="records" :filtered-records="filteredRecords" :sidebar-items="sidebarItems" :selected-record-id="selectedRecordId" :selected-trace-key="selectedTraceKey" :selected-trace="selectedTrace" :selected-request="selectedRequest" :selected-response="selectedResponse" :loading-detail="isLoadingRecord" :recording="settings.recordMessages" :failed-count="failedRecordCount" :upstream-call-count="upstreamCallCount" :tool-first-pass-rate="toolFirstPassRate" :tool-adapter-count="toolAdapterRecords.length" :selected-record-index="selectedRecordIndex" :clearing="isClearingRecords" @toggle-recording="setRecording" @refresh="loadRecords" @clear="askClearRecords" @select-record="selectRecord" @goto="gotoRecord" />
+      <GatewaySettingsWorkspace v-else key="settings" :settings="settings" :config="config" :analytics="analytics" :retention="analyticsRetention" :cleanup-cutoff="cleanupCutoff" :all-models="allModels" v-model:minimum-output-tokens-draft="minimumOutputTokensDraft" :saving-budget="isSavingMinimumOutputTokens" :refreshing-prices="isRefreshingPrices" :saving-retention="isSavingRetention" :previewing-cleanup="isPreviewingCleanup" :secret-reset-token="secretResetToken" :copy-secret="copyCredential" @save-budget="saveMinimumOutputTokens" @set-tool-format="setToolCallFormat" @set-preamble="setPreambleVerbosity" @set-model-tool-format="setModelToolCallFormat" @set-model-preamble="setModelPreambleVerbosity" @refresh-prices="refreshAnalyticsPrices" @save-retention="saveAnalyticsRetention" @update:cleanup-cutoff="cleanupCutoff = $event" @preview-cleanup="previewAnalyticsCleanup" @sign-out="signOut" />
+      </Transition>
     </WorkspaceShell>
 
-    <div v-if="showAddAccount" class="modal-backdrop" @click.self="showAddAccount = false">
-      <form class="modal" role="dialog" aria-modal="true" aria-label="添加账号" @submit.prevent="addAccount">
-        <header class="modal-head">
-          <h2>添加账号</h2>
-          <button class="modal-close" type="button" aria-label="关闭" @click="showAddAccount = false">×</button>
-        </header>
-        <p class="modal-note">保存时将验证门户登录，验证成功后加入连接池。</p>
+    <AppDialog :open="showAddAccount" title="添加账号" description="保存时将验证门户登录，验证成功后加入连接池。" :busy="isSaving" @update:open="showAddAccount = $event">
+      <form class="modal-form" @submit.prevent="addAccount">
         <div class="modal-body">
           <label for="account-label">账号名称</label>
           <input id="account-label" v-model="newAccount.label" type="text" maxlength="120" placeholder="主账号 Kimi" />
@@ -1579,54 +1692,42 @@ onUnmounted(() => {
           </div>
         </div>
         <footer class="modal-foot">
-          <button class="button button-quiet" type="button" @click="showAddAccount = false">取消</button>
-          <button class="button button-primary" type="submit" :disabled="isSaving">{{ isSaving ? "验证中…" : "验证并添加" }}</button>
+          <button class="button button-quiet" type="button" :disabled="isSaving" @click="showAddAccount = false">取消</button>
+          <button class="button button-primary" type="submit" :disabled="isSaving" :aria-busy="isSaving"><span v-if="isSaving" class="spinner" aria-hidden="true"></span>{{ isSaving ? "验证中" : "验证并添加" }}</button>
         </footer>
       </form>
-    </div>
+    </AppDialog>
 
-    <div v-if="proxyEditor" class="modal-backdrop" @click.self="proxyEditor = null">
-      <form class="modal" role="dialog" aria-modal="true" aria-label="设置出口代理" @submit.prevent="saveProxy">
-        <header class="modal-head">
-          <h2>设置出口代理</h2>
-          <button class="modal-close" type="button" aria-label="关闭" @click="proxyEditor = null">×</button>
-        </header>
-        <p class="modal-note">账号「{{ proxyEditor.account.label }}」 · 当前：{{ proxyEditor.account.proxy ?? "直连" }}</p>
+    <AppDialog :open="Boolean(proxyEditor)" title="设置出口代理" :description="proxyEditor ? `账号「${proxyEditor.account.label}」 · 当前：${proxyEditor.account.proxy ?? '直连'}` : ''" :busy="Boolean(proxyEditor && isAccountBusy(proxyEditor.account.id))" @update:open="!$event && (proxyEditor = null)">
+      <form v-if="proxyEditor" class="modal-form" @submit.prevent="saveProxy">
         <div class="modal-body">
           <label for="proxy-input">代理地址</label>
           <input id="proxy-input" v-model="proxyEditor.value" type="text" maxlength="2048" autocomplete="off" spellcheck="false" placeholder="http://host:8080 或 socks5://user:pass@host:1080" />
           <p class="field-hint">支持 http / https / socks4 / socks5，可带认证。留空并保存将清除代理；更换出口不会主动退出账号，门户拒绝现有会话时才重新登录。</p>
         </div>
         <footer class="modal-foot">
-          <button class="button button-quiet" type="button" @click="proxyEditor = null">取消</button>
-          <button class="button button-primary" type="submit" :disabled="isAccountBusy(proxyEditor.account.id)">保存</button>
+          <button class="button button-quiet" type="button" :disabled="isAccountBusy(proxyEditor.account.id)" @click="proxyEditor = null">取消</button>
+          <button class="button button-primary" type="submit" :disabled="isAccountBusy(proxyEditor.account.id)" :aria-busy="isAccountBusy(proxyEditor.account.id)"><span v-if="isAccountBusy(proxyEditor.account.id)" class="spinner" aria-hidden="true"></span>保存</button>
         </footer>
       </form>
-    </div>
+    </AppDialog>
 
-    <div v-if="modelEditor" class="modal-backdrop" @click.self="modelEditor = null">
-      <form class="modal" role="dialog" aria-modal="true" aria-label="编辑模型列表" @submit.prevent="saveModels">
-        <header class="modal-head">
-          <h2>编辑模型列表</h2>
-          <button class="modal-close" type="button" aria-label="关闭" @click="modelEditor = null">×</button>
-        </header>
-        <p class="modal-note">账号「{{ modelEditor.account.label }}」 · 当前 {{ modelEditor.account.models.length }} 个模型</p>
+    <AppDialog :open="Boolean(modelEditor)" title="编辑模型列表" :description="modelEditor ? `账号「${modelEditor.account.label}」 · 当前 ${modelEditor.account.models.length} 个模型` : ''" :busy="Boolean(modelEditor && isAccountBusy(modelEditor.account.id))" @update:open="!$event && (modelEditor = null)">
+      <form v-if="modelEditor" class="modal-form" @submit.prevent="saveModels">
         <div class="modal-body">
           <label for="models-input">模型 ID（每行一个，或用逗号分隔）</label>
           <textarea id="models-input" v-model="modelEditor.value" rows="8" spellcheck="false" placeholder="deepseek-v4-flash&#10;glm-5.2"></textarea>
           <p class="field-hint">保存将替换当前列表；「自动获取」会追加并去重。</p>
         </div>
         <footer class="modal-foot">
-          <button class="button button-quiet" type="button" @click="modelEditor = null">取消</button>
-          <button class="button button-primary" type="submit" :disabled="isAccountBusy(modelEditor.account.id)">保存</button>
+          <button class="button button-quiet" type="button" :disabled="isAccountBusy(modelEditor.account.id)" @click="modelEditor = null">取消</button>
+          <button class="button button-primary" type="submit" :disabled="isAccountBusy(modelEditor.account.id)" :aria-busy="isAccountBusy(modelEditor.account.id)"><span v-if="isAccountBusy(modelEditor.account.id)" class="spinner" aria-hidden="true"></span>保存</button>
         </footer>
       </form>
-    </div>
+    </AppDialog>
 
-    <div v-if="limitEditor" class="modal-backdrop" @click.self="limitEditor = null">
-      <form class="modal limit-modal" role="dialog" aria-modal="true" aria-label="账号调度限额" @submit.prevent="saveAccountLimits">
-        <header class="modal-head"><h2>账号调度限额</h2><button class="modal-close" type="button" aria-label="关闭" @click="limitEditor = null">×</button></header>
-        <p class="modal-note">账号「{{ limitEditor.account.label }}」 · 留空继承全局配置</p>
+    <AppDialog :open="Boolean(limitEditor)" title="账号调度限额" :description="limitEditor ? `账号「${limitEditor.account.label}」 · 留空继承全局配置` : ''" :busy="Boolean(limitEditor && isAccountBusy(limitEditor.account.id))" wide @update:open="!$event && (limitEditor = null)">
+      <form v-if="limitEditor" class="modal-form" @submit.prevent="saveAccountLimits">
         <div class="modal-body">
           <div class="field-row">
             <div><label for="account-rpm-override">账号 RPM</label><input id="account-rpm-override" v-model="limitEditor.accountRpm" type="number" min="1" max="100000" placeholder="继承全局" /></div>
@@ -1637,40 +1738,51 @@ onUnmounted(() => {
             <label v-for="model in limitEditor.account.models" :key="model" class="limit-model-row"><span class="mono">{{ model }}</span><input v-model="limitEditor.modelConcurrency[model]" type="number" min="1" max="1000" :placeholder="`继承 ${limitEditor.account.schedulerOverrides?.accountModelConcurrency ?? settings.scheduler.accountModelConcurrency}`" /></label>
           </div>
         </div>
-        <footer class="modal-foot"><button class="button button-quiet" type="button" @click="limitEditor = null">取消</button><button class="button button-primary" type="submit" :disabled="isAccountBusy(limitEditor.account.id)">保存</button></footer>
+        <footer class="modal-foot"><button class="button button-quiet" type="button" :disabled="isAccountBusy(limitEditor.account.id)" @click="limitEditor = null">取消</button><button class="button button-primary" type="submit" :disabled="isAccountBusy(limitEditor.account.id)" :aria-busy="isAccountBusy(limitEditor.account.id)"><span v-if="isAccountBusy(limitEditor.account.id)" class="spinner" aria-hidden="true"></span>保存</button></footer>
       </form>
-    </div>
+    </AppDialog>
 
-    <div v-if="pendingRemoval" class="modal-backdrop" @click.self="pendingRemoval = null">
-      <div class="modal modal-confirm" role="alertdialog" aria-modal="true" aria-labelledby="remove-title" tabindex="-1">
-        <header class="modal-head">
-          <h2 id="remove-title">移除账号</h2>
-        </header>
-        <p class="confirm-text">确定移除账号「{{ pendingRemoval.label }}」吗？该账号的会话将被删除，此操作不可撤销。</p>
-        <footer class="modal-foot">
-          <button class="button button-quiet" type="button" @click="pendingRemoval = null">取消</button>
-          <button class="button button-danger-solid" type="button" :disabled="isAccountBusy(pendingRemoval.id)" @click="confirmRemoveAccount">移除</button>
-        </footer>
-      </div>
-    </div>
+    <AppConfirmDialog
+      :open="Boolean(pendingRemoval)"
+      title="移除账号"
+      :description="pendingRemoval ? `确定移除账号「${pendingRemoval.label}」吗？该账号的会话将被删除，此操作不可撤销。` : ''"
+      confirm-label="移除"
+      busy-label="移除中"
+      :busy="Boolean(pendingRemoval && isAccountBusy(pendingRemoval.id))"
+      return-focus=".accounts-workspace .search-field input"
+      @update:open="!$event && (pendingRemoval = null)"
+      @confirm="confirmRemoveAccount"
+    />
 
-    <div v-if="showClearConfirm" class="modal-backdrop" @click.self="showClearConfirm = false">
-      <div class="modal modal-confirm" role="alertdialog" aria-modal="true" aria-labelledby="clear-title" tabindex="-1">
-        <header class="modal-head">
-          <h2 id="clear-title">清空聊天记录</h2>
-        </header>
-        <p class="confirm-text">确定清空全部 {{ records.length }} 条聊天记录吗？此操作不可撤销。</p>
-        <footer class="modal-foot">
-          <button class="button button-quiet" type="button" @click="showClearConfirm = false">取消</button>
-          <button class="button button-danger-solid" type="button" :disabled="isClearingRecords" @click="confirmClearRecords">{{ isClearingRecords ? "清空中…" : "清空全部" }}</button>
-        </footer>
-      </div>
-    </div>
+    <AppConfirmDialog
+      :open="showClearConfirm"
+      title="清空聊天记录"
+      :description="`确定清空全部 ${records.length} 条聊天记录吗？此操作不可撤销。`"
+      confirm-label="清空全部"
+      busy-label="清空中"
+      :busy="isClearingRecords"
+      return-focus=".records-workspace .more-trigger"
+      @update:open="showClearConfirm = $event"
+      @confirm="confirmClearRecords"
+    />
+
+    <AppConfirmDialog
+      :open="showCleanupConfirm"
+      title="清理分析数据"
+      :description="cleanupDescription"
+      confirm-label="确认清理"
+      busy-label="清理中"
+      :busy="isCleaningAnalytics"
+      return-focus=".gateway-analytics-cleanup button"
+      @update:open="showCleanupConfirm = $event"
+      @confirm="confirmAnalyticsCleanup"
+    />
 
     <div class="toast-stack" aria-live="polite">
       <div v-for="toast in toasts" :key="toast.id" class="toast" :class="toast.kind">
+        <AppIcon :name="toast.kind === 'error' ? 'alert-circle' : 'check-circle'" :size="15" />
         <span class="toast-text">{{ toast.text }}</span>
-        <button class="toast-close" type="button" aria-label="关闭通知" @click="dismissToast(toast.id)">×</button>
+        <button class="toast-close" type="button" aria-label="关闭通知" @click="dismissToast(toast.id)"><AppIcon name="x" :size="13" /></button>
       </div>
     </div>
   </div>

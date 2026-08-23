@@ -62,6 +62,8 @@ password=<password>
 
 `GET /api/models` 无需会话即可返回 `{"models":[...]}`。每个模型对象包含身份、提供商、上下文长度、每 1K token 价格、`supports_tools`、`supports_json_mode`、`supports_vision`、`supports_reasoning`、预览/弹性标志和（适用时）reasoning 能力块。
 
+2026-08-23 复核确认计费字段为 `prompt_price_per_1k`、`completion_price_per_1k` 和可空的 `cached_input_price_per_1k`，币种为 USD。分析账本按原始门户模型 ID 精确匹配这些字段；缓存价为空时，该模型的缓存输入按普通输入价处理。字段缺失、为负、非有限数或模型 ID 不精确匹配时不得猜测价格。目录数值会变化，运行时冻结每次执行引用的价格版本，本文不把当前数值当作永久契约。
+
 | ID | 上下文 | 工具 | JSON 模式 | 视觉 | 推理 |
 | --- | ---: | :---: | :---: | :---: | :---: |
 | `deepseek-v4-flash` | 1,048,576 | 是 | 是 | 否 | 是 |

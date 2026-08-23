@@ -19,6 +19,7 @@ import {
   isModelCapacityError,
 } from "../server/utils/chat-service.ts";
 import { stateStore } from "../server/utils/state-store.ts";
+import { usageAnalytics } from "../server/utils/usage-analytics.ts";
 import { getProxyConfig, resetProxyConfigForTests } from "../server/utils/config.ts";
 import { HttpError } from "../server/utils/http.ts";
 import { portalClient, PortalError } from "../server/utils/portal-client.ts";
@@ -95,6 +96,7 @@ async function withEmptyDataDir<T>(run: () => Promise<T>): Promise<T> {
   try {
     return await run();
   } finally {
+    await usageAnalytics.resetForTests();
     if (previous === undefined) {
       delete process.env.NEURALWATT_DATA_DIR;
     } else {

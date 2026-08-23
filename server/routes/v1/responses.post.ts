@@ -83,6 +83,7 @@ export default defineHandler(async (event) => {
             await trackedEmit({ event: streamEvent.event, data: streamEvent.data });
           }
           const execution = await executeChatRequest(chatRequest, {
+            endpoint: "/v1/responses",
             stickyKey: stickyKeyFrom(event.req, chatRequest),
             stream: true,
             signal,
@@ -164,6 +165,7 @@ export default defineHandler(async (event) => {
     }
 
     const execution = await executeChatRequest(chatRequest, {
+      endpoint: "/v1/responses",
       stickyKey: stickyKeyFrom(event.req, chatRequest),
       validated,
     });

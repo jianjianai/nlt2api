@@ -1,6 +1,15 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { deriveOverview, parseTheme, parseWorkspace, proxyPolicySummary } from "../app/utils/admin-ui.ts";;
+import {
+  confidenceLabel,
+  deriveOverview,
+  forecastConstraintLabel,
+  formatMicroUsd,
+  parseTheme,
+  parseWorkspace,
+  proxyPolicySummary,
+  signedPercent,
+} from "../app/utils/admin-ui.ts";
 import type { Account, GatewayConfig, ProxyPoolEntry, ProxyPoolSettings, SchedulerRuntime } from "../app/types/admin.ts";
 
 function account(overrides: Partial<Account> = {}): Account {
@@ -106,6 +115,16 @@ test("deriveOverview creates evidence-backed account, proxy, queue and API-key a
   ]);
   assert.equal(result.metrics.find((metric) => metric.id === "traffic")?.value, "2");
   assert.equal(result.metrics.find((metric) => metric.id === "issues")?.value, "4");
+});
+
+test("analytics display helpers preserve money units and explain constraints", () => {
+  assert.equal(formatMicroUsd(0), "$0.00");
+  assert.equal(formatMicroUsd(12_840_000), "$12.84");
+  assert.equal(formatMicroUsd(640), "$0.00064");
+  assert.equal(forecastConstraintLabel("shared_egress_rpm"), "共享出口 RPM");
+  assert.equal(confidenceLabel("low"), "低置信度");
+  assert.equal(signedPercent(0.184), "+18%");
+  assert.equal(signedPercent(-0.126), "-13%");
 });
 
 test("proxyPolicySummary names only enabled policies", () => {

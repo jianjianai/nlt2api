@@ -5,6 +5,7 @@ import { proxyPoolService } from "~/server/utils/proxy-pool.ts";
 import { jsonResponse, openAIErrorResponse, requireAdminAuth } from "~/server/utils/http.ts";
 import { adminHttpError } from "~/server/utils/route-helpers.ts";
 import { stateStore } from "~/server/utils/state-store.ts";
+import { usageAnalytics } from "~/server/utils/usage-analytics.ts";
 
 export default defineHandler(async (event) => {
   try {
@@ -15,11 +16,15 @@ export default defineHandler(async (event) => {
       accountScheduler.runtimeSnapshot(),
       proxyPoolService.snapshot(),
     ]);
+    const publicAccounts = accounts.map((account) => accountScheduler.publicState(account));
+    const upstreamRpm = publicAccounts.reduce((total, account) => total + account.runtime.requestsLastMinute, 0);
+    const analytics = await usageAnalytics.overview(publicAccounts, settings, upstreamRpm);
     const config = getProxyConfig();
     return jsonResponse({
-      accounts: accounts.map((account) => accountScheduler.publicState(account)),
+      accounts: publicAccounts,
       settings,
       scheduler,
+      analytics,
       proxyPool,
       config: {
         adminTokenConfigured: Boolean(config.adminToken),

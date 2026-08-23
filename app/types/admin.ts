@@ -247,6 +247,124 @@ export interface SidebarItem {
   upstream: SidebarUpstreamItem[];
 }
 
+export type ForecastConstraint =
+  | "account_rpm"
+  | "model_concurrency"
+  | "shared_egress_rpm"
+  | "no_healthy_account"
+  | "model_cooldown"
+  | "account_cooldown"
+  | "queue_policy"
+  | "insufficient_samples";
+
+export interface AnalyticsSeriesPoint {
+  minute: string;
+  clientRequests: number;
+  upstreamAttempts: number;
+  demand: number;
+  admitted: number;
+  rejected: number;
+  totalCostMicroUsd: number;
+}
+
+export interface CapacityRecommendation {
+  model: string;
+  forecastRpm: number;
+  effectiveCapacityRpm: number;
+  utilization: number;
+  recommendedAccounts: number;
+  bindingConstraint: ForecastConstraint;
+  confidence: "high" | "medium" | "low";
+  sampleMinutes: number;
+  p95SampleCount: number;
+  p95DurationMs: number;
+  p95Amplification: number;
+  safetyMargin: number;
+  timeToThresholdMinutes?: number;
+  stabilizing?: boolean;
+}
+
+export interface ModelAnalyticsRow {
+  model: string;
+  clientRpm: number;
+  upstreamRpm: number;
+  amplification: number;
+  promptTokens: number;
+  cachedPromptTokens: number;
+  completionTokens: number;
+  totalCostMicroUsd: number;
+  inputCostMicroUsd: number;
+  cachedInputCostMicroUsd: number;
+  outputCostMicroUsd: number;
+  unpricedRequests: number;
+  priceSource?: "vendor_official" | "portal_catalog";
+  priceVerifiedAt?: string;
+  p95DurationMs: number;
+  effectiveCapacityRpm: number;
+  utilization: number;
+  recommendedAccounts: number;
+  bindingConstraint: ForecastConstraint;
+  confidence: "high" | "medium" | "low";
+}
+
+export interface AnalyticsOverview {
+  health: "healthy" | "degraded";
+  error?: string;
+  ledgerStartedAt?: string;
+  priceStatus: "current" | "stale" | "unavailable";
+  priceUpdatedAt?: string;
+  clientRpm: number;
+  upstreamRpm: number;
+  amplification: number;
+  utilization: number;
+  trend15m: number;
+  todayCostMicroUsd: number;
+  monthCostMicroUsd: number;
+  pricedCoverage: number;
+  unpricedRequests: number;
+  unpricedTokens: number;
+  series: AnalyticsSeriesPoint[];
+  models: ModelAnalyticsRow[];
+  recommendation?: CapacityRecommendation;
+  anomalies: string[];
+}
+
+export type AnalyticsGranularity = "minute" | "5m" | "hour" | "day";
+export type AnalyticsSort = "cost" | "utilization" | "rpm" | "tokens";
+
+export interface AnalyticsQueryResult {
+  from: string;
+  to: string;
+  granularity: AnalyticsGranularity;
+  sort: AnalyticsSort;
+  direction: "asc" | "desc";
+  models: ModelAnalyticsRow[];
+  series: AnalyticsSeriesPoint[];
+  totalCostMicroUsd: number;
+  inputCostMicroUsd: number;
+  cachedInputCostMicroUsd: number;
+  outputCostMicroUsd: number;
+  pricedRequests: number;
+  unpricedRequests: number;
+  promptTokens: number;
+  cachedPromptTokens: number;
+  completionTokens: number;
+}
+
+export interface AnalyticsRetention {
+  executionDays: number | null;
+  minuteDays: number | null;
+}
+
+export interface CleanupPreview {
+  token: string;
+  cutoff: string;
+  executions: number;
+  attempts: number;
+  minuteBuckets: number;
+  expiresAt: string;
+}
+
 export interface ApiPayload {
   accounts?: Account[];
   settings?: GatewaySettings;
@@ -255,6 +373,12 @@ export interface ApiPayload {
   results?: ProxyImportLineResult[];
   proxy?: ProxyPoolEntry;
   scheduler?: SchedulerRuntime;
+  analytics?: AnalyticsOverview;
+  result?: AnalyticsQueryResult;
+  retention?: AnalyticsRetention;
+  preview?: CleanupPreview;
+  refreshed?: boolean;
+  deleted?: { executions: number; attempts: number; minuteBuckets: number };
   config?: GatewayConfig;
   records?: DebugRecordSummary[];
   record?: DebugRecord;
