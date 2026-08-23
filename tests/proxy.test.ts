@@ -6,6 +6,7 @@ import test from "node:test";
 import { resetProxyConfigForTests } from "../server/utils/config.ts";
 import { HttpError } from "../server/utils/http.ts";
 import { maskProxyUrl, normalizeProxyUrl, parseProxyImportLine, proxyDispatcher, proxyDispatcherCacheSize, resetProxyDispatcherCacheForTests } from "../server/utils/proxy.ts";
+import { portalResponseBodyTimeoutError } from "../server/utils/portal-client.ts";
 import { StateStore } from "../server/utils/state-store.ts";
 
 async function withTempStore<T>(run: (store: StateStore) => Promise<T>): Promise<T> {
@@ -75,6 +76,12 @@ test("maskProxyUrl hides credentials but keeps scheme, host and port", () => {
   assert.equal(maskProxyUrl("http://proxy.local:8080/"), "http://proxy.local:8080");
   assert.equal(maskProxyUrl("socks5://alice:secret@10.0.0.2:1080"), "socks5://al***@10.0.0.2:1080");
   assert.equal(maskProxyUrl("not-a-url"), "***");
+});
+
+test("response body inactivity is classified as an upstream timeout, not proxy transport", () => {
+  const error = portalResponseBodyTimeoutError();
+  assert.equal(error.status, 504);
+  assert.equal(error.name, "PortalError");
 });
 
 test("proxyDispatcher cache is bounded and clearable", async () => {

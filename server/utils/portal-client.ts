@@ -35,6 +35,11 @@ export class PortalError extends Error {
   }
 }
 
+/** A response already received HTTP headers; body inactivity is upstream timeout, not proxy failure. */
+export function portalResponseBodyTimeoutError(): PortalError {
+  return new PortalError("The NeuralWatt portal response timed out while waiting for data.", 504);
+}
+
 function cookieValues(headers: Headers): string[] {
   const customHeaders = headers as Headers & { getSetCookie?: () => string[] };
   if (typeof customHeaders.getSetCookie === "function") {
@@ -168,9 +173,7 @@ async function portalFetch(input: string, init: RequestInit, clientSignal?: Abor
           if (clientAborted || clientSignal?.aborted) {
             streamController.error(clientAbortError());
           } else if (timedOut) {
-            streamController.error(dispatcher
-              ? new ProxyTransportError("Proxy response timed out while waiting for data.")
-              : new PortalError("The NeuralWatt portal response timed out while waiting for data.", 504));
+            streamController.error(portalResponseBodyTimeoutError());
           } else {
             streamController.error(dispatcher ? asProxyTransportError(error) : error);
           }
