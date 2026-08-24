@@ -14,8 +14,8 @@ const RecordsWorkspace = defineAsyncComponent(() => import("./components/Records
 const SchedulerWorkspace = defineAsyncComponent(() => import("./components/SchedulerWorkspace.vue"));
 import { DEFAULT_THEME, deriveOverview, parseTheme, parseWorkspace, THEME_STORAGE_KEY, WORKSPACE_STORAGE_KEY } from "./utils/admin-ui.ts";
 import type {
-  Account, AnalyticsGranularity, AnalyticsOverview, AnalyticsQueryResult, AnalyticsRetention, AnalyticsSort, ApiPayload, BodyPresentation, CleanupPreview, ConversationTrace, DebugRawBody, DebugRecord, DebugRecordSummary,
-  DebugUpstreamCall, DisplayField, DisplayMessage, DisplayToolCall, GatewayConfig, GatewaySettings,
+  Account, AccountGroup, AccountGroupSummary, AccountOverview, AccountPagination, AccountSort, AccountStatusFilter, AnalyticsGranularity, AnalyticsOverview, AnalyticsQueryResult, AnalyticsRetention, AnalyticsSort, ApiPayload, BodyPresentation, CleanupPreview, ConversationTrace, DebugRawBody, DebugRecord, DebugRecordSummary,
+  DebugUpstreamCall, DisplayField, DisplayMessage, DisplayToolCall, GatewayConfig, GatewaySettings, GroupApiKey,
   PreambleVerbosity, ProxyImportLineResult, ThemeId, ProxyPoolEntry, ProxyPoolSettings, ProxyPoolStatus,
   SchedulerRuntime, SchedulerSettings, SidebarItem, SidebarUpstreamItem, ToolCallFormat, WorkspaceId,
 } from "./types/admin.ts";
@@ -30,7 +30,12 @@ const theme = ref<ThemeId>(typeof window === "undefined" ? DEFAULT_THEME : parse
 const expandedAccountId = ref<string | null>(null);
 const secretResetToken = ref(0);
 // shallowRef: record/account payloads are large and immutable; avoid deep reactivity.
-const accounts = shallowRef<Account[]>([]);
+const accountOverview = reactive<AccountOverview>({ total: 0, enabled: 0, sessions: 0, direct: 0, inFlight: 0, cooling: 0, modelCooling: 0, models: [], rows: [], issues: [] });
+const accountPage = shallowRef<Account[]>([]);
+const accountGroups = shallowRef<AccountGroup[]>([]);
+const groupApiKeys = shallowRef<GroupApiKey[]>([]);
+const groupSummary = reactive<AccountGroupSummary>({ totalAccounts: 0, ungroupedAccounts: 0 });
+const accountPagination = reactive<AccountPagination>({ page: 1, pageSize: 20, total: 0, pageCount: 1 });
 const proxies = shallowRef<ProxyPoolEntry[]>([]);
 const records = shallowRef<DebugRecordSummary[]>([]);
 const analytics = shallowRef<AnalyticsOverview | null>(null);
@@ -85,8 +90,10 @@ const config = reactive({
   toolCallFormat: "auto" as ToolCallFormat,
   preambleVerbosity: "milestone" as PreambleVerbosity,
 });
-const newAccount = reactive({ label: "", email: "", password: "", weight: 1, proxy: "" });
+const newAccount = reactive({ label: "", email: "", password: "", weight: 1, proxy: "", groupIds: [] as string[] });
 const isLoading = ref(false);
+const isConnected = ref(false);
+const currentTime = ref(Date.now());
 const isSaving = ref(false);
 const minimumOutputTokensDraft = ref(8_192);
 const isSavingMinimumOutputTokens = ref(false);
@@ -99,6 +106,7 @@ const proxyImportResults = ref<ProxyImportLineResult[]>([]);
 const proxyFilter = ref<"all" | ProxyPoolStatus>("all");
 const isImportingProxies = ref(false);
 const isCheckingProxies = ref(false);
+const isAssigningDirectProxies = ref(false);
 const busyProxyIds = ref(new Set<string>());
 const isSavingProxyPool = ref(false);
 const isClearingRecords = ref(false);
@@ -167,9 +175,19 @@ const limitEditor = ref<{
   modelConcurrency: Record<string, string>;
 } | null>(null);
 const pendingRemoval = ref<Account | null>(null);
+const groupEditor = ref<{ group: AccountGroup | null; name: string; description: string; enabled: boolean } | null>(null);
+const pendingGroupRemoval = ref<AccountGroup | null>(null);
+const keyManagerGroup = ref<AccountGroup | null>(null);
+const keyNameDraft = ref("");
+const oneTimeGroupSecret = ref("");
+const pendingKeyRemoval = ref<GroupApiKey | null>(null);
+const isLoadingAccounts = ref(false);
+const isSavingGroup = ref(false);
+const isSavingGroupKey = ref(false);
 const showClearConfirm = ref(false);
-const dialogOpen = computed(() => Boolean(showAddAccount.value || proxyEditor.value || modelEditor.value || limitEditor.value || pendingRemoval.value || showClearConfirm.value || showCleanupConfirm.value));
+const dialogOpen = computed(() => Boolean(showAddAccount.value || proxyEditor.value || modelEditor.value || limitEditor.value || pendingRemoval.value || groupEditor.value || pendingGroupRemoval.value || keyManagerGroup.value || pendingKeyRemoval.value || showClearConfirm.value || showCleanupConfirm.value));
 function openAddAccount(): void {
+  newAccount.groupIds = accountGroupFilter.value !== "all" && accountGroupFilter.value !== "ungrouped" ? [accountGroupFilter.value] : [];
   showAddAccount.value = true;
 }
 const busyAccountIds = ref(new Set<string>());
@@ -186,17 +204,27 @@ function isAccountBusy(id: string): boolean {
 
 // ---- Filters ----
 const accountQuery = ref("");
+const accountGroupFilter = ref("all");
+const accountStatusFilter = ref<AccountStatusFilter>("all");
+const accountSort = ref<AccountSort>("created_desc");
+const accountPageSize = ref<20 | 50 | 100>(20);
+const accountPageNumber = ref(1);
 const recordQuery = ref("");
 const recordFilter = ref<"all" | "success" | "failed">("all");
 
 // ---- Auto refresh ----
 const autoRefresh = ref(true);
 let autoRefreshTimer: number | undefined;
+let clockTimer: number | undefined;
+let dashboardRequestSequence = 0;
+let accountRequestSequence = 0;
+let accountQueryTimer: number | undefined;
+let recordsRequestSequence = 0;
 
 // Effective output budget: persisted setting > environment default.
 const effectiveMinimumOutputTokens = computed(() => settings.minimumOutputTokens ?? config.minimumOutputTokens);
-const allModels = computed(() => [...new Set(accounts.value.flatMap((account) => account.models))].sort());
-const overviewSnapshot = computed(() => deriveOverview(accounts.value, proxies.value, schedulerRuntime, config, Date.now()));
+const allModels = computed(() => accountOverview.models);
+const overviewSnapshot = computed(() => deriveOverview(accountOverview, proxies.value, schedulerRuntime, config));
 const cleanupDescription = computed(() => cleanupPreview.value
   ? `将删除 ${cleanupPreview.value.executions} 条执行、${cleanupPreview.value.attempts} 次上游尝试和 ${cleanupPreview.value.minuteBuckets} 个分钟桶。日/月总账与价格版本保持不变。`
   : "请先生成清理预览。",
@@ -256,6 +284,79 @@ async function api(path: string, init: RequestInit = {}): Promise<ApiPayload> {
   return payload;
 }
 
+async function loadAccountGroups(): Promise<void> {
+  const payload = await api("/api/admin/account-groups");
+  accountGroups.value = payload.groups ?? [];
+  Object.assign(groupSummary, payload.groupSummary ?? { totalAccounts: 0, ungroupedAccounts: 0 });
+  if (accountGroupFilter.value !== "all" && accountGroupFilter.value !== "ungrouped"
+    && !accountGroups.value.some((group) => group.id === accountGroupFilter.value)) {
+    accountGroupFilter.value = "all";
+    accountPageNumber.value = 1;
+  }
+}
+
+async function loadAccountPage(): Promise<void> {
+  const sequence = ++accountRequestSequence;
+  const query = new URLSearchParams({
+    page: String(accountPageNumber.value),
+    pageSize: String(accountPageSize.value),
+    status: accountStatusFilter.value,
+    sort: accountSort.value,
+  });
+  if (accountQuery.value.trim()) query.set("query", accountQuery.value.trim());
+  if (accountGroupFilter.value !== "all") query.set("groupId", accountGroupFilter.value);
+  isLoadingAccounts.value = true;
+  try {
+    const payload = await api(`/api/admin/accounts?${query}`);
+    if (sequence !== accountRequestSequence) return;
+    accountPage.value = payload.accounts ?? [];
+    Object.assign(accountPagination, payload.pagination ?? { page: 1, pageSize: accountPageSize.value, total: 0, pageCount: 1 });
+    accountPageNumber.value = accountPagination.page;
+  } finally {
+    if (sequence === accountRequestSequence) isLoadingAccounts.value = false;
+  }
+}
+
+async function requestAccountPage(): Promise<void> {
+  try {
+    await loadAccountPage();
+  } catch (error) {
+    pushToast("error", errorText(error, "无法加载账号列表。"));
+  }
+}
+
+async function refreshAccountWorkspace(): Promise<void> {
+  await loadAccountGroups();
+  await loadAccountPage();
+}
+
+function selectAccountGroup(value: string): void {
+  accountGroupFilter.value = value;
+  accountPageNumber.value = 1;
+  expandedAccountId.value = null;
+  void requestAccountPage();
+}
+function setAccountStatus(value: AccountStatusFilter): void {
+  accountStatusFilter.value = value;
+  accountPageNumber.value = 1;
+  void requestAccountPage();
+}
+function setAccountSort(value: AccountSort): void {
+  accountSort.value = value;
+  accountPageNumber.value = 1;
+  void requestAccountPage();
+}
+function setAccountPageSize(value: 20 | 50 | 100): void {
+  accountPageSize.value = value;
+  accountPageNumber.value = 1;
+  void requestAccountPage();
+}
+function setAccountPage(value: number): void {
+  accountPageNumber.value = value;
+  expandedAccountId.value = null;
+  void requestAccountPage();
+}
+
 function useToken() {
   const value = tokenDraft.value.trim();
   if (!value) {
@@ -266,15 +367,24 @@ function useToken() {
   token.value = value;
   sessionStorage.setItem(tokenStorageKey, value);
   void loadDashboard();
+  if (view.value === "accounts") void refreshAccountWorkspace();
 }
 
 function signOut() {
+  dashboardRequestSequence += 1;
+  recordsRequestSequence += 1;
+  isConnected.value = false;
   secretResetToken.value += 1;
   expandedAccountId.value = null;
   token.value = "";
   tokenDraft.value = "";
   sessionStorage.removeItem(tokenStorageKey);
-  accounts.value = [];
+  Object.assign(accountOverview, { total: 0, enabled: 0, sessions: 0, direct: 0, inFlight: 0, cooling: 0, modelCooling: 0, models: [], rows: [], issues: [] });
+  accountPage.value = [];
+  accountGroups.value = [];
+  groupApiKeys.value = [];
+  Object.assign(groupSummary, { totalAccounts: 0, ungroupedAccounts: 0 });
+  Object.assign(accountPagination, { page: 1, pageSize: 20, total: 0, pageCount: 1 });
   proxies.value = [];
   analytics.value = null;
   analyticsResult.value = null;
@@ -295,6 +405,11 @@ function signOut() {
   modelEditor.value = null;
   limitEditor.value = null;
   pendingRemoval.value = null;
+  groupEditor.value = null;
+  pendingGroupRemoval.value = null;
+  keyManagerGroup.value = null;
+  pendingKeyRemoval.value = null;
+  oneTimeGroupSecret.value = "";
   showClearConfirm.value = false;
   autoRefresh.value = false;
 }
@@ -303,16 +418,20 @@ async function loadDashboard(options?: { silent?: boolean }) {
   if (!token.value) {
     return;
   }
+  const requestSequence = ++dashboardRequestSequence;
   if (!options?.silent) isLoading.value = true;
   try {
     const payload = await api("/api/admin/status");
-    accounts.value = payload.accounts ?? [];
+    if (requestSequence !== dashboardRequestSequence) return;
+    isConnected.value = true;
+    currentTime.value = Date.now();
+    Object.assign(accountOverview, payload.accountOverview ?? { total: 0, enabled: 0, sessions: 0, direct: 0, inFlight: 0, cooling: 0, modelCooling: 0, models: [], rows: [], issues: [] });
     proxies.value = payload.proxyPool ?? payload.proxies ?? [];
-    applySettings(payload.settings);
+    applySettings(payload.settings, { syncDrafts: !options?.silent });
     Object.assign(schedulerRuntime, payload.scheduler ?? { pending: 0, oldestWaitMs: 0, egresses: [] });
     analytics.value = payload.analytics ?? null;
     Object.assign(config, payload.config ?? {});
-    minimumOutputTokensDraft.value = effectiveMinimumOutputTokens.value;
+    if (!options?.silent) minimumOutputTokensDraft.value = effectiveMinimumOutputTokens.value;
     if ((view.value === "overview" || view.value === "settings") && !analyticsResult.value) {
       void loadAnalytics();
     }
@@ -320,6 +439,8 @@ async function loadDashboard(options?: { silent?: boolean }) {
       await loadRecords();
     }
   } catch (error) {
+    if (requestSequence !== dashboardRequestSequence) return;
+    isConnected.value = false;
     const message = errorText(error, "无法加载控制台。");
     if (message.includes("Invalid admin token") || message.includes("管理员令牌无效")) {
       token.value = "";
@@ -330,14 +451,16 @@ async function loadDashboard(options?: { silent?: boolean }) {
       pushToast("error", message);
     }
   } finally {
-    if (!options?.silent) isLoading.value = false;
+    if (requestSequence === dashboardRequestSequence) isLoading.value = false;
   }
 }
 
 async function loadRecords() {
+  const requestSequence = ++recordsRequestSequence;
   const payload = await api("/api/admin/records?limit=100");
+  if (requestSequence !== recordsRequestSequence) return;
   records.value = payload.records ?? [];
-  applySettings(payload.settings);
+  settings.recordMessages = payload.settings?.recordMessages ?? settings.recordMessages;
   // Drop cached details for records that were pruned or cleared server-side.
   const ids = new Set(records.value.map((record) => record.id));
   for (const id of [...detailCache.keys()]) {
@@ -415,6 +538,13 @@ async function selectView(next: WorkspaceId) {
   expandedAccountId.value = null;
   secretResetToken.value += 1;
   localStorage.setItem(WORKSPACE_STORAGE_KEY, next);
+  if (next === "accounts") {
+    try {
+      await refreshAccountWorkspace();
+    } catch (error) {
+      pushToast("error", errorText(error, "无法加载账号与分组。"));
+    }
+  }
   if ((next === "overview" || next === "settings") && !analyticsResult.value) {
     await loadAnalytics();
   }
@@ -440,13 +570,178 @@ async function addAccount() {
     newAccount.password = "";
     newAccount.weight = 1;
     newAccount.proxy = "";
+    newAccount.groupIds = [];
     showAddAccount.value = false;
     pushToast("success", "账号验证成功并已添加");
-    await loadDashboard({ silent: true });
+    await Promise.all([loadDashboard({ silent: true }), refreshAccountWorkspace()]);
   } catch (error) {
     pushToast("error", errorText(error, "无法添加账号。"));
   } finally {
     isSaving.value = false;
+  }
+}
+
+function openCreateGroup(): void {
+  groupEditor.value = { group: null, name: "", description: "", enabled: true };
+}
+function openEditGroup(group: AccountGroup): void {
+  groupEditor.value = { group, name: group.name, description: group.description ?? "", enabled: group.enabled };
+}
+async function saveAccountGroup(): Promise<void> {
+  const editor = groupEditor.value;
+  if (!editor || isSavingGroup.value || !editor.name.trim()) return;
+  isSavingGroup.value = true;
+  try {
+    if (editor.group) {
+      await api(`/api/admin/account-groups/${encodeURIComponent(editor.group.id)}`, {
+        method: "PATCH",
+        body: JSON.stringify({ name: editor.name, description: editor.description, enabled: editor.enabled }),
+      });
+      pushToast("success", `分组「${editor.name.trim()}」已更新`);
+    } else {
+      const payload = await api("/api/admin/account-groups", {
+        method: "POST",
+        body: JSON.stringify({ name: editor.name, description: editor.description }),
+      });
+      if (payload.group) accountGroupFilter.value = payload.group.id;
+      pushToast("success", `分组「${editor.name.trim()}」已创建`);
+    }
+    groupEditor.value = null;
+    accountPageNumber.value = 1;
+    await refreshAccountWorkspace();
+  } catch (error) {
+    pushToast("error", errorText(error, "无法保存账号分组。"));
+  } finally {
+    isSavingGroup.value = false;
+  }
+}
+function askRemoveGroup(group: AccountGroup): void {
+  pendingGroupRemoval.value = group;
+  groupEditor.value = null;
+}
+async function confirmRemoveGroup(): Promise<void> {
+  const group = pendingGroupRemoval.value;
+  if (!group || isSavingGroup.value) return;
+  isSavingGroup.value = true;
+  try {
+    await api(`/api/admin/account-groups/${encodeURIComponent(group.id)}`, { method: "DELETE" });
+    if (accountGroupFilter.value === group.id) accountGroupFilter.value = "all";
+    accountPageNumber.value = 1;
+    pendingGroupRemoval.value = null;
+    await Promise.all([loadDashboard({ silent: true }), refreshAccountWorkspace()]);
+    pushToast("success", `分组「${group.name}」已删除，相关 Key 已撤销`);
+  } catch (error) {
+    pushToast("error", errorText(error, "无法删除账号分组。"));
+  } finally {
+    isSavingGroup.value = false;
+  }
+}
+async function openKeyManager(group: AccountGroup): Promise<void> {
+  keyManagerGroup.value = group;
+  keyNameDraft.value = "";
+  oneTimeGroupSecret.value = "";
+  try {
+    const payload = await api(`/api/admin/account-groups/${encodeURIComponent(group.id)}/api-keys`);
+    groupApiKeys.value = payload.keys ?? [];
+  } catch (error) {
+    keyManagerGroup.value = null;
+    pushToast("error", errorText(error, "无法加载分组 API Key。"));
+  }
+}
+function closeKeyManager(): void {
+  keyManagerGroup.value = null;
+  groupApiKeys.value = [];
+  keyNameDraft.value = "";
+  oneTimeGroupSecret.value = "";
+  pendingKeyRemoval.value = null;
+  secretResetToken.value += 1;
+}
+async function createGroupKey(): Promise<void> {
+  const group = keyManagerGroup.value;
+  if (!group || !keyNameDraft.value.trim() || isSavingGroupKey.value) return;
+  isSavingGroupKey.value = true;
+  try {
+    const payload = await api(`/api/admin/account-groups/${encodeURIComponent(group.id)}/api-keys`, {
+      method: "POST",
+      body: JSON.stringify({ name: keyNameDraft.value }),
+    });
+    if (payload.key) groupApiKeys.value = [...groupApiKeys.value, payload.key];
+    oneTimeGroupSecret.value = payload.secret ?? "";
+    keyNameDraft.value = "";
+    secretResetToken.value += 1;
+    await loadAccountGroups();
+    pushToast("success", "分组 API Key 已创建");
+  } catch (error) {
+    pushToast("error", errorText(error, "无法创建分组 API Key。"));
+  } finally {
+    isSavingGroupKey.value = false;
+  }
+}
+async function rotateGroupKey(key: GroupApiKey): Promise<void> {
+  const group = keyManagerGroup.value;
+  if (!group || isSavingGroupKey.value) return;
+  isSavingGroupKey.value = true;
+  try {
+    const payload = await api(`/api/admin/account-groups/${encodeURIComponent(group.id)}/api-keys/${encodeURIComponent(key.id)}/rotate`, { method: "POST" });
+    if (payload.key) groupApiKeys.value = groupApiKeys.value.map((item) => item.id === key.id ? payload.key! : item);
+    oneTimeGroupSecret.value = payload.secret ?? "";
+    secretResetToken.value += 1;
+    pushToast("success", `Key「${key.name}」已轮换`);
+  } catch (error) {
+    pushToast("error", errorText(error, "无法轮换分组 API Key。"));
+  } finally {
+    isSavingGroupKey.value = false;
+  }
+}
+async function toggleGroupKey(key: GroupApiKey): Promise<void> {
+  const group = keyManagerGroup.value;
+  if (!group || isSavingGroupKey.value) return;
+  isSavingGroupKey.value = true;
+  try {
+    const payload = await api(`/api/admin/account-groups/${encodeURIComponent(group.id)}/api-keys/${encodeURIComponent(key.id)}`, {
+      method: "PATCH",
+      body: JSON.stringify({ enabled: !key.enabled }),
+    });
+    if (payload.key) groupApiKeys.value = groupApiKeys.value.map((item) => item.id === key.id ? payload.key! : item);
+    pushToast("success", key.enabled ? `Key「${key.name}」已停用` : `Key「${key.name}」已启用`);
+  } catch (error) {
+    pushToast("error", errorText(error, "无法更新分组 API Key。"));
+  } finally {
+    isSavingGroupKey.value = false;
+  }
+}
+async function confirmRemoveGroupKey(): Promise<void> {
+  const group = keyManagerGroup.value;
+  const key = pendingKeyRemoval.value;
+  if (!group || !key || isSavingGroupKey.value) return;
+  isSavingGroupKey.value = true;
+  try {
+    await api(`/api/admin/account-groups/${encodeURIComponent(group.id)}/api-keys/${encodeURIComponent(key.id)}`, { method: "DELETE" });
+    groupApiKeys.value = groupApiKeys.value.filter((item) => item.id !== key.id);
+    pendingKeyRemoval.value = null;
+    await loadAccountGroups();
+    pushToast("success", `Key「${key.name}」已撤销`);
+  } catch (error) {
+    pushToast("error", errorText(error, "无法撤销分组 API Key。"));
+  } finally {
+    isSavingGroupKey.value = false;
+  }
+}
+async function saveAccountMembership(account: Account, groupIds: string[]): Promise<void> {
+  if (isAccountBusy(account.id)) return;
+  setAccountBusy(account.id, true);
+  try {
+    const payload = await api(`/api/admin/accounts/${encodeURIComponent(account.id)}`, {
+      method: "PATCH",
+      body: JSON.stringify({ groupIds }),
+    });
+    if (payload.account) replaceAccount(payload.account);
+    await Promise.all([loadDashboard({ silent: true }), refreshAccountWorkspace()]);
+    pushToast("success", `${account.label} 的分组已更新`);
+  } catch (error) {
+    pushToast("error", errorText(error, "无法更新账号分组。"));
+  } finally {
+    setAccountBusy(account.id, false);
   }
 }
 
@@ -617,8 +912,9 @@ async function confirmRemoveAccount() {
   setAccountBusy(account.id, true);
   try {
     await api(`/api/admin/accounts/${encodeURIComponent(account.id)}`, { method: "DELETE" });
-    accounts.value = accounts.value.filter((item) => item.id !== account.id);
+    accountPage.value = accountPage.value.filter((item) => item.id !== account.id);
     pendingRemoval.value = null;
+    await Promise.all([loadDashboard({ silent: true }), refreshAccountWorkspace()]);
     pushToast("success", `账号「${account.label}」已移除`);
   } catch (error) {
     pushToast("error", errorText(error, "无法移除账号。"));
@@ -633,6 +929,8 @@ async function setRecording(value: boolean) {
       method: "PATCH",
       body: JSON.stringify({ recordMessages: value }),
     });
+    recordsRequestSequence += 1;
+    dashboardRequestSequence += 1;
     settings.recordMessages = payload.settings?.recordMessages ?? value;
     pushToast("success", value ? "已开启消息记录" : "已关闭消息记录");
   } catch (error) {
@@ -643,7 +941,7 @@ async function setRecording(value: boolean) {
 async function patchToolCallSettings(body: JsonRecord, successText: string) {
   try {
     const payload = await api("/api/admin/settings", { method: "PATCH", body: JSON.stringify(body) });
-    applySettings(payload.settings);
+    commitSettings(payload.settings);
     pushToast("success", successText);
   } catch (error) {
     pushToast("error", errorText(error, "无法更新工具调用设置。"));
@@ -687,7 +985,7 @@ async function deleteProxyEntry(proxy: ProxyPoolEntry) {
 
 async function saveProxyPoolSettings() {
   isSavingProxyPool.value = true;
-  try { const payload = await api("/api/admin/settings", { method: "PATCH", body: JSON.stringify({ proxyPool: proxyPoolDraft }) }); applySettings(payload.settings); pushToast("success", "代理池策略已生效"); }
+  try { const payload = await api("/api/admin/settings", { method: "PATCH", body: JSON.stringify({ proxyPool: proxyPoolDraft }) }); commitSettings(payload.settings); pushToast("success", "代理池策略已生效"); }
   catch (error) { pushToast("error", errorText(error, "无法更新代理池策略。")); } finally { isSavingProxyPool.value = false; }
 }
 
@@ -695,6 +993,23 @@ async function assignProxy(account: Account) {
   if (account.proxy || isAccountBusy(account.id)) return; setAccountBusy(account.id, true);
   try { const payload = await api(`/api/admin/accounts/${encodeURIComponent(account.id)}/assign-proxy`, { method: "POST" }); if (payload.account) replaceAccount(payload.account); await loadDashboard({ silent: true }); pushToast("success", `${account.label} 已分配空闲代理`); }
   catch (error) { pushToast("error", errorText(error, "无法分配空闲代理。")); } finally { setAccountBusy(account.id, false); }
+}
+
+async function assignProxiesToDirectAccounts() {
+  if (isAssigningDirectProxies.value) return;
+  isAssigningDirectProxies.value = true;
+  try {
+    const payload = await api("/api/admin/proxies/assign-direct", { method: "POST" });
+    await Promise.all([loadDashboard({ silent: true }), view.value === "accounts" ? refreshAccountWorkspace() : Promise.resolve()]);
+    const assigned = payload.assigned ?? 0;
+    const failed = payload.failed ?? 0;
+    const remaining = payload.remaining ?? 0;
+    pushToast(failed > 0 ? "error" : "success", `已分配 ${assigned} 个账号，剩余直连 ${remaining}${failed ? `，失败 ${failed}` : ""}`);
+  } catch (error) {
+    pushToast("error", errorText(error, "无法批量分配代理。"));
+  } finally {
+    isAssigningDirectProxies.value = false;
+  }
 }
 
 async function saveSchedulerSettings() {
@@ -708,7 +1023,7 @@ async function saveSchedulerSettings() {
   isSavingScheduler.value = true;
   try {
     const payload = await api("/api/admin/settings", { method: "PATCH", body: JSON.stringify({ scheduler: schedulerDraft }) });
-    applySettings(payload.settings);
+    commitSettings(payload.settings);
     pushToast("success", "调度与队列设置已生效");
   } catch (error) {
     pushToast("error", errorText(error, "无法更新调度设置。"));
@@ -729,7 +1044,7 @@ async function saveMinimumOutputTokens() {
       method: "PATCH",
       body: JSON.stringify({ minimumOutputTokens: value }),
     });
-    applySettings(payload.settings);
+    commitSettings(payload.settings);
     minimumOutputTokensDraft.value = effectiveMinimumOutputTokens.value;
     pushToast("success", value === 0 ? "已关闭最小上游输出预算" : `最小上游输出预算已设为 ${value}`);
   } catch (error) {
@@ -918,12 +1233,20 @@ async function confirmAnalyticsCleanup(): Promise<void> {
 
 // Replace (not merge) the optional fields: cleared keys are absent from the
 // server payload, and Object.assign would keep the stale local value.
-function applySettings(next: ApiPayload["settings"]) {
+function commitSettings(next: ApiPayload["settings"]): void {
+  dashboardRequestSequence += 1;
+  isLoading.value = false;
+  applySettings(next);
+}
+
+function applySettings(next: ApiPayload["settings"], options: { syncDrafts?: boolean } = {}) {
   settings.recordMessages = next?.recordMessages ?? false;
   settings.scheduler = { ...defaultSchedulerSettings, ...(next?.scheduler ?? {}) };
   settings.proxyPool = { ...defaultProxyPoolSettings, ...(next?.proxyPool ?? {}) };
-  Object.assign(schedulerDraft, settings.scheduler);
-  Object.assign(proxyPoolDraft, settings.proxyPool);
+  if (options.syncDrafts !== false) {
+    Object.assign(schedulerDraft, settings.scheduler);
+    Object.assign(proxyPoolDraft, settings.proxyPool);
+  }
   settings.minimumOutputTokens = next?.minimumOutputTokens;
   settings.toolCallFormat = next?.toolCallFormat;
   settings.preambleVerbosity = next?.preambleVerbosity;
@@ -957,12 +1280,10 @@ async function confirmClearRecords() {
 }
 
 function replaceAccount(next: Account) {
-  const index = accounts.value.findIndex((account) => account.id === next.id);
-  if (index === -1) {
-    accounts.value = [...accounts.value, next];
-  } else {
-    accounts.value = accounts.value.map((account, i) => (i === index ? next : account));
-  }
+  const index = accountPage.value.findIndex((account) => account.id === next.id);
+  accountPage.value = index === -1
+    ? [...accountPage.value, next]
+    : accountPage.value.map((account, position) => (position === index ? next : account));
 }
 
 function pretty(value: unknown): string {
@@ -1604,6 +1925,15 @@ const sidebarItems = computed<SidebarItem[]>(() => filteredRecords.value.map((re
 const selectedRequest = computed(() => (selectedTrace.value ? traceRequest(selectedTrace.value) : null));
 const selectedResponse = computed(() => (selectedTrace.value ? traceResponse(selectedTrace.value) : null));
 
+watch(accountQuery, () => {
+  if (typeof window === "undefined") return;
+  window.clearTimeout(accountQueryTimer);
+  accountQueryTimer = window.setTimeout(() => {
+    accountPageNumber.value = 1;
+    void requestAccountPage();
+  }, 250);
+});
+
 watch(autoRefresh, (enabled) => {
   if (typeof window === "undefined") return;
   window.clearInterval(autoRefreshTimer);
@@ -1611,6 +1941,7 @@ watch(autoRefresh, (enabled) => {
   if (enabled) {
     autoRefreshTimer = window.setInterval(() => {
       void loadDashboard({ silent: true });
+      if (view.value === "accounts") void requestAccountPage();
     }, 5_000);
   }
 }, { immediate: true });
@@ -1626,14 +1957,21 @@ function onKeydown(event: KeyboardEvent): void {
 }
 
 onMounted(() => {
+  currentTime.value = Date.now();
+  clockTimer = window.setInterval(() => {
+    currentTime.value = Date.now();
+  }, 30_000);
   if (token.value) {
     void loadDashboard();
+    if (view.value === "accounts") void refreshAccountWorkspace();
   }
   window.addEventListener("keydown", onKeydown);
 });
 
 onUnmounted(() => {
   window.clearInterval(autoRefreshTimer);
+  window.clearInterval(clockTimer);
+  window.clearTimeout(accountQueryTimer);
   window.removeEventListener("keydown", onKeydown);
 });
 </script>
@@ -1653,18 +1991,18 @@ onUnmounted(() => {
         <p class="access-copy">请输入服务端管理员令牌继续。</p>
         <form class="access-form" @submit.prevent="useToken">
           <label for="admin-token">管理员令牌</label>
-          <input id="admin-token" v-model="tokenDraft" type="password" autocomplete="off" spellcheck="false" />
+          <input id="admin-token" v-model="tokenDraft" name="admin-token" type="password" autocomplete="current-password" spellcheck="false" />
           <button class="button button-primary" type="submit">进入控制台</button>
         </form>
         <p v-if="loginError" class="error-line" role="alert">{{ loginError }}</p>
       </section>
     </main>
 
-    <WorkspaceShell v-else :theme="theme" :workspace="view" :loading="isLoading" :connected="Boolean(token)" :auto-refresh="autoRefresh" @select="selectView" @refresh="loadDashboard()" @toggle-auto-refresh="autoRefresh = !autoRefresh" @change-theme="changeTheme" @sign-out="signOut">
+    <WorkspaceShell v-else :theme="theme" :workspace="view" :loading="isLoading" :connected="isConnected" :auto-refresh="autoRefresh" @select="selectView" @refresh="loadDashboard()" @toggle-auto-refresh="autoRefresh = !autoRefresh" @change-theme="changeTheme" @sign-out="signOut">
       <Transition name="page-fade" mode="out-in">
-      <OverviewWorkspace v-if="view === 'overview'" key="overview" :snapshot="overviewSnapshot" :analytics="analytics" :detail="analyticsResult" :analytics-range="analyticsRange" :analytics-granularity="analyticsGranularity" :analytics-sort="analyticsSort" :analytics-model="analyticsModel" :custom-from="analyticsCustomFrom" :custom-to="analyticsCustomTo" :loading-analytics="isLoadingAnalytics" :accounts="accounts" :proxies="proxies" :egresses="schedulerRuntime.egresses" @navigate="navigateFromOverview" @set-range="setAnalyticsRange" @set-granularity="setAnalyticsGranularity" @set-sort="setAnalyticsSort" @set-model="setAnalyticsModel" @update:custom-from="analyticsCustomFrom = $event" @update:custom-to="analyticsCustomTo = $event" @load-custom="loadAnalytics" />
-      <AccountsWorkspace v-else-if="view === 'accounts'" key="accounts" v-model:query="accountQuery" v-model:expanded-id="expandedAccountId" :accounts="accounts" :proxies="proxies" :scheduler="settings.scheduler" :busy-ids="busyAccountIds" :secret-reset-token="secretResetToken" :copy-secret="copyCredential" @add="openAddAccount" @verify="verifyAccount" @manage-proxy="openProxyEditor" @assign-proxy="assignProxy" @fetch-models="fetchAccountModels" @edit-models="openModelEditor" @edit-limits="openLimitEditor" @toggle="toggleAccount" @remove="askRemoveAccount" />
-      <ProxyPoolWorkspace v-else-if="view === 'proxies'" key="proxies" v-model:import-text="proxyImportText" v-model:filter="proxyFilter" :proxies="proxies" :draft="proxyPoolDraft" :import-results="proxyImportResults" :busy-ids="busyProxyIds" :importing="isImportingProxies" :checking-all="isCheckingProxies" :saving="isSavingProxyPool" @update-policy="updateProxyPolicy" @import="importProxies" @check="checkProxyEntry" @check-many="checkProxyPool" @delete="deleteProxyEntry" @save-policies="saveProxyPoolSettings" />
+      <OverviewWorkspace v-if="view === 'overview'" key="overview" :snapshot="overviewSnapshot" :analytics="analytics" :detail="analyticsResult" :analytics-range="analyticsRange" :analytics-granularity="analyticsGranularity" :analytics-sort="analyticsSort" :analytics-model="analyticsModel" :custom-from="analyticsCustomFrom" :custom-to="analyticsCustomTo" :loading-analytics="isLoadingAnalytics" :account-overview="accountOverview" :proxies="proxies" :egresses="schedulerRuntime.egresses" @navigate="navigateFromOverview" @set-range="setAnalyticsRange" @set-granularity="setAnalyticsGranularity" @set-sort="setAnalyticsSort" @set-model="setAnalyticsModel" @update:custom-from="analyticsCustomFrom = $event" @update:custom-to="analyticsCustomTo = $event" @load-custom="loadAnalytics" />
+      <AccountsWorkspace v-else-if="view === 'accounts'" key="accounts" v-model:query="accountQuery" v-model:expanded-id="expandedAccountId" :accounts="accountPage" :groups="accountGroups" :group-summary="groupSummary" :pagination="accountPagination" :group-filter="accountGroupFilter" :status-filter="accountStatusFilter" :sort="accountSort" :page-size="accountPageSize" :proxies="proxies" :scheduler="settings.scheduler" :busy-ids="busyAccountIds" :loading="isLoadingAccounts" :secret-reset-token="secretResetToken" :copy-secret="copyCredential" @select-group="selectAccountGroup" @set-status="setAccountStatus" @set-sort="setAccountSort" @set-page-size="setAccountPageSize" @set-page="setAccountPage" @add="openAddAccount" @add-group="openCreateGroup" @edit-group="openEditGroup" @manage-keys="openKeyManager" @save-membership="saveAccountMembership" @verify="verifyAccount" @manage-proxy="openProxyEditor" @assign-proxy="assignProxy" @fetch-models="fetchAccountModels" @edit-models="openModelEditor" @edit-limits="openLimitEditor" @toggle="toggleAccount" @remove="askRemoveAccount" />
+      <ProxyPoolWorkspace v-else-if="view === 'proxies'" key="proxies" v-model:import-text="proxyImportText" v-model:filter="proxyFilter" :proxies="proxies" :draft="proxyPoolDraft" :import-results="proxyImportResults" :busy-ids="busyProxyIds" :direct-account-count="accountOverview.direct" :importing="isImportingProxies" :checking-all="isCheckingProxies" :assigning-direct="isAssigningDirectProxies" :saving="isSavingProxyPool" @update-policy="updateProxyPolicy" @import="importProxies" @check="checkProxyEntry" @check-many="checkProxyPool" @assign-direct="assignProxiesToDirectAccounts" @delete="deleteProxyEntry" @save-policies="saveProxyPoolSettings" />
       <SchedulerWorkspace v-else-if="view === 'scheduler'" key="scheduler" :draft="schedulerDraft" :runtime="schedulerRuntime" :saving="isSavingScheduler" @update-field="updateSchedulerField" @save="saveSchedulerSettings" />
       <RecordsWorkspace v-else-if="view === 'records'" key="records" v-model:query="recordQuery" v-model:filter="recordFilter" v-model:raw-trace-key="rawTraceKey" :records="records" :filtered-records="filteredRecords" :sidebar-items="sidebarItems" :selected-record-id="selectedRecordId" :selected-trace-key="selectedTraceKey" :selected-trace="selectedTrace" :selected-request="selectedRequest" :selected-response="selectedResponse" :loading-detail="isLoadingRecord" :recording="settings.recordMessages" :failed-count="failedRecordCount" :upstream-call-count="upstreamCallCount" :tool-first-pass-rate="toolFirstPassRate" :tool-adapter-count="toolAdapterRecords.length" :selected-record-index="selectedRecordIndex" :clearing="isClearingRecords" @toggle-recording="setRecording" @refresh="loadRecords" @clear="askClearRecords" @select-record="selectRecord" @goto="gotoRecord" />
       <GatewaySettingsWorkspace v-else key="settings" :settings="settings" :config="config" :analytics="analytics" :retention="analyticsRetention" :cleanup-cutoff="cleanupCutoff" :all-models="allModels" v-model:minimum-output-tokens-draft="minimumOutputTokensDraft" :saving-budget="isSavingMinimumOutputTokens" :refreshing-prices="isRefreshingPrices" :saving-retention="isSavingRetention" :previewing-cleanup="isPreviewingCleanup" :secret-reset-token="secretResetToken" :copy-secret="copyCredential" @save-budget="saveMinimumOutputTokens" @set-tool-format="setToolCallFormat" @set-preamble="setPreambleVerbosity" @set-model-tool-format="setModelToolCallFormat" @set-model-preamble="setModelPreambleVerbosity" @refresh-prices="refreshAnalyticsPrices" @save-retention="saveAnalyticsRetention" @update:cleanup-cutoff="cleanupCutoff = $event" @preview-cleanup="previewAnalyticsCleanup" @sign-out="signOut" />
@@ -1677,9 +2015,10 @@ onUnmounted(() => {
           <label for="account-label">账号名称</label>
           <input id="account-label" v-model="newAccount.label" type="text" maxlength="120" placeholder="主账号 Kimi" />
           <label for="account-email">门户邮箱</label>
-          <input id="account-email" v-model="newAccount.email" type="email" maxlength="320" autocomplete="off" required />
+          <input id="account-email" v-model="newAccount.email" name="portal-email" type="email" maxlength="320" autocomplete="username" spellcheck="false" required />
           <label for="account-password">门户密码</label>
           <input id="account-password" v-model="newAccount.password" type="password" maxlength="4096" autocomplete="new-password" required />
+          <fieldset v-if="accountGroups.length" class="modal-checkbox-group"><legend>账号分组</legend><label v-for="group in accountGroups" :key="group.id"><input v-model="newAccount.groupIds" type="checkbox" :value="group.id" /><span>{{ group.name }}</span></label></fieldset>
           <div class="field-row">
             <div>
               <label for="account-weight">权重</label>
@@ -1696,6 +2035,21 @@ onUnmounted(() => {
           <button class="button button-primary" type="submit" :disabled="isSaving" :aria-busy="isSaving"><span v-if="isSaving" class="spinner" aria-hidden="true"></span>{{ isSaving ? "验证中" : "验证并添加" }}</button>
         </footer>
       </form>
+    </AppDialog>
+
+    <AppDialog :open="Boolean(groupEditor)" :title="groupEditor?.group ? '编辑账号分组' : '创建账号分组'" :description="groupEditor?.group ? '名称、说明和启用状态立即影响分组 Key。' : '分组用于约束账号调度范围和 API Key 访问。'" :busy="isSavingGroup" @update:open="!$event && (groupEditor = null)">
+      <form v-if="groupEditor" class="modal-form" @submit.prevent="saveAccountGroup">
+        <div class="modal-body"><label for="group-name">分组名称</label><input id="group-name" v-model="groupEditor.name" type="text" maxlength="120" required /><label for="group-description">说明（可选）</label><textarea id="group-description" v-model="groupEditor.description" rows="3" maxlength="500"></textarea><label v-if="groupEditor.group" class="modal-check"><input v-model="groupEditor.enabled" type="checkbox" /><span>允许该分组的 Key 发起新请求</span></label></div>
+        <footer class="modal-foot"><button v-if="groupEditor.group" class="button button-danger modal-danger-left" type="button" :disabled="isSavingGroup" @click="askRemoveGroup(groupEditor.group)">删除分组</button><button class="button button-quiet" type="button" :disabled="isSavingGroup" @click="groupEditor = null">取消</button><button class="button button-primary" type="submit" :disabled="isSavingGroup || !groupEditor.name.trim()">{{ isSavingGroup ? '保存中' : '保存分组' }}</button></footer>
+      </form>
+    </AppDialog>
+
+    <AppDialog :open="Boolean(keyManagerGroup)" title="分组 API Key" :description="keyManagerGroup ? `分组「${keyManagerGroup.name}」 · 每个 Key 仅能调度该组账号` : ''" :busy="isSavingGroupKey" wide @update:open="!$event && closeKeyManager()">
+      <div v-if="keyManagerGroup" class="modal-form"><div class="modal-body">
+        <section v-if="oneTimeGroupSecret" class="one-time-secret"><strong>请立即保存此 Key</strong><p>明文只显示这一次，关闭对话框后无法再次查看。</p><SecretValue :value="oneTimeGroupSecret" :label="`${keyManagerGroup.name} 的 API Key`" :reset-token="secretResetToken" :copy="copyCredential" /></section>
+        <form class="key-create-row" @submit.prevent="createGroupKey"><label for="group-key-name">新 Key 名称</label><div><input id="group-key-name" v-model="keyNameDraft" type="text" maxlength="120" placeholder="例如：生产客户端" /><button class="button button-primary" type="submit" :disabled="isSavingGroupKey || !keyNameDraft.trim()"><AppIcon name="plus" :size="13" />创建 Key</button></div></form>
+        <div v-if="groupApiKeys.length" class="group-key-list"><article v-for="key in groupApiKeys" :key="key.id"><div><strong>{{ key.name }}</strong><code>{{ key.prefix }}…</code><span class="badge" :class="key.enabled ? 'good' : 'muted'">{{ key.enabled ? '已启用' : '已停用' }}</span></div><div class="detail-actions"><button class="button button-quiet" type="button" :disabled="isSavingGroupKey" @click="rotateGroupKey(key)"><AppIcon name="refresh-cw" :size="13" />轮换</button><button class="button button-quiet" type="button" :disabled="isSavingGroupKey" @click="toggleGroupKey(key)">{{ key.enabled ? '停用' : '启用' }}</button><button class="button button-danger" type="button" :disabled="isSavingGroupKey" @click="pendingKeyRemoval = key">撤销</button></div></article></div><div v-else class="workspace-empty"><strong>尚未创建分组 Key</strong><p>创建后，客户端只能访问此分组中的账号。</p></div>
+      </div><footer class="modal-foot"><button class="button button-quiet" type="button" @click="closeKeyManager">关闭</button></footer></div>
     </AppDialog>
 
     <AppDialog :open="Boolean(proxyEditor)" title="设置出口代理" :description="proxyEditor ? `账号「${proxyEditor.account.label}」 · 当前：${proxyEditor.account.proxy ?? '直连'}` : ''" :busy="Boolean(proxyEditor && isAccountBusy(proxyEditor.account.id))" @update:open="!$event && (proxyEditor = null)">
@@ -1741,6 +2095,10 @@ onUnmounted(() => {
         <footer class="modal-foot"><button class="button button-quiet" type="button" :disabled="isAccountBusy(limitEditor.account.id)" @click="limitEditor = null">取消</button><button class="button button-primary" type="submit" :disabled="isAccountBusy(limitEditor.account.id)" :aria-busy="isAccountBusy(limitEditor.account.id)"><span v-if="isAccountBusy(limitEditor.account.id)" class="spinner" aria-hidden="true"></span>保存</button></footer>
       </form>
     </AppDialog>
+
+    <AppConfirmDialog :open="Boolean(pendingGroupRemoval)" title="删除账号分组" :description="pendingGroupRemoval ? `确定删除分组「${pendingGroupRemoval.name}」吗？将从 ${pendingGroupRemoval.accountCount} 个账号移除该分组，并撤销 ${pendingGroupRemoval.apiKeyCount} 个 API Key。` : ''" confirm-label="删除分组" busy-label="删除中" :busy="isSavingGroup" return-focus=".account-group-rail" @update:open="!$event && (pendingGroupRemoval = null)" @confirm="confirmRemoveGroup" />
+
+    <AppConfirmDialog :open="Boolean(pendingKeyRemoval)" title="撤销分组 API Key" :description="pendingKeyRemoval ? `确定撤销 Key「${pendingKeyRemoval.name}」吗？使用该 Key 的新请求将立即认证失败。` : ''" confirm-label="撤销 Key" busy-label="撤销中" :busy="isSavingGroupKey" return-focus=".group-key-list" @update:open="!$event && (pendingKeyRemoval = null)" @confirm="confirmRemoveGroupKey" />
 
     <AppConfirmDialog
       :open="Boolean(pendingRemoval)"

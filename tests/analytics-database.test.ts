@@ -117,6 +117,7 @@ test("forecast snapshots upsert once per model and minute", async () => {
       enabled: true,
       weight: 1,
       proxy: null,
+      groupIds: [],
       models: ["test-model"],
       hasSession: true,
       sessionExpiresAt: null,

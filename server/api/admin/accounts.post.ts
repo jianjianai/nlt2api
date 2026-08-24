@@ -19,12 +19,16 @@ export default defineHandler(async (event) => {
     if (weight !== undefined && !Number.isInteger(weight)) {
       throw new HttpError(400, "`weight` must be an integer.", "invalid_request_error", "weight");
     }
+    const groupIds = body.groupIds === undefined ? [] : body.groupIds;
+    if (!Array.isArray(groupIds) || groupIds.some((groupId) => typeof groupId !== "string")) {
+      throw new HttpError(400, "`groupIds` must be an array of account group ids.", "invalid_request_error", "groupIds");
+    }
     // The add-account form always submits a proxy field; an empty or
     // whitespace-only value means a direct connection.
     const proxyInput = asString(body.proxy, "proxy", { optional: true, allowEmpty: true, maxLength: 2_048 });
     const proxy = proxyInput?.trim() ? normalizeProxyUrl(proxyInput) : undefined;
 
-    let account = await stateStore.addAccount({ email, password, label, weight, ...(proxy ? { proxy } : {}) });
+    let account = await stateStore.addAccount({ email, password, label, weight, groupIds: groupIds as string[], ...(proxy ? { proxy } : {}) });
     accountId = account.id;
     if (!proxy && (await stateStore.getSettings()).proxyPool.autoAssignOnAccountCreate) {
       const assignment = await proxyPoolService.assignIdle(account.id);

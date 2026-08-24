@@ -1,5 +1,5 @@
 import type {
-  Account,
+  AccountOverview,
   GatewayConfig,
   OperationalWorkspaceId,
   ProxyPoolEntry,
@@ -23,7 +23,8 @@ const WORKSPACES = new Set<WorkspaceId>([
 ]);
 
 export function parseTheme(value: unknown): import("../types/admin.ts").ThemeId {
-  return value === "gray" || value === "dark" || value === "light" ? value : DEFAULT_THEME;
+  if (value === "gray") return "dark";
+  return value === "dark" || value === "light" ? value : DEFAULT_THEME;
 }
 
 export function parseWorkspace(value: unknown): WorkspaceId {
@@ -57,20 +58,13 @@ export interface OverviewSnapshot {
 }
 
 export function deriveOverview(
-  accounts: Account[],
+  accounts: AccountOverview,
   proxies: ProxyPoolEntry[],
   scheduler: SchedulerRuntime,
   config: GatewayConfig,
-  now: number,
 ): OverviewSnapshot {
-  const enabled = accounts.filter((account) => account.enabled).length;
   const healthyProxies = proxies.filter((proxy) => proxy.status === "idle" || proxy.status === "in_use").length;
-  const inFlight = accounts.reduce((total, account) => total + account.runtime.inFlight, 0);
   const errorProxies = proxies.filter((proxy) => proxy.status === "error");
-  const cooling = accounts.filter((account) => account.runtime.cooldownUntil > now);
-  const modelCooldowns = accounts.flatMap((account) => Object.entries(account.runtime.modelCooldownUntil)
-    .filter(([, until]) => until > now)
-    .map(([model, until]) => ({ account, model, until })));
 
   const actions: OverviewAction[] = [];
   for (const proxy of errorProxies.slice(0, 4)) {
@@ -84,26 +78,15 @@ export function deriveOverview(
       proxyId: proxy.id,
     });
   }
-  for (const account of cooling.slice(0, 4)) {
+  for (const issue of accounts.issues) {
     actions.push({
-      id: `account:${account.id}`,
-      title: `${account.label} 正在冷却`,
-      detail: account.runtime.lastError || "账号暂时不可用于新的请求。",
+      id: issue.kind === "model" ? `model:${issue.accountId}:${issue.model}` : `account:${issue.accountId}`,
+      title: issue.kind === "model" ? `${issue.accountLabel} 的 ${issue.model} 正在冷却` : `${issue.accountLabel} 正在冷却`,
+      detail: issue.error || (issue.kind === "model" ? `恢复时间 ${new Date(issue.until).toLocaleTimeString()}` : "账号暂时不可用于新的请求。"),
       workspace: "accounts",
       actionLabel: "查看账号",
       tone: "warn",
-      accountId: account.id,
-    });
-  }
-  for (const item of modelCooldowns.slice(0, 4)) {
-    actions.push({
-      id: `model:${item.account.id}:${item.model}`,
-      title: `${item.account.label} 的 ${item.model} 正在冷却`,
-      detail: `恢复时间 ${new Date(item.until).toLocaleTimeString()}`,
-      workspace: "accounts",
-      actionLabel: "查看账号",
-      tone: "warn",
-      accountId: item.account.id,
+      accountId: issue.accountId,
     });
   }
   if (scheduler.pending > 0) {
@@ -131,12 +114,12 @@ export function deriveOverview(
     });
   }
 
-  const issueCount = errorProxies.length + cooling.length + modelCooldowns.length + Number(scheduler.pending > 0);
+  const issueCount = errorProxies.length + accounts.cooling + accounts.modelCooling + Number(scheduler.pending > 0);
   return {
     metrics: [
-      { id: "accounts", label: "启用账号", value: `${enabled}/${accounts.length}`, detail: `${accounts.filter((account) => account.hasSession).length} 个会话有效`, tone: enabled > 0 ? "good" : "warn" },
+      { id: "accounts", label: "启用账号", value: `${accounts.enabled}/${accounts.total}`, detail: `${accounts.sessions} 个会话有效`, tone: accounts.enabled > 0 ? "good" : "warn" },
       { id: "proxies", label: "健康代理", value: `${healthyProxies}/${proxies.length}`, detail: `${errorProxies.length} 个错误`, tone: errorProxies.length > 0 ? "warn" : "good" },
-      { id: "traffic", label: "实时流量", value: `${inFlight}`, detail: `${scheduler.pending} 个排队请求`, tone: scheduler.pending > 0 ? "warn" : "neutral" },
+      { id: "traffic", label: "实时流量", value: `${accounts.inFlight}`, detail: `${scheduler.pending} 个排队请求`, tone: scheduler.pending > 0 ? "warn" : "neutral" },
       { id: "issues", label: "需要处理", value: `${issueCount}`, detail: issueCount > 0 ? "存在运行异常" : "运行状态正常", tone: issueCount > 0 ? "bad" : "good" },
     ],
     actions: actions.slice(0, 8),

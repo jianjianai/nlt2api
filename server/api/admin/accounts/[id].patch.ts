@@ -65,6 +65,7 @@ export default defineHandler(async (event) => {
       weight?: number;
       proxy?: string | null;
       models?: string[];
+      groupIds?: string[];
       schedulerOverrides?: AccountSchedulerOverrides | null;
     } = {};
     if (body.label !== undefined) {
@@ -86,6 +87,12 @@ export default defineHandler(async (event) => {
         ? null
         : asString(body.proxy, "proxy", { allowEmpty: true, maxLength: 2_048 });
       input.proxy = proxyInput?.trim() ? normalizeProxyUrl(proxyInput) : null;
+    }
+    if (body.groupIds !== undefined) {
+      if (!Array.isArray(body.groupIds) || body.groupIds.some((groupId) => typeof groupId !== "string")) {
+        throw new HttpError(400, "`groupIds` must be an array of account group ids.", "invalid_request_error", "groupIds");
+      }
+      input.groupIds = body.groupIds as string[];
     }
     if (body.models !== undefined) {
       if (!Array.isArray(body.models) || body.models.some((model) => typeof model !== "string")) {

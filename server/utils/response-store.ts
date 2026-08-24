@@ -42,6 +42,9 @@ export class ResponseStore {
       if (parsed.id !== id || !Array.isArray(parsed.items)) {
         return undefined;
       }
+      if (!parsed.access) {
+        parsed.access = { scope: "global" };
+      }
       const createdAt = Date.parse(parsed.createdAt);
       if (Number.isFinite(createdAt) && Date.now() - createdAt > RESPONSE_STATE_TTL_MS) {
         return undefined;

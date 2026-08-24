@@ -14,8 +14,10 @@ function asModel(id: string) {
 
 export default defineHandler(async (event) => {
   try {
-    requireClientAuth(event.req);
-    const accounts = await stateStore.listAccounts();
+    const principal = await requireClientAuth(event.req);
+    const accounts = (await stateStore.listAccounts())
+      .filter((account) => account.enabled)
+      .filter((account) => principal.scope === "global" || account.groupIds.includes(principal.groupId));
     const ids = new Set<string>();
     for (const account of accounts) {
       for (const model of account.models) {

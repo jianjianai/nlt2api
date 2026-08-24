@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { defineAsyncComponent, onMounted, onUnmounted, ref } from "vue";
+import { computed, defineAsyncComponent, onMounted, onUnmounted, ref } from "vue";
 import AppIcon from "./ui/AppIcon.vue";
 import AppSwitch from "./ui/AppSwitch.vue";
 import AppTooltip from "./ui/AppTooltip.vue";
@@ -43,9 +43,14 @@ function setCommandOpen(open: boolean): void {
 
 const themeOptions: Array<{ id: ThemeId; label: string; icon: AppIconName }> = [
   { id: "light", label: "浅色", icon: "sun" },
-  { id: "gray", label: "高级灰", icon: "contrast" },
   { id: "dark", label: "暗色", icon: "moon" },
 ];
+const currentThemeOption = computed(() => themeOptions.find((option) => option.id === props.theme) ?? themeOptions[0]!);
+
+function cycleTheme(): void {
+  const currentIndex = themeOptions.findIndex((option) => option.id === props.theme);
+  emit("changeTheme", themeOptions[(currentIndex + 1) % themeOptions.length]!.id);
+}
 
 const operationalItems: Array<{ id: Exclude<WorkspaceId, "settings">; label: string; short: string; icon: AppIconName }> = [
   { id: "overview", label: "运行概览", short: "概览", icon: "layout-dashboard" },
@@ -99,6 +104,7 @@ onUnmounted(() => window.removeEventListener("keydown", onGlobalShortcut));
         </span>
         <label class="workspace-auto-refresh"><AppSwitch :model-value="autoRefresh" label="每5秒自动刷新" @update:model-value="emit('toggleAutoRefresh')" /><span>自动刷新</span></label>
         <div class="theme-picker" role="group" aria-label="主题"><AppTooltip v-for="option in themeOptions" :key="option.id" :text="`${option.label}主题`"><button type="button" :class="{ active: theme === option.id }" :aria-pressed="theme === option.id" :aria-label="`切换到${option.label}主题`" @click="emit('changeTheme', option.id)"><AppIcon :name="option.icon" :size="14" /></button></AppTooltip></div>
+        <AppTooltip :text="`当前${currentThemeOption.label}主题，点击切换`"><button class="icon-action mobile-theme" type="button" :aria-label="`切换主题，当前${currentThemeOption.label}主题`" @click="cycleTheme"><AppIcon :name="currentThemeOption.icon" :size="16" /></button></AppTooltip>
         <AppTooltip text="网关设置"><button class="icon-action mobile-settings" type="button" :aria-current="workspace === 'settings' ? 'page' : undefined" aria-label="网关设置" @click="emit('select', 'settings')"><AppIcon name="settings" :size="16" /></button></AppTooltip>
         <button class="button button-quiet topbar-refresh" type="button" :disabled="loading" :aria-busy="loading" aria-label="刷新当前数据" @click="emit('refresh')"><span v-if="loading" class="spinner" aria-hidden="true"></span><AppIcon v-else name="refresh-cw" :size="14" /><span class="topbar-refresh-label">{{ loading ? "同步中" : "刷新" }}</span></button>
         <button class="button button-quiet signout-action" type="button" @click="emit('signOut')"><AppIcon name="log-out" :size="14" />退出</button>

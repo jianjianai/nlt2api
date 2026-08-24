@@ -54,6 +54,7 @@ export interface AccountLease {
 
 export interface AcquireOptions {
   model: string;
+  groupId?: string;
   stickyKey?: string;
   preferredAccountId?: string;
   /** Internal retries retain the first attempt's immutable account/egress. */
@@ -298,6 +299,7 @@ export class AccountScheduler {
       weight: account.weight,
       proxy: account.proxy ?? null,
       ...(account.proxyPoolEntryId ? { proxyPoolEntryId: account.proxyPoolEntryId } : {}),
+      groupIds: [...account.groupIds],
       models: [...account.models],
       ...(account.schedulerOverrides ? { schedulerOverrides: structuredClone(account.schedulerOverrides) } : {}),
       hasSession: Boolean(account.session),
@@ -508,6 +510,7 @@ export class AccountScheduler {
     const sourceAccounts = waiter.options.accountSnapshot ? [waiter.options.accountSnapshot] : allAccounts;
     const accounts = sourceAccounts
       .filter((account) => account.enabled)
+      .filter((account) => !waiter.options.groupId || account.groupIds.includes(waiter.options.groupId))
       .filter((account) => account.models.includes(waiter.options.model))
       .filter((account) => !excluded.has(account.id));
     if (accounts.length === 0) {

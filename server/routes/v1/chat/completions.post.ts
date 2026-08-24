@@ -54,7 +54,8 @@ export default defineHandler(async (event) => {
   let body: JsonObject | undefined;
   let clientRequest: DebugRawBody | undefined;
   try {
-    requireClientAuth(event.req);
+    const principal = await requireClientAuth(event.req);
+    const groupId = principal.scope === "group" ? principal.groupId : undefined;
     const parsedRequest = await readJsonObjectWithRaw(event.req);
     body = parsedRequest.body;
     clientRequest = jsonDebugBody(parsedRequest.raw);
@@ -73,7 +74,7 @@ export default defineHandler(async (event) => {
     // The validated artifacts are forwarded so execution does not re-validate.
     const toolCallPolicy = await resolveToolCallPolicy(modelFromRequest(requestBody));
     const validated = validateChatRequest(requestBody, toolCallPolicy);
-    await assertModelSupported(validated.model);
+    await assertModelSupported(validated.model, groupId);
     if (body.stream === true) {
       const includeUsage = streamOptions?.include_usage === true;
       const state = createChatStreamState(requestBody);
@@ -89,6 +90,7 @@ export default defineHandler(async (event) => {
           await trackedEmit({ data: startChatStream(state) });
           const execution = await executeChatRequest(requestBody, {
             stickyKey: stickyKeyFrom(event.req, requestBody),
+            groupId,
             stream: true,
             signal,
             validated,
@@ -153,6 +155,7 @@ export default defineHandler(async (event) => {
     }
     const execution = await executeChatRequest(body, {
       stickyKey: stickyKeyFrom(event.req, body),
+      groupId,
       validated,
     });
     const completion = asChatCompletion(execution);

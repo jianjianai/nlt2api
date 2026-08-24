@@ -1,13 +1,15 @@
-import { randomBytes, randomUUID } from "node:crypto";
+import { createHash, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import { mkdir, readFile, readdir, rename, unlink, writeFile } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
 import { getProxyConfig } from "~/server/utils/config.ts";
 import { canonicalProxy } from "~/server/utils/proxy.ts";
 import { DEFAULT_PROXY_POOL_SETTINGS, DEFAULT_SCHEDULER_SETTINGS } from "~/server/utils/types.ts";
 import type {
+  AccountGroup,
   AccountSchedulerOverrides,
   DebugRecord,
   DebugRecordSummary,
+  GroupApiKey,
   ManagedAccount,
   PersistentState,
   PortalSession,
@@ -30,7 +32,7 @@ interface RecordIndexEntry {
 
 function emptyState(): PersistentState {
   return {
-    version: 1,
+    version: 2,
     settings: {
       recordMessages: false,
       scheduler: { ...DEFAULT_SCHEDULER_SETTINGS },
@@ -38,6 +40,8 @@ function emptyState(): PersistentState {
     },
     accounts: [],
     proxyPool: [],
+    accountGroups: [],
+    groupApiKeys: [],
   };
 }
 
@@ -254,6 +258,96 @@ function normaliseModels(value: unknown): string[] {
   return models;
 }
 
+function normaliseStringIds(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return [...new Set(value.filter((item): item is string => typeof item === "string").map((item) => item.trim()).filter(Boolean))];
+}
+
+function normaliseAccountGroups(value: unknown): AccountGroup[] {
+  if (!Array.isArray(value)) return [];
+  const result: AccountGroup[] = [];
+  const ids = new Set<string>();
+  const names = new Set<string>();
+  for (const raw of value) {
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) continue;
+    const group = raw as Record<string, unknown>;
+    const id = typeof group.id === "string" ? group.id.trim() : "";
+    const name = typeof group.name === "string" ? group.name.trim().slice(0, 120) : "";
+    const foldedName = name.toLocaleLowerCase();
+    if (!id || !name || ids.has(id) || names.has(foldedName)) continue;
+    const createdAt = typeof group.createdAt === "string" ? group.createdAt : new Date(0).toISOString();
+    result.push({
+      id,
+      name,
+      enabled: group.enabled !== false,
+      createdAt,
+      updatedAt: typeof group.updatedAt === "string" ? group.updatedAt : createdAt,
+      ...(typeof group.description === "string" && group.description.trim()
+        ? { description: group.description.trim().slice(0, 500) }
+        : {}),
+    });
+    ids.add(id);
+    names.add(foldedName);
+  }
+  return result;
+}
+
+function normaliseGroupApiKeys(value: unknown, groupIds: ReadonlySet<string>): GroupApiKey[] {
+  if (!Array.isArray(value)) return [];
+  const result: GroupApiKey[] = [];
+  const ids = new Set<string>();
+  const namesByGroup = new Set<string>();
+  for (const raw of value) {
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) continue;
+    const key = raw as Record<string, unknown>;
+    const id = typeof key.id === "string" ? key.id.trim() : "";
+    const groupId = typeof key.groupId === "string" ? key.groupId.trim() : "";
+    const name = typeof key.name === "string" ? key.name.trim().slice(0, 120) : "";
+    const prefix = typeof key.prefix === "string" ? key.prefix.trim().slice(0, 24) : "";
+    const secretDigest = typeof key.secretDigest === "string" ? key.secretDigest.toLowerCase() : "";
+    const nameKey = `${groupId}:${name.toLocaleLowerCase()}`;
+    if (!id || !groupIds.has(groupId) || !name || !prefix || !/^[0-9a-f]{64}$/.test(secretDigest)
+      || ids.has(id) || namesByGroup.has(nameKey)) continue;
+    const createdAt = typeof key.createdAt === "string" ? key.createdAt : new Date(0).toISOString();
+    result.push({
+      id,
+      groupId,
+      name,
+      prefix,
+      secretDigest,
+      enabled: key.enabled !== false,
+      createdAt,
+      updatedAt: typeof key.updatedAt === "string" ? key.updatedAt : createdAt,
+    });
+    ids.add(id);
+    namesByGroup.add(nameKey);
+  }
+  return result;
+}
+
+function digestSecret(secret: string): string {
+  return createHash("sha256").update(secret, "utf8").digest("hex");
+}
+
+function secretMatches(secret: string, digest: string): boolean {
+  const candidate = Buffer.from(digestSecret(secret), "hex");
+  const expected = Buffer.from(digest, "hex");
+  return candidate.length === expected.length && timingSafeEqual(candidate, expected);
+}
+
+function createGroupSecret(): { secret: string; prefix: string; secretDigest: string } {
+  const secret = `nwg_${randomBytes(24).toString("base64url")}`;
+  return { secret, prefix: secret.slice(0, 12), secretDigest: digestSecret(secret) };
+}
+
+function createUniqueGroupSecret(keys: readonly GroupApiKey[]): { secret: string; prefix: string; secretDigest: string } {
+  for (let attempt = 0; attempt < 8; attempt += 1) {
+    const material = createGroupSecret();
+    if (!keys.some((key) => key.secretDigest === material.secretDigest)) return material;
+  }
+  throw new Error("Could not generate a unique group API key.");
+}
+
 function normaliseAccount(account: ManagedAccount): ManagedAccount {
   const proxy = typeof account.proxy === "string" && account.proxy.trim() ? account.proxy.trim() : undefined;
   const models = normaliseModels(account.models);
@@ -261,13 +355,15 @@ function normaliseAccount(account: ManagedAccount): ManagedAccount {
   const proxyPoolEntryId = typeof account.proxyPoolEntryId === "string" && account.proxyPoolEntryId
     ? account.proxyPoolEntryId
     : undefined;
-  const { schedulerOverrides: _discardedOverrides, proxyPoolEntryId: _discardedPoolId, ...accountWithoutOverrides } = account;
+  const groupIds = normaliseStringIds(account.groupIds);
+  const { schedulerOverrides: _discardedOverrides, proxyPoolEntryId: _discardedPoolId, groupIds: _discardedGroupIds, ...accountWithoutOverrides } = account;
   return {
     ...accountWithoutOverrides,
     label: account.label.trim() || account.email,
     email: account.email.trim().toLowerCase(),
     weight: Math.max(1, Math.min(100, Math.floor(account.weight || 1))),
     enabled: account.enabled !== false,
+    groupIds,
     models,
     ...(schedulerOverrides ? { schedulerOverrides } : {}),
     ...(proxy ? { proxy } : {}),
@@ -458,25 +554,34 @@ export class StateStore {
 
     try {
       const raw = await readFile(this.storePath, "utf8");
-      const parsed = JSON.parse(raw) as PersistentState;
-      if (parsed.version !== 1 || !Array.isArray(parsed.accounts)) {
+      const parsed = JSON.parse(raw) as { version?: number; settings?: unknown; accounts?: unknown[]; proxyPool?: unknown; accountGroups?: unknown; groupApiKeys?: unknown };
+      if ((parsed.version !== 1 && parsed.version !== 2) || !Array.isArray(parsed.accounts)) {
         throw new Error("The account store has an unsupported schema.");
       }
 
       const proxyPool = normaliseProxyPool(parsed.proxyPool);
+      const accountGroups = normaliseAccountGroups(parsed.accountGroups);
+      const validGroupIds = new Set(accountGroups.map((group) => group.id));
+      const groupApiKeys = normaliseGroupApiKeys(parsed.groupApiKeys, validGroupIds);
       const poolById = new Map(proxyPool.map((entry) => [entry.id, entry]));
-      const accounts = parsed.accounts.map(normaliseAccount).map((account) => {
+      const accounts = parsed.accounts.map((account) => normaliseAccount(account as ManagedAccount)).map((account) => {
+        account.groupIds = account.groupIds.filter((groupId) => validGroupIds.has(groupId));
         const entry = account.proxyPoolEntryId ? poolById.get(account.proxyPoolEntryId) : undefined;
         if (entry && account.proxy === entry.url) return account;
         const { proxyPoolEntryId: _invalidPoolBinding, ...withoutBinding } = account;
         return withoutBinding;
       });
       this.state = {
-        version: 1,
+        version: 2,
         settings: normaliseSettings(parsed.settings),
         accounts,
         proxyPool,
+        accountGroups,
+        groupApiKeys,
       };
+      if (parsed.version === 1) {
+        await this.writeState(this.state);
+      }
     } catch (error) {
       const code = error instanceof Error && "code" in error ? (error as NodeJS.ErrnoException).code : undefined;
       if (code !== "ENOENT") {
@@ -492,6 +597,41 @@ export class StateStore {
     return [...(await this.getState()).accounts];
   }
 
+  async listAccountsPage(options: {
+    page: number;
+    pageSize: 20 | 50 | 100;
+    query?: string;
+    groupId?: string | null;
+    status?: "all" | "enabled" | "disabled";
+    sort?: "created_desc" | "created_asc" | "label_asc" | "label_desc";
+  }): Promise<{ accounts: ManagedAccount[]; page: number; pageSize: 20 | 50 | 100; total: number; pageCount: number }> {
+    const query = options.query?.trim().toLocaleLowerCase() ?? "";
+    const status = options.status ?? "all";
+    const sort = options.sort ?? "created_desc";
+    let accounts = (await this.getState()).accounts.filter((account) => {
+      if (status === "enabled" && !account.enabled) return false;
+      if (status === "disabled" && account.enabled) return false;
+      if (options.groupId === null && account.groupIds.length > 0) return false;
+      if (typeof options.groupId === "string" && !account.groupIds.includes(options.groupId)) return false;
+      return !query || account.label.toLocaleLowerCase().includes(query)
+        || account.email.toLocaleLowerCase().includes(query)
+        || (account.proxy ?? "").toLocaleLowerCase().includes(query);
+    });
+    accounts = [...accounts].sort((left, right) => {
+      if (sort === "label_asc" || sort === "label_desc") {
+        const order = left.label.localeCompare(right.label, undefined, { sensitivity: "base" }) || left.id.localeCompare(right.id);
+        return sort === "label_desc" ? -order : order;
+      }
+      const order = left.createdAt.localeCompare(right.createdAt) || left.id.localeCompare(right.id);
+      return sort === "created_desc" ? -order : order;
+    });
+    const total = accounts.length;
+    const pageCount = Math.max(1, Math.ceil(total / options.pageSize));
+    const page = Math.min(options.page, pageCount);
+    const start = (page - 1) * options.pageSize;
+    return { accounts: structuredClone(accounts.slice(start, start + options.pageSize)), page, pageSize: options.pageSize, total, pageCount };
+  }
+
   async getAccount(id: string): Promise<ManagedAccount | undefined> {
     return (await this.getState()).accounts.find((account) => account.id === id);
   }
@@ -503,13 +643,18 @@ export class StateStore {
     weight?: number;
     proxy?: string;
     models?: string[];
+    groupIds?: string[];
   }): Promise<ManagedAccount> {
     const email = input.email.trim().toLowerCase();
     if (!email || !input.password) {
       throw new Error("An email and password are required.");
     }
 
+    const requestedGroupIds = normaliseStringIds(input.groupIds);
     return this.mutate((state) => {
+      const validGroupIds = new Set(state.accountGroups.map((group) => group.id));
+      const unknownGroupId = requestedGroupIds.find((groupId) => !validGroupIds.has(groupId));
+      if (unknownGroupId) throw new Error(`Account group not found: ${unknownGroupId}`);
       if (state.accounts.some((account) => account.email === email)) {
         throw new Error("An account with this email already exists.");
       }
@@ -523,6 +668,7 @@ export class StateStore {
         enabled: true,
         weight: input.weight ?? 1,
         models: input.models ?? [],
+        groupIds: requestedGroupIds,
         ...(input.proxy ? { proxy: input.proxy } : {}),
         createdAt: now,
         updatedAt: now,
@@ -538,6 +684,7 @@ export class StateStore {
       proxy: string | null;
       models: string[];
       schedulerOverrides: AccountSchedulerOverrides | null;
+      groupIds: string[];
     }>,
   ): Promise<ManagedAccount> {
     return this.mutate((state) => {
@@ -561,6 +708,13 @@ export class StateStore {
       } else if (input.proxy === null) {
         delete account.proxy;
         delete account.proxyPoolEntryId;
+      }
+      if (Array.isArray(input.groupIds)) {
+        const groupIds = normaliseStringIds(input.groupIds);
+        const validGroupIds = new Set(state.accountGroups.map((group) => group.id));
+        const unknownGroupId = groupIds.find((groupId) => !validGroupIds.has(groupId));
+        if (unknownGroupId) throw new Error(`Account group not found: ${unknownGroupId}`);
+        account.groupIds = groupIds;
       }
       if (Array.isArray(input.models)) {
         account.models = normaliseModels(input.models);
@@ -608,6 +762,138 @@ export class StateStore {
       account.session = session;
       account.updatedAt = new Date().toISOString();
     });
+  }
+
+  async listAccountGroups(): Promise<Array<AccountGroup & { accountCount: number; apiKeyCount: number }>> {
+    const state = await this.getState();
+    return state.accountGroups.map((group) => ({
+      ...structuredClone(group),
+      accountCount: state.accounts.filter((account) => account.groupIds.includes(group.id)).length,
+      apiKeyCount: state.groupApiKeys.filter((key) => key.groupId === group.id).length,
+    }));
+  }
+
+  async getAccountGroup(id: string): Promise<AccountGroup | undefined> {
+    const group = (await this.getState()).accountGroups.find((candidate) => candidate.id === id);
+    return group ? structuredClone(group) : undefined;
+  }
+
+  async createAccountGroup(input: { name: string; description?: string }): Promise<AccountGroup> {
+    return this.mutate((state) => {
+      const name = input.name.trim();
+      if (!name) throw new Error("Account group name is required.");
+      if (state.accountGroups.some((group) => group.name.localeCompare(name, undefined, { sensitivity: "base" }) === 0)) {
+        throw new Error("An account group with this name already exists.");
+      }
+      const now = new Date().toISOString();
+      const group: AccountGroup = {
+        id: randomUUID(), name, enabled: true, createdAt: now, updatedAt: now,
+        ...(input.description?.trim() ? { description: input.description.trim().slice(0, 500) } : {}),
+      };
+      state.accountGroups.push(group);
+      return structuredClone(group);
+    });
+  }
+
+  async updateAccountGroup(id: string, input: { name?: string; description?: string | null; enabled?: boolean }): Promise<AccountGroup> {
+    return this.mutate((state) => {
+      const group = state.accountGroups.find((candidate) => candidate.id === id);
+      if (!group) throw new Error("Account group not found.");
+      if (input.name !== undefined) {
+        const name = input.name.trim();
+        if (!name) throw new Error("Account group name is required.");
+        if (state.accountGroups.some((candidate) => candidate.id !== id && candidate.name.localeCompare(name, undefined, { sensitivity: "base" }) === 0)) {
+          throw new Error("An account group with this name already exists.");
+        }
+        group.name = name;
+      }
+      if (input.description === null || input.description === "") delete group.description;
+      else if (typeof input.description === "string") group.description = input.description.trim().slice(0, 500);
+      if (typeof input.enabled === "boolean") group.enabled = input.enabled;
+      group.updatedAt = new Date().toISOString();
+      return structuredClone(group);
+    });
+  }
+
+  async deleteAccountGroup(id: string): Promise<{ accountCount: number; apiKeyCount: number }> {
+    return this.mutate((state) => {
+      const index = state.accountGroups.findIndex((group) => group.id === id);
+      if (index < 0) throw new Error("Account group not found.");
+      const accountCount = state.accounts.filter((account) => account.groupIds.includes(id)).length;
+      const apiKeyCount = state.groupApiKeys.filter((key) => key.groupId === id).length;
+      for (const account of state.accounts) account.groupIds = account.groupIds.filter((groupId) => groupId !== id);
+      state.groupApiKeys = state.groupApiKeys.filter((key) => key.groupId !== id);
+      state.accountGroups.splice(index, 1);
+      return { accountCount, apiKeyCount };
+    });
+  }
+
+  async listGroupApiKeys(groupId: string): Promise<GroupApiKey[]> {
+    return structuredClone((await this.getState()).groupApiKeys.filter((key) => key.groupId === groupId));
+  }
+
+  async createGroupApiKey(groupId: string, nameInput: string): Promise<{ key: GroupApiKey; secret: string }> {
+    return this.mutate((state) => {
+      if (!state.accountGroups.some((group) => group.id === groupId)) throw new Error("Account group not found.");
+      const name = nameInput.trim();
+      if (!name) throw new Error("API key name is required.");
+      if (state.groupApiKeys.some((key) => key.groupId === groupId && key.name.localeCompare(name, undefined, { sensitivity: "base" }) === 0)) {
+        throw new Error("An API key with this name already exists in the group.");
+      }
+      const material = createUniqueGroupSecret(state.groupApiKeys);
+      const now = new Date().toISOString();
+      const key: GroupApiKey = { id: randomUUID(), groupId, name, prefix: material.prefix, secretDigest: material.secretDigest, enabled: true, createdAt: now, updatedAt: now };
+      state.groupApiKeys.push(key);
+      return { key: structuredClone(key), secret: material.secret };
+    });
+  }
+
+  async rotateGroupApiKey(groupId: string, keyId: string): Promise<{ key: GroupApiKey; secret: string }> {
+    return this.mutate((state) => {
+      const key = state.groupApiKeys.find((candidate) => candidate.id === keyId && candidate.groupId === groupId);
+      if (!key) throw new Error("Group API key not found.");
+      const material = createUniqueGroupSecret(state.groupApiKeys);
+      key.prefix = material.prefix;
+      key.secretDigest = material.secretDigest;
+      key.updatedAt = new Date().toISOString();
+      return { key: structuredClone(key), secret: material.secret };
+    });
+  }
+
+  async updateGroupApiKey(groupId: string, keyId: string, input: { name?: string; enabled?: boolean }): Promise<GroupApiKey> {
+    return this.mutate((state) => {
+      const key = state.groupApiKeys.find((candidate) => candidate.id === keyId && candidate.groupId === groupId);
+      if (!key) throw new Error("Group API key not found.");
+      if (input.name !== undefined) {
+        const name = input.name.trim();
+        if (!name) throw new Error("API key name is required.");
+        if (state.groupApiKeys.some((candidate) => candidate.id !== keyId && candidate.groupId === groupId && candidate.name.localeCompare(name, undefined, { sensitivity: "base" }) === 0)) {
+          throw new Error("An API key with this name already exists in the group.");
+        }
+        key.name = name;
+      }
+      if (typeof input.enabled === "boolean") key.enabled = input.enabled;
+      key.updatedAt = new Date().toISOString();
+      return structuredClone(key);
+    });
+  }
+
+  async deleteGroupApiKey(groupId: string, keyId: string): Promise<void> {
+    await this.mutate((state) => {
+      const index = state.groupApiKeys.findIndex((key) => key.id === keyId && key.groupId === groupId);
+      if (index < 0) throw new Error("Group API key not found.");
+      state.groupApiKeys.splice(index, 1);
+    });
+  }
+
+  async authenticateGroupApiKey(secret: string): Promise<{ key: GroupApiKey; group: AccountGroup } | undefined> {
+    const state = await this.getState();
+    for (const key of state.groupApiKeys) {
+      if (!secretMatches(secret, key.secretDigest)) continue;
+      const group = state.accountGroups.find((candidate) => candidate.id === key.groupId);
+      return group ? { key: structuredClone(key), group: structuredClone(group) } : undefined;
+    }
+    return undefined;
   }
 
   async listProxyPool(): Promise<ProxyPoolEntry[]> {

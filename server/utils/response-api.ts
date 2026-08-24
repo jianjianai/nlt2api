@@ -14,6 +14,7 @@ import type {
   ChatMessage,
   JsonObject,
   JsonValue,
+  ResponseAccessScope,
   NormalizedToolCall,
   ToolDefinition,
   UpstreamUsage,
@@ -541,7 +542,10 @@ export interface ValidatedResponseRequest {
  * request so execution, tool-call adaptation, and repair behave identically
  * to `/v1/chat/completions`.
  */
-export async function validateResponseRequest(body: JsonObject): Promise<ValidatedResponseRequest> {
+export async function validateResponseRequest(
+  body: JsonObject,
+  access: ResponseAccessScope = { scope: "global" },
+): Promise<ValidatedResponseRequest> {
   const model = body.model;
   if (model !== undefined && model !== null && (typeof model !== "string" || model.length > 200)) {
     throw invalid("`model` must be a string.", "model");
@@ -579,7 +583,9 @@ export async function validateResponseRequest(body: JsonObject): Promise<Validat
   let chainModel: string | undefined;
   if (typeof previousResponseId === "string" && previousResponseId) {
     const stored = await responseStore.get(previousResponseId);
-    if (!stored) {
+    const allowed = stored && (access.scope === "global"
+      || (stored.access.scope === "group" && stored.access.groupId === access.groupId));
+    if (!allowed) {
       throw new HttpError(400, `Previous response with id '${previousResponseId}' not found.`, "invalid_request_error", "previous_response_id");
     }
     inputItems = [...stored.items, ...inputItems];
@@ -823,6 +829,7 @@ export async function persistResponseState(
   id: string,
   execution: ChatExecution,
   context: ResponseRequestContext,
+  access: ResponseAccessScope = { scope: "global" },
 ): Promise<void> {
   if (!context.store) {
     return;
@@ -832,6 +839,7 @@ export async function persistResponseState(
     await responseStore.save({
       id,
       createdAt: new Date().toISOString(),
+      access,
       model: execution.model,
       ...(context.previousResponseId ? { previousResponseId: context.previousResponseId } : {}),
       items: [...context.inputItems, ...items],

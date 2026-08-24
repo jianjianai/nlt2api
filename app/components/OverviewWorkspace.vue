@@ -2,7 +2,7 @@
 import { computed, ref } from "vue";
 import AppIcon from "./ui/AppIcon.vue";
 import type {
-  Account,
+  AccountOverview,
   AnalyticsGranularity,
   AnalyticsOverview,
   AnalyticsQueryResult,
@@ -29,7 +29,7 @@ const props = defineProps<{
   customFrom: string;
   customTo: string;
   loadingAnalytics: boolean;
-  accounts: Account[];
+  accountOverview: AccountOverview;
   proxies: ProxyPoolEntry[];
   egresses: EgressRuntime[];
 }>();
@@ -71,6 +71,19 @@ const priceSourceLabel = (value?: "vendor_official" | "portal_catalog") => value
       <div><p class="section-kicker">运行状态</p><h1>运行概览</h1><p>实时负载、容量预测、模型消费与运行异常。</p></div>
       <span v-if="analytics" class="analytics-live" :class="analytics.health"><i></i>{{ analytics.health === "healthy" ? "分析正常" : "分析降级" }}</span>
     </header>
+
+    <div class="overview-metrics" aria-label="运行指标">
+      <article v-for="metric in snapshot.metrics" :key="metric.id" :class="`tone-${metric.tone}`">
+        <span>{{ metric.label }}</span>
+        <strong>{{ metric.value }}</strong>
+        <small>{{ metric.detail }}</small>
+      </article>
+    </div>
+    <section class="content-section action-section">
+      <div class="section-heading"><div><h2>需要处理</h2><p>仅显示当前状态中可以直接处理的问题。</p></div><span class="section-count">{{ snapshot.actions.length }}</span></div>
+      <div v-if="snapshot.actions.length === 0" class="status-empty"><span aria-hidden="true"><AppIcon name="check" :size="14" /></span><div><strong>当前没有需要处理的异常</strong><p>账号、代理和队列状态均正常。</p></div></div>
+      <ul v-else class="action-list"><li v-for="item in snapshot.actions" :key="item.id" :class="`tone-${item.tone}`"><span class="action-indicator" aria-hidden="true"></span><div><strong>{{ item.title }}</strong><p>{{ item.detail }}</p></div><button class="button button-quiet" type="button" @click="emit('navigate', item.workspace, item.accountId || item.proxyId)">{{ item.actionLabel }}<AppIcon name="arrow-right" :size="13" /></button></li></ul>
+    </section>
 
     <section v-if="analytics" class="analytics-spotlight" aria-labelledby="rpm-title">
       <div class="rpm-spotlight">
@@ -115,10 +128,10 @@ const priceSourceLabel = (value?: "vendor_official" | "portal_catalog") => value
     <section v-if="analytics" class="content-section analytics-workbench">
       <div class="section-heading analytics-heading">
         <div><h2>容量与消费分析</h2><p>切换视图不会隐藏顶部实时负载与扩容结论。</p></div>
-        <div class="segmented-control analytics-tabs" aria-label="分析视图">
-          <button type="button" :data-state="activeAnalysis === 'capacity' ? 'active' : 'inactive'" @click="activeAnalysis = 'capacity'">容量预测</button>
-          <button type="button" :data-state="activeAnalysis === 'cost' ? 'active' : 'inactive'" @click="activeAnalysis = 'cost'">消费分析</button>
-          <button type="button" :data-state="activeAnalysis === 'models' ? 'active' : 'inactive'" @click="activeAnalysis = 'models'">模型利用率</button>
+        <div class="segmented-control analytics-tabs" role="group" aria-label="分析视图">
+          <button type="button" :aria-pressed="activeAnalysis === 'capacity'" :data-state="activeAnalysis === 'capacity' ? 'active' : 'inactive'" @click="activeAnalysis = 'capacity'">容量预测</button>
+          <button type="button" :aria-pressed="activeAnalysis === 'cost'" :data-state="activeAnalysis === 'cost' ? 'active' : 'inactive'" @click="activeAnalysis = 'cost'">消费分析</button>
+          <button type="button" :aria-pressed="activeAnalysis === 'models'" :data-state="activeAnalysis === 'models' ? 'active' : 'inactive'" @click="activeAnalysis = 'models'">模型利用率</button>
         </div>
       </div>
 
@@ -137,8 +150,8 @@ const priceSourceLabel = (value?: "vendor_official" | "portal_catalog") => value
 
       <div v-else-if="activeAnalysis === 'cost'" class="cost-analysis">
         <div class="analytics-range-bar">
-          <div class="segmented-control" aria-label="消费时间范围">
-            <button v-for="item in [{ id: 'today', label: '今日' }, { id: 'month', label: '本月' }, { id: 'custom', label: '自定义' }]" :key="item.id" type="button" :data-state="analyticsRange === item.id ? 'active' : 'inactive'" @click="emit('setRange', item.id as 'today' | 'month' | 'custom')">{{ item.label }}</button>
+          <div class="segmented-control" role="group" aria-label="消费时间范围">
+            <button v-for="item in [{ id: 'today', label: '今日' }, { id: 'month', label: '本月' }, { id: 'custom', label: '自定义' }]" :key="item.id" type="button" :aria-pressed="analyticsRange === item.id" :data-state="analyticsRange === item.id ? 'active' : 'inactive'" @click="emit('setRange', item.id as 'today' | 'month' | 'custom')">{{ item.label }}</button>
           </div>
           <div class="analytics-query-controls">
             <label>模型筛选<select :value="analyticsModel" @change="emit('setModel', ($event.target as HTMLSelectElement).value)"><option value="">全部模型</option><option v-for="model in modelOptions" :key="model" :value="model">{{ model }}</option></select></label>
@@ -161,9 +174,9 @@ const priceSourceLabel = (value?: "vendor_official" | "portal_catalog") => value
 
       <div v-else class="model-analysis">
         <div v-if="displayedModels.length" class="analytics-model-table" role="table" aria-label="模型利用率">
-          <div class="analytics-model-head" role="row"><span>模型</span><span>客户端 / 上游 RPM</span><span>放大率</span><span>24h 消费</span><span>利用率</span><span>建议</span></div>
+          <div class="analytics-model-head" role="row"><span role="columnheader">模型</span><span role="columnheader">客户端 / 上游 RPM</span><span role="columnheader">放大率</span><span role="columnheader">24h 消费</span><span role="columnheader">利用率</span><span role="columnheader">建议</span></div>
           <div v-for="model in displayedModels" :key="model.model" class="analytics-model-row" role="row">
-            <code :title="model.model">{{ model.model }}</code><span data-label="客户端 / 上游 RPM">{{ model.clientRpm }} / {{ model.upstreamRpm }}</span><span data-label="调用放大">{{ model.amplification.toFixed(2) }}×</span><span data-label="消费">{{ formatMicroUsd(model.totalCostMicroUsd) }}</span><span data-label="利用率"><b class="utilization-bar"><i :style="{ width: `${Math.min(100, Math.round(model.utilization * 100))}%` }"></i></b>{{ Math.round(model.utilization * 100) }}%</span><span data-label="建议">{{ model.recommendedAccounts ? `+${model.recommendedAccounts} 账号` : forecastConstraintLabel(model.bindingConstraint) }}</span>
+            <code role="cell" :title="model.model">{{ model.model }}</code><span role="cell" data-label="客户端 / 上游 RPM">{{ model.clientRpm }} / {{ model.upstreamRpm }}</span><span role="cell" data-label="调用放大">{{ model.amplification.toFixed(2) }}×</span><span role="cell" data-label="消费">{{ formatMicroUsd(model.totalCostMicroUsd) }}</span><span role="cell" data-label="利用率"><b class="utilization-bar"><i :style="{ width: `${Math.min(100, Math.round(model.utilization * 100))}%` }"></i></b>{{ Math.round(model.utilization * 100) }}%</span><span role="cell" data-label="建议">{{ model.recommendedAccounts ? `+${model.recommendedAccounts} 账号` : forecastConstraintLabel(model.bindingConstraint) }}</span>
             <small>{{ totalTokens(model).toLocaleString() }} tokens · 输入 {{ formatMicroUsd(model.inputCostMicroUsd) }} · 缓存 {{ formatMicroUsd(model.cachedInputCostMicroUsd) }} · 输出 {{ formatMicroUsd(model.outputCostMicroUsd) }} · 当前价源 {{ priceSourceLabel(model.priceSource) }}<template v-if="model.priceVerifiedAt">（核验 {{ dateLabel(model.priceVerifiedAt) }}）</template> · {{ confidenceLabel(model.confidence) }}</small>
           </div>
         </div>
@@ -171,15 +184,9 @@ const priceSourceLabel = (value?: "vendor_official" | "portal_catalog") => value
       </div>
     </section>
 
-    <section class="content-section action-section">
-      <div class="section-heading"><div><h2>需要处理</h2><p>仅显示当前状态中可以直接处理的问题。</p></div><span class="section-count">{{ snapshot.actions.length }}</span></div>
-      <div v-if="snapshot.actions.length === 0" class="status-empty"><span aria-hidden="true"><AppIcon name="check" :size="14" /></span><div><strong>当前没有需要处理的异常</strong><p>账号、代理和队列状态均正常。</p></div></div>
-      <ul v-else class="action-list"><li v-for="item in snapshot.actions" :key="item.id" :class="`tone-${item.tone}`"><span class="action-indicator" aria-hidden="true"></span><div><strong>{{ item.title }}</strong><p>{{ item.detail }}</p></div><button class="button button-quiet" type="button" @click="emit('navigate', item.workspace, item.accountId || item.proxyId)">{{ item.actionLabel }}<AppIcon name="arrow-right" :size="13" /></button></li></ul>
-    </section>
-
     <div class="overview-columns">
-      <section class="content-section"><div class="section-heading"><div><h2>账号负载</h2><p>账号 RPM、模型在途和出口摘要。</p></div><button class="inline-action" type="button" @click="emit('navigate', 'accounts')">管理账号<AppIcon name="arrow-right" :size="12" /></button></div><div v-if="accounts.length" class="overview-table"><div v-for="account in accounts.slice(0, 6)" :key="account.id" class="overview-row"><div><strong>{{ account.label }}</strong><span>{{ account.proxy ? (account.proxyPoolEntryId ? "代理池出口" : "自定义代理") : "直连" }}</span></div><span>{{ account.runtime.requestsLastMinute }} / {{ account.schedulerOverrides?.accountRpm ?? "全局" }} RPM</span><span>{{ account.runtime.inFlight }} 个在途</span></div></div><div v-else class="mini-empty">暂无账号。</div></section>
-      <section class="content-section"><div class="section-heading"><div><h2>出口运行</h2><p>调度器当前识别的出口组。</p></div><button class="inline-action" type="button" @click="emit('navigate', 'scheduler')">打开调度<AppIcon name="arrow-right" :size="12" /></button></div><div v-if="egresses.length" class="overview-table"><div v-for="egress in egresses.slice(0, 6)" :key="egress.id" class="overview-row"><div><strong class="mono">{{ egress.id }}</strong><span>{{ egress.accountCount }} 个账号</span></div><span>{{ egress.requestsLastMinute }} / {{ egress.rpm }} RPM</span><span>{{ egress.limited ? "受限流控制" : "未限流" }}</span></div></div><div v-else class="mini-empty">暂无出口运行数据。</div></section>
+      <section class="content-section"><div class="section-heading"><div><h2>账号负载</h2><p>账号 RPM、模型在途和出口摘要。</p></div><button class="inline-action" type="button" @click="emit('navigate', 'accounts')">管理账号<AppIcon name="arrow-right" :size="12" /></button></div><div v-if="accountOverview.rows.length" class="overview-table" role="table" aria-label="账号负载"><div v-for="account in accountOverview.rows" :key="account.id" class="overview-row" role="row"><div role="cell"><strong>{{ account.label }}</strong><span>{{ account.proxy ? (account.proxyPoolEntryId ? "代理池出口" : "自定义代理") : "直连" }}</span></div><span role="cell">{{ account.requestsLastMinute }} / {{ account.accountRpm ?? "全局" }} RPM</span><span role="cell">{{ account.inFlight }} 个在途</span></div></div><div v-else class="mini-empty">暂无账号。</div></section>
+      <section class="content-section"><div class="section-heading"><div><h2>出口运行</h2><p>调度器当前识别的出口组。</p></div><button class="inline-action" type="button" @click="emit('navigate', 'scheduler')">打开调度<AppIcon name="arrow-right" :size="12" /></button></div><div v-if="egresses.length" class="overview-table" role="table" aria-label="出口运行"><div v-for="egress in egresses.slice(0, 6)" :key="egress.id" class="overview-row" role="row"><div role="cell"><strong class="mono">{{ egress.id }}</strong><span>{{ egress.accountCount }} 个账号</span></div><span role="cell">{{ egress.requestsLastMinute }} / {{ egress.rpm }} RPM</span><span role="cell">{{ egress.limited ? "受限流控制" : "未限流" }}</span></div></div><div v-else class="mini-empty">暂无出口运行数据。</div></section>
     </div>
   </section>
 </template>

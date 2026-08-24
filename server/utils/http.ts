@@ -1,7 +1,8 @@
 import { timingSafeEqual } from "node:crypto";
 import { getProxyConfig } from "~/server/utils/config.ts";
 import { redact } from "~/server/utils/redaction.ts";
-import type { JsonObject, JsonValue } from "~/server/utils/types.ts";
+import { stateStore } from "~/server/utils/state-store.ts";
+import type { ClientPrincipal, JsonObject, JsonValue } from "~/server/utils/types.ts";
 
 export { redact } from "~/server/utils/redaction.ts";
 
@@ -131,18 +132,26 @@ function secureEquals(left: string, right: string): boolean {
   return leftBuffer.length === rightBuffer.length && timingSafeEqual(leftBuffer, rightBuffer);
 }
 
-export function requireClientAuth(request: Request): void {
-  const expected = getProxyConfig().apiKey;
-  if (!expected) {
-    if (getProxyConfig().allowAnonymous) {
-      return;
-    }
-    throw new HttpError(503, "NEURALWATT_API_KEY is not configured.", "server_error", undefined, "api_key_not_configured");
-  }
+export async function requireClientAuth(request: Request): Promise<ClientPrincipal> {
+  const config = getProxyConfig();
   const received = bearerToken(request);
-  if (!received || !secureEquals(received, expected)) {
+  if (received) {
+    if (config.apiKey && secureEquals(received, config.apiKey)) {
+      return { scope: "global" };
+    }
+    const matched = await stateStore.authenticateGroupApiKey(received);
+    if (matched?.key.enabled && matched.group.enabled) {
+      return { scope: "group", groupId: matched.group.id, apiKeyId: matched.key.id };
+    }
     throw new HttpError(401, "Invalid API key.", "authentication_error", undefined, "invalid_api_key");
   }
+  if (config.allowAnonymous) {
+    return { scope: "global" };
+  }
+  if (!config.apiKey) {
+    throw new HttpError(503, "NEURALWATT_API_KEY is not configured.", "server_error", undefined, "api_key_not_configured");
+  }
+  throw new HttpError(401, "Invalid API key.", "authentication_error", undefined, "invalid_api_key");
 }
 
 export function requireAdminAuth(request: Request): void {

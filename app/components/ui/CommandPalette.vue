@@ -56,7 +56,6 @@ const actions = computed<PaletteAction[]>(() => [
   { id: "action:refresh", group: "操作", label: "刷新当前数据", description: "立即同步控制台状态", icon: "refresh-cw" },
   { id: "action:auto-refresh", group: "操作", label: props.autoRefresh ? "关闭自动刷新" : "开启自动刷新", description: "每 30 秒同步一次运行状态", icon: "activity", active: props.autoRefresh },
   { id: "theme:light", group: "主题", label: "浅色主题", description: "高对比明亮工作区", icon: "sun", active: props.theme === "light" },
-  { id: "theme:gray", group: "主题", label: "高级灰主题", description: "低饱和专注工作区", icon: "contrast", active: props.theme === "gray" },
   { id: "theme:dark", group: "主题", label: "暗色主题", description: "适合低光环境", icon: "moon", active: props.theme === "dark" },
 ]);
 

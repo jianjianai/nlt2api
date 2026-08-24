@@ -13,8 +13,10 @@ const props = defineProps<{
   importResults: ProxyImportLineResult[];
   filter: "all" | ProxyPoolStatus;
   busyIds: Set<string>;
+  directAccountCount: number;
   importing: boolean;
   checkingAll: boolean;
+  assigningDirect: boolean;
   saving: boolean;
 }>();
 const emit = defineEmits<{
@@ -24,6 +26,7 @@ const emit = defineEmits<{
   import: [];
   check: [proxy: ProxyPoolEntry];
   checkMany: [scope: "error" | "all"];
+  assignDirect: [];
   delete: [proxy: ProxyPoolEntry];
   savePolicies: [];
 }>();
@@ -49,7 +52,7 @@ function setPolicy(field: keyof ProxyPoolSettings, event: Event): void {
 
 <template>
   <section class="workspace-page proxy-workspace">
-    <header class="page-heading page-heading-actions"><div><p class="section-kicker">出口资源</p><h1>代理池</h1><p>导入、测活并分配代理；传输失败时按策略自动轮换。</p></div><div class="page-actions"><button class="button button-quiet" type="button" :disabled="checkingAll" :aria-busy="checkingAll" @click="emit('checkMany', 'error')"><span v-if="checkingAll" class="spinner" aria-hidden="true"></span><AppIcon v-else name="refresh-cw" :size="14" />{{ checkingAll ? "检测中" : "重测错误" }}</button><button class="button button-quiet" type="button" :disabled="checkingAll" @click="emit('checkMany', 'all')"><AppIcon name="activity" :size="14" />测活全部</button></div></header>
+    <header class="page-heading page-heading-actions"><div><p class="section-kicker">出口资源</p><h1>代理池</h1><p>导入、测活并分配代理；传输失败时按策略自动轮换。</p></div><div class="page-actions"><button class="button button-primary" type="button" :disabled="assigningDirect || directAccountCount === 0 || counts.idle === 0" :aria-busy="assigningDirect" :title="directAccountCount === 0 ? '当前没有直连账号' : counts.idle === 0 ? '当前没有健康空闲代理' : `为最多 ${Math.min(directAccountCount, counts.idle)} 个直连账号分配代理`" @click="emit('assignDirect')"><span v-if="assigningDirect" class="spinner" aria-hidden="true"></span><AppIcon v-else name="users" :size="14" />{{ assigningDirect ? "分配中" : `分配直连账号 (${Math.min(directAccountCount, counts.idle)})` }}</button><button class="button button-quiet" type="button" :disabled="checkingAll" :aria-busy="checkingAll" @click="emit('checkMany', 'error')"><span v-if="checkingAll" class="spinner" aria-hidden="true"></span><AppIcon v-else name="refresh-cw" :size="14" />{{ checkingAll ? "检测中" : "重测错误" }}</button><button class="button button-quiet" type="button" :disabled="checkingAll" @click="emit('checkMany', 'all')"><AppIcon name="activity" :size="14" />测活全部</button></div></header>
 
     <div class="resource-summary" aria-label="代理池状态"><button v-for="item in [{ id: 'all', label: '全部' }, { id: 'idle', label: '空闲' }, { id: 'in_use', label: '使用中' }, { id: 'error', label: '错误' }, { id: 'checking', label: '检测中' }]" :key="item.id" type="button" :class="{ active: filter === item.id }" :aria-pressed="filter === item.id" @click="emit('update:filter', item.id as typeof filter)"><span>{{ item.label }}</span><strong>{{ counts[item.id as keyof typeof counts] }}</strong></button></div>
 

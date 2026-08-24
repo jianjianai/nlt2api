@@ -49,6 +49,88 @@ async function recordFiles(dir: string): Promise<string[]> {
   }
 }
 
+test("v1 state migrates to v2 without assigning legacy accounts to groups", async () => {
+  await withTempStore(async (store, dir) => {
+    const file = join(dir, "accounts.json");
+    await writeFile(file, JSON.stringify({
+      version: 1,
+      settings: { recordMessages: false },
+      accounts: [{
+        id: "legacy-account",
+        label: "Legacy",
+        email: "legacy@example.com",
+        password: "secret",
+        enabled: true,
+        weight: 1,
+        models: ["model-a"],
+        createdAt: timestamp(0),
+        updatedAt: timestamp(0),
+      }],
+      proxyPool: [],
+    }), "utf8");
+
+    const state = await store.getState();
+    assert.equal(state.version, 2);
+    assert.deepEqual(state.accountGroups, []);
+    assert.deepEqual(state.groupApiKeys, []);
+    assert.deepEqual(state.accounts[0]?.groupIds, []);
+    const persisted = JSON.parse(await readFile(file, "utf8")) as { version: number };
+    assert.equal(persisted.version, 2);
+  });
+});
+
+test("groups own account membership and store only API key digests", async () => {
+  await withTempStore(async (store, dir) => {
+    const first = await store.createAccountGroup({ name: "Primary", description: "Main capacity" });
+    const second = await store.createAccountGroup({ name: "Overflow" });
+    const account = await store.addAccount({
+      email: "grouped@example.com",
+      password: "secret",
+      groupIds: [first.id, second.id, first.id],
+    });
+    assert.deepEqual(account.groupIds, [first.id, second.id]);
+
+    const created = await store.createGroupApiKey(first.id, "Production");
+    assert.match(created.secret, /^nwg_/);
+    assert.equal((await store.authenticateGroupApiKey(created.secret))?.group.id, first.id);
+    const persisted = await readFile(join(dir, "accounts.json"), "utf8");
+    assert.equal(persisted.includes(created.secret), false);
+    assert.equal(persisted.includes(created.key.secretDigest), true);
+
+    const rotated = await store.rotateGroupApiKey(first.id, created.key.id);
+    assert.notEqual(rotated.secret, created.secret);
+    assert.equal(await store.authenticateGroupApiKey(created.secret), undefined);
+    assert.equal((await store.authenticateGroupApiKey(rotated.secret))?.key.id, created.key.id);
+
+    const removed = await store.deleteAccountGroup(first.id);
+    assert.deepEqual(removed, { accountCount: 1, apiKeyCount: 1 });
+    assert.deepEqual((await store.getAccount(account.id))?.groupIds, [second.id]);
+    assert.deepEqual(await store.listGroupApiKeys(first.id), []);
+  });
+});
+
+test("account pagination uses stable sorting and group filters", async () => {
+  await withTempStore(async (store) => {
+    const group = await store.createAccountGroup({ name: "Paged" });
+    for (let index = 0; index < 21; index += 1) {
+      await store.addAccount({
+        email: `account-${String(index).padStart(2, "0")}@example.com`,
+        password: "secret",
+        label: `Account ${String(index).padStart(2, "0")}`,
+        groupIds: index < 20 ? [group.id] : [],
+      });
+    }
+
+    const first = await store.listAccountsPage({ page: 1, pageSize: 20, groupId: group.id, sort: "label_asc" });
+    assert.equal(first.total, 20);
+    assert.equal(first.pageCount, 1);
+    assert.equal(first.accounts[0]?.label, "Account 00");
+    assert.equal(first.accounts[19]?.label, "Account 19");
+    const ungrouped = await store.listAccountsPage({ page: 1, pageSize: 20, groupId: null });
+    assert.deepEqual(ungrouped.accounts.map((account) => account.label), ["Account 20"]);
+  });
+});
+
 test("proxy pool settings and empty pool default for legacy state", async () => {
   await withTempStore(async (store) => {
     const settings = await store.getSettings();

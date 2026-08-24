@@ -141,6 +141,34 @@ export interface ProxyPoolEntry {
   retryAfter?: number;
 }
 
+export interface AccountGroup {
+  id: string;
+  name: string;
+  description?: string;
+  enabled: boolean;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface GroupApiKey {
+  id: string;
+  groupId: string;
+  name: string;
+  prefix: string;
+  secretDigest: string;
+  enabled: boolean;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export type ClientPrincipal =
+  | { scope: "global" }
+  | { scope: "group"; groupId: string; apiKeyId: string };
+
+export type ResponseAccessScope =
+  | { scope: "global" }
+  | { scope: "group"; groupId: string };
+
 export interface ManagedAccount {
   id: string;
   label: string;
@@ -152,6 +180,8 @@ export interface ManagedAccount {
   proxy?: string;
   /** Pool owner for `proxy`; absent for direct or custom manually-entered proxies. */
   proxyPoolEntryId?: string;
+  /** Groups allowed to schedule this account. Capacity remains account-global. */
+  groupIds: string[];
   /** Model ids this account can serve, fetched from the portal playground. */
   models: string[];
   schedulerOverrides?: AccountSchedulerOverrides;
@@ -183,10 +213,12 @@ export interface ProxySettings {
 }
 
 export interface PersistentState {
-  version: 1;
+  version: 2;
   settings: ProxySettings;
   accounts: ManagedAccount[];
   proxyPool: ProxyPoolEntry[];
+  accountGroups: AccountGroup[];
+  groupApiKeys: GroupApiKey[];
 }
 
 export interface AccountRuntimeState {
@@ -211,6 +243,7 @@ export interface PublicAccount {
   weight: number;
   proxy: string | null;
   proxyPoolEntryId?: string;
+  groupIds: string[];
   models: string[];
   schedulerOverrides?: AccountSchedulerOverrides;
   hasSession: boolean;
@@ -258,6 +291,7 @@ export interface DebugRawBody {
 export interface StoredResponseState {
   id: string;
   createdAt: string;
+  access: ResponseAccessScope;
   model: string;
   previousResponseId?: string;
   /** Normalized Responses input items: request input plus the output items. */

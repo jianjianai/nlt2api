@@ -14,6 +14,8 @@
   --theme-accent-hover: #0c6a61;
   --theme-accent-soft: #e3f2ef;
   --theme-on-accent: #ffffff;
+  --theme-on-primary: #ffffff;
+  --theme-on-danger: #ffffff;
   --theme-warning: #9c6417;
   --theme-warning-soft: #fdf2dd;
   --theme-danger: #b03e3e;
@@ -24,33 +26,6 @@
   --theme-shadow-sm: 0 1px 2px rgba(23, 50, 74, .05);
   --theme-shadow-md: 0 10px 30px rgba(23, 50, 74, .10);
   --theme-shadow-lg: 0 24px 64px rgba(13, 25, 38, .22);
-}
-
-.app-shell[data-theme="gray"] {
-  color-scheme: light;
-  --theme-bg: #e7e8e7;
-  --theme-surface: #f4f5f4;
-  --theme-surface-raised: #ffffff;
-  --theme-surface-sunken: #ecefee;
-  --theme-text: #202426;
-  --theme-muted: #626b6d;
-  --theme-line: #cdd1d0;
-  --theme-line-strong: #b7bfbd;
-  --theme-primary: #293235;
-  --theme-accent: #596a6c;
-  --theme-accent-hover: #48585a;
-  --theme-accent-soft: #dfe5e4;
-  --theme-on-accent: #ffffff;
-  --theme-warning: #8a681e;
-  --theme-warning-soft: #f1e8ce;
-  --theme-danger: #a33f43;
-  --theme-danger-soft: #f5dfdf;
-  --theme-code: #344144;
-  --theme-focus: rgba(89, 106, 108, .42);
-  --theme-selection: rgba(89, 106, 108, .18);
-  --theme-shadow-sm: 0 1px 2px rgba(32, 36, 38, .06);
-  --theme-shadow-md: 0 10px 30px rgba(32, 36, 38, .12);
-  --theme-shadow-lg: 0 24px 64px rgba(20, 24, 25, .26);
 }
 
 .app-shell[data-theme="dark"] {
@@ -68,6 +43,8 @@
   --theme-accent-hover: #5ee0f4;
   --theme-accent-soft: #123a43;
   --theme-on-accent: #062a31;
+  --theme-on-primary: #0d0d10;
+  --theme-on-danger: #1a0d0f;
   --theme-warning: #f3bb55;
   --theme-warning-soft: #3d3019;
   --theme-danger: #f08a8d;
@@ -93,6 +70,8 @@
   --teal-hover: var(--theme-accent-hover);
   --teal-soft: var(--theme-accent-soft);
   --on-accent: var(--theme-on-accent);
+  --on-primary: var(--theme-on-primary);
+  --on-danger: var(--theme-on-danger);
   --amber: var(--theme-warning);
   --amber-soft: var(--theme-warning-soft);
   --red: var(--theme-danger);
@@ -222,7 +201,7 @@ h3,
 .record-fields dd { color: var(--theme-text); }
 .workspace-brand-mark { color: var(--theme-bg); background: var(--theme-primary); }
 .workspace-connection i { background: var(--theme-accent); }
-.button-primary { color: var(--theme-bg); background: var(--theme-primary); }
+.button-primary { color: var(--theme-on-primary); background: var(--theme-primary); }
 .button-primary:hover:not(:disabled) { background: color-mix(in srgb, var(--theme-primary) 82%, var(--theme-accent)); }
 .button-quiet,
 .icon-action,
@@ -236,7 +215,7 @@ h3,
 .copy-button { color: var(--theme-accent); }
 .button-danger,
 .button-danger-solid { color: var(--theme-danger); }
-.button-danger-solid { color: #fff; background: var(--theme-danger); }
+.button-danger-solid { color: var(--theme-on-danger); background: var(--theme-danger); }
 .badge.muted { color: var(--theme-muted); background: color-mix(in srgb, var(--theme-muted) 16%, transparent); }
 .badge.good { color: var(--theme-accent); background: var(--theme-accent-soft); }
 .badge.warn { color: var(--theme-warning); background: var(--theme-warning-soft); }
@@ -277,6 +256,8 @@ h3,
 .trace-preview,
 .message-content { color: var(--theme-muted); }
 .chat-msg.right .chat-bubble { border-color: color-mix(in srgb, var(--theme-accent) 48%, var(--theme-line)); background: var(--theme-accent-soft); }
+.chat-msg.thinking .chat-bubble { border-color: color-mix(in srgb, var(--theme-warning) 42%, var(--theme-line)); background: var(--theme-warning-soft); }
+.chat-msg.thinking .chat-role { color: var(--theme-warning); }
 .tool-call-item { background: var(--theme-accent-soft); border-color: var(--theme-accent); }
 .tool-call-name { color: var(--theme-accent); }
 .fold-count { color: var(--theme-muted); background: color-mix(in srgb, var(--theme-muted) 15%, transparent); }
@@ -292,7 +273,6 @@ h3,
 .theme-picker button:hover { color: var(--theme-text); background: color-mix(in srgb, var(--theme-accent) 12%, transparent); }
 .theme-picker button.active { color: var(--theme-on-accent); background: var(--theme-accent); }
 
-.app-shell[data-theme="gray"] .workspace-topbar { box-shadow: 0 1px 0 rgba(255,255,255,.65); }
 .app-shell[data-theme="dark"] .workspace-topbar { background: #111216; }
 .app-shell[data-theme="dark"] .workspace-mobile-nav { background: rgba(22,22,26,.98); }
 .app-shell[data-theme="dark"] .workspace-brand-mark { background: var(--theme-accent); }

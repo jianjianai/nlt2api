@@ -10,7 +10,7 @@ import {
   proxyPolicySummary,
   signedPercent,
 } from "../app/utils/admin-ui.ts";
-import type { Account, GatewayConfig, ProxyPoolEntry, ProxyPoolSettings, SchedulerRuntime } from "../app/types/admin.ts";
+import type { Account, AccountOverview, GatewayConfig, ProxyPoolEntry, ProxyPoolSettings, SchedulerRuntime } from "../app/types/admin.ts";
 
 function account(overrides: Partial<Account> = {}): Account {
   return {
@@ -35,11 +35,12 @@ function account(overrides: Partial<Account> = {}): Account {
       cooldownUntil: 0,
     },
     ...overrides,
+    groupIds: overrides.groupIds ?? [],
   };
 }
 
 test("parseTheme restores supported themes and defaults invalid values", () => {
-  assert.equal(parseTheme("gray"), "gray");
+  assert.equal(parseTheme("gray"), "dark");
   assert.equal(parseTheme("dark"), "dark");
   assert.equal(parseTheme("light"), "light");
   assert.equal(parseTheme("violet"), "light");
@@ -58,6 +59,25 @@ const config: GatewayConfig = {
 
 const scheduler: SchedulerRuntime = { pending: 0, oldestWaitMs: 0, egresses: [] };
 
+function overview(account: Account): AccountOverview {
+  const modelIssues = Object.entries(account.runtime.modelCooldownUntil).map(([model, until]) => ({ accountId: account.id, accountLabel: account.label, kind: "model" as const, model, until, ...(account.runtime.lastError ? { error: account.runtime.lastError } : {}) }));
+  const accountIssues = account.runtime.cooldownUntil > 0
+    ? [{ accountId: account.id, accountLabel: account.label, kind: "account" as const, until: account.runtime.cooldownUntil, ...(account.runtime.lastError ? { error: account.runtime.lastError } : {}) }]
+    : [];
+  return {
+    total: 1,
+    enabled: account.enabled ? 1 : 0,
+    sessions: account.hasSession ? 1 : 0,
+    direct: account.proxy ? 0 : 1,
+    inFlight: account.runtime.inFlight,
+    cooling: accountIssues.length,
+    modelCooling: modelIssues.length,
+    models: account.models,
+    rows: [{ id: account.id, label: account.label, proxy: Boolean(account.proxy), requestsLastMinute: account.runtime.requestsLastMinute, inFlight: account.runtime.inFlight }],
+    issues: [...accountIssues, ...modelIssues],
+  };
+}
+
 test("parseWorkspace restores only known workspaces", () => {
   assert.equal(parseWorkspace("overview"), "overview");
   assert.equal(parseWorkspace("settings"), "settings");
@@ -67,7 +87,7 @@ test("parseWorkspace restores only known workspaces", () => {
 
 test("deriveOverview reports a healthy snapshot without invented alerts", () => {
   const proxies: ProxyPoolEntry[] = [{ id: "proxy-1", maskedUrl: "http://proxy.local:8080", kind: "http", status: "idle" }];
-  const result = deriveOverview([account()], proxies, scheduler, config, Date.parse("2026-08-23T01:00:00.000Z"));
+  const result = deriveOverview(overview(account()), proxies, scheduler, config);
   assert.deepEqual(result.metrics.map((metric) => [metric.id, metric.value]), [
     ["accounts", "1/1"],
     ["proxies", "1/1"],
@@ -100,11 +120,10 @@ test("deriveOverview creates evidence-backed account, proxy, queue and API-key a
     lastError: "Proxy connection was refused.",
   }];
   const result = deriveOverview(
-    [cooling],
+    overview(cooling),
     proxies,
     { pending: 3, oldestWaitMs: 31_000, egresses: [] },
     { ...config, clientApiKey: "", clientApiKeyRequired: true },
-    now,
   );
   assert.deepEqual(result.actions.map((item) => item.id), [
     "proxy:proxy-error",

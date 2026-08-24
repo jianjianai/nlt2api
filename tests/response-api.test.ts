@@ -577,6 +577,7 @@ test("ResponseStore persists and serves previous_response_id chains", async () =
     await store.save({
       id: "resp_first",
       createdAt: new Date().toISOString(),
+      access: { scope: "global" },
       model: "test-model",
       items: [userInput("first turn"), { type: "message", role: "assistant", content: [{ type: "output_text", text: "answer" }] }],
     });
@@ -596,6 +597,28 @@ test("ResponseStore persists and serves previous_response_id chains", async () =
     assert.equal(chatRequest.user, "response:resp_first");
     assert.equal(context.previousResponseId, "resp_first");
     assert.equal(context.store, true);
+  });
+});
+
+test("stored response chains are isolated by group scope", async () => {
+  await withTempDataDir(async () => {
+    const store = new ResponseStore();
+    await store.save({
+      id: "resp_group_a",
+      createdAt: new Date().toISOString(),
+      access: { scope: "group", groupId: "group-a" },
+      model: "test-model",
+      items: [userInput("first turn")],
+    });
+    const request = baseRequest({ input: [userInput("second turn")], previous_response_id: "resp_group_a" });
+    const sameGroup = await validateResponseRequest(request, { scope: "group", groupId: "group-a" });
+    assert.equal((sameGroup.chatRequest.messages as JsonObject[]).length, 2);
+    await assertHttpError(
+      () => validateResponseRequest(request, { scope: "group", groupId: "group-b" }),
+      { status: 400, param: "previous_response_id", match: /not found/ },
+    );
+    const global = await validateResponseRequest(request, { scope: "global" });
+    assert.equal((global.chatRequest.messages as JsonObject[]).length, 2);
   });
 });
 
@@ -689,6 +712,7 @@ test("response store round trip survives restart", async () => {
     await first.save({
       id: "resp_persist",
       createdAt: new Date().toISOString(),
+      access: { scope: "global" },
       model: "test-model",
       items: [userInput("kept")],
     });

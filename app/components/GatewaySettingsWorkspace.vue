@@ -214,8 +214,8 @@ function analyticsDate(value?: string): string {
             <code :title="model">{{ model }}</code>
             <span>{{ modelHasOverride(model) ? "自定义" : "跟随全局" }}</span>
           </div>
-          <label><span>信封格式</span><select :value="settings.modelToolCallFormats?.[model] ?? ''" @change="emit('setModelToolFormat', model, ($event.target as HTMLSelectElement).value)"><option value="">跟随全局（{{ effectiveFormat() }}）</option><option value="auto">auto</option><option value="json">json</option><option value="xml">xml</option></select></label>
-          <label><span>播报档位</span><select :value="settings.modelPreambleVerbosities?.[model] ?? ''" @change="emit('setModelPreamble', model, ($event.target as HTMLSelectElement).value)"><option value="">跟随全局（{{ effectivePreamble() }}）</option><option value="milestone">milestone</option><option value="normal">normal</option><option value="verbose">verbose</option><option value="quiet">quiet</option></select></label>
+          <label><span>信封格式</span><select :aria-label="`${model} 的信封格式`" :value="settings.modelToolCallFormats?.[model] ?? ''" @change="emit('setModelToolFormat', model, ($event.target as HTMLSelectElement).value)"><option value="">跟随全局（{{ effectiveFormat() }}）</option><option value="auto">auto</option><option value="json">json</option><option value="xml">xml</option></select></label>
+          <label><span>播报档位</span><select :aria-label="`${model} 的播报档位`" :value="settings.modelPreambleVerbosities?.[model] ?? ''" @change="emit('setModelPreamble', model, ($event.target as HTMLSelectElement).value)"><option value="">跟随全局（{{ effectivePreamble() }}）</option><option value="milestone">milestone</option><option value="normal">normal</option><option value="verbose">verbose</option><option value="quiet">quiet</option></select></label>
         </div>
       </div>
       <div v-else class="workspace-empty gateway-model-empty"><strong>暂无可配置模型</strong><p>请先在账号工作区获取或编辑模型列表。</p></div>

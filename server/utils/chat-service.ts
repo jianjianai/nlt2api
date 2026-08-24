@@ -328,9 +328,11 @@ export function validateChatRequest(request: JsonObject, toolCallPolicy?: ToolCa
  * support the model but are cooling down are left to the scheduler, which
  * reports them as temporarily unavailable.
  */
-export async function assertModelSupported(model: string): Promise<void> {
+export async function assertModelSupported(model: string, groupId?: string): Promise<void> {
   const accounts = await stateStore.listAccounts();
-  const enabled = accounts.filter((account) => account.enabled);
+  const enabled = accounts
+    .filter((account) => account.enabled)
+    .filter((account) => !groupId || account.groupIds.includes(groupId));
   if (enabled.length === 0) {
     throw new HttpError(503, "No enabled NeuralWatt account is currently available.", "server_error", undefined, "no_account_available");
   }
@@ -498,6 +500,7 @@ async function getCompletion(
   body: JsonObject,
   stickyKey?: string,
   requiredAccountId?: string,
+  groupId?: string,
   allowEmptyContent = false,
   onFrame?: UpstreamFrameHandler,
   signal?: AbortSignal,
@@ -515,7 +518,9 @@ async function getCompletion(
   // another eligible account when the preferred account lacks capacity.
   let rotationAttempted = false;
   let retryAccountSnapshot: ManagedAccount | undefined;
-  const enabledAccountCount = (await stateStore.listAccounts()).filter((account) => account.enabled).length;
+  const enabledAccountCount = (await stateStore.listAccounts())
+    .filter((account) => account.enabled)
+    .filter((account) => !groupId || account.groupIds.includes(groupId)).length;
   // One extra outer attempt is reserved for a successful proxy rotation even
   // when the deployment has only one account.
   const attempts = Math.max(1, enabledAccountCount) + 1;
@@ -523,9 +528,10 @@ async function getCompletion(
     let lease: AccountLease;
     try {
       lease = await accountScheduler.acquire(retryAccountSnapshot
-        ? { model, accountSnapshot: retryAccountSnapshot, signal }
+        ? { model, groupId, accountSnapshot: retryAccountSnapshot, signal }
         : {
             model,
+            groupId,
             stickyKey,
             ...(requiredAccountId && attempt === 0 ? { preferredAccountId: requiredAccountId } : {}),
             excludedAccountIds: excluded,
@@ -613,6 +619,7 @@ async function getCompletion(
         async () => {
           lease = await accountScheduler.acquire({
             model,
+            groupId,
             accountSnapshot: account,
             signal,
           });
@@ -1273,6 +1280,7 @@ async function executeChatRequestOnce(
   options?: {
     stickyKey?: string;
     requiredAccountId?: string;
+    groupId?: string;
     stream?: boolean;
     onUpstreamFrame?: UpstreamFrameHandler;
     onRepairReasoning?: (reasoning: ReasoningFields) => void | Promise<void>;
@@ -1310,6 +1318,7 @@ async function executeChatRequestOnce(
     upstreamRequest,
     options?.stickyKey,
     options?.requiredAccountId ?? toolAssignedAccountId,
+    options?.groupId,
     toolTurn,
     mayContinueThinking && clientFrameHandler ? holdTerminalFrames(clientFrameHandler) : clientFrameHandler,
     options?.signal,
@@ -1321,6 +1330,7 @@ async function executeChatRequestOnce(
   if (mayContinueThinking && thinkingBudget !== undefined && isThinkingInterrupted(result.completion)) {
     result = await continueThinking(upstreamRequest, result, thinkingBudget, {
       stickyKey: options?.stickyKey,
+      groupId: options?.groupId,
       allowEmptyContent: toolTurn,
       onUpstreamFrame: clientFrameHandler,
       signal: options?.signal,
@@ -1420,6 +1430,7 @@ async function executeChatRequestOnce(
           upstreamRequest,
           options?.stickyKey,
           result.account.id,
+          options?.groupId,
           true,
           repairStream
             ? async (frame) => {
@@ -1621,6 +1632,7 @@ export async function executeChatRequest(
   options?: {
     stickyKey?: string;
     requiredAccountId?: string;
+    groupId?: string;
     stream?: boolean;
     onUpstreamFrame?: UpstreamFrameHandler;
     onRepairReasoning?: (reasoning: ReasoningFields) => void | Promise<void>;
@@ -1668,6 +1680,7 @@ export async function executeChatRequest(
 
 interface ThinkingContinuationOptions {
   stickyKey?: string;
+  groupId?: string;
   allowEmptyContent: boolean;
   onUpstreamFrame?: UpstreamFrameHandler;
   signal?: AbortSignal;
@@ -1733,6 +1746,7 @@ async function continueThinking(
       continuationBody,
       options.stickyKey,
       account.id,
+      options.groupId,
       options.allowEmptyContent,
       options.onUpstreamFrame ? holdTerminalFrames(options.onUpstreamFrame) : undefined,
       options.signal,

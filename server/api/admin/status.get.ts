@@ -17,11 +17,38 @@ export default defineHandler(async (event) => {
       proxyPoolService.snapshot(),
     ]);
     const publicAccounts = accounts.map((account) => accountScheduler.publicState(account));
+    const now = Date.now();
+    const modelIssues = publicAccounts.flatMap((account) => Object.entries(account.runtime.modelCooldownUntil)
+      .filter(([, until]) => until > now)
+      .map(([model, until]) => ({ accountId: account.id, accountLabel: account.label, kind: "model" as const, model, until, ...(account.runtime.lastError ? { error: account.runtime.lastError } : {}) })));
+    const accountIssues = publicAccounts
+      .filter((account) => account.runtime.cooldownUntil > now)
+      .map((account) => ({ accountId: account.id, accountLabel: account.label, kind: "account" as const, until: account.runtime.cooldownUntil, ...(account.runtime.lastError ? { error: account.runtime.lastError } : {}) }));
+    const accountOverview = {
+      total: publicAccounts.length,
+      enabled: publicAccounts.filter((account) => account.enabled).length,
+      sessions: publicAccounts.filter((account) => account.hasSession).length,
+      direct: publicAccounts.filter((account) => !account.proxy).length,
+      inFlight: publicAccounts.reduce((total, account) => total + account.runtime.inFlight, 0),
+      cooling: accountIssues.length,
+      modelCooling: modelIssues.length,
+      models: [...new Set(publicAccounts.flatMap((account) => account.models))].sort(),
+      rows: publicAccounts.slice(0, 6).map((account) => ({
+        id: account.id,
+        label: account.label,
+        proxy: Boolean(account.proxy),
+        ...(account.proxyPoolEntryId ? { proxyPoolEntryId: account.proxyPoolEntryId } : {}),
+        ...(account.schedulerOverrides?.accountRpm ? { accountRpm: account.schedulerOverrides.accountRpm } : {}),
+        requestsLastMinute: account.runtime.requestsLastMinute,
+        inFlight: account.runtime.inFlight,
+      })),
+      issues: [...accountIssues, ...modelIssues].slice(0, 8),
+    };
     const upstreamRpm = publicAccounts.reduce((total, account) => total + account.runtime.requestsLastMinute, 0);
     const analytics = await usageAnalytics.overview(publicAccounts, settings, upstreamRpm);
     const config = getProxyConfig();
     return jsonResponse({
-      accounts: publicAccounts,
+      accountOverview,
       settings,
       scheduler,
       analytics,

@@ -55,6 +55,7 @@ function account(id: string, models = ["m1"], proxy?: string): ManagedAccount {
     enabled: true,
     weight: 1,
     ...(proxy ? { proxy } : {}),
+    groupIds: [],
     models,
     createdAt: `2026-01-01T00:00:0${id.length}.000Z`,
     updatedAt: "2026-01-01T00:00:00.000Z",
@@ -257,6 +258,22 @@ test("soft affinity spills from a full account and follows the successful spill"
   const next = await resolved(scheduler.acquire({ model: "m1", stickyKey: "session" }));
   assert.equal(next.account.id, spill.account.id);
   next.release();
+});
+
+test("group-scoped admission cannot select accounts outside the group", async () => {
+  const grouped = account("grouped");
+  grouped.groupIds = ["group-a"];
+  const outside = account("outside");
+  outside.groupIds = ["group-b"];
+  const { scheduler } = harness([outside, grouped], { accountRpm: 100 });
+
+  const lease = await resolved(scheduler.acquire({ model: "m1", groupId: "group-a" }));
+  assert.equal(lease.account.id, "grouped");
+  lease.release();
+  await assert.rejects(
+    scheduler.acquire({ model: "m1", groupId: "missing-group" }),
+    /No enabled NeuralWatt account/,
+  );
 });
 
 test("abort, timeout, queue size and hot settings updates settle waiters", async () => {

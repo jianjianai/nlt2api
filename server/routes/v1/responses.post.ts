@@ -32,7 +32,7 @@ import {
 import { recordDebug, upstreamHttpError } from "~/server/utils/route-helpers.ts";
 import { requestDebugContext } from "~/server/utils/request-errors.ts";
 import { openAIStreamingSse, type SseEntry } from "~/server/utils/upstream-stream.ts";
-import type { DebugRawBody, JsonObject } from "~/server/utils/types.ts";
+import type { DebugRawBody, JsonObject, ResponseAccessScope } from "~/server/utils/types.ts";
 
 function jsonDebugBody(body: string): DebugRawBody {
   return { contentType: "application/json", body };
@@ -56,7 +56,9 @@ export default defineHandler(async (event) => {
   let body: JsonObject | undefined;
   let clientRequest: DebugRawBody | undefined;
   try {
-    requireClientAuth(event.req);
+    const principal = await requireClientAuth(event.req);
+    const groupId = principal.scope === "group" ? principal.groupId : undefined;
+    const access: ResponseAccessScope = groupId ? { scope: "group", groupId } : { scope: "global" };
     const parsedRequest = await readJsonObjectWithRaw(event.req);
     body = parsedRequest.body;
     clientRequest = jsonDebugBody(parsedRequest.raw);
@@ -64,10 +66,10 @@ export default defineHandler(async (event) => {
     // Convert and validate before any SSE headers are committed so client
     // shape errors stay ordinary HTTP 4xx responses, exactly like the chat
     // endpoint. Execution reuses the validated chat request.
-    const { chatRequest, context } = await validateResponseRequest(requestBody);
+    const { chatRequest, context } = await validateResponseRequest(requestBody, access);
     const toolCallPolicy = await resolveToolCallPolicy(modelFromRequest(chatRequest));
     const validated = validateChatRequest(chatRequest, toolCallPolicy);
-    await assertModelSupported(validated.model);
+    await assertModelSupported(validated.model, groupId);
 
     if (requestBody.stream === true) {
       const streamState = createResponseStreamState(context);
@@ -85,6 +87,7 @@ export default defineHandler(async (event) => {
           const execution = await executeChatRequest(chatRequest, {
             endpoint: "/v1/responses",
             stickyKey: stickyKeyFrom(event.req, chatRequest),
+            groupId,
             stream: true,
             signal,
             validated,
@@ -123,7 +126,7 @@ export default defineHandler(async (event) => {
           }
 
           accountScheduler.bindStickyKey(execution.account.id, `response:${streamState.id}`);
-          await persistResponseState(streamState.id, execution, context);
+          await persistResponseState(streamState.id, execution, context, access);
           await recordDebug({
             endpoint: "/v1/responses",
             accountId: execution.account.id,
@@ -167,12 +170,13 @@ export default defineHandler(async (event) => {
     const execution = await executeChatRequest(chatRequest, {
       endpoint: "/v1/responses",
       stickyKey: stickyKeyFrom(event.req, chatRequest),
+      groupId,
       validated,
     });
     const responseId = `resp_${randomUUID().replaceAll("-", "")}`;
     accountScheduler.bindStickyKey(execution.account.id, `response:${responseId}`);
     const response = responseFromExecution(execution, context, responseId, Math.floor(Date.now() / 1_000));
-    await persistResponseState(responseId, execution, context);
+    await persistResponseState(responseId, execution, context, access);
 
     await recordDebug({
       endpoint: "/v1/responses",

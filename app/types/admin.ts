@@ -9,6 +9,38 @@ export interface SchedulerSettings {
   maxQueueSize: number;
 }
 
+export interface OverviewAccountRow {
+  id: string;
+  label: string;
+  proxy: boolean;
+  proxyPoolEntryId?: string;
+  accountRpm?: number;
+  requestsLastMinute: number;
+  inFlight: number;
+}
+
+export interface OverviewAccountIssue {
+  accountId: string;
+  accountLabel: string;
+  kind: "account" | "model";
+  model?: string;
+  until: number;
+  error?: string;
+}
+
+export interface AccountOverview {
+  total: number;
+  enabled: number;
+  sessions: number;
+  direct: number;
+  inFlight: number;
+  cooling: number;
+  modelCooling: number;
+  models: string[];
+  rows: OverviewAccountRow[];
+  issues: OverviewAccountIssue[];
+}
+
 export interface AccountSchedulerOverrides {
   accountRpm?: number;
   accountModelConcurrency?: number;
@@ -71,6 +103,7 @@ export interface Account {
   weight: number;
   proxy: string | null;
   proxyPoolEntryId?: string;
+  groupIds: string[];
   models: string[];
   schedulerOverrides?: AccountSchedulerOverrides;
   hasSession: boolean;
@@ -80,9 +113,46 @@ export interface Account {
   runtime: RuntimeState;
 }
 
+export interface AccountGroup {
+  id: string;
+  name: string;
+  description?: string;
+  enabled: boolean;
+  createdAt: string;
+  updatedAt: string;
+  accountCount: number;
+  apiKeyCount: number;
+}
+
+export interface GroupApiKey {
+  id: string;
+  groupId: string;
+  name: string;
+  prefix: string;
+  enabled: boolean;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface AccountGroupSummary {
+  totalAccounts: number;
+  ungroupedAccounts: number;
+}
+
+export interface AccountPagination {
+  page: number;
+  pageSize: 20 | 50 | 100;
+  total: number;
+  pageCount: number;
+}
+
+export type AccountGroupFilter = "all" | "ungrouped" | string;
+export type AccountStatusFilter = "all" | "enabled" | "disabled";
+export type AccountSort = "created_desc" | "created_asc" | "label_asc" | "label_desc";
+
 export type ToolCallFormat = "auto" | "json" | "xml";
 export type PreambleVerbosity = "quiet" | "normal" | "verbose" | "milestone";
-export type ThemeId = "light" | "gray" | "dark";
+export type ThemeId = "light" | "dark";
 export type WorkspaceId = "overview" | "accounts" | "proxies" | "scheduler" | "records" | "settings";
 export type OperationalWorkspaceId = Exclude<WorkspaceId, "settings">;
 
@@ -367,6 +437,18 @@ export interface CleanupPreview {
 
 export interface ApiPayload {
   accounts?: Account[];
+  accountOverview?: AccountOverview;
+  groups?: AccountGroup[];
+  group?: AccountGroup;
+  groupSummary?: AccountGroupSummary;
+  keys?: GroupApiKey[];
+  key?: GroupApiKey;
+  secret?: string;
+  pagination?: AccountPagination;
+  assigned?: number;
+  failed?: number;
+  remaining?: number;
+  affected?: { accountCount: number; apiKeyCount: number };
   settings?: GatewaySettings;
   proxyPool?: ProxyPoolEntry[];
   proxies?: ProxyPoolEntry[];
