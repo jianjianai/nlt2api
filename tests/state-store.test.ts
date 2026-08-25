@@ -49,7 +49,7 @@ async function recordFiles(dir: string): Promise<string[]> {
   }
 }
 
-test("v1 state migrates to v3 and removes legacy NeuralWatt accounts", async () => {
+test("v1 state migrates to v4 and removes legacy NeuralWatt accounts", async () => {
   await withTempStore(async (store, dir) => {
     const file = join(dir, "accounts.json");
     await writeFile(file, JSON.stringify({
@@ -68,12 +68,12 @@ test("v1 state migrates to v3 and removes legacy NeuralWatt accounts", async () 
     }), "utf8");
 
     const state = await store.getState();
-    assert.equal(state.version, 3);
+    assert.equal(state.version, 4);
     assert.deepEqual(state.accountGroups, []);
     assert.deepEqual(state.groupApiKeys, []);
     assert.deepEqual(state.accounts, []);
     const persisted = JSON.parse(await readFile(file, "utf8")) as { version: number; accounts: unknown[] };
-    assert.equal(persisted.version, 3);
+    assert.equal(persisted.version, 4);
     assert.deepEqual(persisted.accounts, []);
   });
 });
@@ -90,6 +90,51 @@ test("one egress cannot be assigned to multiple accounts", async () => {
       store.addAccount({ label: "Direct Second" }),
       /one IP may serve only one account/,
     );
+  });
+});
+
+test("v3 state migrates to v4 with proxy sync defaults", async () => {
+  await withTempStore(async (store, dir) => {
+    const file = join(dir, "accounts.json");
+    await writeFile(file, JSON.stringify({
+      version: 3,
+      settings: { recordMessages: false },
+      accounts: [],
+      proxyPool: [],
+      accountGroups: [],
+      groupApiKeys: [],
+    }), "utf8");
+    const state = await store.getState();
+    assert.equal(state.version, 4);
+    assert.equal(state.settings.proxySync?.targetAccountCount, 20);
+    assert.deepEqual(state.proxySyncRuns, []);
+  });
+});
+
+test("replacing a failed proxy preserves account identity and configuration", async () => {
+  await withTempStore(async (store) => {
+    const group = await store.createAccountGroup({ name: "Billing" });
+    const account = await store.addAccount({
+      label: "Stable account",
+      proxy: "socks5h://old.example:1080",
+      models: ["moonshotai/Kimi-K3"],
+      groupIds: [group.id],
+      weight: 7,
+    });
+    await store.updateAccount(account.id, {
+      schedulerOverrides: { accountRpm: 9, accountModelConcurrency: 2 },
+    });
+    const [replacementImport] = await store.importProxyPool([{ url: "socks5h://new.example:1080", kind: "socks5" }]);
+    const result = await store.replaceAccountProxy(account.id, account.proxy!, replacementImport!.entry.id, "old proxy failed");
+    assert.equal(result.account.id, account.id);
+    assert.equal(result.account.proxy, "socks5h://new.example:1080");
+    assert.deepEqual(result.account.models, ["moonshotai/Kimi-K3"]);
+    assert.deepEqual(result.account.groupIds, [group.id]);
+    assert.equal(result.account.weight, 7);
+    assert.deepEqual(result.account.schedulerOverrides, { accountRpm: 9, accountModelConcurrency: 2 });
+    assert.equal(result.archived.lifecycle, "archived");
+    assert.equal(result.archived.url, "socks5h://old.example:1080");
+    assert.equal(result.replacement.lifecycle, "active");
   });
 });
 

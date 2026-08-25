@@ -97,6 +97,15 @@ test("proxy admin handlers expose authentication, not-found, conflict and transp
   });
 });
 
+test("bulk import accepts more than two thousand lines", async () => {
+  await withPool(async ({ service }) => {
+    const text = Array.from({ length: 2_501 }, (_, index) => `10.${Math.floor(index / 256)}.${index % 256}.1:${10_000 + index}`).join("\n");
+    const result = await service.importText(text, "http");
+    assert.equal(result.length, 2_501);
+    assert.equal(result.every((entry) => entry.status === "created"), true);
+  });
+});
+
 test("bulk import keeps valid lines and reports invalid or duplicate lines", async () => {
   await withPool(async ({ service }) => {
     const result = await service.importText([
@@ -147,17 +156,18 @@ test("allocation marks failed candidates and binds the next healthy proxy", asyn
   });
 });
 
-test("concurrent allocations reserve distinct proxies", async () => {
+test("concurrent rotations reserve distinct proxies", async () => {
   const releases = new Map<string, () => void>();
   await withPool(async ({ store, service }) => {
     await service.importText("one.local:8080\ntwo.local:8080", "http");
-    const firstAccount = await store.addAccount({ label: "one@example.com" });
-    const secondAccount = await store.addAccount({ label: "two@example.com" });
-    const first = service.assignIdle(firstAccount.id);
+    const firstAccount = await store.addAccount({ label: "one@example.com", proxy: "socks5h://initial-one.example:1080" });
+    const secondAccount = await store.addAccount({ label: "two@example.com", proxy: "socks5h://initial-two.example:1080" });
+    await store.updateSettings({ proxyPool: { autoRotateOnTransportError: true } });
+    const first = service.rotateCustom(firstAccount, new ProxyTransportError("offline"));
     await new Promise<void>((resolve) => setImmediate(resolve));
     const checking = await service.snapshot();
     assert.equal(checking.filter((entry) => entry.status === "checking").length, 1);
-    const second = service.assignIdle(secondAccount.id);
+    const second = service.rotateCustom(secondAccount, new ProxyTransportError("offline"));
     await new Promise<void>((resolve) => setImmediate(resolve));
     for (const release of releases.values()) release();
     const [left, right] = await Promise.all([first, second]);

@@ -9,14 +9,16 @@ import type {
   ProxyPoolSettings,
 } from "~/server/utils/types.ts";
 
-const MAX_IMPORT_LINES = 2_000;
-const MAX_IMPORT_BYTES = 2 * 1024 * 1024;
+const MAX_IMPORT_BYTES = 16 * 1024 * 1024;
 
 export type ProxyPoolStatus = "idle" | "checking" | "in_use" | "error";
 
 export interface ProxyPoolPublicEntry {
   id: string;
   kind: ProxyKind;
+  source: "manual" | "rola_free";
+  lifecycle: "active" | "failed" | "archived";
+  failureCount: number;
   label?: string;
   maskedUrl: string;
   status: ProxyPoolStatus;
@@ -73,18 +75,15 @@ export class ProxyPoolService {
       throw new Error(`Proxy import exceeds ${MAX_IMPORT_BYTES} bytes.`);
     }
     const lines = text.split(/\r?\n/);
-    if (lines.length > MAX_IMPORT_LINES) {
-      throw new Error(`Proxy import accepts at most ${MAX_IMPORT_LINES} lines.`);
-    }
 
-    const parsed: Array<{ line: number; source: string; url: string; kind: ProxyKind }> = [];
+    const parsed: Array<{ line: number; inputText: string; url: string; kind: ProxyKind }> = [];
     const results: ProxyImportLineResult[] = [];
     for (let index = 0; index < lines.length; index += 1) {
-      const source = lines[index]!.trim();
-      if (!source) continue;
+      const inputText = lines[index]!.trim();
+      if (!inputText) continue;
       try {
-        const proxy = parseProxyImportLine(source, defaultProtocol);
-        parsed.push({ line: index + 1, source, url: proxy.url, kind: proxy.kind });
+        const proxy = parseProxyImportLine(inputText, defaultProtocol);
+        parsed.push({ line: index + 1, inputText, url: proxy.url, kind: proxy.kind });
       } catch (error) {
         results.push({ line: index + 1, source: `Line ${index + 1}`, status: "invalid", error: errorText(error) });
       }
@@ -126,6 +125,9 @@ export class ProxyPoolService {
       return {
         id: entry.id,
         kind: entry.kind,
+        source: entry.source,
+        lifecycle: entry.lifecycle,
+        failureCount: entry.failureCount,
         ...(entry.label ? { label: entry.label } : {}),
         maskedUrl: maskProxyUrl(entry.url),
         status,
@@ -135,6 +137,7 @@ export class ProxyPoolService {
         ...(entry.lastHealthyAt ? { lastHealthyAt: entry.lastHealthyAt } : {}),
         ...(entry.lastError ? { lastError: entry.lastError } : {}),
         ...(entry.failedAt ? { failedAt: entry.failedAt } : {}),
+        ...(entry.archivedAt ? { archivedAt: entry.archivedAt } : {}),
         ...(entry.retryAfter ? { retryAfter: entry.retryAfter } : {}),
         ...(account ? { accountId: account.id, accountLabel: account.label } : {}),
       };
@@ -225,7 +228,8 @@ export class ProxyPoolService {
       }
       throw assignmentError;
     }
-    if (!settings.directFallbackWhenExhausted) return undefined;
+    const syncSettings = await this.dependencies.store.getProxySyncSettings();
+    if (syncSettings.enabled || !settings.directFallbackWhenExhausted) return undefined;
     const direct = await this.dependencies.store.clearCustomProxyIfMatches(account.id, account.proxy);
     this.dependencies.notifyScheduler();
     void error;
@@ -263,7 +267,8 @@ export class ProxyPoolService {
       throw assignmentError;
     }
     if (replacement) return replacement;
-    if (!settings.directFallbackWhenExhausted) return undefined;
+    const syncSettings = await this.dependencies.store.getProxySyncSettings();
+    if (syncSettings.enabled || !settings.directFallbackWhenExhausted) return undefined;
 
     const account = await this.dependencies.store.unbindProxyPoolEntry(accountId, failedEntryId);
     this.dependencies.notifyScheduler();

@@ -63,6 +63,27 @@ export interface RuntimeState {
 export type ProxyKind = "http" | "socks4" | "socks5";
 export type ProxyPoolStatus = "idle" | "checking" | "in_use" | "error";
 
+export interface ProxySyncSettings {
+  enabled: boolean;
+  intervalMinutes: number;
+  targetAccountCount: number;
+  candidateLimit: number;
+  probeConcurrency: number;
+  probeTimeoutSeconds: number;
+  failureThreshold: number;
+  archiveCooldownHours: number;
+}
+
+export interface ProxySyncRun {
+  id: string;
+  trigger: "manual" | "scheduled";
+  status: "running" | "completed" | "failed" | "interrupted";
+  startedAt: string;
+  completedAt?: string;
+  counts: { fetched: number; parsed: number; skipped: number; probed: number; healthy: number; failed: number; replaced: number; archived: number; created: number };
+  error?: string;
+}
+
 export interface ProxyPoolSettings {
   autoAssignOnAccountCreate: boolean;
   autoRotateOnTransportError: boolean;
@@ -78,6 +99,10 @@ export interface ProxyPoolEntry {
   maskedUrl: string;
   kind: ProxyKind;
   status: ProxyPoolStatus;
+  source?: "manual" | "rola_free";
+  lifecycle?: "active" | "failed" | "archived";
+  failureCount?: number;
+  archivedAt?: string;
   accountId?: string;
   accountLabel?: string;
   lastCheckedAt?: string;

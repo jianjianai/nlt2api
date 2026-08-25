@@ -79,6 +79,24 @@ function upstreamError(status: number, body: string, retryAfter?: number): Upstr
  * A ticket is minted per call and never reused: DeepInfra redeems it server-side, so a
  * second request with the same ticket returns 403 `Captcha verification failed`.
  */
+export async function probeDeepInfraProxy(proxy: string, signal?: AbortSignal): Promise<void> {
+  await checkDeepInfraProxy(proxy, signal);
+  const response = await deepInfraChat({
+    model: "moonshotai/Kimi-K3",
+    messages: [{ role: "user", content: "Reply with OK." }],
+    max_tokens: 4,
+    stream: false,
+  }, signal, proxy);
+  try {
+    const body = await response.json() as { choices?: unknown[]; error?: unknown };
+    if (!Array.isArray(body.choices) || body.choices.length === 0 || body.error !== undefined) {
+      throw new UpstreamError("DeepInfra proxy smoke test returned an invalid completion.", 502);
+    }
+  } finally {
+    await discardUpstreamResponse(response).catch(() => undefined);
+  }
+}
+
 export interface DeepInfraChatRetry {
   status: number;
   contentType: string;
@@ -204,4 +222,5 @@ export const deepInfraClient = {
   verifyAccount: verifyDeepInfraAccount,
   listAccountModels: listDeepInfraAccountModels,
   checkProxy: checkDeepInfraProxy,
+  probeProxy: probeDeepInfraProxy,
 };

@@ -121,8 +121,8 @@ test("assertModelSupported reports no enabled accounts as unavailable", async ()
 
 test("scheduler routes only to accounts supporting the requested model", async () => {
   await withTempStore(async () => {
-    const a = await stateStore.addAccount(accountInput("a@example.com", ["m1"]));
-    const b = await stateStore.addAccount(accountInput("b@example.com", ["m2"]));
+    const a = await stateStore.addAccount({ ...accountInput("a@example.com", ["m1"]), proxy: "socks5h://a.example:1080" });
+    const b = await stateStore.addAccount({ ...accountInput("b@example.com", ["m2"]), proxy: "socks5h://b.example:1080" });
     const lease = await accountScheduler.acquire({ model: "m2" });
     assert.equal(lease.account.id, b.id);
     lease.release();
@@ -144,8 +144,8 @@ test("scheduler fails when no account supports the requested model", async () =>
 
 test("scheduler routes across accounts that support the requested model", async () => {
   await withTempStore(async () => {
-    const a = await stateStore.addAccount(accountInput("a@example.com", ["m1"]));
-    const b = await stateStore.addAccount(accountInput("b@example.com", ["m1"]));
+    const a = await stateStore.addAccount({ ...accountInput("a@example.com", ["m1"]), proxy: "socks5h://a.example:1080" });
+    const b = await stateStore.addAccount({ ...accountInput("b@example.com", ["m1"]), proxy: "socks5h://b.example:1080" });
     const lease = await accountScheduler.acquire({ model: "m1" });
     assert.ok([a.id, b.id].includes(lease.account.id));
     lease.release();

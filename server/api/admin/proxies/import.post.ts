@@ -11,7 +11,7 @@ export default defineHandler(async (event) => {
   try {
     requireAdminAuth(event.req);
     const body = await readJsonObject(event.req);
-    const text = asString(body.text, "text", { maxLength: 2 * 1024 * 1024 })!;
+    const text = asString(body.text, "text", { maxLength: 16 * 1024 * 1024 })!;
     const fallback = (await stateStore.getSettings()).proxyPool.defaultImportProtocol;
     const requested = body.defaultProtocol ?? fallback;
     if (typeof requested !== "string" || !PROTOCOLS.has(requested)) {

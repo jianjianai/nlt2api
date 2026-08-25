@@ -24,6 +24,9 @@ export default defineHandler(async (event) => {
     // whitespace-only value means a direct connection.
     const proxyInput = asString(body.proxy, "proxy", { optional: true, allowEmpty: true, maxLength: 2_048 });
     const proxy = proxyInput?.trim() ? normalizeProxyUrl(proxyInput) : undefined;
+    if (!proxy && (await stateStore.listAccounts()).some((account) => !account.proxy)) {
+      throw new HttpError(409, "The direct server IP is already assigned; provide a unique proxy for this account.", "invalid_request_error", "proxy", "egress_already_assigned");
+    }
 
     let account = await stateStore.addAccount({
       label,

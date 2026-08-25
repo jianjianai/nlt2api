@@ -507,6 +507,7 @@ export class AccountScheduler {
     const sourceAccounts = waiter.options.accountSnapshot ? [waiter.options.accountSnapshot] : allAccounts;
     const accounts = sourceAccounts
       .filter((account) => account.enabled)
+      .filter((account) => !account.proxy || account.egressStatus !== "replacing" && account.egressStatus !== "unavailable")
       .filter((account) => !waiter.options.groupId || account.groupIds.includes(waiter.options.groupId))
       .filter((account) => account.models.some((model) => modelIdMatches(model, waiter.options.model)))
       .filter((account) => !excluded.has(account.id));

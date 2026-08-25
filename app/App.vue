@@ -16,7 +16,7 @@ import { DEFAULT_THEME, deriveOverview, parseTheme, parseWorkspace, THEME_STORAG
 import type {
   Account, AccountGroup, AccountGroupSummary, AccountOverview, AccountPagination, AccountSort, AccountStatusFilter, AnalyticsGranularity, AnalyticsOverview, AnalyticsQueryResult, AnalyticsRetention, AnalyticsSort, ApiPayload, BodyPresentation, CleanupPreview, ConversationTrace, DebugRawBody, DebugRecord, DebugRecordSummary,
   DebugUpstreamCall, DisplayField, DisplayMessage, DisplayToolCall, GatewayConfig, GatewaySettings, GroupApiKey,
-  PreambleVerbosity, ProxyImportLineResult, ThemeId, ProxyPoolEntry, ProxyPoolSettings, ProxyPoolStatus,
+  PreambleVerbosity, ProxyImportLineResult, ThemeId, ProxyPoolEntry, ProxyPoolSettings, ProxyPoolStatus, ProxySyncRun, ProxySyncSettings,
   SchedulerRuntime, SchedulerSettings, SidebarItem, SidebarUpstreamItem, ToolCallFormat, WorkspaceId,
 } from "./types/admin.ts";
 
@@ -71,6 +71,10 @@ const defaultProxyPoolSettings: ProxyPoolSettings = {
   retryCurrentRequestAfterRotation: true, directFallbackWhenExhausted: false,
   defaultImportProtocol: "http", healthCheckTimeoutSeconds: 10, errorRetryCooldownSeconds: 300,
 };
+const defaultProxySyncSettings: ProxySyncSettings = {
+  enabled: false, intervalMinutes: 15, targetAccountCount: 20, candidateLimit: 100,
+  probeConcurrency: 10, probeTimeoutSeconds: 45, failureThreshold: 3, archiveCooldownHours: 24,
+};
 const settings = reactive({
   recordMessages: false,
   scheduler: { ...defaultSchedulerSettings },
@@ -106,6 +110,14 @@ const schedulerDraft = reactive<SchedulerSettings>({ ...defaultSchedulerSettings
 const schedulerRuntime = reactive<SchedulerRuntime>({ pending: 0, oldestWaitMs: 0, egresses: [] });
 const isSavingScheduler = ref(false);
 const proxyPoolDraft = reactive<ProxyPoolSettings>({ ...defaultProxyPoolSettings });
+const proxySyncDraft = reactive<ProxySyncSettings>({ ...defaultProxySyncSettings });
+const proxySyncRun = shallowRef<ProxySyncRun | null>(null);
+const isLoadingProxySync = ref(false);
+const isSavingProxySync = ref(false);
+const isRunningProxySync = ref(false);
+let proxySyncSaveTimer: number | undefined;
+let proxySyncSaveChain: Promise<void> = Promise.resolve();
+let proxySyncSavePending = 0;
 const proxyImportText = ref("");
 const proxyImportResults = ref<ProxyImportLineResult[]>([]);
 const proxyFilter = ref<"all" | ProxyPoolStatus>("all");
@@ -530,6 +542,12 @@ function navigateFromOverview(next: "accounts" | "proxies" | "scheduler" | "sett
   }
 }
 
+function updateProxySyncSetting(field: keyof ProxySyncSettings, value: boolean | number): void {
+  (proxySyncDraft as unknown as Record<string, unknown>)[field] = value;
+  window.clearTimeout(proxySyncSaveTimer);
+  proxySyncSaveTimer = window.setTimeout(() => { void persistProxySyncSettings(true).catch(() => undefined); }, 400);
+}
+
 function updateProxyPolicy(field: keyof ProxyPoolSettings, value: boolean | number | string): void {
   (proxyPoolDraft as unknown as Record<string, unknown>)[field] = value;
 }
@@ -543,6 +561,7 @@ async function selectView(next: WorkspaceId) {
   expandedAccountId.value = null;
   secretResetToken.value += 1;
   localStorage.setItem(WORKSPACE_STORAGE_KEY, next);
+  if (next === "proxies") await loadProxySync();
   if (next === "accounts") {
     try {
       await refreshAccountWorkspace();
@@ -564,6 +583,10 @@ async function selectView(next: WorkspaceId) {
 
 async function addAccount() {
   if (isSaving.value) return;
+  if (!newAccount.proxy.trim() && accountOverview.direct > 0) {
+    pushToast("error", "服务器直连 IP 已绑定账号，请填写一个唯一代理出口。");
+    return;
+  }
   isSaving.value = true;
   try {
     await api("/api/admin/accounts", {
@@ -984,6 +1007,58 @@ async function deleteProxyEntry(proxy: ProxyPoolEntry) {
   if (busyProxyIds.value.has(proxy.id)) return; setProxyBusy(proxy.id, true);
   try { await api(`/api/admin/proxies/${encodeURIComponent(proxy.id)}`, { method: "DELETE" }); proxies.value = proxies.value.filter((entry) => entry.id !== proxy.id); pushToast("success", `${proxy.maskedUrl} 已删除`); }
   catch (error) { pushToast("error", errorText(error, "无法删除代理。")); } finally { setProxyBusy(proxy.id, false); }
+}
+
+async function loadProxySync(): Promise<void> {
+  if (isLoadingProxySync.value || !token.value) return;
+  isLoadingProxySync.value = true;
+  try {
+    const payload = await api("/api/admin/proxy-sync");
+    Object.assign(proxySyncDraft, payload.settings ?? defaultProxySyncSettings);
+    proxySyncRun.value = payload.current ?? payload.latest ?? null;
+  } catch (error) { pushToast("error", errorText(error, "无法加载免费代理同步状态。")); }
+  finally { isLoadingProxySync.value = false; }
+}
+
+function persistProxySyncSettings(quiet = false): Promise<void> {
+  const snapshot = { ...proxySyncDraft };
+  proxySyncSavePending += 1;
+  isSavingProxySync.value = true;
+  const task = proxySyncSaveChain.catch(() => undefined).then(async () => {
+    const payload = await api("/api/admin/proxy-sync", { method: "PATCH", body: JSON.stringify(snapshot) });
+    Object.assign(proxySyncDraft, payload.settings ?? snapshot);
+    if (!quiet) pushToast("success", "免费代理同步设置已保存");
+  });
+  proxySyncSaveChain = task.catch((error) => {
+    pushToast("error", errorText(error, "无法保存免费代理同步设置。"));
+  });
+  return task.finally(() => {
+    proxySyncSavePending -= 1;
+    isSavingProxySync.value = proxySyncSavePending > 0;
+  });
+}
+
+async function saveProxySyncSettings(): Promise<void> {
+  window.clearTimeout(proxySyncSaveTimer);
+  try {
+    await persistProxySyncSettings(false);
+  } catch (error) {
+    pushToast("error", errorText(error, "无法保存免费代理同步设置。"));
+  }
+}
+
+async function runProxySync(): Promise<void> {
+  if (isRunningProxySync.value) return;
+  window.clearTimeout(proxySyncSaveTimer);
+  isRunningProxySync.value = true;
+  try {
+    await persistProxySyncSettings(true);
+    const payload = await api("/api/admin/proxy-sync/run", { method: "POST" });
+    proxySyncRun.value = payload.run ?? null;
+    pushToast("success", "免费代理同步已启动");
+    window.setTimeout(() => { void loadProxySync(); void loadDashboard({ silent: true }); }, 2_000);
+  } catch (error) { pushToast("error", errorText(error, "免费代理同步失败。")); }
+  finally { isRunningProxySync.value = false; }
 }
 
 async function saveProxyPoolSettings() {
@@ -1975,6 +2050,7 @@ onUnmounted(() => {
   window.clearInterval(autoRefreshTimer);
   window.clearInterval(clockTimer);
   window.clearTimeout(accountQueryTimer);
+  window.clearTimeout(proxySyncSaveTimer);
   window.removeEventListener("keydown", onKeydown);
 });
 </script>
@@ -2005,7 +2081,7 @@ onUnmounted(() => {
       <Transition name="page-fade" mode="out-in">
       <OverviewWorkspace v-if="view === 'overview'" key="overview" :snapshot="overviewSnapshot" :analytics="analytics" :detail="analyticsResult" :analytics-range="analyticsRange" :analytics-granularity="analyticsGranularity" :analytics-sort="analyticsSort" :analytics-model="analyticsModel" :custom-from="analyticsCustomFrom" :custom-to="analyticsCustomTo" :loading-analytics="isLoadingAnalytics" :account-overview="accountOverview" :proxies="proxies" :egresses="schedulerRuntime.egresses" @navigate="navigateFromOverview" @set-range="setAnalyticsRange" @set-granularity="setAnalyticsGranularity" @set-sort="setAnalyticsSort" @set-model="setAnalyticsModel" @update:custom-from="analyticsCustomFrom = $event" @update:custom-to="analyticsCustomTo = $event" @load-custom="loadAnalytics" />
       <AccountsWorkspace v-else-if="view === 'accounts'" key="accounts" v-model:query="accountQuery" v-model:expanded-id="expandedAccountId" :accounts="accountPage" :groups="accountGroups" :group-summary="groupSummary" :pagination="accountPagination" :group-filter="accountGroupFilter" :status-filter="accountStatusFilter" :sort="accountSort" :page-size="accountPageSize" :proxies="proxies" :scheduler="settings.scheduler" :busy-ids="busyAccountIds" :loading="isLoadingAccounts" :secret-reset-token="secretResetToken" :copy-secret="copyCredential" @select-group="selectAccountGroup" @set-status="setAccountStatus" @set-sort="setAccountSort" @set-page-size="setAccountPageSize" @set-page="setAccountPage" @add="openAddAccount" @add-group="openCreateGroup" @edit-group="openEditGroup" @manage-keys="openKeyManager" @save-membership="saveAccountMembership" @verify="verifyAccount" @manage-proxy="openProxyEditor" @assign-proxy="assignProxy" @fetch-models="fetchAccountModels" @edit-models="openModelEditor" @edit-limits="openLimitEditor" @toggle="toggleAccount" @remove="askRemoveAccount" />
-      <ProxyPoolWorkspace v-else-if="view === 'proxies'" key="proxies" v-model:import-text="proxyImportText" v-model:filter="proxyFilter" :proxies="proxies" :draft="proxyPoolDraft" :import-results="proxyImportResults" :busy-ids="busyProxyIds" :direct-account-count="accountOverview.direct" :importing="isImportingProxies" :checking-all="isCheckingProxies" :assigning-direct="isAssigningDirectProxies" :saving="isSavingProxyPool" @update-policy="updateProxyPolicy" @import="importProxies" @check="checkProxyEntry" @check-many="checkProxyPool" @assign-direct="assignProxiesToDirectAccounts" @delete="deleteProxyEntry" @save-policies="saveProxyPoolSettings" />
+      <ProxyPoolWorkspace v-else-if="view === 'proxies'" key="proxies" v-model:import-text="proxyImportText" v-model:filter="proxyFilter" :proxies="proxies" :draft="proxyPoolDraft" :sync-draft="proxySyncDraft" :sync-run="proxySyncRun" :import-results="proxyImportResults" :busy-ids="busyProxyIds" :direct-account-count="accountOverview.direct" :importing="isImportingProxies" :checking-all="isCheckingProxies" :assigning-direct="isAssigningDirectProxies" :saving="isSavingProxyPool" :saving-sync="isSavingProxySync" :running-sync="isRunningProxySync" @update-policy="updateProxyPolicy" @update-sync="updateProxySyncSetting" @import="importProxies" @check="checkProxyEntry" @check-many="checkProxyPool" @assign-direct="assignProxiesToDirectAccounts" @delete="deleteProxyEntry" @save-policies="saveProxyPoolSettings" @save-sync="saveProxySyncSettings" @run-sync="runProxySync" />
       <SchedulerWorkspace v-else-if="view === 'scheduler'" key="scheduler" :draft="schedulerDraft" :runtime="schedulerRuntime" :saving="isSavingScheduler" @update-field="updateSchedulerField" @save="saveSchedulerSettings" />
       <RecordsWorkspace v-else-if="view === 'records'" key="records" v-model:query="recordQuery" v-model:filter="recordFilter" v-model:raw-trace-key="rawTraceKey" :records="records" :filtered-records="filteredRecords" :sidebar-items="sidebarItems" :selected-record-id="selectedRecordId" :selected-trace-key="selectedTraceKey" :selected-trace="selectedTrace" :selected-request="selectedRequest" :selected-response="selectedResponse" :loading-detail="isLoadingRecord" :recording="settings.recordMessages" :failed-count="failedRecordCount" :upstream-call-count="upstreamCallCount" :tool-first-pass-rate="toolFirstPassRate" :tool-adapter-count="toolAdapterRecords.length" :selected-record-index="selectedRecordIndex" :clearing="isClearingRecords" @toggle-recording="setRecording" @refresh="loadRecords" @clear="askClearRecords" @select-record="selectRecord" @goto="gotoRecord" />
       <GatewaySettingsWorkspace v-else key="settings" :settings="settings" :config="config" :analytics="analytics" :retention="analyticsRetention" :cleanup-cutoff="cleanupCutoff" :all-models="allModels" v-model:minimum-output-tokens-draft="minimumOutputTokensDraft" :saving-budget="isSavingMinimumOutputTokens" :refreshing-prices="isRefreshingPrices" :saving-retention="isSavingRetention" :previewing-cleanup="isPreviewingCleanup" :secret-reset-token="secretResetToken" :copy-secret="copyCredential" @save-budget="saveMinimumOutputTokens" @set-tool-format="setToolCallFormat" @set-preamble="setPreambleVerbosity" @set-model-tool-format="setModelToolCallFormat" @set-model-preamble="setModelPreambleVerbosity" @refresh-prices="refreshAnalyticsPrices" @save-retention="saveAnalyticsRetention" @update:cleanup-cutoff="cleanupCutoff = $event" @preview-cleanup="previewAnalyticsCleanup" @sign-out="signOut" />
@@ -2017,11 +2093,11 @@ onUnmounted(() => {
         <div class="modal-body">
           <label for="account-label">账号名称</label>
           <input id="account-label" v-model="newAccount.label" type="text" maxlength="120" placeholder="DeepInfra 出口账号" />
-          <p class="modal-note">匿名免费线路无需凭据。留空代理表示服务器直连；填写代理可创建独立出口账号。</p>
+          <p class="modal-note">匿名免费线路无需凭据。每个账号必须拥有唯一出口；服务器直连只能绑定一个账号，其余账号必须填写代理。</p>
           <fieldset v-if="accountGroups.length" class="modal-checkbox-group"><legend>账号分组</legend><label v-for="group in accountGroups" :key="group.id"><input v-model="newAccount.groupIds" type="checkbox" :value="group.id" /><span>{{ group.name }}</span></label></fieldset>
           <div class="field-row">
             <div><label for="account-weight">权重</label><input id="account-weight" v-model.number="newAccount.weight" type="number" min="1" max="100" step="1" required /></div>
-            <div><label for="account-proxy">出口代理（可选）</label><input id="account-proxy" v-model="newAccount.proxy" type="text" maxlength="2048" autocomplete="off" spellcheck="false" placeholder="socks5://user:pass@host:1080" /></div>
+            <div><label for="account-proxy">出口代理{{ accountOverview.direct > 0 ? "（必填）" : "（首个账号可留空直连）" }}</label><input id="account-proxy" v-model="newAccount.proxy" type="text" maxlength="2048" autocomplete="off" spellcheck="false" :required="accountOverview.direct > 0" placeholder="socks5://user:pass@host:1080" /></div>
           </div>
         </div>
         <footer class="modal-foot"><button class="button button-quiet" type="button" :disabled="isSaving" @click="showAddAccount = false">取消</button><button class="button button-primary" type="submit" :disabled="isSaving" :aria-busy="isSaving"><span v-if="isSaving" class="spinner" aria-hidden="true"></span>{{ isSaving ? '验证中' : '验证并添加' }}</button></footer>

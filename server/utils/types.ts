@@ -128,6 +128,28 @@ export interface AccountSchedulerOverrides {
 
 export type ProxyKind = "http" | "socks4" | "socks5";
 
+export interface ProxySyncSettings {
+  enabled: boolean;
+  intervalMinutes: number;
+  targetAccountCount: number;
+  candidateLimit: number;
+  probeConcurrency: number;
+  probeTimeoutSeconds: number;
+  failureThreshold: number;
+  archiveCooldownHours: number;
+}
+
+export const DEFAULT_PROXY_SYNC_SETTINGS: Readonly<ProxySyncSettings> = Object.freeze({
+  enabled: false,
+  intervalMinutes: 15,
+  targetAccountCount: 20,
+  candidateLimit: 100,
+  probeConcurrency: 10,
+  probeTimeoutSeconds: 45,
+  failureThreshold: 3,
+  archiveCooldownHours: 24,
+});
+
 export interface ProxyPoolSettings {
   autoAssignOnAccountCreate: boolean;
   autoRotateOnTransportError: boolean;
@@ -148,10 +170,26 @@ export const DEFAULT_PROXY_POOL_SETTINGS: Readonly<ProxyPoolSettings> = Object.f
   errorRetryCooldownSeconds: 300,
 });
 
+export type ProxySource = "manual" | "rola_free";
+export type ProxyLifecycle = "active" | "failed" | "archived";
+
+export interface ProxySourceMetadata {
+  country?: string;
+  anonymity?: string;
+  reportedLatencyMs?: number;
+  reportedUptimePercent?: number;
+  sourceCheckedAt?: string;
+  sourceUrl?: string;
+}
+
 export interface ProxyPoolEntry {
   id: string;
   url: string;
   kind: ProxyKind;
+  source: ProxySource;
+  lifecycle: ProxyLifecycle;
+  failureCount: number;
+  sourceMetadata?: ProxySourceMetadata;
   label?: string;
   createdAt: string;
   updatedAt: string;
@@ -159,6 +197,7 @@ export interface ProxyPoolEntry {
   lastHealthyAt?: string;
   lastError?: string;
   failedAt?: string;
+  archivedAt?: string;
   retryAfter?: number;
 }
 
@@ -190,6 +229,8 @@ export type ResponseAccessScope =
   | { scope: "global" }
   | { scope: "group"; groupId: string };
 
+export type AccountEgressStatus = "active" | "replacing" | "unavailable";
+
 export interface ManagedAccount {
   id: string;
   label: string;
@@ -199,6 +240,8 @@ export interface ManagedAccount {
   proxy?: string;
   /** Pool owner for `proxy`; absent for direct or custom manually-entered proxies. */
   proxyPoolEntryId?: string;
+  /** Proxy-backed accounts preserve identity while this egress lifecycle changes. */
+  egressStatus?: AccountEgressStatus;
   /** Groups allowed to schedule this account. Capacity remains account-global. */
   groupIds: string[];
   /** Anonymous DeepInfra model ids available through this egress. */
@@ -208,10 +251,48 @@ export interface ManagedAccount {
   updatedAt: string;
 }
 
+export type ProxySyncRunTrigger = "manual" | "scheduled";
+export type ProxySyncRunStatus = "running" | "completed" | "failed" | "interrupted";
+
+export interface ProxySyncRunCounts {
+  fetched: number;
+  parsed: number;
+  skipped: number;
+  probed: number;
+  healthy: number;
+  failed: number;
+  replaced: number;
+  archived: number;
+  created: number;
+}
+
+export interface ProxySyncRunDetail {
+  candidate?: string;
+  accountId?: string;
+  oldProxyId?: string;
+  newProxyId?: string;
+  status: "healthy" | "failed" | "replaced" | "archived" | "created" | "skipped";
+  reason?: string;
+  durationMs?: number;
+}
+
+export interface ProxySyncRun {
+  id: string;
+  trigger: ProxySyncRunTrigger;
+  status: ProxySyncRunStatus;
+  startedAt: string;
+  completedAt?: string;
+  sourceUrl: string;
+  counts: ProxySyncRunCounts;
+  details: ProxySyncRunDetail[];
+  error?: string;
+}
+
 export interface ProxySettings {
   recordMessages: boolean;
   scheduler: SchedulerSettings;
   proxyPool: ProxyPoolSettings;
+  proxySync?: ProxySyncSettings;
   /** Minimum per-round portal output budget; zero respects the client value. */
   minimumOutputTokens?: number;
   /**
@@ -231,12 +312,13 @@ export interface ProxySettings {
 }
 
 export interface PersistentState {
-  version: 3;
+  version: 4;
   settings: ProxySettings;
   accounts: ManagedAccount[];
   proxyPool: ProxyPoolEntry[];
   accountGroups: AccountGroup[];
   groupApiKeys: GroupApiKey[];
+  proxySyncRuns: ProxySyncRun[];
 }
 
 export interface AccountRuntimeState {

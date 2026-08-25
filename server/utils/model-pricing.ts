@@ -51,14 +51,14 @@ export function deepInfraModelPrice(value: Record<string, unknown>): DeepInfraMo
     : nonNegativeFinite(pricing.rate_per_input_token_cached);
   if (!id || inputCents === undefined || outputCents === undefined || cachedRate === undefined) return undefined;
   const provider = id.includes("/") ? id.slice(0, id.indexOf("/")) : "DeepInfra";
-  const inputPerMillion = inputCents * 10_000;
+  const inputPerMillion = Number((inputCents * 10_000).toFixed(12));
   return {
     id,
     name: id,
     provider,
     inputPricePerMillion: inputPerMillion,
-    outputPricePerMillion: outputCents * 10_000,
-    cachedInputPricePerMillion: cachedRate === null ? null : inputPerMillion * cachedRate,
+    outputPricePerMillion: Number((outputCents * 10_000).toFixed(12)),
+    cachedInputPricePerMillion: cachedRate === null ? null : Number((inputPerMillion * cachedRate).toFixed(12)),
   };
 }
 

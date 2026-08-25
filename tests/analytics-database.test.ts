@@ -9,8 +9,8 @@ import { UsageAnalyticsService } from "../server/utils/usage-analytics.ts";
 async function withAnalytics<T>(
   run: (service: UsageAnalyticsService, database: AnalyticsDatabase) => Promise<T>,
   loadCatalogModels: () => Promise<Record<string, unknown>[]> = async () => [{
-    id: "test-model",
-    metadata: { pricing: { input_tokens: 0.001 * 1_000, output_tokens: 0.002 * 1_000, cache_read_tokens: 0.0001 * 1_000 } },
+    model_name: "test-model",
+    pricing: { cents_per_input_token: 0.0001, cents_per_output_token: 0.0002, rate_per_input_token_cached: 0.1 },
   }],
 ): Promise<T> {
   const dir = await mkdtemp(join(tmpdir(), "deepinfra-analytics-test-"));
@@ -64,8 +64,8 @@ test("catalog price A to B to A reactivates the original immutable version", asy
     assert.equal(third.id, first.id);
     assert.equal(database.get<{ count: number }>("SELECT COUNT(*) AS count FROM price_versions WHERE model_id = 'test-model'")?.count, 2);
   }, async () => [{
-    id: "test-model",
-    metadata: { pricing: { input_tokens: promptPrice * 1_000, output_tokens: 0.002 * 1_000, cache_read_tokens: 0.0001 * 1_000 } },
+    model_name: "test-model",
+    pricing: { cents_per_input_token: promptPrice / 10, cents_per_output_token: 0.0002, rate_per_input_token_cached: 0.1 },
   }]);
 });
 
