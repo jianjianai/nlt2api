@@ -41,6 +41,8 @@ interface InternalAccountRuntime {
 interface InternalEgressRuntime {
   identity: EgressIdentity;
   requestTimes: number[];
+  cooldownUntil: number;
+  lastError?: string;
 }
 
 export interface AccountLease {
@@ -136,7 +138,7 @@ export class SchedulerAdmissionError extends HttpError {
   constructor(
     message: string,
     code: "queue_full" | "queue_timeout",
-    readonly retryAfterSeconds?: number,
+    override readonly retryAfterSeconds?: number,
   ) {
     super(429, message, "rate_limit_error", undefined, code);
     this.name = "SchedulerAdmissionError";
@@ -226,6 +228,14 @@ export class AccountScheduler {
       runtime.cooldownUntil,
       this.dependencies.now() + Math.max(exponentialBackoffMs, retryAfterMs),
     );
+    this.requestDrain();
+  }
+
+  markEgressRateLimit(proxy: string | undefined, message: string, retryAfterSeconds?: number): void {
+    const runtime = this.egressRuntime(egressIdentity(proxy));
+    const fallbackSeconds = Math.max(1, retryAfterSeconds ?? 60);
+    runtime.cooldownUntil = Math.max(runtime.cooldownUntil, this.dependencies.now() + fallbackSeconds * 1_000);
+    runtime.lastError = message.slice(0, 300);
     this.requestDrain();
   }
 
@@ -334,6 +344,8 @@ export class AccountScheduler {
         ...(limited && runtime.requestTimes.length >= rpm
           ? { nextRateAvailableAt: this.rateAvailableAt(runtime.requestTimes, rpm) }
           : {}),
+        ...(runtime.cooldownUntil > now ? { cooldownUntil: runtime.cooldownUntil } : {}),
+        ...(runtime.lastError ? { lastError: runtime.lastError } : {}),
         limited,
         rpm,
       };
@@ -573,6 +585,11 @@ export class AccountScheduler {
       const identity = egressIdentity(account.proxy);
       const egress = this.egressRuntime(identity);
       this.pruneTimes(egress.requestTimes, now);
+      if (egress.cooldownUntil > now) {
+        constraints.add("shared_egress_rpm");
+        nextEligibleAt = minDefined(nextEligibleAt, egress.cooldownUntil);
+        continue;
+      }
       const egressLimited = !identity.direct || settings.directEgressLimitEnabled;
       const egressRpm = identity.direct ? settings.directEgressRpm : settings.proxyRpm;
       if (egressLimited && egress.requestTimes.length >= egressRpm) {
@@ -660,7 +677,7 @@ export class AccountScheduler {
   private egressRuntime(identity: EgressIdentity): InternalEgressRuntime {
     const existing = this.runtimeByEgress.get(identity.key);
     if (existing) return existing;
-    const created = { identity, requestTimes: [] };
+    const created: InternalEgressRuntime = { identity, requestTimes: [], cooldownUntil: 0 };
     this.runtimeByEgress.set(identity.key, created);
     return created;
   }

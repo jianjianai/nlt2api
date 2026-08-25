@@ -18,6 +18,7 @@ export class HttpError extends Error {
     type = "invalid_request_error",
     param?: string,
     code?: string,
+    readonly retryAfterSeconds?: number,
   ) {
     super(message);
     this.name = "HttpError";

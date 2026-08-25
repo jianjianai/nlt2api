@@ -354,6 +354,8 @@ export interface EgressRuntimeState {
   accountCount: number;
   requestsLastMinute: number;
   nextRateAvailableAt?: number;
+  cooldownUntil?: number;
+  lastError?: string;
   limited: boolean;
   rpm: number;
 }

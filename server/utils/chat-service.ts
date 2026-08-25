@@ -57,7 +57,7 @@ const MAX_TOOL_DEFINITION_BYTES = 1024 * 1024;
 const MAX_TOOL_ARGUMENT_BYTES = 64 * 1024;
 const MAX_TOOL_RESULT_BYTES = 256 * 1024;
 const DEFAULT_OUTPUT_TOKENS = 8_192;
-const MAX_TOOL_REPAIR_ATTEMPTS = 5;
+const MAX_TOOL_REPAIR_ATTEMPTS = 1;
 const MAX_TOOL_REPAIR_CANDIDATE_CHARS = 131_072;
 // From this attempt on, the correction carries a prefill skeleton: static
 // rules alone stop converging once the model has failed twice.
@@ -122,7 +122,7 @@ function asRecord(value: unknown): Record<string, unknown> | undefined {
   return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : undefined;
 }
 
-function parseMessages(value: unknown): ChatMessage[] {
+function parseMessages(value: unknown, tools: ToolDefinition[] = []): ChatMessage[] {
   if (!Array.isArray(value) || value.length === 0) {
     throw new HttpError(400, "`messages` must be a non-empty array.", "invalid_request_error", "messages");
   }
@@ -151,8 +151,15 @@ function parseMessages(value: unknown): ChatMessage[] {
     }
     const normalized = message as ChatMessage;
     if (role === "assistant" && Array.isArray(normalized.tool_calls)) {
-      // Validate history tool-call structure before any upstream work.
-      normaliseAssistantToolCalls(normalized, [], "history");
+      // Validate history tool-call structure against the current declarations.
+      try {
+        normaliseAssistantToolCalls(normalized, tools, "history");
+      } catch (error) {
+        if (error instanceof InvalidStructuredToolCallsError) {
+          throw new HttpError(400, `messages[${index}].tool_calls is invalid or references an undeclared function.`, "invalid_request_error", "messages");
+        }
+        throw error;
+      }
     }
     return normalized;
   });
@@ -253,6 +260,16 @@ function validateSampling(request: JsonObject): void {
   if (topP !== undefined && (typeof topP !== "number" || !Number.isFinite(topP) || topP < 0 || topP > 1)) {
     throw new HttpError(400, "`top_p` must be between 0 and 1.", "invalid_request_error", "top_p");
   }
+  const minP = request.min_p;
+  if (minP !== undefined && (typeof minP !== "number" || !Number.isFinite(minP) || minP < 0 || minP > 1)) {
+    throw new HttpError(400, "`min_p` must be between 0 and 1.", "invalid_request_error", "min_p");
+  }
+  for (const field of ["presence_penalty", "frequency_penalty"] as const) {
+    const value = request[field];
+    if (value !== undefined && (typeof value !== "number" || !Number.isFinite(value) || value < -2 || value > 2)) {
+      throw new HttpError(400, `\`${field}\` must be between -2 and 2.`, "invalid_request_error", field);
+    }
+  }
   const stop = request.stop;
   if (stop !== undefined && typeof stop !== "string" && !(Array.isArray(stop) && stop.every((item) => typeof item === "string") && stop.length <= 4)) {
     throw new HttpError(400, "`stop` must be a string or an array of at most four strings.", "invalid_request_error", "stop");
@@ -273,13 +290,29 @@ export function validateChatRequest(request: JsonObject): ValidatedChatRequest {
   validateSampling(request);
   validateTokenLimit(request);
   const tools = parseTools(request.tools);
-  const messages = parseMessages(request.messages);
+  const messages = parseMessages(request.messages, tools);
   validateToolChoice(request.tool_choice, tools);
   if (request.parallel_tool_calls !== undefined && typeof request.parallel_tool_calls !== "boolean") {
     throw new HttpError(400, "`parallel_tool_calls` must be a boolean.", "invalid_request_error", "parallel_tool_calls");
   }
   if (request.n !== undefined && request.n !== 1) {
     throw new HttpError(400, "Only n=1 is supported by the DeepInfra adapter.", "invalid_request_error", "n");
+  }
+  if (request.stop_token_ids !== undefined && !(Array.isArray(request.stop_token_ids) && request.stop_token_ids.every((value) => Number.isInteger(value)))) {
+    throw new HttpError(400, "`stop_token_ids` must be an array of integers.", "invalid_request_error", "stop_token_ids");
+  }
+  for (const field of ["continue_final_message", "ignore_eos", "fail_fast"] as const) {
+    if (request[field] !== undefined && typeof request[field] !== "boolean") {
+      throw new HttpError(400, `\`${field}\` must be a boolean.`, "invalid_request_error", field);
+    }
+  }
+  for (const field of ["reasoning", "chat_template_kwargs", "prompt_cache_options"] as const) {
+    if (request[field] !== undefined && (!request[field] || typeof request[field] !== "object" || Array.isArray(request[field]))) {
+      throw new HttpError(400, `\`${field}\` must be an object.`, "invalid_request_error", field);
+    }
+  }
+  if (request.models !== undefined && !(Array.isArray(request.models) && request.models.every((value) => typeof value === "string"))) {
+    throw new HttpError(400, "`models` must be an array of model ids.", "invalid_request_error", "models");
   }
   return { model, messages, tools };
 }
@@ -302,19 +335,13 @@ export async function assertModelSupported(model: string, groupId?: string): Pro
   }
 }
 
-/**
- * Sampling fields accepted by DeepInfra's OpenAI-compatible endpoint.
- * `min_p` and `logit_bias` are deliberately absent: speculative decoding
- * rejects them upstream with HTTP 422.
- */
+/** Sampling and generation fields accepted by DeepInfra's current Chat Completions contract. */
 const DEEPINFRA_EXTRA_FIELDS = [
-  "top_k",
-  "presence_penalty",
-  "frequency_penalty",
-  "repetition_penalty",
-  "n",
-  "logprobs",
-  "echo",
+  "top_k", "min_p",
+  "presence_penalty", "frequency_penalty", "repetition_penalty",
+  "n", "logprobs", "top_logprobs", "echo",
+  "stop_token_ids", "models", "fail_fast",
+  "reasoning", "chat_template_kwargs", "continue_final_message", "ignore_eos",
   "prompt_cache_key", "prompt_cache_options",
 ];
 
@@ -331,7 +358,7 @@ function promptCacheKey(request: JsonObject, messages: ChatMessage[], tools: Too
   return `deepinfra:${fingerprint}`;
 }
 
-function deepInfraBody(
+export function deepInfraBody(
   request: JsonObject,
   model: string,
   messages: ChatMessage[],
@@ -352,7 +379,15 @@ function deepInfraBody(
   for (const field of accepted) {
     if (request[field] !== undefined) body[field] = request[field];
   }
-  if (tools.length > 0) body.tools = tools as unknown as JsonValue;
+  if (tools.length > 0) {
+    body.tools = tools.map((tool) => ({
+      ...tool,
+      function: {
+        ...tool.function,
+        description: tool.function.description?.trim() || `Call ${tool.function.name}.`,
+      },
+    })) as unknown as JsonValue;
+  }
   const budget = validateTokenLimit(request);
   if (budget !== undefined) body.max_tokens = budget;
   // `stream_options` is only legal alongside `stream: true`; DeepInfra returns 422 otherwise.
@@ -403,10 +438,10 @@ export function isModelCapacityError(error: UpstreamError): boolean {
   return structuredCapacitySignal(error.payload) || MODEL_CAPACITY_PATTERN.test(error.message);
 }
 
-function markCapacityFailure(accountId: string, model: string, error: UpstreamError, admissionSequence: number): void {
-  if (isModelCapacityError(error)) {
+function markCapacityFailure(account: ManagedAccount, model: string, error: UpstreamError, admissionSequence: number): void {
+  if (error.kind === "model_capacity" || isModelCapacityError(error)) {
     accountScheduler.markModelCapacityFailure(
-      accountId,
+      account.id,
       model,
       error.message,
       error.retryAfterSeconds,
@@ -414,7 +449,11 @@ function markCapacityFailure(accountId: string, model: string, error: UpstreamEr
     );
     return;
   }
-  accountScheduler.markFailure(accountId, error.message, error.retryAfterSeconds, admissionSequence);
+  if (error.kind === "rate_limit" || error.status === 429) {
+    accountScheduler.markEgressRateLimit(account.proxy, error.message, error.retryAfterSeconds);
+    return;
+  }
+  accountScheduler.markFailure(account.id, error.message, error.retryAfterSeconds, admissionSequence);
 }
 
 function isAbortError(error: unknown): boolean {
@@ -702,7 +741,7 @@ async function getCompletion(
             ? new UpstreamError(error.message, error.status, error.retryAfterSeconds)
             : new UpstreamError(error instanceof Error ? error.message : "Unknown portal streaming error.", 502);
         if (countsAgainstAccount(failure.status)) {
-          markCapacityFailure(account.id, model, failure, lease.admissionSequence);
+          markCapacityFailure(account, model, failure, lease.admissionSequence);
         }
         if (error instanceof ProxyRequestError) {
           throw error;
@@ -719,18 +758,28 @@ async function getCompletion(
         if (!countsAgainstAccount(portalError.status)) {
           throw new ProxyRequestError(portalError, currentContext);
         }
-        markCapacityFailure(account.id, model, portalError, lease.admissionSequence);
+        markCapacityFailure(account, model, portalError, lease.admissionSequence);
         excluded.add(account.id);
         continue;
       }
       if (error instanceof UpstreamError) {
         lastError = error;
         lastContext = currentContext;
+        if (error.kind === "challenge") {
+          throw new ProxyRequestError(error, currentContext);
+        }
         if (!countsAgainstAccount(error.status)) {
           throw new ProxyRequestError(error, currentContext);
         }
-        markCapacityFailure(account.id, model, error, lease.admissionSequence);
-        excluded.add(account.id);
+        markCapacityFailure(account, model, error, lease.admissionSequence);
+        if (error.kind === "rate_limit" || error.status === 429) {
+          const limitedEgress = egressIdentity(account.proxy).key;
+          for (const candidate of await stateStore.listAccounts()) {
+            if (egressIdentity(candidate.proxy).key === limitedEgress) excluded.add(candidate.id);
+          }
+        } else {
+          excluded.add(account.id);
+        }
       } else {
         const message = error instanceof Error ? error.message : "Unknown portal transport error.";
         accountScheduler.markFailure(account.id, message, undefined, lease.admissionSequence);

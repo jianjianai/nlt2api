@@ -10,12 +10,15 @@ const compatibleFetch = undiciFetch as unknown as (
 ) => Promise<Response>;
 const responseFinishes = new WeakMap<Response, () => void>();
 
+export type UpstreamFailureKind = "challenge" | "rate_limit" | "model_capacity" | "upstream";
+
 export class UpstreamError extends Error {
   constructor(
     message: string,
     readonly status: number,
     readonly retryAfterSeconds?: number,
     readonly payload?: JsonObject,
+    readonly kind: UpstreamFailureKind = status === 429 ? "rate_limit" : "upstream",
   ) {
     super(message);
     this.name = "UpstreamError";

@@ -101,9 +101,9 @@ test("createAccounts consumes healthy idle proxies and writes models", async () 
   await withPool(async ({ store, service }) => {
     const imported = await service.importText("one.local:8080\ntwo.local:8080", "http");
     for (const item of imported) await store.updateProxyPoolHealth(item.entry!.id, { healthy: true, checkedAt: new Date().toISOString() });
-    const originalProbe = deepInfraClient.probeProxy;
+    const originalProbe = deepInfraClient.probeChat;
     const originalModels = deepInfraClient.models;
-    deepInfraClient.probeProxy = async () => undefined;
+    deepInfraClient.probeChat = async () => undefined;
     deepInfraClient.models = async () => [{ id: "moonshotai/Kimi-K3", freeForAnonymous: true }];
     try {
       const result = await service.createAccounts(2);
@@ -113,7 +113,7 @@ test("createAccounts consumes healthy idle proxies and writes models", async () 
       assert.equal(result.accounts.every((account) => account.models.includes("moonshotai/Kimi-K3")), true);
       assert.equal((await store.listAccounts()).length, 2);
     } finally {
-      deepInfraClient.probeProxy = originalProbe;
+      deepInfraClient.probeChat = originalProbe;
       deepInfraClient.models = originalModels;
     }
   });
@@ -123,16 +123,16 @@ test("createAccounts skips failed proxies and reports partial capacity", async (
   await withPool(async ({ store, service }) => {
     const imported = await service.importText("bad.local:8080\ngood.local:8080", "http");
     for (const item of imported) await store.updateProxyPoolHealth(item.entry!.id, { healthy: true, checkedAt: new Date().toISOString() });
-    const originalProbe = deepInfraClient.probeProxy;
+    const originalProbe = deepInfraClient.probeChat;
     const originalModels = deepInfraClient.models;
-    deepInfraClient.probeProxy = async (proxy) => { if (proxy.includes("bad.local")) throw new ProxyTransportError("offline"); };
+    deepInfraClient.probeChat = async (proxy) => { if (proxy?.includes("bad.local")) throw new ProxyTransportError("offline"); };
     deepInfraClient.models = async () => [{ id: "moonshotai/Kimi-K3", freeForAnonymous: true }];
     try {
       const result = await service.createAccounts(2);
       assert.equal(result.accounts.length, 1);
       assert.equal(result.failed.length, 1);
     } finally {
-      deepInfraClient.probeProxy = originalProbe;
+      deepInfraClient.probeChat = originalProbe;
       deepInfraClient.models = originalModels;
     }
   });
@@ -141,16 +141,16 @@ test("createAccounts skips failed proxies and reports partial capacity", async (
 test("createAccounts probes imported proxies on demand", async () => {
   await withPool(async ({ store, service }) => {
     await service.importText("untested.local:8080", "http");
-    const originalProbe = deepInfraClient.probeProxy;
+    const originalProbe = deepInfraClient.probeChat;
     const originalModels = deepInfraClient.models;
-    deepInfraClient.probeProxy = async () => undefined;
+    deepInfraClient.probeChat = async () => undefined;
     deepInfraClient.models = async () => [{ id: "moonshotai/Kimi-K3", freeForAnonymous: true }];
     try {
       const result = await service.createAccounts(1);
       assert.equal(result.accounts.length, 1);
       assert.equal((await store.listAccounts()).length, 1);
     } finally {
-      deepInfraClient.probeProxy = originalProbe;
+      deepInfraClient.probeChat = originalProbe;
       deepInfraClient.models = originalModels;
     }
   });
@@ -160,15 +160,15 @@ test("createAccounts bounds failed candidate attempts", async () => {
   let checks = 0;
   await withPool(async ({ service }) => {
     await service.importText(Array.from({ length: 10 }, (_, index) => `bad-${index}.local:8080`).join("\n"), "http");
-    const originalProbe = deepInfraClient.probeProxy;
-    deepInfraClient.probeProxy = async () => { throw new ProxyTransportError("offline"); };
+    const originalProbe = deepInfraClient.probeChat;
+    deepInfraClient.probeChat = async () => { throw new ProxyTransportError("offline"); };
     try {
       const result = await service.createAccounts(1);
       assert.equal(result.accounts.length, 0);
       assert.equal(result.failed.length, 6);
       assert.equal(checks, 6);
     } finally {
-      deepInfraClient.probeProxy = originalProbe;
+      deepInfraClient.probeChat = originalProbe;
     }
   }, async () => { checks += 1; });
 });

@@ -55,7 +55,17 @@ function requestHeaders(ticket: TurnstileTicket, stream: boolean): Record<string
   };
 }
 
-function upstreamError(status: number, body: string, retryAfter?: number): UpstreamError {
+function retryAfterFromPayload(payload: JsonObject | undefined): number | undefined {
+  const error = payload?.error && typeof payload.error === "object" && !Array.isArray(payload.error)
+    ? payload.error as JsonObject
+    : undefined;
+  const value = error?.retry_after ?? payload?.retry_after;
+  return typeof value === "number" && Number.isFinite(value) && value > 0 ? Math.min(value, 86_400) : undefined;
+}
+
+const MODEL_CAPACITY_PATTERN = /(?:model\s+busy|busy,?\s+retry\s+later|concurrenc(?:y|ies)|slots?\s+in\s+use)/i;
+
+export function deepInfraUpstreamError(status: number, body: string, retryAfter?: number): UpstreamError {
   let message = body.slice(0, 300);
   let payload: JsonObject | undefined;
   try {
@@ -70,7 +80,12 @@ function upstreamError(status: number, body: string, retryAfter?: number): Upstr
   } catch {
     // Non-JSON upstream body; the truncated text is the most useful message available.
   }
-  return new UpstreamError(`DeepInfra upstream failed: ${message}`, status, retryAfter, payload);
+  const kind = MODEL_CAPACITY_PATTERN.test(message) || MODEL_CAPACITY_PATTERN.test(body)
+    ? "model_capacity"
+    : status === 429
+      ? "rate_limit"
+      : "upstream";
+  return new UpstreamError(`DeepInfra upstream failed: ${message}`, status, retryAfter ?? retryAfterFromPayload(payload), payload, kind);
 }
 
 /**
@@ -79,8 +94,7 @@ function upstreamError(status: number, body: string, retryAfter?: number): Upstr
  * A ticket is minted per call and never reused: DeepInfra redeems it server-side, so a
  * second request with the same ticket returns 403 `Captcha verification failed`.
  */
-export async function probeDeepInfraProxy(proxy: string, signal?: AbortSignal): Promise<void> {
-  await checkDeepInfraProxy(proxy, signal);
+export async function probeDeepInfraChat(proxy?: string, signal?: AbortSignal): Promise<void> {
   const response = await deepInfraChat({
     model: "moonshotai/Kimi-K3",
     messages: [{ role: "user", content: "Reply with OK." }],
@@ -95,6 +109,12 @@ export async function probeDeepInfraProxy(proxy: string, signal?: AbortSignal): 
   } finally {
     await discardUpstreamResponse(response).catch(() => undefined);
   }
+}
+
+export async function probeDeepInfraProxy(proxy?: string, signal?: AbortSignal): Promise<void> {
+  if (proxy) await checkDeepInfraProxy(proxy, signal);
+  else await deepInfraCatalog(signal);
+  await probeDeepInfraChat(proxy, signal);
 }
 
 export interface DeepInfraChatRetry {
@@ -120,7 +140,7 @@ export async function deepInfraChat(
       ticket = await deepInfraTurnstileMinter().mint();
     } catch (error) {
       if (error instanceof TurnstileMintError) {
-        throw new UpstreamError(`DeepInfra challenge unavailable (${error.reason}).`, 503);
+        throw new UpstreamError(`DeepInfra challenge unavailable (${error.reason}).`, 503, undefined, undefined, "challenge");
       }
       throw error;
     }
@@ -160,7 +180,7 @@ export async function deepInfraChat(
     }
 
     if (!response.ok) {
-      throw upstreamError(response.status, await response.text(), retryAfterSeconds(response));
+      throw deepInfraUpstreamError(response.status, await response.text(), retryAfterSeconds(response));
     }
     return response;
   }
@@ -175,7 +195,7 @@ export async function deepInfraChat(
 export async function deepInfraCatalog(signal?: AbortSignal, proxy?: string): Promise<Array<Record<string, unknown>>> {
   const response = await upstreamFetch(MODELS_URL, {}, signal, egressDispatcher(proxy));
   if (!response.ok) {
-    throw upstreamError(response.status, await response.text(), retryAfterSeconds(response));
+    throw deepInfraUpstreamError(response.status, await response.text(), retryAfterSeconds(response));
   }
   const payload = await response.json();
   return Array.isArray(payload) ? payload.filter((entry): entry is Record<string, unknown> => Boolean(entry) && typeof entry === "object") : [];
@@ -200,7 +220,7 @@ export async function deepInfraModels(signal?: AbortSignal, proxy?: string): Pro
 }
 
 export async function verifyDeepInfraAccount(account: ManagedAccount, signal?: AbortSignal): Promise<void> {
-  await deepInfraModels(signal, account.proxy);
+  await deepInfraClient.probeProxy(account.proxy, signal);
 }
 
 export async function listDeepInfraAccountModels(account: ManagedAccount, signal?: AbortSignal): Promise<string[]> {
@@ -211,6 +231,9 @@ export async function listDeepInfraAccountModels(account: ManagedAccount, signal
 
 export async function checkDeepInfraProxy(proxy: string, signal?: AbortSignal): Promise<void> {
   const response = await upstreamFetch(MODELS_URL, {}, signal, proxyDispatcher(proxy));
+  if (!response.ok) {
+    throw deepInfraUpstreamError(response.status, await response.text(), retryAfterSeconds(response));
+  }
   await discardUpstreamResponse(response);
 }
 
@@ -222,5 +245,6 @@ export const deepInfraClient = {
   verifyAccount: verifyDeepInfraAccount,
   listAccountModels: listDeepInfraAccountModels,
   checkProxy: checkDeepInfraProxy,
+  probeChat: probeDeepInfraChat,
   probeProxy: probeDeepInfraProxy,
 };

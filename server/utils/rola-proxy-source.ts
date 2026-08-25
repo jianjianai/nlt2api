@@ -115,7 +115,9 @@ export function parseRolaProxyHtml(html: string, sourceUrl = ROLA_FREE_PROXY_URL
     const port = numberFrom(row[indexes.port] ?? "");
     const parsedProtocol = protocol(row[indexes.protocol] ?? "");
     if (!publicIpv4(ip) || !port || !Number.isInteger(port) || port < 1 || port > 65_535 || !parsedProtocol) continue;
-    const scheme = parsedProtocol === "HTTPS" ? "https" : parsedProtocol.toLocaleLowerCase();
+    // Rola's HTTPS label means the proxy can tunnel HTTPS targets via CONNECT;
+    // the proxy listener itself is still a plain HTTP endpoint.
+    const scheme = parsedProtocol === "HTTPS" ? "http" : parsedProtocol.toLocaleLowerCase();
     const canonical = parseProxyImportLine(`${scheme}://${ip}:${port}`, proxyKind(parsedProtocol));
     if (seen.has(canonical.url)) continue;
     seen.add(canonical.url);

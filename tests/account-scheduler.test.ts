@@ -191,6 +191,22 @@ test("one DeepInfra gateway schedules independent egress accounts", async () => 
   fallback.release();
 });
 
+test("upstream rate limits cool every account sharing the egress", async () => {
+  const sharedA = account("a", ["m1"], "http://first:one@proxy.example:8080");
+  const sharedB = account("b", ["m1"], "http://second:two@PROXY.example:8080");
+  const { scheduler, clock } = harness([sharedA, sharedB], { proxyRpm: 100, accountRpm: 100 });
+  scheduler.markEgressRateLimit(sharedA.proxy, "Too many requests", 12);
+  const blocked = scheduler.acquire({ model: "m1" });
+  assert.equal(await pending(blocked), true);
+  const snapshot = await scheduler.runtimeSnapshot();
+  assert.equal(snapshot.egresses[0]?.cooldownUntil, 12_000);
+  assert.equal(snapshot.egresses[0]?.lastError, "Too many requests");
+  await clock.advance(12_000);
+  const recovered = await resolved(blocked);
+  assert.ok(["a", "b"].includes(recovered.account.id));
+  recovered.release();
+});
+
 test("proxy RPM is shared across credentials while different proxies stay independent", async () => {
   const sharedA = account("a", ["m1"], "http://first:one@proxy.example:8080");
   const sharedB = account("b", ["m1"], "http://second:two@PROXY.example:8080");

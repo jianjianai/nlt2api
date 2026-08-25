@@ -194,7 +194,7 @@ export class ProxyPoolService {
       excluded.add(candidate.id);
       try {
         if (!candidate.lastHealthyAt) await this.checkReserved(candidate, signal);
-        await deepInfraClient.probeProxy(candidate.url, signal);
+        await deepInfraClient.probeChat(candidate.url, signal);
         const models = inheritedModels.length > 0
           ? [...inheritedModels]
           : (await deepInfraClient.models(signal, candidate.url)).filter((model) => model.freeForAnonymous).map((model) => model.id);

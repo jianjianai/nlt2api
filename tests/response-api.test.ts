@@ -183,19 +183,14 @@ test("validateResponseRequest maps instructions, tools, tool_choice and budgets"
   });
 });
 
-test("validateResponseRequest drops hosted tools and flattens namespaces", async () => {
+test("validateResponseRequest rejects hosted tools instead of silently dropping them", async () => {
   await withTempDataDir(async () => {
-    const { chatRequest, context } = await validateResponseRequest(baseRequest({
+    await assertHttpError(() => validateResponseRequest(baseRequest({
       tools: [
         functionTool(),
         { type: "web_search", external_web_access: false },
-        { type: "namespace", name: "multi_agent_v1", tools: [{ type: "function", name: "spawn_agent", parameters: { type: "object" } }] },
       ],
-    }));
-    const chatTools = chatRequest.tools as JsonObject[];
-    assert.equal(chatTools.length, 2);
-    assert.equal((chatTools[1]!.function as JsonObject).name, "multi_agent_v1.spawn_agent");
-    assert.deepEqual(context.droppedTools, ["web_search"]);
+    })), { status: 400, match: /unsupported tool type `web_search`/, param: "tools" });
   });
 });
 
@@ -247,22 +242,15 @@ test("validateResponseRequest harvests tools from additional_tools and namespace
   });
 });
 
-test("validateResponseRequest accepts tool_choice auto when every tool is dropped", async () => {
+test("validateResponseRequest rejects a hosted-only tool set", async () => {
   await withTempDataDir(async () => {
-    // Hosted tools have no executor on this gateway and are dropped; a client
-    // default of tool_choice "auto" must not turn the request into a 400.
-    const { chatRequest, context } = await validateResponseRequest({
+    await assertHttpError(() => validateResponseRequest({
       model: "test-model",
       store: false,
       tool_choice: "auto",
       tools: [{ type: "web_search" }],
       input: [userInput("Search something")],
-    });
-    assert.equal(chatRequest.tools, undefined);
-    assert.equal(chatRequest.tool_choice, "auto");
-    assert.deepEqual(context.droppedTools, ["web_search"]);
-    // The downstream chat validation accepts the no-op selection.
-    validateChatRequest(chatRequest);
+    }), { status: 400, match: /unsupported tool type `web_search`/, param: "tools" });
   });
 });
 
@@ -757,12 +745,11 @@ test("tool output items accept structured output objects", () => {
   assert.equal(messages[2]!.content, "line1\nline2");
 });
 
-test("dropped tool types never reach the chat request", async () => {
+test("hosted tool types are rejected before the chat request", async () => {
   await withTempDataDir(async () => {
-    const { chatRequest } = await validateResponseRequest(baseRequest({
+    await assertHttpError(() => validateResponseRequest(baseRequest({
       tools: [{ type: "web_search" }, { type: "mcp", server_label: "x" }],
-    }));
-    assert.equal(chatRequest.tools, undefined);
+    })), { status: 400, match: /unsupported tool type `web_search`/, param: "tools" });
   });
 });
 

@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { resetProxyConfigForTests } from "../server/utils/config.ts";
+import { ProxyTransportError } from "../server/utils/proxy.ts";
 import { ProxySyncService } from "../server/utils/proxy-sync.ts";
 import { StateStore } from "../server/utils/state-store.ts";
 import type { RolaProxyCandidate } from "../server/utils/rola-proxy-source.ts";
@@ -44,7 +45,8 @@ test("proxy sync replaces the proxy on the same account and preserves billing id
       store,
       fetchCandidates: async () => [candidate("socks5h://1.1.1.1:1080")],
       checkProxy: async () => undefined,
-      probeProxy: async (proxy) => { if (proxy.includes("8.8.8.8")) throw new Error("dead"); },
+      probeChat: async () => undefined,
+      probeProxy: async (proxy) => { if (proxy.includes("8.8.8.8")) throw new ProxyTransportError("dead"); },
       notifyScheduler: () => undefined,
       now: () => Date.now(),
     });
@@ -70,7 +72,8 @@ test("proxy sync keeps account unavailable when no replacement is healthy", asyn
       store,
       fetchCandidates: async () => [],
       checkProxy: async () => undefined,
-      probeProxy: async () => { throw new Error("dead"); },
+      probeChat: async () => undefined,
+      probeProxy: async () => { throw new ProxyTransportError("dead"); },
       notifyScheduler: () => undefined,
       now: () => Date.now(),
     });
@@ -90,6 +93,7 @@ test("concurrent manual triggers share one active synchronization run", async ()
       store,
       fetchCandidates: async () => { await gate; return []; },
       checkProxy: async () => undefined,
+      probeChat: async () => undefined,
       probeProxy: async () => undefined,
       notifyScheduler: () => undefined,
       now: () => Date.now(),

@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { accountScheduler } from "~/server/utils/account-scheduler.ts";
 import { deepInfraClient } from "~/server/utils/deepinfra-client.ts";
-import { egressIdentity } from "~/server/utils/proxy.ts";
+import { egressIdentity, ProxyTransportError } from "~/server/utils/proxy.ts";
 import { fetchRolaProxyCandidates, ROLA_FREE_PROXY_URL, type RolaProxyCandidate } from "~/server/utils/rola-proxy-source.ts";
 import { stateStore, type StateStore } from "~/server/utils/state-store.ts";
 import type { ManagedAccount, ProxyPoolEntry, ProxySyncRun, ProxySyncRunDetail, ProxySyncRunTrigger, ProxySyncSettings } from "~/server/utils/types.ts";
@@ -10,6 +10,7 @@ interface ProxySyncDependencies {
   store: StateStore;
   fetchCandidates(signal?: AbortSignal): Promise<RolaProxyCandidate[]>;
   checkProxy(proxy: string, signal?: AbortSignal): Promise<void>;
+  probeChat(proxy: string, signal?: AbortSignal): Promise<void>;
   probeProxy(proxy: string, signal?: AbortSignal): Promise<void>;
   notifyScheduler(): void;
   now(): number;
@@ -19,6 +20,7 @@ const productionDependencies: ProxySyncDependencies = {
   store: stateStore,
   fetchCandidates: fetchRolaProxyCandidates,
   checkProxy: deepInfraClient.checkProxy,
+  probeChat: deepInfraClient.probeChat,
   probeProxy: deepInfraClient.probeProxy,
   notifyScheduler: () => accountScheduler.notifyStateChanged(),
   now: () => Date.now(),
@@ -127,8 +129,9 @@ export class ProxySyncService {
       }).slice(0, settings.candidateLimit);
       run.counts.skipped = Math.max(0, fetched.length - candidates.length);
 
+      const minterCount = Math.max(1, Number(process.env.DEEPINFRA_TURNSTILE_MINTERS ?? "2"));
       const unhealthy: Array<{ account: ManagedAccount; reason: string }> = [];
-      await mapConcurrent(managedAccounts, settings.probeConcurrency, async (account) => {
+      await mapConcurrent(managedAccounts, Math.min(settings.probeConcurrency, minterCount), async (account) => {
         if (signal?.aborted) return;
         const currentProxy = account.proxy;
         if (!currentProxy) return;
@@ -141,8 +144,12 @@ export class ProxySyncService {
           }
           if (account.egressStatus !== "active") await this.dependencies.store.setAccountEgressStatus(account.id, "active");
         } catch (error) {
-          run.counts.failed += 1;
           const reason = errorText(error);
+          if (!(error instanceof ProxyTransportError)) {
+            run.details.push({ accountId: account.id, candidate: currentProxy, status: "skipped", reason });
+            return;
+          }
+          run.counts.failed += 1;
           let failures = settings.failureThreshold;
           let poolEntryId = account.proxyPoolEntryId;
           if (!poolEntryId) {
@@ -179,21 +186,22 @@ export class ProxySyncService {
           await withTimeout(settings.probeTimeoutSeconds, (probeSignal) => this.dependencies.checkProxy(candidate.url, probeSignal), signal);
           return { candidate, healthy: true, durationMs: this.dependencies.now() - started };
         } catch (error) {
-          run.counts.failed += 1;
-          return { candidate, healthy: false, error: errorText(error), durationMs: this.dependencies.now() - started };
+          const proxyFailure = error instanceof ProxyTransportError;
+          if (proxyFailure) run.counts.failed += 1;
+          return { candidate, healthy: false, proxyFailure, error: errorText(error), durationMs: this.dependencies.now() - started };
         }
       });
-      const minterCount = Math.max(1, Number(process.env.DEEPINFRA_TURNSTILE_MINTERS ?? "2"));
       const chatCandidates = catalogCandidates.filter((result) => result.healthy);
       const probedCandidates = await mapConcurrent(chatCandidates, Math.min(settings.probeConcurrency, minterCount), async (result) => {
         const started = this.dependencies.now();
         try {
-          await withTimeout(settings.probeTimeoutSeconds + 30, (probeSignal) => this.dependencies.probeProxy(result.candidate.url, probeSignal), signal);
+          await withTimeout(settings.probeTimeoutSeconds + 30, (probeSignal) => this.dependencies.probeChat(result.candidate.url, probeSignal), signal);
           run.counts.healthy += 1;
           return { candidate: result.candidate, healthy: true, durationMs: result.durationMs + this.dependencies.now() - started };
         } catch (error) {
-          run.counts.failed += 1;
-          return { candidate: result.candidate, healthy: false, error: errorText(error), durationMs: result.durationMs + this.dependencies.now() - started };
+          const proxyFailure = error instanceof ProxyTransportError;
+          if (proxyFailure) run.counts.failed += 1;
+          return { candidate: result.candidate, healthy: false, proxyFailure, error: errorText(error), durationMs: result.durationMs + this.dependencies.now() - started };
         }
       });
       const allCandidateResults = [...catalogCandidates.filter((result) => !result.healthy), ...probedCandidates];
@@ -207,7 +215,7 @@ export class ProxySyncService {
         }]);
         if (result.healthy) {
           await this.dependencies.store.updateProxyPoolHealth(imported!.entry.id, { healthy: true, checkedAt: new Date(this.dependencies.now()).toISOString() });
-        } else {
+        } else if (result.proxyFailure) {
           await this.dependencies.store.updateProxyPoolHealth(imported!.entry.id, {
             healthy: false,
             checkedAt: new Date(this.dependencies.now()).toISOString(),
@@ -215,7 +223,7 @@ export class ProxySyncService {
             retryAfter: this.dependencies.now() + settings.archiveCooldownHours * 60 * 60_000,
           });
         }
-        run.details.push({ candidate: result.candidate.url, status: result.healthy ? "healthy" : "failed", ...(result.error ? { reason: result.error } : {}), durationMs: result.durationMs });
+        run.details.push({ candidate: result.candidate.url, status: result.healthy ? "healthy" : result.proxyFailure ? "failed" : "skipped", ...(result.error ? { reason: result.error } : {}), durationMs: result.durationMs });
       }
 
       let cursor = 0;

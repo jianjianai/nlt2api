@@ -373,10 +373,7 @@ function flattenResponseTools(
       }
       continue;
     }
-    // Hosted/server-side tools (web_search, MCP listings, ...) have no executor
-    // on this gateway. Dropping them keeps the model from issuing calls the
-    // client could not complete.
-    into.dropped.push(type ?? at);
+    throw invalid(`${at} uses unsupported tool type \`${type ?? "unknown"}\`; this DeepInfra route supports function tools only.`, "tools");
   }
 }
 
@@ -599,7 +596,7 @@ export async function validateResponseRequest(
     inputItems = [...stored.items, ...inputItems];
     chainModel = stored.model;
   }
-  const { tools, chatTools, dropped } = harvestInputTools(inputItems, parseResponseTools(body.tools));
+  const { tools, chatTools } = harvestInputTools(inputItems, parseResponseTools(body.tools));
   const toolChoice = parseResponseToolChoice(body.tool_choice, tools);
   if (inputItems.length === 0) {
     throw invalid("`input` must not be empty.", "input");
@@ -643,7 +640,7 @@ export async function validateResponseRequest(
       model: chatRequest.model as string,
       ...(typeof instructions === "string" ? { instructions } : {}),
       tools,
-      droppedTools: dropped,
+      droppedTools: [],
       ...(toolChoice !== undefined ? { toolChoice } : {}),
       parallelToolCalls,
       store,

@@ -19,8 +19,14 @@ export function upstreamHttpError(error: unknown): HttpError {
     if (error.status === 400 || error.status === 404 || error.status === 422) {
       return new HttpError(error.status, "DeepInfra rejected the requested model or parameters.", "invalid_request_error");
     }
+    if (error.kind === "challenge") {
+      return new HttpError(503, "DeepInfra challenge service is temporarily unavailable.", "api_error", undefined, "challenge_unavailable", error.retryAfterSeconds);
+    }
+    if (error.kind === "model_capacity") {
+      return new HttpError(429, "The requested DeepInfra model is temporarily busy.", "rate_limit_error", "model", "model_capacity", error.retryAfterSeconds ?? 1);
+    }
     if (error.status === 429) {
-      return new HttpError(429, "The selected DeepInfra account is rate limited.", "rate_limit_error", undefined, "rate_limit_exceeded");
+      return new HttpError(429, "The selected DeepInfra egress is rate limited.", "rate_limit_error", undefined, "rate_limit_exceeded", error.retryAfterSeconds ?? 60);
     }
     if (error.status === 504) {
       return new HttpError(504, "DeepInfra timed out while waiting for upstream data.", "api_error", undefined, "upstream_timeout");

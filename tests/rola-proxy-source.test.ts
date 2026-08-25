@@ -19,6 +19,7 @@ test("Rola parser maps headers independent of column order and ranks candidates"
     ["8.8.8.8", "socks5", "SOCKS5"],
     ["1.1.1.1", "http", "HTTPS"],
   ]);
+  assert.equal(candidates[1]?.url, "http://1.1.1.1:443/");
   assert.equal(candidates[1]?.metadata.reportedUptimePercent, 99);
 });
 

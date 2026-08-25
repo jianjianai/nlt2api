@@ -9,6 +9,7 @@ import test from "node:test";
 import {
   chatChunksFromUpstreamFrame,
   createChatStreamState,
+  deepInfraBody,
   executeChatRequest,
   locatedSchemaErrorText,
   repairMessages,
@@ -105,6 +106,42 @@ async function withEmptyDataDir<T>(run: () => Promise<T>): Promise<T> {
   }
 }
 
+test("deepInfraBody fills missing function descriptions and forwards current parameters", () => {
+  const request = validRequest({
+    tools: [tool],
+    min_p: 0.2,
+    stop_token_ids: [1, 2],
+    reasoning: { enabled: true },
+    chat_template_kwargs: { enable_thinking: true },
+    continue_final_message: true,
+    ignore_eos: false,
+    fail_fast: true,
+  });
+  const validated = validateChatRequest(request);
+  const body = deepInfraBody(request, validated.model, validated.messages, validated.tools, false);
+  const outputTool = (body.tools as unknown as ToolDefinition[])[0]!;
+  assert.equal(outputTool.function.description, "Find things");
+  assert.equal(body.min_p, 0.2);
+  assert.deepEqual(body.stop_token_ids, [1, 2]);
+  assert.deepEqual(body.reasoning, { enabled: true });
+  assert.deepEqual(body.chat_template_kwargs, { enable_thinking: true });
+  assert.equal(body.continue_final_message, true);
+  assert.equal(body.ignore_eos, false);
+  assert.equal(body.fail_fast, true);
+
+  const noDescription = validateChatRequest(validRequest({
+    tools: [{ type: "function", function: { name: "bare", parameters: { type: "object" } } } as unknown as JsonValue],
+  }));
+  const normalized = deepInfraBody(request, noDescription.model, noDescription.messages, noDescription.tools, false);
+  assert.equal(((normalized.tools as unknown as ToolDefinition[])[0]!).function.description, "Call bare.");
+});
+
+test("validateChatRequest rejects invalid current DeepInfra parameter types", () => {
+  for (const [field, value] of [["min_p", 2], ["stop_token_ids", [1, 1.5]], ["reasoning", true], ["continue_final_message", "yes"]] as const) {
+    assertChatHttpError(() => validateChatRequest(validRequest({ [field]: value as unknown as JsonValue })), { status: 400, param: field });
+  }
+});
+
 test("validateChatRequest returns the parsed model, messages and tools", () => {
   const request = validRequest({ tools: [tool] });
   const validated = validateChatRequest(request);
@@ -115,6 +152,27 @@ test("validateChatRequest returns the parsed model, messages and tools", () => {
   assert.equal(validated.messages[0], (request.messages as JsonObject[])[0]);
   assert.equal(validated.tools.length, 1);
   assert.equal(validated.tools[0]?.function.name, "lookup");
+});
+
+test("validateChatRequest accepts native assistant tool calls followed by tool results", () => {
+  const validated = validateChatRequest(validRequest({
+    messages: [
+      { role: "user", content: "Call lookup" },
+      { role: "assistant", content: null, tool_calls: [{ id: "call_1", type: "function", function: { name: "lookup", arguments: "{\"query\":\"x\"}" } }] },
+      { role: "tool", tool_call_id: "call_1", content: "done" },
+    ] as unknown as JsonValue,
+    tools: [tool],
+    tool_choice: "none",
+  }));
+  assert.equal(validated.messages[1]?.tool_calls?.[0]?.function.name, "lookup");
+  assert.equal(validated.messages[2]?.tool_call_id, "call_1");
+});
+
+test("validateChatRequest rejects history calls to undeclared functions as 400", () => {
+  assertChatHttpError(() => validateChatRequest(validRequest({
+    messages: [{ role: "assistant", content: null, tool_calls: [{ id: "call_1", type: "function", function: { name: "missing", arguments: "{}" } }] }] as unknown as JsonValue,
+    tools: [tool],
+  })), { status: 400, param: "messages" });
 });
 
 test("validateChatRequest accepts opaque tool-call IDs", () => {
@@ -343,7 +401,7 @@ test("validateChatRequest rejects invalid requests with unchanged errors", () =>
 });
 
 test("validateChatRequest still surfaces malformed history tool calls early", () => {
-  assert.throws(
+  assertChatHttpError(
     () => validateChatRequest(validRequest({
       messages: [
         { role: "user", content: "hi" },
@@ -356,7 +414,7 @@ test("validateChatRequest still surfaces malformed history tool calls early", ()
       ] as unknown as JsonValue,
       tools: [tool],
     })),
-    (error: unknown) => error instanceof InvalidStructuredToolCallsError,
+    { status: 400, param: "messages" },
   );
 });
 

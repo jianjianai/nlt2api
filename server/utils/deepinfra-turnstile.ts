@@ -259,6 +259,7 @@ export class DeepInfraTurnstileMinter {
   private idleTimer: ReturnType<typeof setTimeout> | undefined;
   /** In-flight mints; the idle reclaimer must never close the browser under one. */
   private active = 0;
+  private closed = false;
 
   constructor(options: TurnstileMinterOptions = {}) {
     this.port = options.port ?? 9333;
@@ -275,6 +276,7 @@ export class DeepInfraTurnstileMinter {
   }
 
   async mint(): Promise<TurnstileTicket> {
+    if (this.closed) throw new TurnstileMintError("closed", "The challenge minter is shutting down.");
     this.active += 1;
     if (this.idleTimer) {
       clearTimeout(this.idleTimer);
@@ -295,6 +297,7 @@ export class DeepInfraTurnstileMinter {
    * throwaway attempt instead of surfacing it as a downstream 503.
    */
   private async mintSerialized(): Promise<TurnstileTicket> {
+    if (this.closed) throw new TurnstileMintError("closed", "The challenge minter is shutting down.");
     if (!this.warmed && !this.skipWarmup) {
       this.warmed = true;
       await this.mintOnce().catch(() => undefined);
@@ -349,6 +352,7 @@ export class DeepInfraTurnstileMinter {
 
   /** Opens the CDP session once and reuses it for every later mint. */
   private async ensureSession(): Promise<CdpSession> {
+    if (this.closed) throw new TurnstileMintError("closed", "The challenge minter is shutting down.");
     if (this.session) return this.session;
     const page = await this.ensurePage();
     if (!page.webSocketDebuggerUrl) {
@@ -413,6 +417,7 @@ export class DeepInfraTurnstileMinter {
   }
 
   private async launchBrowser(): Promise<void> {
+    if (this.closed) throw new TurnstileMintError("closed", "The challenge minter is shutting down.");
     const executablePath = detectExecutable(this.executablePath);
     await mkdir(this.profileDir, { recursive: true });
     this.browser = spawn(executablePath, [
@@ -459,6 +464,7 @@ export class DeepInfraTurnstileMinter {
   }
 
   async close(): Promise<void> {
+    this.closed = true;
     if (this.idleTimer) {
       clearTimeout(this.idleTimer);
       this.idleTimer = undefined;
@@ -500,6 +506,12 @@ let sharedMinter: DeepInfraTurnstilePool | undefined;
 export function deepInfraTurnstileMinter(): DeepInfraTurnstilePool {
   sharedMinter ??= new DeepInfraTurnstilePool();
   return sharedMinter;
+}
+
+export async function closeDeepInfraTurnstileMinter(): Promise<void> {
+  const previous = sharedMinter;
+  sharedMinter = undefined;
+  await previous?.close();
 }
 
 export function resetDeepInfraTurnstileMinterForTests(): void {
