@@ -333,7 +333,16 @@ test("validateResponseRequest rejects invalid shapes", async () => {
       param: "previous_response_id",
       match: /not found/,
     });
-    await assertHttpError(() => validateResponseRequest(baseRequest({ tools: [{ type: "function", name: "bad name!" }] })), { status: 400, param: "tools" });
+    const repaired = await validateResponseRequest(baseRequest({
+      tools: [{ type: "function", name: "bad_schema", parameters: {
+        type: "object",
+        properties: { password: "string" },
+      } }],
+    }));
+    assert.deepEqual((repaired.chatRequest.tools as JsonObject[])[0]?.function && ((repaired.chatRequest.tools as JsonObject[])[0]!.function as JsonObject).parameters, {
+      type: "object",
+      properties: { password: { type: "string" } },
+    });
     await assertHttpError(() => validateResponseRequest(baseRequest({ tools: [functionTool()], tool_choice: { type: "function", name: "nope" } })), { status: 400, param: "tool_choice" });
     await assertHttpError(() => validateResponseRequest(baseRequest({ max_output_tokens: 0 })), { status: 400, param: "max_output_tokens" });
     await assertHttpError(() => validateResponseRequest(baseRequest({ store: "yes" as unknown as boolean })), { status: 400, param: "store" });

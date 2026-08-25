@@ -7,6 +7,7 @@ import {
   type ChatExecution,
 } from "~/server/utils/chat-service.ts";
 import { getProxyConfig } from "~/server/utils/config.ts";
+import { normalizeJsonSchema, validateSchemaDefinition } from "~/server/utils/json-schema.ts";
 import { HttpError } from "~/server/utils/http.ts";
 import { responseStore } from "~/server/utils/response-store.ts";
 import { isValidToolCallId, stringifyContent } from "~/server/utils/tool-calls.ts";
@@ -348,11 +349,18 @@ function flattenResponseTools(
         if (tool?.parameters !== undefined && !parameters) {
           throw invalid(`${at}.parameters must be a JSON Schema object.`, "tools");
         }
+        const normalizedParameters = parameters ? normalizeJsonSchema(parameters as JsonObject) : undefined;
+        if (normalizedParameters) {
+          const schema = validateSchemaDefinition(normalizedParameters);
+          if (!schema.valid) {
+            throw invalid(`${at}.parameters is invalid: ${schema.errors.join("; ")}`, "tools");
+          }
+        }
         into.tools.push({
           kind: "function",
           name,
           ...(typeof tool?.description === "string" ? { description: tool.description } : {}),
-          ...(parameters ? { parameters: parameters as JsonObject } : {}),
+          ...(normalizedParameters ? { parameters: normalizedParameters } : {}),
           ...(typeof tool?.strict === "boolean" ? { strict: tool.strict } : {}),
         });
       } else {

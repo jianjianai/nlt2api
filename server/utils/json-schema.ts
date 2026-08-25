@@ -90,6 +90,49 @@ export function validateSchemaDefinition(schema: JsonObject): SchemaValidationRe
     : { valid: true, errors: [] };
 }
 
+const SHORTHAND_SCHEMA_TYPES = new Set(["string", "number", "integer", "boolean", "object", "array", "null"]);
+const SCHEMA_NODE_KEYS = ["items", "additionalProperties", "contains", "not", "if", "then", "else", "propertyNames"] as const;
+const SCHEMA_NODE_MAP_KEYS = ["properties", "patternProperties", "$defs", "definitions", "dependentSchemas"] as const;
+const SCHEMA_NODE_ARRAY_KEYS = ["allOf", "anyOf", "oneOf", "prefixItems"] as const;
+
+function normalizeSchemaNode(value: unknown): unknown {
+  if (typeof value === "string" && SHORTHAND_SCHEMA_TYPES.has(value)) {
+    return { type: value };
+  }
+  if (Array.isArray(value)) {
+    return value.map(normalizeSchemaNode);
+  }
+  if (value && typeof value === "object") {
+    return normalizeSchemaObject(value as JsonObject);
+  }
+  return value;
+}
+
+function normalizeSchemaMap(value: unknown): unknown {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return value;
+  return Object.fromEntries(Object.entries(value as JsonObject)
+    .map(([key, schema]) => [key, normalizeSchemaNode(schema)]));
+}
+
+function normalizeSchemaObject(schema: JsonObject): JsonObject {
+  const normalized = { ...schema };
+  for (const key of SCHEMA_NODE_KEYS) {
+    if (key in normalized) normalized[key] = normalizeSchemaNode(normalized[key]) as JsonValue | undefined;
+  }
+  for (const key of SCHEMA_NODE_MAP_KEYS) {
+    if (key in normalized) normalized[key] = normalizeSchemaMap(normalized[key]) as JsonValue | undefined;
+  }
+  for (const key of SCHEMA_NODE_ARRAY_KEYS) {
+    if (key in normalized) normalized[key] = normalizeSchemaNode(normalized[key]) as JsonValue | undefined;
+  }
+  return normalized;
+}
+
+/** Convert only unambiguous schema type shorthands; preserve all other values. */
+export function normalizeJsonSchema(schema: JsonObject): JsonObject {
+  return normalizeSchemaObject(schema);
+}
+
 export function validateJsonSchema(value: unknown, schema: JsonObject | undefined): SchemaValidationResult {
   if (!schema || Object.keys(schema).length === 0) {
     return { valid: true, errors: [] };

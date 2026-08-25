@@ -7,6 +7,7 @@ import { getProxyConfig } from "~/server/utils/config.ts";
 import { HttpError } from "~/server/utils/http.ts";
 import {
   minimalSchemaExample,
+  normalizeJsonSchema,
   parseAndValidateToolArgumentsLocated,
   validateSchemaDefinition,
   type LocatedSchemaValidationResult,
@@ -185,8 +186,9 @@ export function parseTools(value: unknown): ToolDefinition[] {
     if (parameters !== undefined && (!asRecord(parameters) || Array.isArray(parameters))) {
       throw new HttpError(400, `tools[${index}].function.parameters must be a JSON Schema object.`, "invalid_request_error", "tools");
     }
-    if (parameters) {
-      const schema = validateSchemaDefinition(parameters as JsonObject);
+    const normalizedParameters = parameters ? normalizeJsonSchema(parameters as JsonObject) : undefined;
+    if (normalizedParameters) {
+      const schema = validateSchemaDefinition(normalizedParameters);
       if (!schema.valid) {
         throw new HttpError(400, `tools[${index}].function.parameters is invalid: ${schema.errors.join("; ")}`, "invalid_request_error", "tools");
       }
@@ -196,7 +198,7 @@ export function parseTools(value: unknown): ToolDefinition[] {
       function: {
         name,
         ...(typeof functionDefinition.description === "string" ? { description: functionDefinition.description } : {}),
-        ...(parameters ? { parameters: parameters as JsonObject } : {}),
+        ...(normalizedParameters ? { parameters: normalizedParameters } : {}),
         ...(typeof functionDefinition.strict === "boolean" ? { strict: functionDefinition.strict } : {}),
       },
     };
