@@ -268,7 +268,7 @@ export function messagesFromResponseItems(items: JsonObject[], customTools: Set<
       // A message item carrying the assistant's narration followed by
       // function_call items is ONE turn: attach the call to that message so
       // its text becomes the tool-call envelope's preamble when the history
-      // is re-encoded for the portal. Splitting them apart would mis-mark
+      // is re-encoded for the DeepInfra. Splitting them apart would mis-mark
       // the text as a <|FINAL_REPLY|> message and teach the model to
       // announce instead of calling tools.
       if (previous?.role === "assistant") {
@@ -521,7 +521,7 @@ function normalizeInputItems(input: unknown): JsonObject[] {
   if (input.length > maxItems) {
     // 413, not 400: the request is well-formed but exceeds a server payload
     // limit, matching the body-size handling in http.ts.
-    throw new HttpError(413, `\`input\` exceeds the supported item limit (limit ${maxItems} items; raise NEURALWATT_MAX_RESPONSE_ITEMS).`, "invalid_request_error", "input");
+    throw new HttpError(413, `\`input\` exceeds the supported item limit (limit ${maxItems} items; raise DEEPINFRA_GATEWAY_MAX_RESPONSE_ITEMS).`, "invalid_request_error", "input");
   }
   return input.map((item, index) => {
     const record = asRecord(item);
@@ -598,7 +598,7 @@ export async function validateResponseRequest(
   }
   const historyBytes = Buffer.byteLength(JSON.stringify(inputItems), "utf8");
   if (historyBytes > getProxyConfig().maxResponseHistoryBytes) {
-    throw invalid(`The reconstructed response history exceeds the supported size (limit ${getProxyConfig().maxResponseHistoryBytes} bytes; raise NEURALWATT_MAX_RESPONSE_HISTORY_BYTES).`, "input");
+    throw invalid(`The reconstructed response history exceeds the supported size (limit ${getProxyConfig().maxResponseHistoryBytes} bytes; raise DEEPINFRA_GATEWAY_MAX_RESPONSE_HISTORY_BYTES).`, "input");
   }
 
   const customTools = new Set(tools.filter((tool) => tool.kind === "custom").map((tool) => tool.name));
@@ -810,6 +810,9 @@ export function responseObject(
     top_p: context.topP ?? null,
     metadata: {},
     usage: responseUsage(execution.completion.usage) ?? null,
+    ...(execution.completion.energy ? { energy: execution.completion.energy as unknown as JsonValue } : {}),
+    ...(execution.completion.cost ? { cost: execution.completion.cost as unknown as JsonValue } : {}),
+    ...(execution.completion.service_tier ? { service_tier: execution.completion.service_tier } : {}),
   };
 }
 

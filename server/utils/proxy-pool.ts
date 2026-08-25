@@ -1,6 +1,6 @@
 import { accountScheduler } from "~/server/utils/account-scheduler.ts";
 import { evictProxyDispatcher, maskProxyUrl, parseProxyImportLine, ProxyTransportError } from "~/server/utils/proxy.ts";
-import { portalClient } from "~/server/utils/portal-client.ts";
+import { deepInfraClient } from "~/server/utils/deepinfra-client.ts";
 import { stateStore, StateStore } from "~/server/utils/state-store.ts";
 import type {
   ManagedAccount,
@@ -54,7 +54,7 @@ export interface ProxyPoolDependencies {
 
 const productionDependencies: ProxyPoolDependencies = {
   store: stateStore,
-  checkProxy: (proxy, signal) => portalClient.checkProxy(proxy, signal),
+  checkProxy: deepInfraClient.checkProxy,
   now: () => Date.now(),
   notifyScheduler: () => accountScheduler.notifyStateChanged(),
 };

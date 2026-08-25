@@ -10,31 +10,29 @@ import {
   chatChunksFromUpstreamFrame,
   createChatStreamState,
   executeChatRequest,
-  isThinkingInterrupted,
   locatedSchemaErrorText,
   repairMessages,
-  resolvePortalOutputBudget,
-  resolveToolCallPolicy,
-  validateChatRequest,
+    validateChatRequest,
   isModelCapacityError,
 } from "../server/utils/chat-service.ts";
 import { stateStore } from "../server/utils/state-store.ts";
 import { usageAnalytics } from "../server/utils/usage-analytics.ts";
 import { getProxyConfig, resetProxyConfigForTests } from "../server/utils/config.ts";
 import { HttpError } from "../server/utils/http.ts";
-import { portalClient, PortalError } from "../server/utils/portal-client.ts";
-import { FINAL_REPLY_MARKER, InvalidStructuredToolCallsError, withToolCallContract } from "../server/utils/tool-calls.ts";
+import { deepInfraClient } from "../server/utils/deepinfra-client.ts";
+import { UpstreamError } from "../server/utils/upstream-http.ts";
+import { InvalidStructuredToolCallsError } from "../server/utils/tool-calls.ts";
 import type { ChatMessage, JsonObject, JsonValue, ToolDefinition, UpstreamCompletion } from "../server/utils/types.ts";
 
 test("model capacity classification prefers structured signals and is status-independent", () => {
-  assert.equal(isModelCapacityError(new PortalError(
+  assert.equal(isModelCapacityError(new UpstreamError(
     "busy",
     503,
     undefined,
     { error: { code: "concurrent_limit", used: 5, limit: 5 } },
   )), true);
-  assert.equal(isModelCapacityError(new PortalError("5/5 slots in use", 503)), true);
-  assert.equal(isModelCapacityError(new PortalError("The selected portal account is rate limited.", 429)), false);
+  assert.equal(isModelCapacityError(new UpstreamError("5/5 slots in use", 503)), true);
+  assert.equal(isModelCapacityError(new UpstreamError("The selected portal account is rate limited.", 429)), false);
 });
 
 const tool = {
@@ -89,51 +87,23 @@ function assertChatHttpError(fn: () => unknown, expected: ErrorExpectation): voi
 }
 
 async function withEmptyDataDir<T>(run: () => Promise<T>): Promise<T> {
-  const dir = await mkdtemp(join(tmpdir(), "neuralwatt-chat-validation-test-"));
-  const previous = process.env.NEURALWATT_DATA_DIR;
-  process.env.NEURALWATT_DATA_DIR = dir;
+  const dir = await mkdtemp(join(tmpdir(), "deepinfra-chat-validation-test-"));
+  const previous = process.env.DEEPINFRA_GATEWAY_DATA_DIR;
+  process.env.DEEPINFRA_GATEWAY_DATA_DIR = dir;
   resetProxyConfigForTests();
   try {
     return await run();
   } finally {
     await usageAnalytics.resetForTests();
     if (previous === undefined) {
-      delete process.env.NEURALWATT_DATA_DIR;
+      delete process.env.DEEPINFRA_GATEWAY_DATA_DIR;
     } else {
-      process.env.NEURALWATT_DATA_DIR = previous;
+      process.env.DEEPINFRA_GATEWAY_DATA_DIR = previous;
     }
     resetProxyConfigForTests();
     await rm(dir, { recursive: true, force: true });
   }
 }
-
-test("resolveToolCallPolicy prefers per-model, then global, then env defaults", async () => {
-  await withEmptyDataDir(async () => {
-    stateStore.resetForTests();
-    try {
-      // Env defaults: format auto, preamble verbosity milestone.
-      assert.deepEqual(await resolveToolCallPolicy("model-a"), { format: "auto", preambleVerbosity: "milestone" });
-
-      await stateStore.updateSettings({ toolCallFormat: "json", preambleVerbosity: "quiet" });
-      assert.deepEqual(await resolveToolCallPolicy("model-a"), { format: "json", preambleVerbosity: "quiet" });
-
-      await stateStore.updateSettings({ modelToolCallFormats: { "model-a": "xml" } });
-      assert.deepEqual(await resolveToolCallPolicy("model-a"), { format: "xml", preambleVerbosity: "quiet" });
-      assert.deepEqual(await resolveToolCallPolicy("model-b"), { format: "json", preambleVerbosity: "quiet" });
-
-      // Per-model verbosity overrides the global setting, independently of format.
-      await stateStore.updateSettings({ modelPreambleVerbosities: { "model-a": "verbose" } });
-      assert.deepEqual(await resolveToolCallPolicy("model-a"), { format: "xml", preambleVerbosity: "verbose" });
-      assert.deepEqual(await resolveToolCallPolicy("model-b"), { format: "json", preambleVerbosity: "quiet" });
-
-      // Clearing returns to the env defaults.
-      await stateStore.updateSettings({ toolCallFormat: null, preambleVerbosity: null, modelToolCallFormats: null, modelPreambleVerbosities: null });
-      assert.deepEqual(await resolveToolCallPolicy("model-a"), { format: "auto", preambleVerbosity: "milestone" });
-    } finally {
-      stateStore.resetForTests();
-    }
-  });
-});
 
 test("validateChatRequest returns the parsed model, messages and tools", () => {
   const request = validRequest({ tools: [tool] });
@@ -189,16 +159,8 @@ test("validateChatRequest falls back to the configured default model", () => {
     } else {
       request.model = model;
     }
-    assert.equal(validateChatRequest(request).model, getProxyConfig().defaultModel);
+    assert.equal(validateChatRequest(request).model, getProxyConfig().defaultModel.split("/").at(-1));
   }
-});
-
-test("portal output budget applies the configured floor without exceeding the round cap", () => {
-  assert.equal(resolvePortalOutputBudget(validRequest({ max_tokens: 128 }), 8_192), 8_192);
-  assert.equal(resolvePortalOutputBudget(validRequest({ max_completion_tokens: 128 }), 0), 128);
-  assert.equal(resolvePortalOutputBudget(validRequest({ max_tokens: 4_096 }), 1_024), 4_096);
-  assert.equal(resolvePortalOutputBudget(validRequest({ max_tokens: 100_000 }), 8_192), 8_192);
-  assert.equal(resolvePortalOutputBudget(validRequest(), 8_192), 8_192);
 });
 
 test("validateChatRequest accepts valid tool_choice and sampling variants", () => {
@@ -253,7 +215,7 @@ test("validateChatRequest rejects invalid requests with unchanged errors", () =>
     {
       name: "n other than 1",
       mutate: (request) => { request.n = 2; },
-      expected: { status: 400, message: "Only n=1 is supported by the portal adapter.", param: "n" },
+      expected: { status: 400, message: "Only n=1 is supported by the DeepInfra adapter.", param: "n" },
     },
     {
       name: "non-integer max_tokens",
@@ -295,7 +257,7 @@ test("validateChatRequest rejects invalid requests with unchanged errors", () =>
       mutate: (request) => {
         request.messages = Array.from({ length: getProxyConfig().maxChatMessages + 1 }, () => ({ role: "user", content: "x" })) as unknown as JsonValue;
       },
-      expected: { status: 413, message: "`messages` exceeds the supported history limit (limit 10000 messages; raise NEURALWATT_MAX_CHAT_MESSAGES).", param: "messages" },
+      expected: { status: 413, message: "`messages` exceeds the supported history limit (limit 10000 messages; raise DEEPINFRA_GATEWAY_MAX_CHAT_MESSAGES).", param: "messages" },
     },
     {
       name: "unsupported role",
@@ -398,62 +360,6 @@ test("validateChatRequest still surfaces malformed history tool calls early", ()
   );
 });
 
-test("validateChatRequest prebuilds the contracted upstream messages", () => {
-  const request = validRequest({ tools: [tool] });
-  const validated = validateChatRequest(request);
-  const expected = withToolCallContract(
-    [{ role: "user", content: "Hello" }],
-    validated.tools,
-    undefined,
-    true,
-  );
-  assert.deepEqual(validated.upstreamMessages, expected);
-});
-
-test("validateChatRequest prebuilds plain portal messages when no tools are declared", () => {
-  const validated = validateChatRequest(validRequest());
-  assert.deepEqual(validated.upstreamMessages, [{ role: "user", content: "Hello" }]);
-});
-
-test("validateChatRequest prebuilds marked history for tool turns", () => {
-  const validated = validateChatRequest(validRequest({
-    tools: [tool],
-    messages: [
-      { role: "user", content: "hi" },
-      { role: "assistant", content: "done" },
-      { role: "user", content: "again" },
-    ] as unknown as JsonValue,
-  }));
-  const roles = validated.upstreamMessages.map((message) => message.role);
-  assert.deepEqual(roles, ["system", "user", "assistant", "user", "user"]);
-  assert.match(String(validated.upstreamMessages[0]?.content), /IMPORTANT ADAPTER OVERRIDE/);
-  assert.ok(String(validated.upstreamMessages[2]?.content).startsWith(FINAL_REPLY_MARKER));
-  assert.match(String(validated.upstreamMessages.at(-1)?.content), /IMPORTANT TOOL TURN REMINDER/);
-});
-
-test("validateChatRequest prebuilds serialized tool-call history for tool turns", () => {
-  const validated = validateChatRequest(validRequest({
-    tools: [tool],
-    messages: [
-      { role: "user", content: "hi" },
-      {
-        role: "assistant",
-        content: null,
-        tool_calls: [{ id: "call_1", type: "function", function: { name: "lookup", arguments: '{"query":"x"}' } }],
-      },
-      { role: "tool", tool_call_id: "call_1", content: "result" },
-      { role: "user", content: "again" },
-    ] as unknown as JsonValue,
-  }));
-  const roles = validated.upstreamMessages.map((message) => message.role);
-  assert.deepEqual(roles, ["system", "user", "assistant", "tool", "user", "user"]);
-  const assistant = validated.upstreamMessages[2];
-  assert.equal(assistant?.tool_calls, undefined);
-  const envelope = JSON.parse(String(assistant?.content));
-  assert.equal(envelope.type, "tool_calls");
-  assert.deepEqual(envelope.tool_calls, [{ name: "lookup", arguments: { query: "x" } }]);
-});
-
 test("executeChatRequest validates when no validation result is supplied", async () => {
   await withEmptyDataDir(async () => {
     await assert.rejects(
@@ -469,125 +375,52 @@ test("executeChatRequest validates when no validation result is supplied", async
   });
 });
 
-test("executeChatRequest rotates a failed custom proxy into the pool", async () => {
-  await withEmptyDataDir(async () => {
-    stateStore.resetForTests(); accountScheduler.resetForTests();
-    const account = await stateStore.addAccount({ email: "custom-request@example.com", password: "secret", models: ["test-model"], proxy: "http://custom.local:8080/" });
-    const originalProxy = account.proxy;
-    const [replacement] = await stateStore.importProxyPool([{ url: "http://replacement.local:8080/", kind: "http" }]);
-    await stateStore.updateSettings({ proxyPool: { autoRotateOnTransportError: true, retryCurrentRequestAfterRotation: true } });
-    const originalRequestChat = portalClient.requestChat; const originalCheckProxy = portalClient.checkProxy;
-    const proxies: Array<string | undefined> = [];
-    portalClient.checkProxy = async () => {};
-    portalClient.requestChat = (async (candidate) => {
-      proxies.push(candidate.proxy);
-      if (proxies.length === 1) throw new ProxyTransportError("offline");
-      return new Response(JSON.stringify({ choices: [{ index: 0, message: { role: "assistant", content: "ok" }, finish_reason: "stop" }] }), { status: 200, headers: { "Content-Type": "application/json" } });
-    }) as typeof portalClient.requestChat;
-    try {
-      const execution = await executeChatRequest(validRequest());
-      assert.equal(execution.message.content, "ok");
-      assert.deepEqual(proxies, [originalProxy, replacement?.entry.url]);
-      assert.equal((await stateStore.getAccount(account.id))?.proxyPoolEntryId, replacement?.entry.id);
-    } finally {
-      portalClient.requestChat = originalRequestChat; portalClient.checkProxy = originalCheckProxy;
-      accountScheduler.resetForTests(); stateStore.resetForTests();
-    }
-  });
-});
-
-test("executeChatRequest rotates one failed pool proxy and retries with the replacement", async () => {
+test("executeChatRequest excludes a failed fixed egress and schedules another account", async () => {
   await withEmptyDataDir(async () => {
     stateStore.resetForTests();
     accountScheduler.resetForTests();
-    const account = await stateStore.addAccount({ email: "rotate@example.com", password: "secret", models: ["test-model"] });
-    const [oldPool, newPool] = await stateStore.importProxyPool([
-      { url: "http://old.local:8080/", kind: "http" },
-      { url: "http://new.local:8080/", kind: "http" },
-    ]);
-    const bound = await stateStore.bindProxyPoolEntry(account.id, oldPool!.entry.id);
-    await stateStore.updateSettings({ proxyPool: { autoRotateOnTransportError: true, retryCurrentRequestAfterRotation: true } });
-
-    const originalRequestChat = portalClient.requestChat;
-    const originalCheckProxy = portalClient.checkProxy;
-    const originalRotate = proxyPoolService.rotate;
+    const failed = await stateStore.addAccount({
+      label: "failed egress",
+      models: ["test-model"],
+      proxy: "http://failed.local:8080/",
+    });
+    await stateStore.addAccount({ label: "direct fallback", models: ["test-model"] });
+    const originalChat = deepInfraClient.chat;
     const proxies: Array<string | undefined> = [];
-    let rotations = 0;
-    portalClient.checkProxy = async () => {};
-    portalClient.requestChat = (async (candidate) => {
-      proxies.push(candidate.proxy);
-      if (proxies.length === 1) throw new ProxyTransportError("proxy offline");
+    deepInfraClient.chat = (async (_body, _signal, proxy) => {
+      proxies.push(proxy);
+      if (proxy) throw new ProxyTransportError("fixed egress offline");
       return new Response(JSON.stringify({
         choices: [{ index: 0, message: { role: "assistant", content: "ok" }, finish_reason: "stop" }],
       }), { status: 200, headers: { "Content-Type": "application/json" } });
-    }) as typeof portalClient.requestChat;
-    proxyPoolService.rotate = (async (...args) => {
-      rotations += 1;
-      return originalRotate.apply(proxyPoolService, args);
-    }) as typeof proxyPoolService.rotate;
+    }) as typeof deepInfraClient.chat;
     try {
-      const execution = await executeChatRequest(validRequest());
+      const execution = await executeChatRequest(validRequest(), { requiredAccountId: failed.id });
       assert.equal(execution.message.content, "ok");
-      assert.deepEqual(proxies, [oldPool?.entry.url, newPool?.entry.url]);
-      assert.equal(rotations, 1);
-      assert.equal((await stateStore.getAccount(account.id))?.proxyPoolEntryId, newPool?.entry.id);
+      assert.deepEqual(proxies, ["http://failed.local:8080/", undefined]);
+      assert.equal((await stateStore.getAccount(failed.id))?.proxy, "http://failed.local:8080/");
+      assert.ok(accountScheduler.publicState(failed).runtime.cooldownUntil > 0);
     } finally {
-      portalClient.requestChat = originalRequestChat;
-      portalClient.checkProxy = originalCheckProxy;
-      proxyPoolService.rotate = originalRotate;
+      deepInfraClient.chat = originalChat;
       accountScheduler.resetForTests();
       stateStore.resetForTests();
     }
   });
 });
 
-test("executeChatRequest marks the replacement error without a second rotation", async () => {
+test("executeChatRequest does not rotate for a DeepInfra rate limit", async () => {
   await withEmptyDataDir(async () => {
     stateStore.resetForTests();
     accountScheduler.resetForTests();
-    const account = await stateStore.addAccount({ email: "twice@example.com", password: "secret", models: ["test-model"] });
-    const [oldPool, newPool] = await stateStore.importProxyPool([
-      { url: "http://old.local:8080/", kind: "http" },
-      { url: "http://new.local:8080/", kind: "http" },
-    ]);
-    await stateStore.bindProxyPoolEntry(account.id, oldPool!.entry.id);
-    await stateStore.updateSettings({ proxyPool: { autoRotateOnTransportError: true, retryCurrentRequestAfterRotation: true } });
-    const originalRequestChat = portalClient.requestChat;
-    const originalCheckProxy = portalClient.checkProxy;
-    const originalRotate = proxyPoolService.rotate;
-    let rotations = 0;
-    portalClient.checkProxy = async () => {};
-    portalClient.requestChat = (async () => { throw new ProxyTransportError("proxy offline"); }) as typeof portalClient.requestChat;
-    proxyPoolService.rotate = (async (...args) => { rotations += 1; return originalRotate.apply(proxyPoolService, args); }) as typeof proxyPoolService.rotate;
-    try {
-      await assert.rejects(executeChatRequest(validRequest()));
-      assert.equal(rotations, 1);
-      const current = await stateStore.getAccount(account.id);
-      assert.equal(current?.proxyPoolEntryId, newPool?.entry.id);
-      assert.equal((await stateStore.getProxyPoolEntry(newPool!.entry.id))?.lastError, "proxy offline");
-    } finally {
-      portalClient.requestChat = originalRequestChat;
-      portalClient.checkProxy = originalCheckProxy;
-      proxyPoolService.rotate = originalRotate;
-      accountScheduler.resetForTests();
-      stateStore.resetForTests();
-    }
-  });
-});
-
-test("executeChatRequest does not rotate for a portal rate limit", async () => {
-  await withEmptyDataDir(async () => {
-    stateStore.resetForTests();
-    accountScheduler.resetForTests();
-    const account = await stateStore.addAccount({ email: "rate@example.com", password: "secret", models: ["test-model"] });
+    const account = await stateStore.addAccount({ label: "rate@example.com", models: ["test-model"] });
     const [pool] = await stateStore.importProxyPool([{ url: "http://pool.local:8080/", kind: "http" }]);
     await stateStore.bindProxyPoolEntry(account.id, pool!.entry.id);
     await stateStore.updateSettings({ proxyPool: { autoRotateOnTransportError: true } });
 
-    const originalRequestChat = portalClient.requestChat;
+    const originalRequestChat = deepInfraClient.chat;
     const originalRotate = proxyPoolService.rotate;
     let rotations = 0;
-    portalClient.requestChat = (async () => { throw new PortalError("rate limited", 429); }) as typeof portalClient.requestChat;
+    deepInfraClient.chat = (async () => { throw new UpstreamError("rate limited", 429); }) as typeof deepInfraClient.chat;
     proxyPoolService.rotate = (async (...args) => {
       rotations += 1;
       return originalRotate.apply(proxyPoolService, args);
@@ -596,8 +429,83 @@ test("executeChatRequest does not rotate for a portal rate limit", async () => {
       await assert.rejects(executeChatRequest(validRequest()));
       assert.equal(rotations, 0);
     } finally {
-      portalClient.requestChat = originalRequestChat;
+      deepInfraClient.chat = originalRequestChat;
       proxyPoolService.rotate = originalRotate;
+      accountScheduler.resetForTests();
+      stateStore.resetForTests();
+    }
+  });
+});
+
+test("DeepInfra repairs native tool arguments that fail local schema validation", async () => {
+  await withEmptyDataDir(async () => {
+    stateStore.resetForTests();
+    accountScheduler.resetForTests();
+    await stateStore.addAccount({
+      label: "API repair",
+      models: ["test-model"],
+    });
+    const originalRequestChat = deepInfraClient.chat;
+    const requests: Array<Record<string, unknown>> = [];
+    deepInfraClient.chat = (async (body) => {
+      requests.push(body);
+      const argumentsValue = requests.length === 1
+        ? '{"params":"{\\"value\\":1}"}'
+        : '{"params":{"value":1}}';
+      return new Response(JSON.stringify({
+        id: `chatcmpl_${requests.length}`,
+        choices: [{
+          index: 0,
+          message: {
+            role: "assistant",
+            content: null,
+            tool_calls: [{
+              id: `call_${requests.length}`,
+              type: "function",
+              function: { name: "package_proxy", arguments: argumentsValue },
+            }],
+          },
+          finish_reason: "tool_calls",
+        }],
+        usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 },
+        cost: { request_cost_usd: 0.001, accounting_method: "energy" },
+        energy: { energy_kwh: 0.0001 },
+      }), { status: 200, headers: { "Content-Type": "application/json" } });
+    }) as typeof deepInfraClient.chat;
+    try {
+      const request = validRequest({
+        tools: [{
+          type: "function",
+          function: {
+            name: "package_proxy",
+            parameters: {
+              type: "object",
+              properties: {
+                params: {
+                  type: "object",
+                  properties: { value: { type: "integer" } },
+                  required: ["value"],
+                  additionalProperties: false,
+                },
+              },
+              required: ["params"],
+              additionalProperties: false,
+            },
+          },
+        }] as unknown as JsonValue,
+        tool_choice: "required",
+      });
+      const execution = await executeChatRequest(request);
+      assert.equal(requests.length, 2);
+      assert.deepEqual(JSON.parse(execution.message.tool_calls?.[0]?.function.arguments ?? ""), { params: { value: 1 } });
+      assert.equal(execution.toolCallAdapter?.initialOutcome, "invalid");
+      assert.equal(execution.toolCallAdapter?.finalOutcome, "tool_calls");
+      assert.equal(execution.toolCallAdapter?.repairAttempts, 1);
+      const repairMessages = requests[1]?.messages as ChatMessage[];
+      assert.deepEqual(repairMessages.map((message) => message.role), ["user", "assistant", "tool", "user"]);
+      assert.match(String(repairMessages.at(-1)?.content), /preserve JSON types/);
+    } finally {
+      deepInfraClient.chat = originalRequestChat;
       accountScheduler.resetForTests();
       stateStore.resetForTests();
     }
@@ -700,51 +608,6 @@ test("located schema errors include the offending source position", () => {
   assert.match(text, /\/query/);
   assert.match(text, /line 1, column 11/);
   assert.match(text, /must be string/);
-});
-
-test("isThinkingInterrupted only accepts a length stop with empty content and reasoning", () => {
-  const completion = (message: JsonObject, finishReason: string | null): UpstreamCompletion => ({
-    choices: [{ index: 0, message, finish_reason: finishReason }],
-  } as unknown as UpstreamCompletion);
-
-  // Reasoning cut off mid-thought: continued.
-  assert.equal(isThinkingInterrupted(completion(
-    { role: "assistant", content: "", reasoning: "partial thought" },
-    "length",
-  )), true);
-  assert.equal(isThinkingInterrupted(completion(
-    { role: "assistant", content: null, reasoning_content: "partial thought" },
-    "length",
-  )), true);
-
-  // No reasoning to continue from.
-  assert.equal(isThinkingInterrupted(completion(
-    { role: "assistant", content: "" },
-    "length",
-  )), false);
-
-  // A truncated non-empty answer is returned as-is, not continued.
-  assert.equal(isThinkingInterrupted(completion(
-    { role: "assistant", content: "partial answer", reasoning: "thought" },
-    "length",
-  )), false);
-
-  // A natural stop is not an interruption.
-  assert.equal(isThinkingInterrupted(completion(
-    { role: "assistant", content: "", reasoning: "thought" },
-    "stop",
-  )), false);
-
-  // Native tool calls already produced output.
-  assert.equal(isThinkingInterrupted(completion(
-    {
-      role: "assistant",
-      content: "",
-      reasoning: "thought",
-      tool_calls: [{ id: "call_1", type: "function", function: { name: "lookup", arguments: "{}" } }],
-    },
-    "length",
-  )), false);
 });
 
 const lookupTool: ToolDefinition = {

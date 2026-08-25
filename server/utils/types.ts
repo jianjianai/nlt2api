@@ -59,6 +59,23 @@ export interface UpstreamChoice {
   [key: string]: JsonValue | ChatMessage | undefined;
 }
 
+export interface UpstreamEnergy {
+  energy_joules?: number;
+  energy_kwh?: number;
+  energy_kwh_charged?: number;
+  pricing_multiplier?: number;
+  attribution_method?: string;
+  [key: string]: JsonValue | undefined;
+}
+
+export interface UpstreamCost {
+  request_cost_usd?: number;
+  cache_savings_usd?: number;
+  allowance_remaining_usd?: number;
+  accounting_method?: "energy" | "token";
+  [key: string]: JsonValue | undefined;
+}
+
 export interface UpstreamCompletion {
   id?: string;
   object?: string;
@@ -66,7 +83,11 @@ export interface UpstreamCompletion {
   model?: string;
   choices?: UpstreamChoice[];
   usage?: UpstreamUsage;
-  [key: string]: JsonValue | UpstreamChoice[] | UpstreamUsage | undefined;
+  energy?: UpstreamEnergy;
+  cost?: UpstreamCost;
+  service_tier?: string;
+  system_fingerprint?: string;
+  [key: string]: JsonValue | UpstreamChoice[] | UpstreamUsage | UpstreamEnergy | UpstreamCost | undefined;
 }
 
 export interface PortalSession {
@@ -172,8 +193,6 @@ export type ResponseAccessScope =
 export interface ManagedAccount {
   id: string;
   label: string;
-  email: string;
-  password: string;
   enabled: boolean;
   weight: number;
   /** Optional per-account egress proxy URL (http/https/socks4/socks5). */
@@ -182,10 +201,9 @@ export interface ManagedAccount {
   proxyPoolEntryId?: string;
   /** Groups allowed to schedule this account. Capacity remains account-global. */
   groupIds: string[];
-  /** Model ids this account can serve, fetched from the portal playground. */
+  /** Anonymous DeepInfra model ids available through this egress. */
   models: string[];
   schedulerOverrides?: AccountSchedulerOverrides;
-  session?: PortalSession;
   createdAt: string;
   updatedAt: string;
 }
@@ -198,7 +216,7 @@ export interface ProxySettings {
   minimumOutputTokens?: number;
   /**
    * Global default tool-call wire format offered to upstream models.
-   * Per-model overrides win; falls back to NEURALWATT_TOOL_CALL_FORMAT.
+   * Per-model overrides win; falls back to DEEPINFRA_GATEWAY_TOOL_CALL_FORMAT.
    */
   toolCallFormat?: "auto" | "json" | "xml";
   /** Per-model tool-call wire-format overrides, keyed by model id. */
@@ -207,13 +225,13 @@ export interface ProxySettings {
   modelPreambleVerbosities?: Record<string, "quiet" | "normal" | "verbose" | "milestone">;
   /**
    * How readily the contract asks the model for user-visible preambles.
-   * Falls back to NEURALWATT_PREAMBLE_VERBOSITY.
+   * Falls back to DEEPINFRA_GATEWAY_PREAMBLE_VERBOSITY.
    */
   preambleVerbosity?: "quiet" | "normal" | "verbose" | "milestone";
 }
 
 export interface PersistentState {
-  version: 2;
+  version: 3;
   settings: ProxySettings;
   accounts: ManagedAccount[];
   proxyPool: ProxyPoolEntry[];
@@ -237,8 +255,6 @@ export interface AccountRuntimeState {
 export interface PublicAccount {
   id: string;
   label: string;
-  email: string;
-  password: string;
   enabled: boolean;
   weight: number;
   proxy: string | null;
@@ -246,8 +262,6 @@ export interface PublicAccount {
   groupIds: string[];
   models: string[];
   schedulerOverrides?: AccountSchedulerOverrides;
-  hasSession: boolean;
-  sessionExpiresAt: number | null;
   createdAt: string;
   updatedAt: string;
   runtime: AccountRuntimeState;

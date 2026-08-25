@@ -33,10 +33,10 @@ import {
 } from "../server/utils/upstream-stream.ts";
 import { redact } from "../server/utils/redaction.ts";
 import {
-  MAX_PORTAL_CHAT_ATTEMPTS,
-  portalRetryDelayMs,
-  retryablePortalError,
-  retryablePortalStatus,
+  MAX_UPSTREAM_CHAT_ATTEMPTS,
+  upstreamRetryDelayMs,
+  retryableUpstreamError,
+  retryableUpstreamStatus,
 } from "../server/utils/upstream-retry.ts";
 
 const tools = [{
@@ -845,19 +845,19 @@ test("compiled JSON Schema caches stay bounded", () => {
   }
 });
 
-test("portal retry policy retries transient failures without retrying rate limits", () => {
-  assert.equal(MAX_PORTAL_CHAT_ATTEMPTS, 3);
-  assert.equal(retryablePortalStatus(408), true);
-  assert.equal(retryablePortalStatus(425), true);
-  assert.equal(retryablePortalStatus(500), true);
-  assert.equal(retryablePortalStatus(429), false);
-  assert.equal(retryablePortalStatus(400), false);
-  assert.equal(retryablePortalError(new TypeError("fetch failed")), true);
-  assert.equal(retryablePortalError({ status: 504 }), true);
-  assert.equal(retryablePortalError({ status: 429 }), false);
-  assert.equal(portalRetryDelayMs(1), 100);
-  assert.equal(portalRetryDelayMs(2), 200);
-  assert.equal(portalRetryDelayMs(99), 2_000);
+test("upstream retry policy retries transient failures without retrying rate limits", () => {
+  assert.equal(MAX_UPSTREAM_CHAT_ATTEMPTS, 3);
+  assert.equal(retryableUpstreamStatus(408), true);
+  assert.equal(retryableUpstreamStatus(425), true);
+  assert.equal(retryableUpstreamStatus(500), true);
+  assert.equal(retryableUpstreamStatus(429), false);
+  assert.equal(retryableUpstreamStatus(400), false);
+  assert.equal(retryableUpstreamError(new TypeError("fetch failed")), true);
+  assert.equal(retryableUpstreamError({ status: 504 }), true);
+  assert.equal(retryableUpstreamError({ status: 429 }), false);
+  assert.equal(upstreamRetryDelayMs(1), 100);
+  assert.equal(upstreamRetryDelayMs(2), 200);
+  assert.equal(upstreamRetryDelayMs(99), 2_000);
 });
 
 test("fragmented upstream SSE is assembled without losing deltas", async () => {
@@ -883,6 +883,25 @@ test("fragmented upstream SSE is assembled without losing deltas", async () => {
   assert.equal(collected.completion.choices?.[0]?.message?.content, "hello");
   assert.equal(collected.completion.choices?.[0]?.finish_reason, "stop");
   assert.equal(collected.completion.usage?.total_tokens, 5);
+});
+
+test("upstream SSE preserves authoritative energy and cost comments", async () => {
+  const stream = new ReadableStream<Uint8Array>({
+    start(controller) {
+      const encoder = new TextEncoder();
+      controller.enqueue(encoder.encode(': energy {"energy_kwh":0.000012,"energy_kwh_charged":0.0000078}\n\n'));
+      controller.enqueue(encoder.encode('data: {"id":"chatcmpl-energy","choices":[{"delta":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":2,"total_tokens":12}}\n\n'));
+      controller.enqueue(encoder.encode(': cost {"request_cost_usd":0.000078,"allowance_remaining_usd":5.999922,"accounting_method":"energy"}\n\n'));
+      controller.enqueue(encoder.encode(': routing {"service_tier":"flex"}\n\ndata: [DONE]\n\n'));
+      controller.close();
+    },
+  });
+  const collected = await collectUpstreamStream(new Response(stream));
+  assert.equal(collected.completion.energy?.energy_kwh, 0.000012);
+  assert.equal(collected.completion.energy?.energy_kwh_charged, 0.0000078);
+  assert.equal(collected.completion.cost?.request_cost_usd, 0.000078);
+  assert.equal(collected.completion.cost?.accounting_method, "energy");
+  assert.equal(collected.completion.service_tier, "flex");
 });
 
 test("streaming SSE writes its first event before the producer finishes", async () => {

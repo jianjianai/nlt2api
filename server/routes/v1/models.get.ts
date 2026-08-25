@@ -1,5 +1,6 @@
 import { defineHandler } from "nitro";
 import { jsonResponse, openAIErrorResponse, requireClientAuth } from "~/server/utils/http.ts";
+import { publicModelId } from "~/server/utils/model-id.ts";
 import { stateStore } from "~/server/utils/state-store.ts";
 import { upstreamHttpError } from "~/server/utils/route-helpers.ts";
 
@@ -8,7 +9,7 @@ function asModel(id: string) {
     id,
     object: "model",
     created: 0,
-    owned_by: "neuralwatt",
+    owned_by: "deepinfra",
   };
 }
 
@@ -21,7 +22,7 @@ export default defineHandler(async (event) => {
     const ids = new Set<string>();
     for (const account of accounts) {
       for (const model of account.models) {
-        ids.add(model);
+        ids.add(publicModelId(model));
       }
     }
     const models = [...ids].sort().map(asModel);

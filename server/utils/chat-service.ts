@@ -11,7 +11,9 @@ import {
   validateSchemaDefinition,
   type LocatedSchemaValidationResult,
 } from "~/server/utils/json-schema.ts";
-import { portalClient, PortalError, readPortalJsonBody, retryAfterSeconds } from "~/server/utils/portal-client.ts";
+import { deepInfraClient } from "~/server/utils/deepinfra-client.ts";
+import { finishUpstreamResponse, readUpstreamJsonBody, retryAfterSeconds, UpstreamError } from "~/server/utils/upstream-http.ts";
+import { modelIdMatches, publicModelId, upstreamModelId } from "~/server/utils/model-id.ts";
 import { proxyPoolService } from "~/server/utils/proxy-pool.ts";
 import { egressIdentity, ProxyTransportError } from "~/server/utils/proxy.ts";
 import { ProxyRequestError, type RequestDebugContext } from "~/server/utils/request-errors.ts";
@@ -21,18 +23,12 @@ import {
   FINAL_REPLY_MARKER,
   InvalidStructuredToolCallsError,
   type ReasoningFields,
-  stripRepairReasoning,
-  tagRepairReasoning,
-  buildToolRepairHistory,
   envelopeAllowedForToolChoice,
   isValidToolCallId,
   normaliseAssistantToolCalls,
-  mergeSystemMessages,
   parseControlledToolEnvelopeDetailed,
   parseRepairJson,
-  serializeAssistantToolCallsForPortal,
-  withToolCallContract,
-  type PreambleVerbosity,
+  tagRepairReasoning,
   type ToolCallFormat,
 } from "~/server/utils/tool-calls.ts";
 import {
@@ -60,13 +56,6 @@ const MAX_TOOL_DEFINITION_BYTES = 1024 * 1024;
 const MAX_TOOL_ARGUMENT_BYTES = 64 * 1024;
 const MAX_TOOL_RESULT_BYTES = 256 * 1024;
 const DEFAULT_OUTPUT_TOKENS = 8_192;
-// The Playground currently rejects max_tokens above 8,192 even for models
-// whose context window is much larger. Larger client budgets are fulfilled by
-// bounded continuation rounds below, but only when the upstream was cut off
-// while still thinking (finish_reason "length" with empty content). A
-// truncated non-empty answer is returned as-is with finish_reason "length".
-const PORTAL_MAX_OUTPUT_TOKENS = 8_192;
-const MAX_CONTINUATION_ROUNDS = 16;
 const MAX_TOOL_REPAIR_ATTEMPTS = 5;
 const MAX_TOOL_REPAIR_CANDIDATE_CHARS = 131_072;
 // From this attempt on, the correction carries a prefill skeleton: static
@@ -140,7 +129,7 @@ function parseMessages(value: unknown): ChatMessage[] {
   if (value.length > maxMessages) {
     // 413, not 400: the request is well-formed but exceeds a server payload
     // limit, matching the body-size handling in http.ts.
-    throw new HttpError(413, `\`messages\` exceeds the supported history limit (limit ${maxMessages} messages; raise NEURALWATT_MAX_CHAT_MESSAGES).`, "invalid_request_error", "messages");
+    throw new HttpError(413, `\`messages\` exceeds the supported history limit (limit ${maxMessages} messages; raise DEEPINFRA_GATEWAY_MAX_CHAT_MESSAGES).`, "invalid_request_error", "messages");
   }
 
   return value.map((raw, index) => {
@@ -159,7 +148,12 @@ function parseMessages(value: unknown): ChatMessage[] {
         throw new HttpError(400, `messages[${index}].content exceeds the ${MAX_TOOL_RESULT_BYTES} byte tool-result limit.`, "invalid_request_error", "messages");
       }
     }
-    return message as ChatMessage;
+    const normalized = message as ChatMessage;
+    if (role === "assistant" && Array.isArray(normalized.tool_calls)) {
+      // Validate history tool-call structure before any upstream work.
+      normaliseAssistantToolCalls(normalized, [], "history");
+    }
+    return normalized;
   });
 }
 
@@ -226,12 +220,12 @@ function validateToolChoice(value: unknown, tools: ToolDefinition[]): void {
 export function modelFromRequest(request: JsonObject): string {
   const model = request.model;
   if (model === undefined || model === null || model === "") {
-    return getProxyConfig().defaultModel;
+    return publicModelId(getProxyConfig().defaultModel);
   }
   if (typeof model !== "string" || model.length > 200) {
     throw new HttpError(400, "`model` must be a string.", "invalid_request_error", "model");
   }
-  return model;
+  return publicModelId(model);
 }
 
 function validateTokenLimit(request: JsonObject): number | undefined {
@@ -267,60 +261,25 @@ export interface ValidatedChatRequest {
   model: string;
   messages: ChatMessage[];
   tools: ToolDefinition[];
-  /** The policy the contract was applied with; repair re-encoding reuses it. */
-  toolCallPolicy: ToolCallPolicy;
-  /**
-   * Portal-ready messages built during validation (contract applied, system
-   * messages merged, schemas serialized). Execution reuses them instead of
-   * re-running the message pipeline; the only stream-dependent output of the
-   * builder is the body's `stream` flag.
-   */
-  upstreamMessages: ChatMessage[];
 }
 
-/**
- * The effective tool-call contract policy for one request: which envelope
- * wire format the contract offers and how readily it asks for preambles.
- */
-export interface ToolCallPolicy {
-  format: ToolCallFormat;
-  preambleVerbosity: PreambleVerbosity;
-}
-
-/** The env-configured policy, used when no admin setting overrides it. */
-function envToolCallPolicy(): ToolCallPolicy {
-  const config = getProxyConfig();
-  return { format: config.toolCallFormat, preambleVerbosity: config.preambleVerbosity };
-}
-
-/**
- * Resolve the effective policy for one model: per-model override first, then
- * the global admin setting, then the env config.
- */
-export async function resolveToolCallPolicy(model: string): Promise<ToolCallPolicy> {
-  const settings = await stateStore.getSettings();
-  const env = envToolCallPolicy();
-  return {
-    format: settings.modelToolCallFormats?.[model] ?? settings.toolCallFormat ?? env.format,
-    preambleVerbosity: settings.modelPreambleVerbosities?.[model] ?? settings.preambleVerbosity ?? env.preambleVerbosity,
-  };
-}
-
-export function validateChatRequest(request: JsonObject, toolCallPolicy?: ToolCallPolicy): ValidatedChatRequest {
+export function validateChatRequest(request: JsonObject): ValidatedChatRequest {
   const model = modelFromRequest(request);
   if (request.stream !== undefined && typeof request.stream !== "boolean") {
     throw new HttpError(400, "`stream` must be a boolean.", "invalid_request_error", "stream");
   }
   validateSampling(request);
+  validateTokenLimit(request);
   const tools = parseTools(request.tools);
   const messages = parseMessages(request.messages);
   validateToolChoice(request.tool_choice, tools);
-  if (request.n !== undefined && request.n !== 1) {
-    throw new HttpError(400, "Only n=1 is supported by the portal adapter.", "invalid_request_error", "n");
+  if (request.parallel_tool_calls !== undefined && typeof request.parallel_tool_calls !== "boolean") {
+    throw new HttpError(400, "`parallel_tool_calls` must be a boolean.", "invalid_request_error", "parallel_tool_calls");
   }
-  const policy = toolCallPolicy ?? envToolCallPolicy();
-  const built = upstreamBody(request, model, messages, tools, false, undefined, policy);
-  return { model, messages, tools, toolCallPolicy: policy, upstreamMessages: built.messages };
+  if (request.n !== undefined && request.n !== 1) {
+    throw new HttpError(400, "Only n=1 is supported by the DeepInfra adapter.", "invalid_request_error", "n");
+  }
+  return { model, messages, tools };
 }
 
 /**
@@ -334,111 +293,75 @@ export async function assertModelSupported(model: string, groupId?: string): Pro
     .filter((account) => account.enabled)
     .filter((account) => !groupId || account.groupIds.includes(groupId));
   if (enabled.length === 0) {
-    throw new HttpError(503, "No enabled NeuralWatt account is currently available.", "server_error", undefined, "no_account_available");
+    throw new HttpError(503, "No enabled DeepInfra account is currently available.", "server_error", undefined, "no_account_available");
   }
-  if (!enabled.some((account) => account.models.includes(model))) {
+  if (!enabled.some((account) => account.models.some((candidate) => modelIdMatches(candidate, model)))) {
     throw new HttpError(404, `The model '${model}' is not supported by any enabled account.`, "invalid_request_error", "model", "model_not_supported");
   }
 }
 
-function portalMessages(messages: ChatMessage[], markFinalReplies = false, toolCallFormat: ToolCallFormat = "json"): ChatMessage[] {
-  // The Playground currently rejects the OpenAI `developer` role. Map it to
-  // system, then normalize all system instructions into one message at index 0.
-  const mapped = messages.map((message) => {
-    const normalized = message.role === "developer" ? { ...message, role: "system" as const } : { ...message };
-    for (const field of ["reasoning", "reasoning_content"] as const) {
-      if (typeof normalized[field] === "string") {
-        const cleaned = stripRepairReasoning(normalized[field]);
-        if (cleaned) normalized[field] = cleaned;
-        else delete normalized[field];
-      }
-    }
-    if (
-      markFinalReplies
-      && normalized.role === "assistant"
-      && typeof normalized.content === "string"
-      && normalized.content.length > 0
-      && !normalized.content.startsWith(FINAL_REPLY_MARKER)
-      && !normalized.tool_calls?.length
-    ) {
-      return { ...normalized, content: `${FINAL_REPLY_MARKER}${normalized.content}` };
-    }
-    return normalized;
-  });
-  return mergeSystemMessages(serializeAssistantToolCallsForPortal(mapped, toolCallFormat));
+/**
+ * Sampling fields accepted by DeepInfra's OpenAI-compatible endpoint.
+ * `min_p` and `logit_bias` are deliberately absent: speculative decoding
+ * rejects them upstream with HTTP 422.
+ */
+const DEEPINFRA_EXTRA_FIELDS = [
+  "top_k",
+  "presence_penalty",
+  "frequency_penalty",
+  "repetition_penalty",
+  "n",
+  "logprobs",
+  "echo",
+  "prompt_cache_key", "prompt_cache_options",
+];
+
+function promptCacheKey(request: JsonObject, messages: ChatMessage[], tools: ToolDefinition[]): string | undefined {
+  if (typeof request.prompt_cache_key === "string" && request.prompt_cache_key.trim()) {
+    return request.prompt_cache_key.trim().slice(0, 256);
+  }
+  const stablePrefix = messages.filter((message) => message.role === "system" || message.role === "developer");
+  if (stablePrefix.length === 0) return undefined;
+  const fingerprint = createHash("sha256")
+    .update(JSON.stringify({ messages: stablePrefix, tools }), "utf8")
+    .digest("hex")
+    .slice(0, 32);
+  return `deepinfra:${fingerprint}`;
 }
 
-function upstreamBody(
+function deepInfraBody(
   request: JsonObject,
   model: string,
   messages: ChatMessage[],
   tools: ToolDefinition[],
   stream: boolean,
-  prebuiltMessages?: ChatMessage[],
-  toolCallPolicy?: ToolCallPolicy,
-  minimumOutputTokens = getProxyConfig().minimumOutputTokens,
-): { body: JsonObject; messages: ChatMessage[] } {
-  const toolChoice = request.tool_choice;
-  const toolTurn = tools.length > 0 && toolChoice !== "none";
-  const parallelToolCalls = request.parallel_tool_calls === undefined ? true : request.parallel_tool_calls;
-  if (typeof parallelToolCalls !== "boolean") {
-    throw new HttpError(400, "`parallel_tool_calls` must be a boolean.", "invalid_request_error", "parallel_tool_calls");
-  }
+): JsonObject {
   const accepted = [
-    "temperature",
-    "top_p",
-    "stop",
-    "seed",
-    "reasoning_effort",
-    "thinking_token_budget",
-    "chat_template_kwargs",
-    "parallel_tool_calls",
+    "temperature", "top_p", "stop", "seed", "reasoning_effort", "response_format",
+    "parallel_tool_calls", "tool_choice", "user", "metadata",
+    ...DEEPINFRA_EXTRA_FIELDS,
   ];
-  // Validation already ran the message pipeline (contract application, system
-  // merge, schema serialization); only the scalar body fields, including
-  // `stream`, are rebuilt per execution.
-  const policy = toolCallPolicy ?? envToolCallPolicy();
-  const upstreamMessages = prebuiltMessages ?? (toolTurn
-    ? withToolCallContract(
-      portalMessages(messages, true, policy.format),
-      tools,
-      toolChoice,
-      parallelToolCalls,
-      policy.format,
-      policy.preambleVerbosity,
-    )
-    : portalMessages(messages, false));
   const body: JsonObject = {
-    model,
-    messages: upstreamMessages as unknown as JsonValue,
+    model: publicModelId(model),
+    messages: messages.map((message) => ({ ...message })) as unknown as JsonValue,
     stream,
+    ...(promptCacheKey(request, messages, tools) ? { prompt_cache_key: promptCacheKey(request, messages, tools) } : {}),
   };
   for (const field of accepted) {
-    if (request[field] !== undefined) {
-      body[field] = request[field];
-    }
+    if (request[field] !== undefined) body[field] = request[field];
   }
-  // The Playground otherwise applies its conversational sampling default.
-  // Tool turns are protocol work, so use deterministic sampling unless the
-  // OpenAI client explicitly selected a temperature.
-  if (toolTurn && request.temperature === undefined) {
-    body.temperature = 0;
+  if (tools.length > 0) body.tools = tools as unknown as JsonValue;
+  const budget = validateTokenLimit(request);
+  if (budget !== undefined) body.max_tokens = budget;
+  // `stream_options` is only legal alongside `stream: true`; DeepInfra returns 422 otherwise.
+  if (stream) {
+    body.stream_options = { include_usage: true, continuous_usage_stats: true };
   }
-  body.max_tokens = resolvePortalOutputBudget(request, minimumOutputTokens);
-  if (!toolTurn && request.response_format !== undefined) {
-    body.response_format = request.response_format;
-  }
-  return { body, messages: upstreamMessages };
+  return body;
 }
 
-/** Resolve one portal round without changing the client-visible requested budget. */
-export function resolvePortalOutputBudget(request: JsonObject, minimumOutputTokens: number): number {
-  const requested = validateTokenLimit(request) ?? Math.min(DEFAULT_OUTPUT_TOKENS, getProxyConfig().maxOutputTokens);
-  return Math.min(Math.max(requested, minimumOutputTokens), PORTAL_MAX_OUTPUT_TOKENS);
-}
-
-async function parsePortalError(response: Response): Promise<{ error: PortalError; payload?: JsonObject; raw: string }> {
-  const body = await readPortalJsonBody(response);
+async function parseUpstreamError(response: Response): Promise<{ error: UpstreamError; payload?: JsonObject; raw: string }> {
+  const body = await readUpstreamJsonBody(response);
   const payload = body.valid ? asRecord(body.value) : undefined;
   const error = asRecord(payload?.error);
   const message = typeof payload?.error === "string"
@@ -447,14 +370,14 @@ async function parsePortalError(response: Response): Promise<{ error: PortalErro
       ? error.message
       : typeof payload?.detail === "string"
         ? payload.detail
-        : `Portal request failed with HTTP ${response.status}.`;
+        : `DeepInfra request failed with HTTP ${response.status}.`;
   const retryValue = error?.retry_after ?? payload?.retry_after;
   const bodyRetryAfter = typeof retryValue === "number" && Number.isFinite(retryValue) && retryValue > 0
     ? Math.min(retryValue, 86_400)
     : undefined;
   const retryAfter = retryAfterSeconds(response) ?? bodyRetryAfter;
   return {
-    error: new PortalError(message, response.status, retryAfter, payload as JsonObject | undefined),
+    error: new UpstreamError(message, response.status, retryAfter, payload as JsonObject | undefined),
     raw: body.raw,
     ...(payload ? { payload: payload as JsonObject } : {}),
   };
@@ -464,7 +387,7 @@ function countsAgainstAccount(status: number): boolean {
   return status === 401 || status === 403 || status === 408 || status === 425 || status === 429 || status >= 500;
 }
 
-const MODEL_CAPACITY_PATTERN = /(?:concurrent(?:cy)?[_ -]?(?:limit|slots?)|slots?\s+in\s+use|\d+\/\d+\s+slots?)/i;
+const MODEL_CAPACITY_PATTERN = /(?:concurrent(?:cy)?[_ -]?(?:limit|slots?)|slots?\s+in\s+use|model\s+busy|busy,?\s+retry\s+later|\d+\/\d+\s+slots?)/i;;
 
 function structuredCapacitySignal(value: unknown): boolean {
   if (typeof value === "string") return MODEL_CAPACITY_PATTERN.test(value);
@@ -474,11 +397,11 @@ function structuredCapacitySignal(value: unknown): boolean {
     MODEL_CAPACITY_PATTERN.test(key) || structuredCapacitySignal(entry));
 }
 
-export function isModelCapacityError(error: PortalError): boolean {
+export function isModelCapacityError(error: UpstreamError): boolean {
   return structuredCapacitySignal(error.payload) || MODEL_CAPACITY_PATTERN.test(error.message);
 }
 
-function markCapacityFailure(accountId: string, model: string, error: PortalError, admissionSequence: number): void {
+function markCapacityFailure(accountId: string, model: string, error: UpstreamError, admissionSequence: number): void {
   if (isModelCapacityError(error)) {
     accountScheduler.markModelCapacityFailure(
       accountId,
@@ -496,6 +419,16 @@ function isAbortError(error: unknown): boolean {
   return error instanceof DOMException && error.name === "AbortError";
 }
 
+/**
+ * Whether the upstream reports authoritative billing for its own request.
+ * DeepInfra's free line returns only an `estimated_cost` derived from the public
+ * price list, so treating it as authoritative would book estimates as real spend.
+ */
+function billingAuthoritative(): boolean {
+  // The anonymous web route reports estimates, not an authoritative billed amount.
+  return false;
+}
+
 async function getCompletion(
   body: JsonObject,
   stickyKey?: string,
@@ -508,7 +441,7 @@ async function getCompletion(
   analytics?: UsageExecutionTracker,
 ): Promise<{ account: ManagedAccount; completion: UpstreamCompletion; receivedSse: boolean }> {
   const excluded = new Set<string>();
-  let lastError: PortalError | undefined;
+  let lastError: UpstreamError | undefined;
   let lastContext: RequestDebugContext = {
     upstreamRequest: body,
     ...(trace ? { upstreamCalls: trace.calls } : {}),
@@ -548,18 +481,24 @@ async function getCompletion(
       if (lastError) {
         throw new ProxyRequestError(lastError, lastContext);
       }
-      throw new HttpError(503, "No enabled NeuralWatt account is currently available.", "server_error", undefined, "no_account_available");
+      throw new HttpError(503, "No enabled DeepInfra account is currently available.", "server_error", undefined, "no_account_available");
     }
     const account = lease.account;
-
+    const resolvedModel = upstreamModelId(account, model);
+    if (!resolvedModel) {
+      lease.release();
+      excluded.add(account.id);
+      continue;
+    }
+    const upstreamBodyForAccount: JsonObject = { ...body, model: resolvedModel };
     const currentContext: RequestDebugContext = {
       accountId: account.id,
       accountLabel: account.label,
-      upstreamRequest: body,
+      upstreamRequest: upstreamBodyForAccount,
       ...(trace ? { upstreamCalls: trace.calls } : {}),
     };
     let debugCall: DebugUpstreamCall | undefined = trace
-      ? createDebugCall(trace, account, body)
+      ? createDebugCall(trace, account, upstreamBodyForAccount)
       : undefined;
     debugCall && trace!.calls.push(debugCall);
     let streamedOutput = false;
@@ -569,9 +508,24 @@ async function getCompletion(
       model,
       accountId: account.id,
       egressHash: egressIdentity(account.proxy).id,
+      billingAuthoritative: billingAuthoritative(),
     });
-    const finishAnalyticsAttempt = (status: number, outcome: "success" | "failure" | "aborted", usage?: UpstreamUsage): void => {
-      analytics?.finishAttempt(analyticsAttempt, { status, outcome, usage });
+    const finishAnalyticsAttempt = (
+      status: number,
+      outcome: "success" | "failure" | "aborted",
+      usage?: UpstreamUsage,
+      completion?: UpstreamCompletion,
+    ): void => {
+      analytics?.finishAttempt(analyticsAttempt, {
+        status,
+        outcome,
+        usage,
+        billing: completion ? {
+          energy: completion.energy,
+          cost: completion.cost,
+          serviceTier: completion.service_tier,
+        } : undefined,
+      });
       analyticsAttempt = undefined;
     };
     const startRetryAnalyticsAttempt = (): void => {
@@ -580,6 +534,7 @@ async function getCompletion(
         model,
         accountId: account.id,
         egressHash: egressIdentity(account.proxy).id,
+        billingAuthoritative: billingAuthoritative(),
       });
     };
     let receivedSse = false;
@@ -588,10 +543,10 @@ async function getCompletion(
       if (signal?.aborted) {
         throw new ClientDisconnectedError();
       }
-      const response = await portalClient.requestChat(
-        account,
-        body as Record<string, unknown>,
+      const response = await deepInfraClient.chat(
+        upstreamBodyForAccount,
         signal,
+        account.proxy,
         trace
           ? async (retry) => {
             finishAnalyticsAttempt(retry.status, "failure");
@@ -605,7 +560,7 @@ async function getCompletion(
               if (retry.error) {
                 debugCall.error = retry.error;
               }
-              debugCall = createDebugCall(trace, account, body);
+              debugCall = createDebugCall(trace, account, upstreamBodyForAccount);
               trace.calls.push(debugCall);
             }
             // The failed attempt consumed RPM but no longer needs a
@@ -629,7 +584,7 @@ async function getCompletion(
       const contentType = response.headers.get("content-type")?.toLowerCase() ?? "";
       debugCall && (debugCall.responseStatus = response.status);
       if (!response.ok) {
-        const parsed = await parsePortalError(response);
+        const parsed = await parseUpstreamError(response);
         currentContext.upstreamResponse = parsed.payload;
         if (debugCall) {
           debugCall.response = responseDebugBody(parsed.raw, contentType);
@@ -655,7 +610,7 @@ async function getCompletion(
             }
           }, getProxyConfig().maxUpstreamBytes);
         } finally {
-          portalClient.finishResponse(response);
+          finishUpstreamResponse(response);
         }
         completion = collected.completion;
         payload = asRecord(completion);
@@ -663,7 +618,7 @@ async function getCompletion(
           debugCall.response = responseDebugBody(collected.raw, contentType);
         }
       } else {
-        const parsed = await readPortalJsonBody(response);
+        const parsed = await readUpstreamJsonBody(response);
         if (debugCall) {
           debugCall.response = responseDebugBody(parsed.raw, contentType);
         }
@@ -673,7 +628,7 @@ async function getCompletion(
       currentContext.upstreamResponse = payload as JsonObject | undefined;
       observedAttemptUsage = completion?.usage;
       if (!payload) {
-        throw new PortalError("The NeuralWatt portal returned a non-object completion.", 502);
+        throw new UpstreamError("DeepInfra returned a non-object completion.", 502);
       }
       const embeddedError = asRecord(completion.error);
       if (embeddedError || typeof completion.error === "string") {
@@ -681,12 +636,12 @@ async function getCompletion(
           ? completion.error
           : typeof embeddedError?.message === "string"
             ? embeddedError.message
-            : "Portal returned a streaming-style error payload.";
+            : "DeepInfra returned a streaming-style error payload.";
         const embeddedStatus = typeof completion.status === "number" ? completion.status : 502;
         const errorPayload: JsonObject = embeddedError
           ? { error: embeddedError as JsonObject }
           : { error: String(completion.error) };
-        throw new PortalError(message, embeddedStatus, undefined, errorPayload);
+        throw new UpstreamError(message, embeddedStatus, undefined, errorPayload);
       }
       const choices = Array.isArray(completion.choices) ? completion.choices : [];
       const choice = asRecord(choices[0]);
@@ -695,13 +650,13 @@ async function getCompletion(
       const hasStructuredCalls = Array.isArray(message?.tool_calls) && message.tool_calls.length > 0;
       const hasRepairableEmptyContent = allowEmptyContent && (content === null || content === undefined);
       if (!choice || !message || (typeof content !== "string" && !hasStructuredCalls && !hasRepairableEmptyContent)) {
-        throw new PortalError("The NeuralWatt portal returned an invalid completion shape.", 502);
+        throw new UpstreamError("DeepInfra returned an invalid completion shape.", 502);
       }
-      finishAnalyticsAttempt(response.status, "success", observedAttemptUsage);
+      finishAnalyticsAttempt(response.status, "success", observedAttemptUsage, completion);
       accountScheduler.markSuccess(account.id, lease.admissionSequence);
       return { account, completion, receivedSse };
     } catch (error) {
-      const attemptStatus = error instanceof PortalError || error instanceof UpstreamStreamError
+      const attemptStatus = error instanceof UpstreamError || error instanceof UpstreamStreamError
         ? error.status
         : error instanceof ClientDisconnectedError || signal?.aborted || isAbortError(error)
           ? 499
@@ -717,24 +672,14 @@ async function getCompletion(
       }
       if (error instanceof ProxyTransportError) {
         if (debugCall && !debugCall.error) debugCall.error = error.message;
-        if (rotationAttempted) {
-          await proxyPoolService.markBoundProxyError(account, error);
-          throw new ProxyRequestError(error, currentContext);
-        }
-        const rotated = account.proxyPoolEntryId
-          ? await proxyPoolService.rotate(account.id, account.proxyPoolEntryId, error, signal)
-          : account.proxy
-            ? await proxyPoolService.rotateCustom(account, error, signal)
-            : undefined;
-        rotationAttempted = Boolean(account.proxy);
-        const retryAfterRotation = rotated
-          && !streamedOutput
-          && (await stateStore.getSettings()).proxyPool.retryCurrentRequestAfterRotation;
-        if (retryAfterRotation) {
-          retryAccountSnapshot = rotated.account;
-          continue;
-        }
-        throw new ProxyRequestError(error, currentContext);
+        // A channel account owns one stable egress. Cool it down and let the
+        // scheduler select another account; never mutate its proxy identity.
+        await proxyPoolService.markBoundProxyError(account, error);
+        accountScheduler.markFailure(account.id, error.message, undefined, lease.admissionSequence);
+        lastError = new UpstreamError(error.message, 502);
+        lastContext = currentContext;
+        excluded.add(account.id);
+        continue;
       }
       if (debugCall && !debugCall.error) {
         if (error instanceof UpstreamStreamError && error.rawResponse !== undefined && !debugCall.response) {
@@ -749,11 +694,11 @@ async function getCompletion(
       // duplicate or reorder its answer. Surface the failure on the current
       // stream instead of silently starting a second completion.
       if (streamedOutput) {
-        const failure = error instanceof PortalError
+        const failure = error instanceof UpstreamError
           ? error
           : error instanceof UpstreamStreamError
-            ? new PortalError(error.message, error.status, error.retryAfterSeconds)
-            : new PortalError(error instanceof Error ? error.message : "Unknown portal streaming error.", 502);
+            ? new UpstreamError(error.message, error.status, error.retryAfterSeconds)
+            : new UpstreamError(error instanceof Error ? error.message : "Unknown portal streaming error.", 502);
         if (countsAgainstAccount(failure.status)) {
           markCapacityFailure(account.id, model, failure, lease.admissionSequence);
         }
@@ -766,7 +711,7 @@ async function getCompletion(
         );
       }
       if (error instanceof UpstreamStreamError) {
-        const portalError = new PortalError(error.message, error.status, error.retryAfterSeconds);
+        const portalError = new UpstreamError(error.message, error.status, error.retryAfterSeconds);
         lastError = portalError;
         lastContext = currentContext;
         if (!countsAgainstAccount(portalError.status)) {
@@ -776,7 +721,7 @@ async function getCompletion(
         excluded.add(account.id);
         continue;
       }
-      if (error instanceof PortalError) {
+      if (error instanceof UpstreamError) {
         lastError = error;
         lastContext = currentContext;
         if (!countsAgainstAccount(error.status)) {
@@ -787,7 +732,7 @@ async function getCompletion(
       } else {
         const message = error instanceof Error ? error.message : "Unknown portal transport error.";
         accountScheduler.markFailure(account.id, message, undefined, lease.admissionSequence);
-        lastError = new PortalError(message, 502);
+        lastError = new UpstreamError(message, 502);
         lastContext = currentContext;
         excluded.add(account.id);
       }
@@ -797,7 +742,7 @@ async function getCompletion(
   }
 
   throw new ProxyRequestError(
-    lastError ?? new PortalError("No portal account completed the request.", 503),
+    lastError ?? new UpstreamError("No portal account completed the request.", 503),
     lastContext,
   );
 }
@@ -1199,6 +1144,89 @@ function toolCallExpectation(toolChoice: unknown): ToolCallAdapterTrace["toolCal
   return "auto";
 }
 
+function nativeRepairMessages(
+  originalHistory: ChatMessage[],
+  candidate: ChatMessage,
+  error: string,
+  attempt: number,
+  tools: ToolDefinition[],
+  toolChoice: unknown,
+  parallelToolCalls: boolean,
+): ChatMessage[] {
+  const calls = candidate.tool_calls ?? [];
+  const declared = new Set(tools.map((tool) => tool.function.name));
+  const callNames = calls.map((call) => call.function.name).filter((name) => declared.has(name));
+  const forcedName = asRecord(toolChoice)?.type === "function"
+    ? asRecord(asRecord(toolChoice)?.function)?.name
+    : undefined;
+  const names = [...new Set([
+    ...callNames,
+    ...(typeof forcedName === "string" ? [forcedName] : []),
+  ])];
+  const limited = (parallelToolCalls ? names : names.slice(0, 1)).slice(0, MAX_REPAIR_SKELETON_CALLS);
+  const examples = limited.map((name) => {
+    const definition = tools.find((tool) => tool.function.name === name);
+    return {
+      name,
+      arguments: minimalSchemaExample(definition?.function.parameters) ?? {},
+    };
+  });
+  const assistant: ChatMessage = {
+    role: "assistant",
+    content: typeof candidate.content === "string" ? candidate.content : null,
+    ...(calls.length > 0 ? { tool_calls: calls } : {}),
+    ...(candidate.reasoning ? { reasoning: candidate.reasoning } : {}),
+    ...(candidate.reasoning_content ? { reasoning_content: candidate.reasoning_content } : {}),
+  };
+  const rejections: ChatMessage[] = calls.length > 0
+    ? calls.map((call) => ({
+      role: "tool" as const,
+      tool_call_id: call.id,
+      content: `The tool call was rejected by local validation.\n\n${error.slice(0, 2_000)}`,
+    }))
+    : [];
+  const correction: ChatMessage = {
+    role: "user",
+    content: [
+      `Native tool-call repair attempt ${attempt}.`,
+      "Repeat the intended call using the API's native tool_calls channel.",
+      "Every argument must match the supplied function JSON Schema exactly; preserve JSON types such as object, array, boolean, integer, and number.",
+      parallelToolCalls ? "Preserve every intended call." : "Return at most one call.",
+      "Do not return a JSON/XML envelope, markdown, or an explanation.",
+      ...(examples.length > 0 ? ["Schema-derived argument examples:", JSON.stringify(examples, null, 2)] : []),
+      "Validation error:",
+      error.slice(0, 2_000),
+    ].join("\n"),
+  };
+  return [...originalHistory, assistant, ...rejections, correction];
+}
+
+function evaluateNativeApiToolCandidate(
+  completion: UpstreamCompletion,
+  tools: ToolDefinition[],
+  toolChoice: unknown,
+  parallelToolCalls: boolean,
+): { accepted: boolean; outcome: "tool_calls" | "final" | "invalid"; message: ChatMessage; error?: string } {
+  let message: ChatMessage;
+  try {
+    message = assistantFrom(completion, tools);
+  } catch (error) {
+    if (!(error instanceof InvalidStructuredToolCallsError)) throw error;
+    const candidate = repairCandidateFrom(completion, tools, initialReasoning(completion));
+    return { accepted: false, outcome: "invalid", message: candidate.message, error: error.message };
+  }
+  try {
+    validateGeneratedCalls(message.tool_calls ?? [], tools, toolChoice, parallelToolCalls);
+  } catch (error) {
+    return { accepted: false, outcome: "invalid", message, error: candidateError(error) };
+  }
+  return {
+    accepted: true,
+    outcome: message.tool_calls?.length ? "tool_calls" : "final",
+    message,
+  };
+}
+
 function evaluateToolCandidate(
   completion: UpstreamCompletion,
   tools: ToolDefinition[],
@@ -1287,11 +1315,10 @@ async function executeChatRequestOnce(
     signal?: AbortSignal;
     upstreamCalls?: DebugUpstreamCall[];
     validated?: ValidatedChatRequest;
-    toolCallPolicy?: ToolCallPolicy;
     analytics?: UsageExecutionTracker;
   },
 ): Promise<ChatExecution> {
-  const { model, messages, tools, toolCallPolicy, upstreamMessages: prebuiltMessages } = options?.validated ?? validateChatRequest(request, options?.toolCallPolicy);
+  const { model, messages, tools } = options?.validated ?? validateChatRequest(request);
 
   const toolTurn = tools.length > 0 && request.tool_choice !== "none";
   const observedToolCallIds = messages
@@ -1301,18 +1328,7 @@ async function executeChatRequestOnce(
     ? undefined
     : accountScheduler.accountForToolCalls(observedToolCallIds);
   const streamUpstream = options?.stream ?? request.stream === true;
-  const settings = await stateStore.getSettings();
-  const minimumOutputTokens = settings.minimumOutputTokens ?? getProxyConfig().minimumOutputTokens;
-  const builtUpstream = upstreamBody(request, model, messages, tools, streamUpstream, prebuiltMessages, toolCallPolicy, minimumOutputTokens);
-  let upstreamRequest = builtUpstream.body;
-  // A client budget above the per-round portal cap enables thinking
-  // continuation: when the upstream stops with finish_reason "length" while
-  // the visible content is still empty, the turn was cut off mid-thought and
-  // is continued below before any tool-call evaluation or repair. While
-  // continuation is possible, terminal and usage frames are held back so the
-  // client only ever sees the combined terminal state.
-  const thinkingBudget = requestedOutputBudget(request);
-  const mayContinueThinking = thinkingBudget !== undefined && thinkingBudget > PORTAL_MAX_OUTPUT_TOKENS;
+  let upstreamRequest = deepInfraBody(request, model, messages, tools, streamUpstream);
   const clientFrameHandler = streamUpstream ? options?.onUpstreamFrame : undefined;
   let result = await getCompletion(
     upstreamRequest,
@@ -1320,50 +1336,18 @@ async function executeChatRequestOnce(
     options?.requiredAccountId ?? toolAssignedAccountId,
     options?.groupId,
     toolTurn,
-    mayContinueThinking && clientFrameHandler ? holdTerminalFrames(clientFrameHandler) : clientFrameHandler,
+    clientFrameHandler,
     options?.signal,
     options?.upstreamCalls
       ? { calls: options.upstreamCalls, type: "initial", round: 1 }
       : undefined,
     options?.analytics,
   );
-  if (mayContinueThinking && thinkingBudget !== undefined && isThinkingInterrupted(result.completion)) {
-    result = await continueThinking(upstreamRequest, result, thinkingBudget, {
-      stickyKey: options?.stickyKey,
-      groupId: options?.groupId,
-      allowEmptyContent: toolTurn,
-      onUpstreamFrame: clientFrameHandler,
-      signal: options?.signal,
-      upstreamCalls: options?.upstreamCalls,
-      analytics: options?.analytics,
-    });
-  }
   let message: ChatMessage;
   let toolCallAdapter: ToolCallAdapterTrace | undefined;
 
   if (toolTurn) {
-    // upstreamBody already applied the adapter contract and the internal
-    // reminder to the original history exactly once; reuse that list so the
-    // repair history cannot drift from what was actually sent. Repair turns
-    // append the failed candidate, a tool-role rejection result, and a
-    // user-role correction instruction after the reminder, so the reminder
-    // always stays right after the user instruction instead of after the
-    // error message.
-    const contractedOriginalMessages = builtUpstream.messages;
     const firstReasoning = initialReasoning(result.completion);
-    // The portal occasionally returns a JSON completion even after accepting
-    // a streaming request. Forward the original reasoning before a repair so
-    // clients retain the same progressive feedback as the SSE path.
-    if (
-      !result.receivedSse
-      && options?.onUpstreamFrame
-      && (firstReasoning.reasoning || firstReasoning.reasoning_content)
-    ) {
-      await options.onUpstreamFrame({
-        choices: [{ delta: { role: "assistant", ...firstReasoning } }],
-      });
-    }
-    let repairCandidate = repairCandidateFrom(result.completion, tools, firstReasoning);
     let repairReasoning: ReasoningFields | undefined;
     let repairReasoningOpen = false;
     const collectRepairReasoning = async (fields: ReasoningFields): Promise<void> => {
@@ -1375,7 +1359,7 @@ async function executeChatRequestOnce(
       };
       await options?.onRepairReasoning?.(tagged);
     };
-    let evaluation = evaluateToolCandidate(
+    let evaluation = evaluateNativeApiToolCandidate(
       result.completion,
       tools,
       request.tool_choice,
@@ -1385,114 +1369,71 @@ async function executeChatRequestOnce(
       toolCallExpected: toolCallExpectation(request.tool_choice),
       initialParseSucceeded: evaluation.outcome === "tool_calls",
       finalParseSucceeded: evaluation.outcome === "tool_calls",
-      initialParseRepaired: evaluation.repaired === true,
-      finalParseRepaired: evaluation.repaired === true,
       initialOutcome: evaluation.outcome,
       finalOutcome: evaluation.outcome,
       repairAttempts: 0,
       maxRepairAttempts: MAX_TOOL_REPAIR_ATTEMPTS,
       errors: [],
     };
-
     while (!evaluation.accepted && toolCallAdapter.repairAttempts < MAX_TOOL_REPAIR_ATTEMPTS) {
-      const error = evaluation.error ?? "The model output was not a valid controlled tool-call envelope.";
+      const error = evaluation.error ?? "The native tool call failed local validation.";
       toolCallAdapter.errors.push(error);
       toolCallAdapter.repairAttempts += 1;
-      const repairHistory = buildToolRepairHistory(
-        contractedOriginalMessages,
-        repairCandidate.message,
-        repairMessages({
-          error,
-          attempt: toolCallAdapter.repairAttempts,
-          candidate: repairCandidate.message,
-          tools,
-          toolChoice: request.tool_choice,
-          parallelToolCalls: request.parallel_tool_calls !== false,
-          format: toolCallPolicy.format,
-        }),
-        toolCallPolicy.format,
-      );
       const repairStream = Boolean(options?.onRepairReasoning);
-      upstreamRequest = {
+      const repairRequest: JsonObject = {
         ...upstreamRequest,
-        // Repair content remains internal. When a client stream is active, the
-        // upstream repair request may stream only its reasoning through the
-        // filtered callback below.
         stream: repairStream,
-        // A repair is internal protocol recovery, not a fresh creative turn.
-        // Deterministic sampling improves JSON/schema correction even when
-        // the caller intentionally used a higher temperature.
+        ...(repairStream ? { stream_options: { include_usage: true } } : {}),
         temperature: 0,
-        messages: repairHistory as unknown as JsonValue,
+        messages: nativeRepairMessages(
+          messages,
+          evaluation.message,
+          error,
+          toolCallAdapter.repairAttempts,
+          tools,
+          request.tool_choice,
+          request.parallel_tool_calls !== false,
+        ) as unknown as JsonValue,
       };
-      try {
-        result = await getCompletion(
-          upstreamRequest,
-          options?.stickyKey,
-          result.account.id,
-          options?.groupId,
-          true,
-          repairStream
-            ? async (frame) => {
-              const fields = initialReasoning({ choices: [{ message: frame.choices?.[0]?.delta }] });
-              if (fields.reasoning || fields.reasoning_content) {
-                await collectRepairReasoning(fields);
-                return true;
-              }
-              return false;
+      result = await getCompletion(
+        repairRequest,
+        options?.stickyKey,
+        result.account.id,
+        options?.groupId,
+        true,
+        repairStream
+          ? async (frame) => {
+            const fields = initialReasoning({ choices: [{ message: frame.choices?.[0]?.delta }] });
+            if (fields.reasoning || fields.reasoning_content) {
+              await collectRepairReasoning(fields);
+              return true;
             }
-            : undefined,
-          options?.signal,
-          options?.upstreamCalls
-            ? { calls: options.upstreamCalls, type: "repair", round: toolCallAdapter.repairAttempts }
-            : undefined,
-          options?.analytics,
-        );
-      } catch (error) {
-        if (error instanceof ClientDisconnectedError || options?.signal?.aborted) {
-          throw new ClientDisconnectedError();
-        }
-        if (error instanceof ProxyRequestError) {
-          error.debugContext.toolCallAdapter = toolCallAdapter;
-          throw error;
-        }
-        throw new ProxyRequestError(error, {
-          accountId: result.account.id,
-          accountLabel: result.account.label,
-          upstreamRequest,
-          toolCallAdapter,
-        });
-      }
-      // A stream-requesting portal may still fall back to a JSON completion.
-      // Its repair reasoning was not delivered through the frame callback, so
-      // forward/tag it here just as a non-streaming repair does.
+            return false;
+          }
+          : undefined,
+        options?.signal,
+        options?.upstreamCalls
+          ? { calls: options.upstreamCalls, type: "repair", round: toolCallAdapter.repairAttempts }
+          : undefined,
+        options?.analytics,
+      );
       if (!result.receivedSse) {
-        const nextRepairReasoning = initialReasoning(result.completion);
-        if (nextRepairReasoning.reasoning || nextRepairReasoning.reasoning_content) {
-          await collectRepairReasoning(nextRepairReasoning);
-        }
+        const fields = initialReasoning(result.completion);
+        if (fields.reasoning || fields.reasoning_content) await collectRepairReasoning(fields);
       }
-      const nextCandidate = repairCandidateFrom(result.completion, tools, firstReasoning);
-      // A reasoning-only upstream reply is not an error candidate. Retain the
-      // prior malformed call so the next repair has a concrete object to fix.
-      if (nextCandidate.hasCandidate) {
-        repairCandidate = nextCandidate;
-      }
-      evaluation = evaluateToolCandidate(
+      evaluation = evaluateNativeApiToolCandidate(
         result.completion,
         tools,
         request.tool_choice,
         request.parallel_tool_calls !== false,
       );
     }
-
     toolCallAdapter.finalParseSucceeded = evaluation.outcome === "tool_calls";
-    toolCallAdapter.finalParseRepaired = evaluation.repaired === true;
     toolCallAdapter.finalOutcome = evaluation.outcome;
     if (!evaluation.accepted) {
-      toolCallAdapter.errors.push(evaluation.error ?? "The final repair output was invalid.");
+      toolCallAdapter.errors.push(evaluation.error ?? "The final native tool-call repair output was invalid.");
       throw new ProxyRequestError(
-        new HttpError(502, "Portal did not return a valid tool call after bounded repair.", "server_error"),
+        new HttpError(502, "DeepInfra did not return a valid tool call after bounded repair.", "server_error"),
         {
           accountId: result.account.id,
           accountLabel: result.account.label,
@@ -1542,91 +1483,6 @@ async function executeChatRequestOnce(
   };
 }
 
-function requestedOutputBudget(request: JsonObject): number | undefined {
-  const value = request.max_completion_tokens ?? request.max_tokens;
-  return typeof value === "number" && Number.isInteger(value) && value >= 1 ? value : undefined;
-}
-
-function completionReasoningText(completion: UpstreamCompletion, field: "reasoning" | "reasoning_content"): string {
-  const value = completion.choices?.[0]?.message?.[field];
-  return typeof value === "string" ? value : "";
-}
-
-function consumedCompletionTokens(completion: UpstreamCompletion): number {
-  const tokens = completion.usage?.completion_tokens;
-  // Without usage data assume the round spent the whole per-round cap so the
-  // continuation budget shrinks conservatively instead of looping forever.
-  return typeof tokens === "number" ? tokens : PORTAL_MAX_OUTPUT_TOKENS;
-}
-
-/**
- * A thinking interruption means the upstream hit the output cap while still
- * reasoning: finish_reason is "length", the visible content is still empty,
- * and there is partial reasoning to continue from. A truncated non-empty
- * answer is not continued; it is returned as-is with finish_reason "length".
- */
-export function isThinkingInterrupted(completion: UpstreamCompletion): boolean {
-  const choice = completion.choices?.[0];
-  const message = choice?.message;
-  if (choice?.finish_reason !== "length" || !message) {
-    return false;
-  }
-  if (typeof message.content === "string" && message.content.length > 0) {
-    return false;
-  }
-  if (Array.isArray(message.tool_calls) && message.tool_calls.length > 0) {
-    return false;
-  }
-  return completionReasoningText(completion, "reasoning").length > 0
-    || completionReasoningText(completion, "reasoning_content").length > 0;
-}
-
-/**
- * Wrap a client frame handler so terminal and usage frames are held back.
- * Each upstream round is an internal segment; the client only sees the
- * combined terminal state emitted after the final round.
- */
-function holdTerminalFrames(handler: UpstreamFrameHandler): UpstreamFrameHandler {
-  return async (frame) => {
-    const choice = frame.choices?.[0];
-    if (choice?.finish_reason !== undefined && choice.finish_reason !== null) {
-      return false;
-    }
-    if (frame.usage) {
-      return false;
-    }
-    return handler(frame);
-  };
-}
-
-function addUsageTotals(
-  total: UpstreamUsage | undefined,
-  usage: UpstreamUsage | undefined,
-): UpstreamUsage | undefined {
-  if (!total && !usage) return undefined;
-  const merged: UpstreamUsage = { ...(total ?? {}), ...(usage ?? {}) };
-  for (const key of ["prompt_tokens", "completion_tokens", "total_tokens"] as const) {
-    const left = typeof total?.[key] === "number" ? total[key] : 0;
-    const right = typeof usage?.[key] === "number" ? usage[key] : 0;
-    if (left || right) merged[key] = left + right;
-  }
-  const mergedDetails = {
-    ...(total?.prompt_tokens_details ?? {}),
-    ...(usage?.prompt_tokens_details ?? {}),
-    cached_tokens: (typeof total?.prompt_tokens_details?.cached_tokens === "number" ? total.prompt_tokens_details.cached_tokens : 0)
-      + (typeof usage?.prompt_tokens_details?.cached_tokens === "number" ? usage.prompt_tokens_details.cached_tokens : 0),
-  };
-  const completionDetails = {
-    ...(total?.completion_tokens_details ?? {}),
-    ...(usage?.completion_tokens_details ?? {}),
-    reasoning_tokens: (typeof total?.completion_tokens_details?.reasoning_tokens === "number" ? total.completion_tokens_details.reasoning_tokens : 0)
-      + (typeof usage?.completion_tokens_details?.reasoning_tokens === "number" ? usage.completion_tokens_details.reasoning_tokens : 0),
-  };
-  merged.prompt_tokens_details = mergedDetails;
-  merged.completion_tokens_details = completionDetails;
-  return merged;
-}
-
 export async function executeChatRequest(
   request: JsonObject,
   options?: {
@@ -1638,14 +1494,13 @@ export async function executeChatRequest(
     onRepairReasoning?: (reasoning: ReasoningFields) => void | Promise<void>;
     signal?: AbortSignal;
     validated?: ValidatedChatRequest;
-    toolCallPolicy?: ToolCallPolicy;
     endpoint?: "/v1/chat/completions" | "/v1/responses";
   },
 ): Promise<ChatExecution> {
   const { validated: prevalidated, endpoint = "/v1/chat/completions", ...forwardedOptions } = options ?? {};
   // Validate once per client request; execution reuses the supplied result
   // instead of re-running the full validation pipeline.
-  const validated = prevalidated ?? validateChatRequest(request, options?.toolCallPolicy);
+  const validated = prevalidated ?? validateChatRequest(request);
   const analytics = usageAnalytics.beginExecution(endpoint, validated.model);
   const upstreamCalls: DebugUpstreamCall[] = [];
   try {
@@ -1661,7 +1516,7 @@ export async function executeChatRequest(
     const original = error instanceof ProxyRequestError ? error.originalError : error;
     const status = original instanceof HttpError
       ? original.status
-      : original instanceof PortalError || original instanceof UpstreamStreamError
+      : original instanceof UpstreamError || original instanceof UpstreamStreamError
         ? original.status
         : original instanceof ClientDisconnectedError
           ? 499
@@ -1676,123 +1531,6 @@ export async function executeChatRequest(
     }
     throw error;
   }
-}
-
-interface ThinkingContinuationOptions {
-  stickyKey?: string;
-  groupId?: string;
-  allowEmptyContent: boolean;
-  onUpstreamFrame?: UpstreamFrameHandler;
-  signal?: AbortSignal;
-  upstreamCalls?: DebugUpstreamCall[];
-  analytics?: UsageExecutionTracker;
-}
-
-/**
- * Continue a thinking-interrupted completion with the remaining output
- * budget. Each round appends the accumulated reasoning as a trailing
- * assistant turn (prefill, no extra user prompt) to the already-built
- * upstream messages (for tool turns these are the contracted messages, so
- * the tool contract stays intact), pinned to the account that produced the
- * partial thinking. Continuation reasoning is appended verbatim, without
- * the repair marker used for tool-call repair rounds.
- */
-async function continueThinking(
-  body: JsonObject,
-  first: { account: ManagedAccount; completion: UpstreamCompletion; receivedSse: boolean },
-  budget: number,
-  options: ThinkingContinuationOptions,
-): Promise<{ account: ManagedAccount; completion: UpstreamCompletion; receivedSse: boolean }> {
-  let { account, completion, receivedSse } = first;
-  let reasoning = completionReasoningText(completion, "reasoning");
-  let reasoningContent = completionReasoningText(completion, "reasoning_content");
-  let usage = completion.usage;
-  let remaining = budget - consumedCompletionTokens(completion);
-  let round = 1;
-  // A JSON-fallback round never streamed its reasoning; forward it now so
-  // every round's thinking reaches the client exactly once.
-  const forwardReasoning = async (interrupted: UpstreamCompletion): Promise<void> => {
-    if (!options.onUpstreamFrame) return;
-    const fields = initialReasoning(interrupted);
-    if (fields.reasoning || fields.reasoning_content) {
-      await options.onUpstreamFrame({ choices: [{ delta: { role: "assistant", ...fields } }] });
-    }
-  };
-  if (!receivedSse) {
-    await forwardReasoning(completion);
-  }
-
-  while (isThinkingInterrupted(completion) && remaining > 0 && round < MAX_CONTINUATION_ROUNDS) {
-    const assistant: ChatMessage = {
-      role: "assistant",
-      content: "",
-      ...(reasoning ? { reasoning } : {}),
-      ...(reasoningContent ? { reasoning_content: reasoningContent } : {}),
-    };
-    const continuationBody: JsonObject = {
-      ...body,
-      max_tokens: Math.min(remaining, PORTAL_MAX_OUTPUT_TOKENS),
-      // Prefill-style continuation: the request ends with the assistant
-      // message carrying the accumulated thinking. Probes showed a trailing
-      // "Continue" user prompt makes reasoning models burn tokens on
-      // instruction meta-reasoning and suppresses the answer body, while
-      // the bare prefill just continues the thought.
-      messages: [
-        ...(Array.isArray(body.messages) ? body.messages : []),
-        assistant as unknown as JsonValue,
-      ],
-    };
-    const next = await getCompletion(
-      continuationBody,
-      options.stickyKey,
-      account.id,
-      options.groupId,
-      options.allowEmptyContent,
-      options.onUpstreamFrame ? holdTerminalFrames(options.onUpstreamFrame) : undefined,
-      options.signal,
-      options.upstreamCalls
-        ? { calls: options.upstreamCalls, type: "continuation", round }
-        : undefined,
-      options.analytics,
-    );
-    round += 1;
-    account = next.account;
-    completion = next.completion;
-    if (!next.receivedSse) {
-      await forwardReasoning(next.completion);
-    }
-    receivedSse = receivedSse && next.receivedSse;
-    reasoning += completionReasoningText(completion, "reasoning");
-    reasoningContent += completionReasoningText(completion, "reasoning_content");
-    usage = addUsageTotals(usage, completion.usage);
-    remaining -= consumedCompletionTokens(completion);
-  }
-
-  const lastChoice = completion.choices?.[0];
-  const merged: UpstreamCompletion = {
-    ...completion,
-    choices: [{
-      ...lastChoice,
-      index: lastChoice?.index ?? 0,
-      message: {
-        role: "assistant",
-        content: null,
-        ...(lastChoice?.message ?? {}),
-        ...(reasoning ? { reasoning } : {}),
-        ...(reasoningContent ? { reasoning_content: reasoningContent } : {}),
-      },
-      finish_reason: lastChoice?.finish_reason ?? null,
-    }],
-    ...(usage ? { usage } : {}),
-  };
-  return {
-    account,
-    completion: merged,
-    // When a client stream is active every round's reasoning has been
-    // forwarded already, so downstream JSON-fallback forwarding must not
-    // repeat the accumulated reasoning.
-    receivedSse: receivedSse || Boolean(options.onUpstreamFrame),
-  };
 }
 
 export function asChatCompletion(execution: ChatExecution): JsonObject {
@@ -1817,13 +1555,16 @@ export function asChatCompletion(execution: ChatExecution): JsonObject {
     id: completion.id ?? `chatcmpl_${randomUUID().replaceAll("-", "")}`,
     object: "chat.completion",
     created: completion.created ?? Math.floor(Date.now() / 1_000),
-    model: execution.model,
+    model: publicModelId(execution.model),
     choices: [{
       index: 0,
       message,
       finish_reason: execution.finishReason,
     }],
     ...(completion.usage ? { usage: completion.usage as unknown as JsonValue } : {}),
+    ...(completion.energy ? { energy: completion.energy as unknown as JsonValue } : {}),
+    ...(completion.cost ? { cost: completion.cost as unknown as JsonValue } : {}),
+    ...(completion.service_tier ? { service_tier: completion.service_tier } : {}),
   };
 }
 
@@ -1850,7 +1591,7 @@ export function createChatStreamState(request: JsonObject): ChatStreamState {
   return {
     id: `chatcmpl_${randomUUID().replaceAll("-", "")}`,
     created: Math.floor(Date.now() / 1_000),
-    model: typeof request.model === "string" && request.model ? request.model : getProxyConfig().defaultModel,
+    model: publicModelId(typeof request.model === "string" && request.model ? request.model : getProxyConfig().defaultModel),
     toolTurn,
     toolContentMode: toolTurn ? "unknown" : "final",
     toolContentBuffer: "",
@@ -2030,13 +1771,22 @@ export function finishChatStream(
     state.usageSeen = true;
     chunks.push({ ...chatStreamBase(state), choices: [], usage: execution.completion.usage as unknown as JsonValue });
   }
+  if (execution.completion.energy || execution.completion.cost || execution.completion.service_tier) {
+    chunks.push({
+      ...chatStreamBase(state),
+      choices: [],
+      ...(execution.completion.energy ? { energy: execution.completion.energy as unknown as JsonValue } : {}),
+      ...(execution.completion.cost ? { cost: execution.completion.cost as unknown as JsonValue } : {}),
+      ...(execution.completion.service_tier ? { service_tier: execution.completion.service_tier } : {}),
+    });
+  }
   return chunks;
 }
 
 export function asChatCompletionStream(execution: ChatExecution, includeUsage = false): JsonObject[] {
   const id = execution.completion.id ?? `chatcmpl_${randomUUID().replaceAll("-", "")}`;
   const created = execution.completion.created ?? Math.floor(Date.now() / 1_000);
-  const base = { id, object: "chat.completion.chunk", created, model: execution.model };
+  const base = { id, object: "chat.completion.chunk", created, model: publicModelId(execution.model) };
   const chunks: JsonObject[] = [{ ...base, choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }] }];
   if (typeof execution.message.reasoning === "string" && execution.message.reasoning) {
     chunks.push({ ...base, choices: [{ index: 0, delta: { reasoning: execution.message.reasoning }, finish_reason: null }] });
@@ -2070,6 +1820,15 @@ export function asChatCompletionStream(execution: ChatExecution, includeUsage = 
   chunks.push({ ...base, choices: [{ index: 0, delta: {}, finish_reason: execution.finishReason }] });
   if (includeUsage && execution.completion.usage) {
     chunks.push({ ...base, choices: [], usage: execution.completion.usage as unknown as JsonValue });
+  }
+  if (execution.completion.energy || execution.completion.cost || execution.completion.service_tier) {
+    chunks.push({
+      ...base,
+      choices: [],
+      ...(execution.completion.energy ? { energy: execution.completion.energy as unknown as JsonValue } : {}),
+      ...(execution.completion.cost ? { cost: execution.completion.cost as unknown as JsonValue } : {}),
+      ...(execution.completion.service_tier ? { service_tier: execution.completion.service_tier } : {}),
+    });
   }
   return chunks;
 }

@@ -11,9 +11,9 @@ import { assertModelSupported } from "../server/utils/chat-service.ts";
 import { HttpError } from "../server/utils/http.ts";
 
 async function withTempStore<T>(run: () => Promise<T>): Promise<T> {
-  const dir = await mkdtemp(join(tmpdir(), "neuralwatt-models-test-"));
-  const previous = process.env.NEURALWATT_DATA_DIR;
-  process.env.NEURALWATT_DATA_DIR = dir;
+  const dir = await mkdtemp(join(tmpdir(), "deepinfra-models-test-"));
+  const previous = process.env.DEEPINFRA_GATEWAY_DATA_DIR;
+  process.env.DEEPINFRA_GATEWAY_DATA_DIR = dir;
   resetProxyConfigForTests();
   stateStore.resetForTests();
   try {
@@ -21,9 +21,9 @@ async function withTempStore<T>(run: () => Promise<T>): Promise<T> {
   } finally {
     await usageAnalytics.resetForTests();
     if (previous === undefined) {
-      delete process.env.NEURALWATT_DATA_DIR;
+      delete process.env.DEEPINFRA_GATEWAY_DATA_DIR;
     } else {
-      process.env.NEURALWATT_DATA_DIR = previous;
+      process.env.DEEPINFRA_GATEWAY_DATA_DIR = previous;
     }
     resetProxyConfigForTests();
     stateStore.resetForTests();
@@ -47,11 +47,11 @@ test("account models are normalised, deduplicated and trimmed", async () => {
   });
 });
 
-test("mergeAccountModels appends and deduplicates without replacing manual entries", async () => {
+test("replaceAccountModels replaces stale entries with the authoritative catalog", async () => {
   await withTempStore(async () => {
     const account = await stateStore.addAccount(accountInput("a@example.com", ["manual-a", "shared"]));
-    const merged = await stateStore.mergeAccountModels(account.id, ["shared", "fetched-b", "fetched-b"]);
-    assert.deepEqual(merged.models, ["manual-a", "shared", "fetched-b"]);
+    const merged = await stateStore.replaceAccountModels(account.id, ["shared", "fetched-b", "fetched-b"]);
+    assert.deepEqual(merged.models, ["shared", "fetched-b"]);
   });
 });
 
@@ -67,6 +67,18 @@ test("legacy accounts without models load with an empty list", async () => {
   await withTempStore(async () => {
     const account = await stateStore.addAccount(accountInput("a@example.com"));
     assert.deepEqual(account.models, []);
+  });
+});
+
+test("public short model IDs resolve to full DeepInfra catalog IDs", async () => {
+  await withTempStore(async () => {
+    const account = await stateStore.addAccount(accountInput("kimi", ["moonshotai/Kimi-K3"]));
+    await assertModelSupported("Kimi-K3");
+    await assertModelSupported("moonshotai/Kimi-K3");
+    const lease = await accountScheduler.acquire({ model: "Kimi-K3" });
+    assert.equal(lease.account.id, account.id);
+    lease.release();
+    accountScheduler.remove(account.id);
   });
 });
 
@@ -124,7 +136,7 @@ test("scheduler fails when no account supports the requested model", async () =>
     const a = await stateStore.addAccount(accountInput("a@example.com", ["m1"]));
     await assert.rejects(
       accountScheduler.acquire({ model: "m2" }),
-      /No enabled NeuralWatt account is currently available/,
+      /No enabled DeepInfra account is currently available/,
     );
     accountScheduler.remove(a.id);
   });

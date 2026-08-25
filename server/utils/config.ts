@@ -40,23 +40,23 @@ export function getProxyConfig(): ProxyConfig {
     return cachedConfig;
   }
 
-  const rawMaxRequestBytes = Number(process.env.NEURALWATT_MAX_REQUEST_BYTES ?? "67108864");
-  const rawMaxOutputTokens = Number(process.env.NEURALWATT_MAX_OUTPUT_TOKENS ?? "128000");
-  const rawMinimumOutputTokens = Number(process.env.NEURALWATT_MIN_OUTPUT_TOKENS ?? "8192");
-  const rawMaxUpstreamBytes = Number(process.env.NEURALWATT_MAX_UPSTREAM_BYTES ?? "16777216");
-  const rawMaxResponseHistoryBytes = Number(process.env.NEURALWATT_MAX_RESPONSE_HISTORY_BYTES ?? "16777216");
-  const rawMaxResponseStateBytes = Number(process.env.NEURALWATT_MAX_RESPONSE_STATE_BYTES ?? "16777216");
-  const rawMaxResponseItems = Number(process.env.NEURALWATT_MAX_RESPONSE_ITEMS ?? "10000");
-  const rawMaxChatMessages = Number(process.env.NEURALWATT_MAX_CHAT_MESSAGES ?? "10000");
-  const rawUpstreamTimeoutMs = Number(process.env.NEURALWATT_UPSTREAM_TIMEOUT_MS ?? "120000");
-  const rawToolCallFormat = process.env.NEURALWATT_TOOL_CALL_FORMAT ?? "auto";
-  const rawPreambleVerbosity = process.env.NEURALWATT_PREAMBLE_VERBOSITY ?? "milestone";
+  const rawMaxRequestBytes = Number(process.env.DEEPINFRA_GATEWAY_MAX_REQUEST_BYTES ?? "67108864");
+  const rawMaxOutputTokens = Number(process.env.DEEPINFRA_GATEWAY_MAX_OUTPUT_TOKENS ?? "128000");
+  const rawMinimumOutputTokens = Number(process.env.DEEPINFRA_GATEWAY_MIN_OUTPUT_TOKENS ?? "8192");
+  const rawMaxUpstreamBytes = Number(process.env.DEEPINFRA_GATEWAY_MAX_UPSTREAM_BYTES ?? "16777216");
+  const rawMaxResponseHistoryBytes = Number(process.env.DEEPINFRA_GATEWAY_MAX_RESPONSE_HISTORY_BYTES ?? "16777216");
+  const rawMaxResponseStateBytes = Number(process.env.DEEPINFRA_GATEWAY_MAX_RESPONSE_STATE_BYTES ?? "16777216");
+  const rawMaxResponseItems = Number(process.env.DEEPINFRA_GATEWAY_MAX_RESPONSE_ITEMS ?? "10000");
+  const rawMaxChatMessages = Number(process.env.DEEPINFRA_GATEWAY_MAX_CHAT_MESSAGES ?? "10000");
+  const rawUpstreamTimeoutMs = Number(process.env.DEEPINFRA_GATEWAY_UPSTREAM_TIMEOUT_MS ?? "120000");
+  const rawToolCallFormat = process.env.DEEPINFRA_GATEWAY_TOOL_CALL_FORMAT ?? "auto";
+  const rawPreambleVerbosity = process.env.DEEPINFRA_GATEWAY_PREAMBLE_VERBOSITY ?? "milestone";
   cachedConfig = {
-    adminToken: process.env.NEURALWATT_ADMIN_TOKEN ?? "",
-    apiKey: process.env.NEURALWATT_API_KEY ?? "",
-    allowAnonymous: process.env.NEURALWATT_ALLOW_ANONYMOUS === "true",
-    dataDir: resolve(process.env.NEURALWATT_DATA_DIR ?? ".data/neuralwatt"),
-    defaultModel: process.env.NEURALWATT_DEFAULT_MODEL ?? "kimi-k3-fast",
+    adminToken: process.env.DEEPINFRA_GATEWAY_ADMIN_TOKEN ?? "",
+    apiKey: process.env.DEEPINFRA_GATEWAY_API_KEY ?? "",
+    allowAnonymous: process.env.DEEPINFRA_GATEWAY_ALLOW_ANONYMOUS === "true",
+    dataDir: resolve(process.env.DEEPINFRA_GATEWAY_DATA_DIR ?? ".data/deepinfra"),
+    defaultModel: process.env.DEEPINFRA_GATEWAY_DEFAULT_MODEL ?? "moonshotai/Kimi-K3",
     toolCallFormat: rawToolCallFormat === "json" || rawToolCallFormat === "xml" ? rawToolCallFormat : "auto",
     preambleVerbosity: rawPreambleVerbosity === "quiet" || rawPreambleVerbosity === "normal" || rawPreambleVerbosity === "verbose" ? rawPreambleVerbosity : "milestone",
     maxRequestBytes: Number.isFinite(rawMaxRequestBytes) && rawMaxRequestBytes > 0

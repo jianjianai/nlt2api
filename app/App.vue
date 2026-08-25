@@ -22,7 +22,7 @@ import type {
 
 type JsonRecord = Record<string, unknown>;
 
-const tokenStorageKey = "neuralwatt-admin-token";
+const tokenStorageKey = "deepinfra-gateway-admin-token";
 const token = ref(typeof window === "undefined" ? "" : sessionStorage.getItem(tokenStorageKey) ?? "");
 const tokenDraft = ref(token.value);
 const view = ref<WorkspaceId>(typeof window === "undefined" ? "overview" : parseWorkspace(localStorage.getItem(WORKSPACE_STORAGE_KEY)));
@@ -90,7 +90,12 @@ const config = reactive({
   toolCallFormat: "auto" as ToolCallFormat,
   preambleVerbosity: "milestone" as PreambleVerbosity,
 });
-const newAccount = reactive({ label: "", email: "", password: "", weight: 1, proxy: "", groupIds: [] as string[] });
+const newAccount = reactive({
+  label: "",
+  weight: 1,
+  proxy: "",
+  groupIds: [] as string[],
+});
 const isLoading = ref(false);
 const isConnected = ref(false);
 const currentTime = ref(Date.now());
@@ -566,13 +571,11 @@ async function addAccount() {
       body: JSON.stringify(newAccount),
     });
     newAccount.label = "";
-    newAccount.email = "";
-    newAccount.password = "";
     newAccount.weight = 1;
     newAccount.proxy = "";
     newAccount.groupIds = [];
     showAddAccount.value = false;
-    pushToast("success", "账号验证成功并已添加");
+    pushToast("success", "DeepInfra 出口账号已验证并添加");
     await Promise.all([loadDashboard({ silent: true }), refreshAccountWorkspace()]);
   } catch (error) {
     pushToast("error", errorText(error, "无法添加账号。"));
@@ -1980,7 +1983,7 @@ onUnmounted(() => {
     <header v-if="!token" class="topbar">
       <div class="wordmark">
         <span class="wordmark-mark"><AppIcon name="activity" :size="16" /></span>
-        <span>NeuralWatt 网关</span>
+        <span>DeepInfra 网关</span>
       </div>
     </header>
 
@@ -2009,31 +2012,19 @@ onUnmounted(() => {
       </Transition>
     </WorkspaceShell>
 
-    <AppDialog :open="showAddAccount" title="添加账号" description="保存时将验证门户登录，验证成功后加入连接池。" :busy="isSaving" @update:open="showAddAccount = $event">
+    <AppDialog :open="showAddAccount" title="添加 DeepInfra 出口账号" description="匿名免费线路无需 Key；每个请求现铸一次性挑战票据。" :busy="isSaving" @update:open="showAddAccount = $event">
       <form class="modal-form" @submit.prevent="addAccount">
         <div class="modal-body">
           <label for="account-label">账号名称</label>
-          <input id="account-label" v-model="newAccount.label" type="text" maxlength="120" placeholder="主账号 Kimi" />
-          <label for="account-email">门户邮箱</label>
-          <input id="account-email" v-model="newAccount.email" name="portal-email" type="email" maxlength="320" autocomplete="username" spellcheck="false" required />
-          <label for="account-password">门户密码</label>
-          <input id="account-password" v-model="newAccount.password" type="password" maxlength="4096" autocomplete="new-password" required />
+          <input id="account-label" v-model="newAccount.label" type="text" maxlength="120" placeholder="DeepInfra 出口账号" />
+          <p class="modal-note">匿名免费线路无需凭据。留空代理表示服务器直连；填写代理可创建独立出口账号。</p>
           <fieldset v-if="accountGroups.length" class="modal-checkbox-group"><legend>账号分组</legend><label v-for="group in accountGroups" :key="group.id"><input v-model="newAccount.groupIds" type="checkbox" :value="group.id" /><span>{{ group.name }}</span></label></fieldset>
           <div class="field-row">
-            <div>
-              <label for="account-weight">权重</label>
-              <input id="account-weight" v-model.number="newAccount.weight" type="number" min="1" max="100" step="1" required />
-            </div>
-            <div>
-              <label for="account-proxy">出口代理（可选）</label>
-              <input id="account-proxy" v-model="newAccount.proxy" type="text" maxlength="2048" autocomplete="off" spellcheck="false" placeholder="socks5://user:pass@host:1080" />
-            </div>
+            <div><label for="account-weight">权重</label><input id="account-weight" v-model.number="newAccount.weight" type="number" min="1" max="100" step="1" required /></div>
+            <div><label for="account-proxy">出口代理（可选）</label><input id="account-proxy" v-model="newAccount.proxy" type="text" maxlength="2048" autocomplete="off" spellcheck="false" placeholder="socks5://user:pass@host:1080" /></div>
           </div>
         </div>
-        <footer class="modal-foot">
-          <button class="button button-quiet" type="button" :disabled="isSaving" @click="showAddAccount = false">取消</button>
-          <button class="button button-primary" type="submit" :disabled="isSaving" :aria-busy="isSaving"><span v-if="isSaving" class="spinner" aria-hidden="true"></span>{{ isSaving ? "验证中" : "验证并添加" }}</button>
-        </footer>
+        <footer class="modal-foot"><button class="button button-quiet" type="button" :disabled="isSaving" @click="showAddAccount = false">取消</button><button class="button button-primary" type="submit" :disabled="isSaving" :aria-busy="isSaving"><span v-if="isSaving" class="spinner" aria-hidden="true"></span>{{ isSaving ? '验证中' : '验证并添加' }}</button></footer>
       </form>
     </AppDialog>
 
@@ -2057,7 +2048,7 @@ onUnmounted(() => {
         <div class="modal-body">
           <label for="proxy-input">代理地址</label>
           <input id="proxy-input" v-model="proxyEditor.value" type="text" maxlength="2048" autocomplete="off" spellcheck="false" placeholder="http://host:8080 或 socks5://user:pass@host:1080" />
-          <p class="field-hint">支持 http / https / socks4 / socks5，可带认证。留空并保存将清除代理；更换出口不会主动退出账号，门户拒绝现有会话时才重新登录。</p>
+          <p class="field-hint">支持 http / https / socks4 / socks5，可带认证。留空并保存将清除代理；更换出口会改变账号的稳定出口身份，保存后请执行验证。</p>
         </div>
         <footer class="modal-foot">
           <button class="button button-quiet" type="button" :disabled="isAccountBusy(proxyEditor.account.id)" @click="proxyEditor = null">取消</button>

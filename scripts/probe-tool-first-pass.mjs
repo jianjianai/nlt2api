@@ -1,17 +1,17 @@
-const baseUrl = process.env.NEURALWATT_PROBE_BASE_URL || "http://localhost:3000";
-const adminToken = process.env.NEURALWATT_PROBE_ADMIN_TOKEN;
-const clientKey = process.env.NEURALWATT_PROBE_CLIENT_KEY;
-const email = process.env.NEURALWATT_PROBE_EMAIL;
-const password = process.env.NEURALWATT_PROBE_PASSWORD;
-const total = Number.parseInt(process.env.NEURALWATT_PROBE_TURNS || "40", 10);
-const delayMs = Number.parseInt(process.env.NEURALWATT_PROBE_DELAY_MS || "3500", 10);
-const model = process.env.NEURALWATT_PROBE_MODEL || "kimi-k3-fast";
-const temperature = Number(process.env.NEURALWATT_PROBE_TEMPERATURE ?? "0");
-const requireFirstPassThreshold = process.env.NEURALWATT_PROBE_REQUIRE_FIRST_PASS !== "false";
-const minimumRepairEligible = Number.parseInt(process.env.NEURALWATT_PROBE_MIN_REPAIRS || "0", 10);
-const endpoint = process.env.NEURALWATT_PROBE_ENDPOINT || "chat";
+const baseUrl = process.env.DEEPINFRA_PROBE_BASE_URL || "http://localhost:3000";
+const adminToken = process.env.DEEPINFRA_PROBE_ADMIN_TOKEN;
+const clientKey = process.env.DEEPINFRA_PROBE_CLIENT_KEY;
+const email = process.env.DEEPINFRA_PROBE_EMAIL;
+const password = process.env.DEEPINFRA_PROBE_PASSWORD;
+const total = Number.parseInt(process.env.DEEPINFRA_PROBE_TURNS || "40", 10);
+const delayMs = Number.parseInt(process.env.DEEPINFRA_PROBE_DELAY_MS || "3500", 10);
+const model = process.env.DEEPINFRA_PROBE_MODEL || "kimi-k3-fast";
+const temperature = Number(process.env.DEEPINFRA_PROBE_TEMPERATURE ?? "0");
+const requireFirstPassThreshold = process.env.DEEPINFRA_PROBE_REQUIRE_FIRST_PASS !== "false";
+const minimumRepairEligible = Number.parseInt(process.env.DEEPINFRA_PROBE_MIN_REPAIRS || "0", 10);
+const endpoint = process.env.DEEPINFRA_PROBE_ENDPOINT || "chat";
 if (!["chat", "responses"].includes(endpoint)) {
-  throw new Error("NEURALWATT_PROBE_ENDPOINT must be chat or responses.");
+  throw new Error("DEEPINFRA_PROBE_ENDPOINT must be chat or responses.");
 }
 
 for (const [name, value] of Object.entries({ adminToken, clientKey, email, password })) {
@@ -20,19 +20,19 @@ for (const [name, value] of Object.entries({ adminToken, clientKey, email, passw
   }
 }
 if (!Number.isInteger(total) || total < 1 || total > 100) {
-  throw new Error("NEURALWATT_PROBE_TURNS must be an integer from 1 to 100.");
+  throw new Error("DEEPINFRA_PROBE_TURNS must be an integer from 1 to 100.");
 }
 if (!Number.isInteger(delayMs) || delayMs < 0 || delayMs > 60_000) {
-  throw new Error("NEURALWATT_PROBE_DELAY_MS must be an integer from 0 to 60000.");
+  throw new Error("DEEPINFRA_PROBE_DELAY_MS must be an integer from 0 to 60000.");
 }
 if (typeof model !== "string" || !model.trim() || model.length > 200) {
-  throw new Error("NEURALWATT_PROBE_MODEL must be a non-empty model name.");
+  throw new Error("DEEPINFRA_PROBE_MODEL must be a non-empty model name.");
 }
 if (!Number.isFinite(temperature) || temperature < 0 || temperature > 2) {
-  throw new Error("NEURALWATT_PROBE_TEMPERATURE must be between 0 and 2.");
+  throw new Error("DEEPINFRA_PROBE_TEMPERATURE must be between 0 and 2.");
 }
 if (!Number.isInteger(minimumRepairEligible) || minimumRepairEligible < 0 || minimumRepairEligible > total) {
-  throw new Error("NEURALWATT_PROBE_MIN_REPAIRS must be an integer from 0 through NEURALWATT_PROBE_TURNS.");
+  throw new Error("DEEPINFRA_PROBE_MIN_REPAIRS must be an integer from 0 through DEEPINFRA_PROBE_TURNS.");
 }
 
 const adminHeaders = {
@@ -211,7 +211,7 @@ let ownsAccount = false;
 try {
   const settingsBeforeProbe = await jsonRequest("/api/admin/settings", { headers: adminHeaders });
   previousRecordMessages = Boolean(settingsBeforeProbe?.settings?.recordMessages);
-  const requestedAccountId = process.env.NEURALWATT_PROBE_ACCOUNT_ID;
+  const requestedAccountId = process.env.DEEPINFRA_PROBE_ACCOUNT_ID;
   if (requestedAccountId) {
     const existing = await jsonRequest("/api/admin/accounts", { headers: adminHeaders });
     if (!existing.accounts?.some((account) => account.id === requestedAccountId)) {

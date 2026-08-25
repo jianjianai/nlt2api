@@ -68,7 +68,7 @@ export async function readJsonObjectWithRaw(request: Request): Promise<ReadJsonO
   const maxBytes = getProxyConfig().maxRequestBytes;
   const declaredLength = Number(request.headers.get("content-length") ?? "");
   if (Number.isFinite(declaredLength) && declaredLength > maxBytes) {
-    throw new HttpError(413, `Request body is too large (limit ${maxBytes} bytes; raise NEURALWATT_MAX_REQUEST_BYTES).`, "invalid_request_error");
+    throw new HttpError(413, `Request body is too large (limit ${maxBytes} bytes; raise DEEPINFRA_GATEWAY_MAX_REQUEST_BYTES).`, "invalid_request_error");
   }
 
   let text = "";
@@ -86,7 +86,7 @@ export async function readJsonObjectWithRaw(request: Request): Promise<ReadJsonO
           total += value.byteLength;
           if (total > maxBytes) {
             await reader.cancel();
-            throw new HttpError(413, `Request body is too large (limit ${maxBytes} bytes; raise NEURALWATT_MAX_REQUEST_BYTES).`, "invalid_request_error");
+            throw new HttpError(413, `Request body is too large (limit ${maxBytes} bytes; raise DEEPINFRA_GATEWAY_MAX_REQUEST_BYTES).`, "invalid_request_error");
           }
           chunks.push(value);
         }
@@ -149,7 +149,7 @@ export async function requireClientAuth(request: Request): Promise<ClientPrincip
     return { scope: "global" };
   }
   if (!config.apiKey) {
-    throw new HttpError(503, "NEURALWATT_API_KEY is not configured.", "server_error", undefined, "api_key_not_configured");
+    throw new HttpError(503, "DEEPINFRA_GATEWAY_API_KEY is not configured.", "server_error", undefined, "api_key_not_configured");
   }
   throw new HttpError(401, "Invalid API key.", "authentication_error", undefined, "invalid_api_key");
 }
@@ -157,7 +157,7 @@ export async function requireClientAuth(request: Request): Promise<ClientPrincip
 export function requireAdminAuth(request: Request): void {
   const expected = getProxyConfig().adminToken;
   if (!expected) {
-    throw new HttpError(503, "NEURALWATT_ADMIN_TOKEN is not configured.", "server_error", undefined, "admin_not_configured");
+    throw new HttpError(503, "DEEPINFRA_GATEWAY_ADMIN_TOKEN is not configured.", "server_error", undefined, "admin_not_configured");
   }
   const received = request.headers.get("x-admin-token")?.trim() || bearerToken(request);
   if (!received || !secureEquals(received, expected)) {

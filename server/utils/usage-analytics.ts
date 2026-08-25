@@ -24,8 +24,8 @@ import {
   type ModelForecastInput,
   type RecommendationHistoryEntry,
 } from "~/server/utils/capacity-forecast.ts";
-import { builtinVendorPrices, calculateCost, portalModelPrice, portalPriceDefinition } from "~/server/utils/model-pricing.ts";
-import { portalClient } from "~/server/utils/portal-client.ts";
+import { builtinVendorPrices, calculateCost, deepInfraModelPrice, deepInfraPriceDefinition } from "~/server/utils/model-pricing.ts";
+import { deepInfraClient } from "~/server/utils/deepinfra-client.ts";
 import { egressIdentity } from "~/server/utils/proxy.ts";
 import type { ProxySettings, PublicAccount, UpstreamUsage } from "~/server/utils/types.ts";
 
@@ -76,15 +76,29 @@ const EMPTY_USAGE: TokenUsage = Object.freeze({
   totalTokens: 0,
   missing: false,
 });
-
 export interface UsageAttemptHandle {
   sequence: number;
   type: AttemptSettlement["type"];
   model: string;
   accountId?: string;
   egressHash?: string;
+  billingAuthoritative: boolean;
   startedAtMs: number;
   finished: boolean;
+}
+
+export interface UpstreamBillingObservation {
+  energy?: import("~/server/utils/types.ts").UpstreamEnergy;
+  cost?: import("~/server/utils/types.ts").UpstreamCost;
+  serviceTier?: string;
+}
+
+function nanoKwh(value: unknown): number {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 ? Math.round(value * 1_000_000_000) : 0;
+}
+
+function microUsd(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 ? Math.round(value * 1_000_000) : undefined;
 }
 
 export class UsageExecutionTracker {
@@ -108,6 +122,7 @@ export class UsageExecutionTracker {
     model: string;
     accountId?: string;
     egressHash?: string;
+    billingAuthoritative?: boolean;
     now?: number;
   }): UsageAttemptHandle {
     return {
@@ -116,6 +131,7 @@ export class UsageExecutionTracker {
       model: input.model,
       ...(input.accountId ? { accountId: input.accountId } : {}),
       ...(input.egressHash ? { egressHash: input.egressHash } : {}),
+      billingAuthoritative: input.billingAuthoritative === true,
       startedAtMs: input.now ?? Date.now(),
       finished: false,
     };
@@ -123,11 +139,20 @@ export class UsageExecutionTracker {
 
   finishAttempt(
     attempt: UsageAttemptHandle | undefined,
-    input: { status: number; outcome: AttemptSettlement["outcome"]; usage?: UpstreamUsage; now?: number },
+    input: {
+      status: number;
+      outcome: AttemptSettlement["outcome"];
+      usage?: UpstreamUsage;
+      billing?: UpstreamBillingObservation;
+      now?: number;
+    },
   ): void {
     if (!attempt || attempt.finished) return;
     attempt.finished = true;
     const completedAtMs = input.now ?? Date.now();
+    const consumed = nanoKwh(input.billing?.energy?.energy_kwh);
+    const charged = nanoKwh(input.billing?.energy?.energy_kwh_charged ?? input.billing?.energy?.energy_kwh);
+    const upstreamCost = microUsd(input.billing?.cost?.request_cost_usd);
     this.attempts.push({
       sequence: attempt.sequence,
       type: attempt.type,
@@ -140,6 +165,12 @@ export class UsageExecutionTracker {
       status: input.status,
       outcome: input.outcome,
       usage: tokenUsage(input.usage),
+      billingAuthoritative: attempt.billingAuthoritative,
+      energyConsumedNanoKwh: consumed,
+      energyChargedNanoKwh: charged,
+      ...(upstreamCost !== undefined ? { upstreamCostMicroUsd: upstreamCost } : {}),
+      ...(input.billing?.serviceTier ? { serviceTier: input.billing.serviceTier } : {}),
+      ...(input.billing?.cost?.accounting_method ? { accountingMethod: input.billing.cost.accounting_method } : {}),
     });
   }
 
@@ -230,7 +261,9 @@ function priceFromRow(row: Record<string, unknown>): PriceDefinition {
     modelId: String(row.model_id),
     provider: String(row.provider),
     displayName: String(row.display_name),
-    source: row.source === "vendor_official" ? "vendor_official" : "portal_catalog",
+    source: row.source === "vendor_official"
+      ? "vendor_official"
+      : row.source === "legacy_catalog" ? "legacy_catalog" : "deepinfra_catalog",
     sourceUrl: String(row.source_url),
     currency: "USD",
     inputNanoUsdPerToken: Number(row.input_nano_usd_per_token),
@@ -258,7 +291,7 @@ export class UsageAnalyticsService {
 
   constructor(
     private readonly database = analyticsDatabase,
-    private readonly loadPortalModels: () => Promise<Record<string, unknown>[]> = () => portalClient.listModels(),
+    private readonly loadCatalogModels: () => Promise<Record<string, unknown>[]> = deepInfraClient.catalog,
   ) {}
 
   beginExecution(endpoint: ExecutionSettlement["endpoint"], model: string): UsageExecutionTracker {
@@ -311,7 +344,7 @@ export class UsageAnalyticsService {
         this.priceError = error instanceof Error ? error.message : "Price refresh failed.";
         try {
           this.database.run(`INSERT INTO catalog_sync (source, checked_at, status, error)
-            VALUES ('portal_catalog', COALESCE((SELECT checked_at FROM catalog_sync WHERE source = 'portal_catalog'), ?), 'error', ?)
+            VALUES ('deepinfra_catalog', COALESCE((SELECT checked_at FROM catalog_sync WHERE source = 'deepinfra_catalog'), ?), 'error', ?)
             ON CONFLICT(source) DO UPDATE SET status = excluded.status, error = excluded.error`,
           new Date(0).toISOString(), this.priceError.slice(0, 500));
         } catch {
@@ -326,21 +359,21 @@ export class UsageAnalyticsService {
   }
 
   async refreshPricesIfDue(): Promise<void> {
-    const latest = this.database.get<{ checked_at: string; status: string }>("SELECT checked_at, status FROM catalog_sync WHERE source = 'portal_catalog'");
+    const latest = this.database.get<{ checked_at: string; status: string }>("SELECT checked_at, status FROM catalog_sync WHERE source = 'deepinfra_catalog'");
     const due = !latest || latest.status !== "ok" || Date.now() - Date.parse(latest.checked_at) >= PRICE_REFRESH_MS;
     if (due) await this.refreshPrices(false);
   }
 
   private async performPriceRefresh(force: boolean): Promise<void> {
-    const latest = this.database.get<{ checked_at: string; status: string }>("SELECT checked_at, status FROM catalog_sync WHERE source = 'portal_catalog'");
+    const latest = this.database.get<{ checked_at: string; status: string }>("SELECT checked_at, status FROM catalog_sync WHERE source = 'deepinfra_catalog'");
     if (!force && latest?.status === "ok" && Date.now() - Date.parse(latest.checked_at) < PRICE_REFRESH_MS) return;
     const fetchedAt = new Date().toISOString();
-    const models = (await this.loadPortalModels()).map(portalModelPrice).filter((model): model is NonNullable<typeof model> => Boolean(model));
-    if (models.length === 0) throw new Error("The portal model catalog contained no valid price rows.");
+    const models = (await this.loadCatalogModels()).map(deepInfraModelPrice).filter((model): model is NonNullable<typeof model> => Boolean(model));
+    if (models.length === 0) throw new Error("The DeepInfra model catalog contained no valid price rows.");
     this.database.transaction((database) => {
-      for (const model of models) this.insertPrice(database, portalPriceDefinition(model, fetchedAt));
+      for (const model of models) this.insertPrice(database, deepInfraPriceDefinition(model, fetchedAt));
       database.prepare(`INSERT INTO catalog_sync (source, checked_at, status, error)
-        VALUES ('portal_catalog', ?, 'ok', NULL)
+        VALUES ('deepinfra_catalog', ?, 'ok', NULL)
         ON CONFLICT(source) DO UPDATE SET checked_at = excluded.checked_at, status = excluded.status, error = NULL`).run(fetchedAt);
     });
     this.healthError = undefined;
@@ -403,26 +436,46 @@ export class UsageAnalyticsService {
 
   private prepareSettlement(input: UnpricedExecution): ExecutionSettlement {
     const usage = input.attempts.reduce((total, attempt) => addTokenUsage(total, attempt.usage), { ...EMPTY_USAGE });
-    const price = this.priceFor(input.model);
-    const priced = Boolean(price) && !usage.missing;
-    const cost = priced && price ? calculateCost(usage, price) : {
+    const authoritativeAttempts = input.attempts.filter((attempt) => attempt.billingAuthoritative);
+    const authoritativeComplete = authoritativeAttempts.length > 0
+      && authoritativeAttempts.every((attempt) => attempt.outcome !== "success" || attempt.upstreamCostMicroUsd !== undefined);
+    const upstreamCostMicroUsd = authoritativeAttempts.reduce((total, attempt) => total + (attempt.upstreamCostMicroUsd ?? 0), 0);
+    const energyConsumedNanoKwh = input.attempts.reduce((total, attempt) => total + attempt.energyConsumedNanoKwh, 0);
+    const energyChargedNanoKwh = input.attempts.reduce((total, attempt) => total + attempt.energyChargedNanoKwh, 0);
+    const price = authoritativeAttempts.length === 0 ? this.priceFor(input.model) : undefined;
+    const catalogPriced = Boolean(price) && !usage.missing;
+    const priced = authoritativeComplete || catalogPriced;
+    const catalogCost = catalogPriced && price ? calculateCost(usage, price) : {
       inputCostMicroUsd: 0,
       cachedInputCostMicroUsd: 0,
       outputCostMicroUsd: 0,
       totalCostMicroUsd: 0,
     };
+    const cost = authoritativeComplete ? {
+      inputCostMicroUsd: 0,
+      cachedInputCostMicroUsd: 0,
+      outputCostMicroUsd: 0,
+      totalCostMicroUsd: upstreamCostMicroUsd,
+    } : catalogCost;
+    const costSource = authoritativeComplete ? "upstream_billed" : catalogPriced ? "catalog_estimate" : "unpriced";
     const normalized = {
       ...input,
       usage,
-      priceId: priced ? price?.id ?? null : null,
+      priceId: catalogPriced ? price?.id ?? null : null,
       cost,
+      costSource,
+      energyConsumedNanoKwh,
+      energyChargedNanoKwh,
       priced,
     };
     return {
       ...input,
       usage,
-      ...(priced && price ? { price } : {}),
+      ...(catalogPriced && price ? { price } : {}),
       ...cost,
+      costSource,
+      energyConsumedNanoKwh,
+      energyChargedNanoKwh,
       priced,
       payloadHash: hashPayload(normalized),
     };
@@ -450,8 +503,9 @@ export class UsageAnalyticsService {
       id, endpoint, model, started_at, completed_at, duration_ms, status, outcome, upstream_attempts,
       prompt_tokens, cached_prompt_tokens, completion_tokens, reasoning_tokens, total_tokens, usage_missing,
       price_version_id, input_cost_micro_usd, cached_input_cost_micro_usd, output_cost_micro_usd,
-      total_cost_micro_usd, priced, payload_hash, created_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+      total_cost_micro_usd, priced, cost_source, energy_consumed_nano_kwh, energy_charged_nano_kwh,
+      payload_hash, created_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
       settlement.id,
       settlement.endpoint,
       settlement.model,
@@ -473,13 +527,18 @@ export class UsageAnalyticsService {
       settlement.outputCostMicroUsd,
       settlement.totalCostMicroUsd,
       settlement.priced ? 1 : 0,
+      settlement.costSource,
+      settlement.energyConsumedNanoKwh,
+      settlement.energyChargedNanoKwh,
       settlement.payloadHash,
       new Date().toISOString(),
     );
     const insertAttempt = database.prepare(`INSERT INTO execution_attempts (
       execution_id, sequence, type, model, account_id, egress_hash, started_at, completed_at, duration_ms,
-      status, outcome, prompt_tokens, cached_prompt_tokens, completion_tokens, reasoning_tokens, total_tokens, usage_missing
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
+      status, outcome, prompt_tokens, cached_prompt_tokens, completion_tokens, reasoning_tokens, total_tokens, usage_missing,
+      billing_authoritative, energy_consumed_nano_kwh, energy_charged_nano_kwh, upstream_cost_micro_usd,
+      service_tier, accounting_method
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
     for (const attempt of settlement.attempts) {
       insertAttempt.run(
         settlement.id,
@@ -499,6 +558,12 @@ export class UsageAnalyticsService {
         attempt.usage.reasoningTokens,
         attempt.usage.totalTokens,
         attempt.usage.missing ? 1 : 0,
+        attempt.billingAuthoritative ? 1 : 0,
+        attempt.energyConsumedNanoKwh,
+        attempt.energyChargedNanoKwh,
+        attempt.upstreamCostMicroUsd ?? null,
+        attempt.serviceTier ?? null,
+        attempt.accountingMethod ?? null,
       );
     }
     this.updateSettlementAggregates(database, settlement);
@@ -544,8 +609,9 @@ export class UsageAnalyticsService {
       database.prepare(`INSERT INTO ${table} (
         ${periodColumn}, model, client_requests, upstream_attempts, prompt_tokens, cached_prompt_tokens,
         completion_tokens, total_cost_micro_usd, unpriced_requests, input_cost_micro_usd,
-        cached_input_cost_micro_usd, output_cost_micro_usd, unpriced_tokens
-      ) VALUES (?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        cached_input_cost_micro_usd, output_cost_micro_usd, unpriced_tokens,
+        energy_consumed_nano_kwh, energy_charged_nano_kwh, upstream_billed_requests
+      ) VALUES (?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(${periodColumn}, model) DO UPDATE SET
         client_requests = client_requests + 1,
         upstream_attempts = upstream_attempts + excluded.upstream_attempts,
@@ -557,7 +623,10 @@ export class UsageAnalyticsService {
         input_cost_micro_usd = input_cost_micro_usd + excluded.input_cost_micro_usd,
         cached_input_cost_micro_usd = cached_input_cost_micro_usd + excluded.cached_input_cost_micro_usd,
         output_cost_micro_usd = output_cost_micro_usd + excluded.output_cost_micro_usd,
-        unpriced_tokens = unpriced_tokens + excluded.unpriced_tokens`).run(
+        unpriced_tokens = unpriced_tokens + excluded.unpriced_tokens,
+        energy_consumed_nano_kwh = energy_consumed_nano_kwh + excluded.energy_consumed_nano_kwh,
+        energy_charged_nano_kwh = energy_charged_nano_kwh + excluded.energy_charged_nano_kwh,
+        upstream_billed_requests = upstream_billed_requests + excluded.upstream_billed_requests`).run(
         period,
         settlement.model,
         settlement.attempts.length,
@@ -570,6 +639,9 @@ export class UsageAnalyticsService {
         settlement.cachedInputCostMicroUsd,
         settlement.outputCostMicroUsd,
         settlement.priced ? 0 : settlement.usage.totalTokens,
+        settlement.energyConsumedNanoKwh,
+        settlement.energyChargedNanoKwh,
+        settlement.costSource === "upstream_billed" ? 1 : 0,
       );
     }
   }
@@ -579,7 +651,19 @@ export class UsageAnalyticsService {
       FROM analytics_failures WHERE next_retry_at <= ? ORDER BY created_at LIMIT ?`, new Date().toISOString(), limit);
     for (const row of rows) {
       try {
-        const settlement = JSON.parse(row.payload_json) as ExecutionSettlement;
+        const parsed = JSON.parse(row.payload_json) as ExecutionSettlement;
+        const settlement: ExecutionSettlement = {
+          ...parsed,
+          costSource: parsed.costSource ?? (parsed.priced ? "catalog_estimate" : "unpriced"),
+          energyConsumedNanoKwh: parsed.energyConsumedNanoKwh ?? 0,
+          energyChargedNanoKwh: parsed.energyChargedNanoKwh ?? 0,
+          attempts: parsed.attempts.map((attempt) => ({
+            ...attempt,
+            billingAuthoritative: attempt.billingAuthoritative ?? false,
+            energyConsumedNanoKwh: attempt.energyConsumedNanoKwh ?? 0,
+            energyChargedNanoKwh: attempt.energyChargedNanoKwh ?? 0,
+          })),
+        };
         this.database.transaction((database) => this.insertSettlement(database, settlement));
         this.database.run("DELETE FROM analytics_failures WHERE execution_id = ?", row.execution_id);
       } catch (error) {
@@ -747,6 +831,8 @@ export class UsageAnalyticsService {
         trend15m: this.trend15m(series),
         todayCostMicroUsd: totals.today,
         monthCostMicroUsd: totals.month,
+        todayEnergyConsumedNanoKwh: totals.todayEnergy,
+        monthEnergyConsumedNanoKwh: totals.monthEnergy,
         pricedCoverage: pricedTotal > 0 ? totals.pricedRequests / pricedTotal : 1,
         unpricedRequests: totals.unpricedRequests,
         unpricedTokens: totals.unpricedTokens,
@@ -845,6 +931,8 @@ export class UsageAnalyticsService {
       trend15m: 0,
       todayCostMicroUsd: 0,
       monthCostMicroUsd: 0,
+      todayEnergyConsumedNanoKwh: 0,
+      monthEnergyConsumedNanoKwh: 0,
       pricedCoverage: 0,
       unpricedRequests: 0,
       unpricedTokens: 0,
@@ -909,21 +997,33 @@ export class UsageAnalyticsService {
     return baseline > 0 ? (recent - baseline) / baseline : 0;
   }
 
-  private costTotals(now: number): { today: number; month: number; pricedRequests: number; unpricedRequests: number; unpricedTokens: number } {
+  private costTotals(now: number): {
+    today: number;
+    month: number;
+    todayEnergy: number;
+    monthEnergy: number;
+    pricedRequests: number;
+    unpricedRequests: number;
+    unpricedTokens: number;
+  } {
     const day = new Date(now).toISOString().slice(0, 10);
     const month = day.slice(0, 7);
     const today = this.database.get<Record<string, unknown>>(`SELECT
       COALESCE(SUM(total_cost_micro_usd), 0) AS total_cost_micro_usd,
       COALESCE(SUM(client_requests - unpriced_requests), 0) AS priced_requests,
       COALESCE(SUM(unpriced_requests), 0) AS unpriced_requests,
-      COALESCE(SUM(unpriced_tokens), 0) AS unpriced_tokens
+      COALESCE(SUM(unpriced_tokens), 0) AS unpriced_tokens,
+      COALESCE(SUM(energy_consumed_nano_kwh), 0) AS energy_consumed_nano_kwh
       FROM daily_model_totals WHERE day = ?`, day) ?? {};
-    const monthTotal = this.database.get<{ total_cost_micro_usd: number }>(`SELECT
-      COALESCE(SUM(total_cost_micro_usd), 0) AS total_cost_micro_usd
+    const monthTotal = this.database.get<{ total_cost_micro_usd: number; energy_consumed_nano_kwh: number }>(`SELECT
+      COALESCE(SUM(total_cost_micro_usd), 0) AS total_cost_micro_usd,
+      COALESCE(SUM(energy_consumed_nano_kwh), 0) AS energy_consumed_nano_kwh
       FROM monthly_model_totals WHERE month = ?`, month);
     return {
       today: Number(today.total_cost_micro_usd ?? 0),
       month: Number(monthTotal?.total_cost_micro_usd ?? 0),
+      todayEnergy: Number(today.energy_consumed_nano_kwh ?? 0),
+      monthEnergy: Number(monthTotal?.energy_consumed_nano_kwh ?? 0),
       pricedRequests: Number(today.priced_requests ?? 0),
       unpricedRequests: Number(today.unpriced_requests ?? 0),
       unpricedTokens: Number(today.unpriced_tokens ?? 0),
@@ -941,7 +1041,8 @@ export class UsageAnalyticsService {
     const rows = this.database.all<Record<string, unknown>>(`SELECT model, client_requests AS requests,
       upstream_attempts, prompt_tokens, cached_prompt_tokens, completion_tokens,
       total_cost_micro_usd, input_cost_micro_usd, cached_input_cost_micro_usd,
-      output_cost_micro_usd, unpriced_requests
+      output_cost_micro_usd, energy_consumed_nano_kwh, energy_charged_nano_kwh,
+      upstream_billed_requests, unpriced_requests
       FROM daily_model_totals WHERE day = ? ORDER BY total_cost_micro_usd DESC`, day);
     const byModel = new Map(rows.map((row) => [String(row.model), row]));
     return modelIds.map((model) => {
@@ -961,6 +1062,9 @@ export class UsageAnalyticsService {
         inputCostMicroUsd: Number(row.input_cost_micro_usd ?? 0),
         cachedInputCostMicroUsd: Number(row.cached_input_cost_micro_usd ?? 0),
         outputCostMicroUsd: Number(row.output_cost_micro_usd ?? 0),
+        energyConsumedNanoKwh: Number(row.energy_consumed_nano_kwh ?? 0),
+        energyChargedNanoKwh: Number(row.energy_charged_nano_kwh ?? 0),
+        upstreamBilledRequests: Number(row.upstream_billed_requests ?? 0),
         unpricedRequests: Number(row.unpriced_requests ?? 0),
         ...(price ? { priceSource: price.source, priceVerifiedAt: price.verifiedAt } : {}),
         p95DurationMs: 0,
@@ -1001,7 +1105,7 @@ export class UsageAnalyticsService {
           ? null
           : identity.direct ? settings.scheduler.directEgressRpm : settings.scheduler.proxyRpm,
         modelConcurrency,
-        healthy: account.enabled && account.hasSession && account.runtime.cooldownUntil <= now
+        healthy: account.enabled && account.runtime.cooldownUntil <= now
           && (account.runtime.modelCooldownUntil[model] ?? 0) <= now,
       };
     });
@@ -1031,6 +1135,8 @@ export class UsageAnalyticsService {
       COALESCE(SUM(input_cost_micro_usd), 0) AS input_cost_micro_usd,
       COALESCE(SUM(cached_input_cost_micro_usd), 0) AS cached_input_cost_micro_usd,
       COALESCE(SUM(output_cost_micro_usd), 0) AS output_cost_micro_usd,
+      COALESCE(SUM(energy_consumed_nano_kwh), 0) AS energy_consumed_nano_kwh,
+      COALESCE(SUM(energy_charged_nano_kwh), 0) AS energy_charged_nano_kwh,
       COALESCE(SUM(client_requests - unpriced_requests), 0) AS priced_requests,
       COALESCE(SUM(unpriced_requests), 0) AS unpriced_requests,
       COALESCE(SUM(prompt_tokens), 0) AS prompt_tokens,
@@ -1044,6 +1150,9 @@ export class UsageAnalyticsService {
       SUM(input_cost_micro_usd) AS input_cost_micro_usd,
       SUM(cached_input_cost_micro_usd) AS cached_input_cost_micro_usd,
       SUM(output_cost_micro_usd) AS output_cost_micro_usd,
+      SUM(energy_consumed_nano_kwh) AS energy_consumed_nano_kwh,
+      SUM(energy_charged_nano_kwh) AS energy_charged_nano_kwh,
+      SUM(upstream_billed_requests) AS upstream_billed_requests,
       SUM(unpriced_requests) AS unpriced_requests
       FROM daily_model_totals WHERE ${where} GROUP BY model ORDER BY total_cost_micro_usd DESC`, ...params);
     const forecastRows = this.database.all<Record<string, unknown>>(`SELECT snapshot.* FROM forecast_snapshots snapshot
@@ -1071,6 +1180,9 @@ export class UsageAnalyticsService {
         inputCostMicroUsd: Number(row.input_cost_micro_usd ?? 0),
         cachedInputCostMicroUsd: Number(row.cached_input_cost_micro_usd ?? 0),
         outputCostMicroUsd: Number(row.output_cost_micro_usd ?? 0),
+        energyConsumedNanoKwh: Number(row.energy_consumed_nano_kwh ?? 0),
+        energyChargedNanoKwh: Number(row.energy_charged_nano_kwh ?? 0),
+        upstreamBilledRequests: Number(row.upstream_billed_requests ?? 0),
         unpricedRequests: Number(row.unpriced_requests ?? 0),
         ...(price ? { priceSource: price.source, priceVerifiedAt: price.verifiedAt } : {}),
         p95DurationMs: 0,
@@ -1111,6 +1223,8 @@ export class UsageAnalyticsService {
       inputCostMicroUsd: Number(total.input_cost_micro_usd ?? 0),
       cachedInputCostMicroUsd: Number(total.cached_input_cost_micro_usd ?? 0),
       outputCostMicroUsd: Number(total.output_cost_micro_usd ?? 0),
+      energyConsumedNanoKwh: Number(total.energy_consumed_nano_kwh ?? 0),
+      energyChargedNanoKwh: Number(total.energy_charged_nano_kwh ?? 0),
       pricedRequests: Number(total.priced_requests ?? 0),
       unpricedRequests: Number(total.unpriced_requests ?? 0),
       promptTokens: Number(total.prompt_tokens ?? 0),
@@ -1219,11 +1333,13 @@ export class UsageAnalyticsService {
   private aggregateChecksum(database: DatabaseSync): string {
     const rows = database.prepare(`SELECT 'day' AS kind, day AS period, model, client_requests, upstream_attempts,
       prompt_tokens, cached_prompt_tokens, completion_tokens, total_cost_micro_usd, unpriced_requests,
-      input_cost_micro_usd, cached_input_cost_micro_usd, output_cost_micro_usd, unpriced_tokens
+      input_cost_micro_usd, cached_input_cost_micro_usd, output_cost_micro_usd, unpriced_tokens,
+      energy_consumed_nano_kwh, energy_charged_nano_kwh, upstream_billed_requests
       FROM daily_model_totals UNION ALL
       SELECT 'month', month, model, client_requests, upstream_attempts, prompt_tokens,
       cached_prompt_tokens, completion_tokens, total_cost_micro_usd, unpriced_requests,
-      input_cost_micro_usd, cached_input_cost_micro_usd, output_cost_micro_usd, unpriced_tokens
+      input_cost_micro_usd, cached_input_cost_micro_usd, output_cost_micro_usd, unpriced_tokens,
+      energy_consumed_nano_kwh, energy_charged_nano_kwh, upstream_billed_requests
       FROM monthly_model_totals ORDER BY kind, period, model`).all();
     return hashPayload(rows);
   }

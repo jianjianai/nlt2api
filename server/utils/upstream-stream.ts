@@ -21,10 +21,17 @@ export class UpstreamStreamError extends Error {
   }
 }
 
+export interface UpstreamBillingTelemetry {
+  energy?: import("~/server/utils/types.ts").UpstreamEnergy;
+  cost?: import("~/server/utils/types.ts").UpstreamCost;
+  serviceTier?: string;
+}
+
 export interface CollectedUpstreamStream {
   completion: UpstreamCompletion;
   frames: UpstreamCompletion[];
   raw: string;
+  telemetry: UpstreamBillingTelemetry;
 }
 
 /**
@@ -91,6 +98,27 @@ function mergeDelta(target: ChatMessage, delta: ChatMessage): void {
     }
     target.tool_calls = existing;
   }
+}
+
+function parseSseComment(line: string): Partial<UpstreamBillingTelemetry> | undefined {
+  if (!line.startsWith(":")) return undefined;
+  const match = /^:\s*(energy|cost|routing)\s+(.+)$/.exec(line);
+  if (!match) return undefined;
+  try {
+    const value = JSON.parse(match[2]!) as Record<string, unknown>;
+    if (match[1] === "energy") return { energy: value as UpstreamBillingTelemetry["energy"] };
+    if (match[1] === "cost") return { cost: value as UpstreamBillingTelemetry["cost"] };
+    return typeof value.service_tier === "string" ? { serviceTier: value.service_tier } : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function mergeTelemetry(target: UpstreamBillingTelemetry, next: Partial<UpstreamBillingTelemetry> | undefined): void {
+  if (!next) return;
+  if (next.energy) target.energy = { ...(target.energy ?? {}), ...next.energy };
+  if (next.cost) target.cost = { ...(target.cost ?? {}), ...next.cost };
+  if (next.serviceTier) target.serviceTier = next.serviceTier;
 }
 
 function parseDataLine(line: string): UpstreamCompletion | undefined {
@@ -179,11 +207,12 @@ export async function collectUpstreamStream(
   let raw = "";
   let totalBytes = 0;
   const frames: UpstreamCompletion[] = [];
+  const telemetry: UpstreamBillingTelemetry = {};
   try {
     for await (const chunk of response.body) {
       totalBytes += chunk.byteLength;
       if (totalBytes > maxBytes) {
-        throw new Error("The NeuralWatt portal response exceeded the adapter limit.");
+        throw new Error("The DeepInfra response exceeded the adapter limit.");
       }
       const decoded = decoder.decode(chunk, { stream: true });
       raw += decoded;
@@ -191,7 +220,9 @@ export async function collectUpstreamStream(
       const lines = buffer.split("\n");
       buffer = lines.pop() ?? "";
       for (const line of lines) {
-        const frame = parseDataLine(line.replace(/\r$/, ""));
+        const normalized = line.replace(/\r$/, "");
+        mergeTelemetry(telemetry, parseSseComment(normalized));
+        const frame = parseDataLine(normalized);
         if (frame) {
           frames.push(frame);
           // Error frames are handled by assemble() so callers never render an
@@ -206,14 +237,20 @@ export async function collectUpstreamStream(
     const finalDecoded = decoder.decode();
     raw += finalDecoded;
     buffer += finalDecoded;
-    const finalFrame = parseDataLine(buffer.replace(/\r$/, ""));
+    const normalizedFinal = buffer.replace(/\r$/, "");
+    mergeTelemetry(telemetry, parseSseComment(normalizedFinal));
+    const finalFrame = parseDataLine(normalizedFinal);
     if (finalFrame) {
       frames.push(finalFrame);
       if (!finalFrame.error && onFrame) {
         await onFrame(finalFrame);
       }
     }
-    return { completion: assemble(frames), frames, raw };
+    const completion = assemble(frames);
+    if (telemetry.energy) completion.energy = telemetry.energy;
+    if (telemetry.cost) completion.cost = telemetry.cost;
+    if (telemetry.serviceTier) completion.service_tier = telemetry.serviceTier;
+    return { completion, frames, raw, telemetry };
   } catch (error) {
     if (error instanceof ProxyTransportError) {
       throw error;
@@ -228,14 +265,14 @@ export async function collectUpstreamStream(
     if (typeof statusValue === "number" && Number.isInteger(statusValue) && statusValue >= 400 && statusValue <= 599) {
       const retryValue = asObject(error)?.retryAfterSeconds;
       throw new UpstreamStreamError(
-        error instanceof Error ? error.message : "The NeuralWatt portal streaming response failed.",
+        error instanceof Error ? error.message : "The DeepInfra streaming response failed.",
         statusValue,
         typeof retryValue === "number" ? retryValue : undefined,
         raw,
       );
     }
     throw new UpstreamStreamError(
-      error instanceof Error ? error.message : "The NeuralWatt portal streaming response failed.",
+      error instanceof Error ? error.message : "The DeepInfra streaming response failed.",
       502,
       undefined,
       raw,

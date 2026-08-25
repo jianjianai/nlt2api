@@ -4,7 +4,7 @@ import { DatabaseSync, type SQLInputValue } from "node:sqlite";
 import { getProxyConfig } from "~/server/utils/config.ts";
 
 const DATABASE_FILE = "usage-analytics.sqlite";
-const SCHEMA_VERSION = 4;
+const SCHEMA_VERSION = 6;
 
 const MIGRATION_1 = `
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -16,7 +16,7 @@ CREATE TABLE IF NOT EXISTS price_versions (
   model_id TEXT NOT NULL,
   provider TEXT NOT NULL,
   display_name TEXT NOT NULL,
-  source TEXT NOT NULL CHECK (source IN ('vendor_official', 'portal_catalog')),
+  source TEXT NOT NULL CHECK (source IN ('vendor_official', 'deepinfra_catalog', 'legacy_catalog')),
   source_url TEXT NOT NULL,
   currency TEXT NOT NULL CHECK (currency = 'USD'),
   input_nano_usd_per_token INTEGER NOT NULL CHECK (input_nano_usd_per_token >= 0),
@@ -283,6 +283,71 @@ export class AnalyticsDatabase {
         database.exec("COMMIT");
       } catch (error) {
         database.exec("ROLLBACK");
+        throw error;
+      }
+    }
+    if ((current.version ?? 0) < 5) {
+      database.exec("BEGIN IMMEDIATE");
+      try {
+        database.exec(`ALTER TABLE executions ADD COLUMN cost_source TEXT NOT NULL DEFAULT 'catalog_estimate';
+        ALTER TABLE executions ADD COLUMN energy_consumed_nano_kwh INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE executions ADD COLUMN energy_charged_nano_kwh INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE execution_attempts ADD COLUMN billing_authoritative INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE execution_attempts ADD COLUMN energy_consumed_nano_kwh INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE execution_attempts ADD COLUMN energy_charged_nano_kwh INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE execution_attempts ADD COLUMN upstream_cost_micro_usd INTEGER;
+        ALTER TABLE execution_attempts ADD COLUMN service_tier TEXT;
+        ALTER TABLE execution_attempts ADD COLUMN accounting_method TEXT;
+        ALTER TABLE daily_model_totals ADD COLUMN energy_consumed_nano_kwh INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE daily_model_totals ADD COLUMN energy_charged_nano_kwh INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE daily_model_totals ADD COLUMN upstream_billed_requests INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE monthly_model_totals ADD COLUMN energy_consumed_nano_kwh INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE monthly_model_totals ADD COLUMN energy_charged_nano_kwh INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE monthly_model_totals ADD COLUMN upstream_billed_requests INTEGER NOT NULL DEFAULT 0;`);
+        database.prepare("INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)").run(5, new Date().toISOString());
+        database.exec("COMMIT");
+      } catch (error) {
+        database.exec("ROLLBACK");
+        throw error;
+      }
+    }
+    if ((current.version ?? 0) < 6) {
+      database.exec("PRAGMA foreign_keys=OFF; BEGIN IMMEDIATE");
+      try {
+        database.exec(`CREATE TABLE price_versions_v6 (
+          id INTEGER PRIMARY KEY,
+          model_id TEXT NOT NULL,
+          provider TEXT NOT NULL,
+          display_name TEXT NOT NULL,
+          source TEXT NOT NULL CHECK (source IN ('vendor_official', 'deepinfra_catalog', 'legacy_catalog')),
+          source_url TEXT NOT NULL,
+          currency TEXT NOT NULL CHECK (currency = 'USD'),
+          input_nano_usd_per_token INTEGER NOT NULL CHECK (input_nano_usd_per_token >= 0),
+          cached_input_nano_usd_per_token INTEGER CHECK (cached_input_nano_usd_per_token >= 0),
+          output_nano_usd_per_token INTEGER NOT NULL CHECK (output_nano_usd_per_token >= 0),
+          effective_at TEXT NOT NULL,
+          fetched_at TEXT NOT NULL,
+          verified_at TEXT NOT NULL,
+          content_hash TEXT NOT NULL UNIQUE
+        ) STRICT;
+        INSERT INTO price_versions_v6 (
+          id, model_id, provider, display_name, source, source_url, currency,
+          input_nano_usd_per_token, cached_input_nano_usd_per_token, output_nano_usd_per_token,
+          effective_at, fetched_at, verified_at, content_hash
+        ) SELECT
+          id, model_id, provider, display_name,
+          CASE source WHEN 'portal_catalog' THEN 'legacy_catalog' ELSE source END,
+          source_url, currency, input_nano_usd_per_token, cached_input_nano_usd_per_token,
+          output_nano_usd_per_token, effective_at, fetched_at, verified_at, content_hash
+        FROM price_versions;
+        DROP TABLE price_versions;
+        ALTER TABLE price_versions_v6 RENAME TO price_versions;
+        CREATE INDEX idx_price_versions_model ON price_versions(model_id, effective_at DESC);
+        DELETE FROM catalog_sync WHERE source = 'portal_catalog';`);
+        database.prepare("INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)").run(6, new Date().toISOString());
+        database.exec("COMMIT; PRAGMA foreign_keys=ON");
+      } catch (error) {
+        database.exec("ROLLBACK; PRAGMA foreign_keys=ON");
         throw error;
       }
     }

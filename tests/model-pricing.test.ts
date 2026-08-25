@@ -1,39 +1,38 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { calculateCost, portalModelPrice, portalPriceDefinition } from "../server/utils/model-pricing.ts";
+import { calculateCost, deepInfraModelPrice, deepInfraPriceDefinition } from "../server/utils/model-pricing.ts";
 
 const fetchedAt = "2026-08-23T00:00:00.000Z";
 
-test("portal prices require exact valid numeric fields", () => {
-  const parsed = portalModelPrice({
-    id: "kimi-k3-fast",
-    name: "Kimi K3 Fast",
-    provider: "Moonshot",
-    prompt_price_per_1k: 0.003,
-    completion_price_per_1k: 0.015,
-    cached_input_price_per_1k: 0.0003,
-  });
+function catalogRow(inputCents = 0.000285, outputCents = 0.001425, cachedRate: number | null = 0.1) {
+  return {
+    model_name: "moonshotai/Kimi-K3",
+    pricing: {
+      cents_per_input_token: inputCents,
+      cents_per_output_token: outputCents,
+      rate_per_input_token_cached: cachedRate,
+    },
+  };
+}
+
+test("DeepInfra catalog prices require valid complete-catalog pricing fields", () => {
+  const parsed = deepInfraModelPrice(catalogRow());
   assert.deepEqual(parsed, {
-    id: "kimi-k3-fast",
-    name: "Kimi K3 Fast",
-    provider: "Moonshot",
-    promptPricePer1k: 0.003,
-    completionPricePer1k: 0.015,
-    cachedInputPricePer1k: 0.0003,
+    id: "moonshotai/Kimi-K3",
+    name: "moonshotai/Kimi-K3",
+    provider: "moonshotai",
+    inputPricePerMillion: 2.85,
+    outputPricePerMillion: 14.25,
+    cachedInputPricePerMillion: 0.285,
   });
-  assert.equal(portalModelPrice({ id: "bad", prompt_price_per_1k: -1, completion_price_per_1k: 1 }), undefined);
+  assert.equal(deepInfraModelPrice(catalogRow(-1)), undefined);
 });
 
-test("cached prompt tokens are not charged again at the regular input rate", () => {
-  const model = portalModelPrice({
-    id: "model-1",
-    name: "Model 1",
-    provider: "Provider",
-    prompt_price_per_1k: 0.001,
-    completion_price_per_1k: 0.002,
-    cached_input_price_per_1k: 0.0001,
-  })!;
-  const price = portalPriceDefinition(model, fetchedAt);
+test("DeepInfra per-million prices convert to exact per-token nano USD", () => {
+  const price = deepInfraPriceDefinition(deepInfraModelPrice(catalogRow())!, fetchedAt);
+  assert.equal(price.inputNanoUsdPerToken, 2_850);
+  assert.equal(price.cachedInputNanoUsdPerToken, 285);
+  assert.equal(price.outputNanoUsdPerToken, 14_250);
   const cost = calculateCost({
     promptTokens: 1_000,
     cachedPromptTokens: 400,
@@ -43,24 +42,17 @@ test("cached prompt tokens are not charged again at the regular input rate", () 
     missing: false,
   }, price);
   assert.deepEqual(cost, {
-    inputCostMicroUsd: 600,
-    cachedInputCostMicroUsd: 40,
-    outputCostMicroUsd: 1_000,
-    totalCostMicroUsd: 1_640,
+    inputCostMicroUsd: 1_710,
+    cachedInputCostMicroUsd: 114,
+    outputCostMicroUsd: 7_125,
+    totalCostMicroUsd: 8_949,
   });
 });
 
-test("identical economic portal prices keep a stable content hash across refreshes", () => {
-  const model = portalModelPrice({
-    id: "model-1",
-    name: "Model 1",
-    provider: "Provider",
-    prompt_price_per_1k: 0.001,
-    completion_price_per_1k: 0.002,
-    cached_input_price_per_1k: null,
-  })!;
+test("identical DeepInfra economic terms keep a stable hash across refreshes", () => {
+  const model = deepInfraModelPrice(catalogRow(0.0001, 0.0002, null))!;
   assert.equal(
-    portalPriceDefinition(model, "2026-08-23T00:00:00.000Z").contentHash,
-    portalPriceDefinition(model, "2026-08-24T00:00:00.000Z").contentHash,
+    deepInfraPriceDefinition(model, "2026-08-23T00:00:00.000Z").contentHash,
+    deepInfraPriceDefinition(model, "2026-08-24T00:00:00.000Z").contentHash,
   );
 });

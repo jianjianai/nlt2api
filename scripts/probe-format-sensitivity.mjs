@@ -38,10 +38,10 @@ function loadEnvFile(path) {
 }
 
 const envFile = loadEnvFile(resolve(".env"));
-const baseUrl = process.env.NEURALWATT_PROBE_BASE_URL || "http://localhost:3000";
-const adminToken = process.env.NEURALWATT_ADMIN_TOKEN || envFile.NEURALWATT_ADMIN_TOKEN;
-const clientKey = process.env.NEURALWATT_API_KEY || envFile.NEURALWATT_API_KEY;
-const accountId = arg("account", process.env.NEURALWATT_PROBE_ACCOUNT_ID || "");
+const baseUrl = process.env.DEEPINFRA_PROBE_BASE_URL || "http://localhost:3000";
+const adminToken = process.env.DEEPINFRA_GATEWAY_ADMIN_TOKEN || envFile.DEEPINFRA_GATEWAY_ADMIN_TOKEN;
+const clientKey = process.env.DEEPINFRA_GATEWAY_API_KEY || envFile.DEEPINFRA_GATEWAY_API_KEY;
+const accountId = arg("account", process.env.DEEPINFRA_PROBE_ACCOUNT_ID || "");
 const turns = Number.parseInt(arg("turns", "20"), 10);
 const delayMs = Number.parseInt(arg("delay", "3000"), 10);
 const endpoint = arg("endpoint", "chat");
@@ -122,19 +122,19 @@ function runProbe(model, format) {
     const child = spawn(process.execPath, [probeScript], {
       env: {
         ...process.env,
-        NEURALWATT_PROBE_BASE_URL: baseUrl,
-        NEURALWATT_PROBE_ADMIN_TOKEN: adminToken,
-        NEURALWATT_PROBE_CLIENT_KEY: clientKey,
+        DEEPINFRA_PROBE_BASE_URL: baseUrl,
+        DEEPINFRA_PROBE_ADMIN_TOKEN: adminToken,
+        DEEPINFRA_PROBE_CLIENT_KEY: clientKey,
         // Unused when an account id is supplied, but the probe requires them.
-        NEURALWATT_PROBE_EMAIL: "probe-reuse@example.invalid",
-        NEURALWATT_PROBE_PASSWORD: "probe-reuse-unused",
-        NEURALWATT_PROBE_ACCOUNT_ID: accountId,
-        NEURALWATT_PROBE_MODEL: model,
-        NEURALWATT_PROBE_TURNS: String(turns),
-        NEURALWATT_PROBE_DELAY_MS: String(delayMs),
-        NEURALWATT_PROBE_ENDPOINT: endpoint,
+        DEEPINFRA_PROBE_EMAIL: "probe-reuse@example.invalid",
+        DEEPINFRA_PROBE_PASSWORD: "probe-reuse-unused",
+        DEEPINFRA_PROBE_ACCOUNT_ID: accountId,
+        DEEPINFRA_PROBE_MODEL: model,
+        DEEPINFRA_PROBE_TURNS: String(turns),
+        DEEPINFRA_PROBE_DELAY_MS: String(delayMs),
+        DEEPINFRA_PROBE_ENDPOINT: endpoint,
         // Data collection only: never fail the run on the pass threshold.
-        NEURALWATT_PROBE_REQUIRE_FIRST_PASS: "false",
+        DEEPINFRA_PROBE_REQUIRE_FIRST_PASS: "false",
       },
       stdio: ["ignore", "pipe", "pipe"],
     });

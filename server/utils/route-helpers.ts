@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { HttpError } from "~/server/utils/http.ts";
 import { redact } from "~/server/utils/redaction.ts";
-import { PortalError } from "~/server/utils/portal-client.ts";
+import { UpstreamError } from "~/server/utils/upstream-http.ts";
 import { ProxyTransportError } from "~/server/utils/proxy.ts";
 import { requestCause } from "~/server/utils/request-errors.ts";
 import { stateStore } from "~/server/utils/state-store.ts";
@@ -13,19 +13,19 @@ export function upstreamHttpError(error: unknown): HttpError {
     return error;
   }
   if (error instanceof ProxyTransportError) {
-    return new HttpError(502, "The configured proxy could not reach the NeuralWatt portal.", "api_error", undefined, "proxy_transport_error");
+    return new HttpError(502, "The configured proxy could not reach DeepInfra.", "api_error", undefined, "proxy_transport_error");
   }
-  if (error instanceof PortalError) {
+  if (error instanceof UpstreamError) {
     if (error.status === 400 || error.status === 404 || error.status === 422) {
-      return new HttpError(error.status, "The NeuralWatt portal rejected the requested model or parameters.", "invalid_request_error");
+      return new HttpError(error.status, "DeepInfra rejected the requested model or parameters.", "invalid_request_error");
     }
     if (error.status === 429) {
-      return new HttpError(429, "The selected portal account is rate limited.", "rate_limit_error", undefined, "rate_limit_exceeded");
+      return new HttpError(429, "The selected DeepInfra account is rate limited.", "rate_limit_error", undefined, "rate_limit_exceeded");
     }
     if (error.status === 504) {
-      return new HttpError(504, "The NeuralWatt portal timed out while waiting for upstream data.", "api_error", undefined, "upstream_timeout");
+      return new HttpError(504, "DeepInfra timed out while waiting for upstream data.", "api_error", undefined, "upstream_timeout");
     }
-    return new HttpError(502, "The NeuralWatt portal could not complete the request.", "api_error", undefined, "upstream_error");
+    return new HttpError(502, "DeepInfra could not complete the request.", "api_error", undefined, "upstream_error");
   }
   return new HttpError(500, "Internal proxy error.", "server_error");
 }
@@ -37,7 +37,7 @@ export function adminHttpError(error: unknown): HttpError {
   if (error instanceof ProxyTransportError) {
     return new HttpError(502, "The proxy health check could not reach the target.", "api_error", undefined, "proxy_transport_error");
   }
-  if (error instanceof PortalError) {
+  if (error instanceof UpstreamError) {
     return upstreamHttpError(error);
   }
   return new HttpError(

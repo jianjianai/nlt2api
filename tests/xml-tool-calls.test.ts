@@ -110,7 +110,7 @@ test("the model-preferred attribute+parameter format parses end to end", () => {
   const xml = [
     "<tool_calls>",
     '<tool_call name="bash">',
-    '<parameter name="command">cd /c/Users/28018/Desktop/neuralwatt-ai && npx tsx --test tests/xml-tool-calls.test.ts 2>&1 | tail -30</parameter>',
+    '<parameter name="command">cd /c/Users/28018/Desktop/deepinfra-ai && npx tsx --test tests/xml-tool-calls.test.ts 2>&1 | tail -30</parameter>',
     "</tool_call>",
     "</tool_calls>",
   ].join("\n");
@@ -120,7 +120,7 @@ test("the model-preferred attribute+parameter format parses end to end", () => {
   if (result.envelope?.type !== "tool_calls") return;
   assert.equal(result.envelope.toolCalls[0]?.function.name, "bash");
   assert.deepEqual(JSON.parse(result.envelope.toolCalls[0]!.function.arguments), {
-    command: "cd /c/Users/28018/Desktop/neuralwatt-ai && npx tsx --test tests/xml-tool-calls.test.ts 2>&1 | tail -30",
+    command: "cd /c/Users/28018/Desktop/deepinfra-ai && npx tsx --test tests/xml-tool-calls.test.ts 2>&1 | tail -30",
   });
 });
 

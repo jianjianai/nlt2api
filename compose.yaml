@@ -1,15 +1,20 @@
 services:
-  nlt2api:
-    image: ${NEURALWATT_IMAGE:-ghcr.io/jianjianai/nlt2api:latest}
-    container_name: nlt2api
+  deepinfra-gateway:
+    image: ${DEEPINFRA_GATEWAY_IMAGE:-ghcr.io/jianjianai/nlt2api:latest}
+    container_name: deepinfra-gateway
     restart: unless-stopped
     ports:
-      - "127.0.0.1:${NEURALWATT_HOST_PORT:-3000}:3000"
+      - "127.0.0.1:${DEEPINFRA_GATEWAY_HOST_PORT:-3000}:3000"
     environment:
-      NEURALWATT_ADMIN_TOKEN: ${NEURALWATT_ADMIN_TOKEN:?set NEURALWATT_ADMIN_TOKEN}
-      NEURALWATT_API_KEY: ${NEURALWATT_API_KEY:-}
-      NEURALWATT_ALLOW_ANONYMOUS: ${NEURALWATT_ALLOW_ANONYMOUS:-false}
-      NEURALWATT_DEFAULT_MODEL: ${NEURALWATT_DEFAULT_MODEL:-kimi-k3-fast}
+      DEEPINFRA_GATEWAY_ADMIN_TOKEN: ${DEEPINFRA_GATEWAY_ADMIN_TOKEN:?set DEEPINFRA_GATEWAY_ADMIN_TOKEN}
+      DEEPINFRA_GATEWAY_API_KEY: ${DEEPINFRA_GATEWAY_API_KEY:-}
+      DEEPINFRA_GATEWAY_ALLOW_ANONYMOUS: ${DEEPINFRA_GATEWAY_ALLOW_ANONYMOUS:-false}
+      DEEPINFRA_GATEWAY_DEFAULT_MODEL: ${DEEPINFRA_GATEWAY_DEFAULT_MODEL:-moonshotai/Kimi-K3}
+      DEEPINFRA_GATEWAY_DATA_DIR: /app/.data
+      DEEPINFRA_BROWSER_PATH: /usr/bin/chromium
+      DEEPINFRA_DISPLAY: :99
+      DEEPINFRA_PROFILE_DIR: /app/.data/deepinfra-profile
+      DEEPINFRA_TURNSTILE_MINTERS: ${DEEPINFRA_TURNSTILE_MINTERS:-2}
+      DEEPINFRA_TURNSTILE_BASE_PORT: ${DEEPINFRA_TURNSTILE_BASE_PORT:-9333}
     volumes:
-      # A named volume preserves the non-root ownership from the image.
       - ./data:/app/.data

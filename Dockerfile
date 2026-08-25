@@ -1,5 +1,5 @@
-# Build stage: install deps and produce the self-contained Nitro output.
-FROM node:22-alpine AS build
+# Build stage: install dependencies and produce the self-contained Nitro output.
+FROM node:22-bookworm-slim AS build
 WORKDIR /app
 RUN corepack enable && corepack prepare pnpm@10.34.5 --activate
 COPY package.json pnpm-lock.yaml ./
@@ -8,25 +8,28 @@ RUN --mount=type=cache,id=pnpm-store,target=/pnpm/store \
 COPY . .
 RUN pnpm build
 
-# Runtime stage: .output is self-contained, no node_modules install needed.
-FROM node:22-alpine AS runtime
+# DeepInfra's anonymous route needs a headed Chrome renderer. Xvfb supplies a
+# virtual display and SwiftShader supplies WebGL on GPU-less Linux hosts.
+FROM node:22-bookworm-slim AS runtime
 WORKDIR /app
-# Containers must accept external connections; Nitro defaults to localhost.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      chromium xvfb fonts-liberation fonts-noto-core fonts-noto-cjk \
+      fonts-noto-color-emoji ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd --system --gid 101 deepinfra \
+    && useradd --system --uid 100 --gid 101 --home /app deepinfra \
+    && mkdir -p /app/.data/deepinfra-profile \
+    && chown -R 100:101 /app/.data
 ENV NODE_ENV=production \
     NITRO_HOST=0.0.0.0 \
-    NITRO_PORT=3000
-# Create the user and the state dir in one layer. State lives under .data
-# (NEURALWATT_DATA_DIR defaults to <cwd>/.data/neuralwatt). IDs are pinned to
-# the values alpine's dynamic system-user assignment used historically
-# (uid 100 / gid 101), so existing bind-mounted data dirs stay readable, and
-# the COPY below can reference them numerically.
-RUN addgroup -S -g 101 neuralwatt && adduser -S -u 100 -G neuralwatt -h /app neuralwatt \
-    && mkdir -p /app/.data && chown neuralwatt:neuralwatt /app/.data
-# --chown here replaces the old `chown -R /app` layer, which duplicated all of
-# .output. With --link the copy is resolved against an empty filesystem, so
-# named users cannot be looked up ("invalid user index") — use numeric IDs.
+    NITRO_PORT=3000 \
+    DEEPINFRA_BROWSER_PATH=/usr/bin/chromium \
+    DEEPINFRA_DISPLAY=:99 \
+    DEEPINFRA_PROFILE_DIR=/app/.data/deepinfra-profile
 COPY --from=build --link --chown=100:101 /app/.output ./.output
-USER neuralwatt
+COPY --chown=100:101 docker-entrypoint.sh /usr/local/bin/deepinfra-entrypoint
+RUN chmod 0755 /usr/local/bin/deepinfra-entrypoint
+USER deepinfra
 EXPOSE 3000
-HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 CMD node -e "fetch('http://127.0.0.1:3000/health').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"
-CMD ["node", ".output/server/index.mjs"]
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 CMD node -e "fetch('http://127.0.0.1:3000/health').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"
+CMD ["/usr/local/bin/deepinfra-entrypoint"]

@@ -111,8 +111,8 @@ export default defineHandler(async (event) => {
     if (input.enabled === false) {
       accountScheduler.invalidateStickyAccount(id);
     }
-    // Proxy changes preserve the current session. If the portal rejects that
-    // session on the new egress, the existing 401/403 refresh logs in once.
+    // Proxy changes preserve the account identity but change its stable egress.
+    // The next health check/request validates DeepInfra reachability.
     accountScheduler.notifyStateChanged();
     return jsonResponse({ account: accountScheduler.publicState(account) });
   } catch (error) {

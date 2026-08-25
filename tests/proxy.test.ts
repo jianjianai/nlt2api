@@ -6,21 +6,21 @@ import test from "node:test";
 import { resetProxyConfigForTests } from "../server/utils/config.ts";
 import { HttpError } from "../server/utils/http.ts";
 import { maskProxyUrl, normalizeProxyUrl, parseProxyImportLine, proxyDispatcher, proxyDispatcherCacheSize, resetProxyDispatcherCacheForTests } from "../server/utils/proxy.ts";
-import { portalResponseBodyTimeoutError } from "../server/utils/portal-client.ts";
+import { upstreamResponseBodyTimeoutError } from "../server/utils/upstream-http.ts";
 import { StateStore } from "../server/utils/state-store.ts";
 
 async function withTempStore<T>(run: (store: StateStore) => Promise<T>): Promise<T> {
-  const dir = await mkdtemp(join(tmpdir(), "neuralwatt-proxy-test-"));
-  const previous = process.env.NEURALWATT_DATA_DIR;
-  process.env.NEURALWATT_DATA_DIR = dir;
+  const dir = await mkdtemp(join(tmpdir(), "deepinfra-proxy-test-"));
+  const previous = process.env.DEEPINFRA_GATEWAY_DATA_DIR;
+  process.env.DEEPINFRA_GATEWAY_DATA_DIR = dir;
   resetProxyConfigForTests();
   try {
     return await run(new StateStore());
   } finally {
     if (previous === undefined) {
-      delete process.env.NEURALWATT_DATA_DIR;
+      delete process.env.DEEPINFRA_GATEWAY_DATA_DIR;
     } else {
-      process.env.NEURALWATT_DATA_DIR = previous;
+      process.env.DEEPINFRA_GATEWAY_DATA_DIR = previous;
     }
     resetProxyConfigForTests();
     await rm(dir, { recursive: true, force: true });
@@ -79,9 +79,9 @@ test("maskProxyUrl hides credentials but keeps scheme, host and port", () => {
 });
 
 test("response body inactivity is classified as an upstream timeout, not proxy transport", () => {
-  const error = portalResponseBodyTimeoutError();
+  const error = upstreamResponseBodyTimeoutError();
   assert.equal(error.status, 504);
-  assert.equal(error.name, "PortalError");
+  assert.equal(error.name, "UpstreamError");
 });
 
 test("proxyDispatcher cache is bounded and clearable", async () => {
@@ -104,9 +104,7 @@ test("proxyDispatcher returns a cached dispatcher per proxy URL", () => {
 
 test("accounts persist, update and clear their proxy", async () => {
   await withTempStore(async (store) => {
-    const account = await store.addAccount({
-      email: "proxy@example.com",
-      password: "secret",
+    const account = await store.addAccount({ label: "proxy@example.com",
       proxy: "socks5://user:pass@127.0.0.1:1080",
     });
     assert.equal(account.proxy, "socks5://user:pass@127.0.0.1:1080");
@@ -125,7 +123,7 @@ test("accounts persist, update and clear their proxy", async () => {
 
 test("accounts without a proxy stay proxy-less", async () => {
   await withTempStore(async (store) => {
-    const account = await store.addAccount({ email: "plain@example.com", password: "secret" });
+    const account = await store.addAccount({ label: "plain@example.com" });
     assert.equal(account.proxy, undefined);
     const updated = await store.updateAccount(account.id, { label: "renamed" });
     assert.equal(updated.proxy, undefined);

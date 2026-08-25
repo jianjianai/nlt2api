@@ -2,7 +2,7 @@ import { createHash, randomBytes, randomUUID, timingSafeEqual } from "node:crypt
 import { mkdir, readFile, readdir, rename, unlink, writeFile } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
 import { getProxyConfig } from "~/server/utils/config.ts";
-import { canonicalProxy } from "~/server/utils/proxy.ts";
+import { canonicalProxy, egressIdentity } from "~/server/utils/proxy.ts";;
 import { DEFAULT_PROXY_POOL_SETTINGS, DEFAULT_SCHEDULER_SETTINGS } from "~/server/utils/types.ts";
 import type {
   AccountGroup,
@@ -12,7 +12,6 @@ import type {
   GroupApiKey,
   ManagedAccount,
   PersistentState,
-  PortalSession,
   ProxyKind,
   ProxyPoolEntry,
   ProxyPoolSettings,
@@ -32,7 +31,7 @@ interface RecordIndexEntry {
 
 function emptyState(): PersistentState {
   return {
-    version: 2,
+    version: 3,
     settings: {
       recordMessages: false,
       scheduler: { ...DEFAULT_SCHEDULER_SETTINGS },
@@ -127,6 +126,18 @@ function normaliseSchedulerSettings(value: unknown): SchedulerSettings {
     queueTimeoutSeconds: normaliseBoundedInteger(parsed.queueTimeoutSeconds, DEFAULT_SCHEDULER_SETTINGS.queueTimeoutSeconds, 0, 86_400),
     maxQueueSize: normaliseBoundedInteger(parsed.maxQueueSize, DEFAULT_SCHEDULER_SETTINGS.maxQueueSize, 0, 100_000),
   };
+}
+
+function accountEgressKey(proxy: string | undefined): string {
+  return egressIdentity(proxy).key;
+}
+
+function assertUniqueAccountEgress(accounts: readonly ManagedAccount[], candidate: ManagedAccount, ignoreId?: string): void {
+  const key = accountEgressKey(candidate.proxy);
+  const duplicate = accounts.find((account) => account.id !== ignoreId && accountEgressKey(account.proxy) === key);
+  if (duplicate) {
+    throw new Error(`Egress is already assigned to account "${duplicate.label}"; one IP may serve only one account.`);
+  }
 }
 
 function normaliseAccountSchedulerOverrides(value: unknown, models: string[]): AccountSchedulerOverrides | undefined {
@@ -336,7 +347,7 @@ function secretMatches(secret: string, digest: string): boolean {
 }
 
 function createGroupSecret(): { secret: string; prefix: string; secretDigest: string } {
-  const secret = `nwg_${randomBytes(24).toString("base64url")}`;
+  const secret = `dig_${randomBytes(24).toString("base64url")}`;
   return { secret, prefix: secret.slice(0, 12), secretDigest: digestSecret(secret) };
 }
 
@@ -348,7 +359,11 @@ function createUniqueGroupSecret(keys: readonly GroupApiKey[]): { secret: string
   throw new Error("Could not generate a unique group API key.");
 }
 
-function normaliseAccount(account: ManagedAccount): ManagedAccount {
+function normaliseAccount(value: unknown): ManagedAccount {
+  const account = value && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : {};
+  const id = typeof account.id === "string" && account.id ? account.id : randomUUID();
   const proxy = typeof account.proxy === "string" && account.proxy.trim() ? account.proxy.trim() : undefined;
   const models = normaliseModels(account.models);
   const schedulerOverrides = normaliseAccountSchedulerOverrides(account.schedulerOverrides, models);
@@ -356,18 +371,19 @@ function normaliseAccount(account: ManagedAccount): ManagedAccount {
     ? account.proxyPoolEntryId
     : undefined;
   const groupIds = normaliseStringIds(account.groupIds);
-  const { schedulerOverrides: _discardedOverrides, proxyPoolEntryId: _discardedPoolId, groupIds: _discardedGroupIds, ...accountWithoutOverrides } = account;
+  const now = new Date().toISOString();
   return {
-    ...accountWithoutOverrides,
-    label: account.label.trim() || account.email,
-    email: account.email.trim().toLowerCase(),
-    weight: Math.max(1, Math.min(100, Math.floor(account.weight || 1))),
+    id,
+    label: typeof account.label === "string" && account.label.trim() ? account.label.trim() : "DeepInfra Free",
+    weight: Math.max(1, Math.min(100, Math.floor(typeof account.weight === "number" ? account.weight : 1))),
     enabled: account.enabled !== false,
     groupIds,
     models,
     ...(schedulerOverrides ? { schedulerOverrides } : {}),
     ...(proxy ? { proxy } : {}),
     ...(proxy && proxyPoolEntryId ? { proxyPoolEntryId } : {}),
+    createdAt: typeof account.createdAt === "string" ? account.createdAt : now,
+    updatedAt: typeof account.updatedAt === "string" ? account.updatedAt : now,
   };
 }
 
@@ -555,7 +571,7 @@ export class StateStore {
     try {
       const raw = await readFile(this.storePath, "utf8");
       const parsed = JSON.parse(raw) as { version?: number; settings?: unknown; accounts?: unknown[]; proxyPool?: unknown; accountGroups?: unknown; groupApiKeys?: unknown };
-      if ((parsed.version !== 1 && parsed.version !== 2) || !Array.isArray(parsed.accounts)) {
+      if ((parsed.version !== 1 && parsed.version !== 2 && parsed.version !== 3) || !Array.isArray(parsed.accounts)) {
         throw new Error("The account store has an unsupported schema.");
       }
 
@@ -564,7 +580,14 @@ export class StateStore {
       const validGroupIds = new Set(accountGroups.map((group) => group.id));
       const groupApiKeys = normaliseGroupApiKeys(parsed.groupApiKeys, validGroupIds);
       const poolById = new Map(proxyPool.map((entry) => [entry.id, entry]));
-      const accounts = parsed.accounts.map((account) => normaliseAccount(account as ManagedAccount)).map((account) => {
+      // Legacy stores may contain NeuralWatt credentials. Only explicitly marked
+      // DeepInfra accounts survive the v3 migration; ids and egress bindings remain.
+      const migratedAccounts = parsed.version === 3
+        ? parsed.accounts
+        : parsed.accounts.filter((value) => Boolean(value)
+          && typeof value === "object"
+          && (value as Record<string, unknown>).provider === "deepinfra");
+      const accounts = migratedAccounts.map(normaliseAccount).map((account) => {
         account.groupIds = account.groupIds.filter((groupId) => validGroupIds.has(groupId));
         const entry = account.proxyPoolEntryId ? poolById.get(account.proxyPoolEntryId) : undefined;
         if (entry && account.proxy === entry.url) return account;
@@ -572,14 +595,14 @@ export class StateStore {
         return withoutBinding;
       });
       this.state = {
-        version: 2,
+        version: 3,
         settings: normaliseSettings(parsed.settings),
         accounts,
         proxyPool,
         accountGroups,
         groupApiKeys,
       };
-      if (parsed.version === 1) {
+      if (parsed.version !== 3) {
         await this.writeState(this.state);
       }
     } catch (error) {
@@ -614,7 +637,6 @@ export class StateStore {
       if (options.groupId === null && account.groupIds.length > 0) return false;
       if (typeof options.groupId === "string" && !account.groupIds.includes(options.groupId)) return false;
       return !query || account.label.toLocaleLowerCase().includes(query)
-        || account.email.toLocaleLowerCase().includes(query)
         || (account.proxy ?? "").toLocaleLowerCase().includes(query);
     });
     accounts = [...accounts].sort((left, right) => {
@@ -637,34 +659,22 @@ export class StateStore {
   }
 
   async addAccount(input: {
-    email: string;
-    password: string;
     label?: string;
     weight?: number;
     proxy?: string;
     models?: string[];
     groupIds?: string[];
   }): Promise<ManagedAccount> {
-    const email = input.email.trim().toLowerCase();
-    if (!email || !input.password) {
-      throw new Error("An email and password are required.");
-    }
-
     const requestedGroupIds = normaliseStringIds(input.groupIds);
     return this.mutate((state) => {
       const validGroupIds = new Set(state.accountGroups.map((group) => group.id));
       const unknownGroupId = requestedGroupIds.find((groupId) => !validGroupIds.has(groupId));
       if (unknownGroupId) throw new Error(`Account group not found: ${unknownGroupId}`);
-      if (state.accounts.some((account) => account.email === email)) {
-        throw new Error("An account with this email already exists.");
-      }
 
       const now = new Date().toISOString();
       const account = normaliseAccount({
         id: randomUUID(),
-        label: input.label?.trim() || email,
-        email,
-        password: input.password,
+        label: input.label?.trim() || "DeepInfra Free",
         enabled: true,
         weight: input.weight ?? 1,
         models: input.models ?? [],
@@ -673,6 +683,7 @@ export class StateStore {
         createdAt: now,
         updatedAt: now,
       });
+      assertUniqueAccountEgress(state.accounts, account);
       state.accounts.push(account);
       return account;
     });
@@ -694,7 +705,7 @@ export class StateStore {
       }
 
       if (typeof input.label === "string") {
-        account.label = input.label.trim() || account.email;
+        account.label = input.label.trim() || "DeepInfra Free";
       }
       if (typeof input.enabled === "boolean") {
         account.enabled = input.enabled;
@@ -725,6 +736,7 @@ export class StateStore {
         account.schedulerOverrides = normaliseAccountSchedulerOverrides(input.schedulerOverrides, account.models);
       }
       account.schedulerOverrides = normaliseAccountSchedulerOverrides(account.schedulerOverrides, account.models);
+      assertUniqueAccountEgress(state.accounts, account, id);
       account.updatedAt = new Date().toISOString();
       return account;
     });
@@ -740,27 +752,16 @@ export class StateStore {
     });
   }
 
-  /** Append model ids to an account's list, deduplicating in place. */
-  async mergeAccountModels(id: string, models: string[]): Promise<ManagedAccount> {
+  /** Replace an account's model list with the current authoritative anonymous catalog. */
+  async replaceAccountModels(id: string, models: string[]): Promise<ManagedAccount> {
     return this.mutate((state) => {
       const account = state.accounts.find((candidate) => candidate.id === id);
       if (!account) {
         throw new Error("Account not found.");
       }
-      account.models = normaliseModels([...(account.models ?? []), ...models]);
+      account.models = normaliseModels(models);
       account.updatedAt = new Date().toISOString();
       return account;
-    });
-  }
-
-  async updateSession(id: string, session: PortalSession | undefined): Promise<void> {
-    await this.mutate((state) => {
-      const account = state.accounts.find((candidate) => candidate.id === id);
-      if (!account) {
-        throw new Error("Account not found.");
-      }
-      account.session = session;
-      account.updatedAt = new Date().toISOString();
     });
   }
 
@@ -972,7 +973,7 @@ export class StateStore {
         throw new Error("Proxy pool entry is already assigned.");
       }
       account.proxy = entry.url;
-      account.proxyPoolEntryId = entry.id;
+      assertUniqueAccountEgress(state.accounts, account, accountId);
       account.updatedAt = new Date().toISOString();
       return structuredClone(account);
     });
@@ -1010,6 +1011,7 @@ export class StateStore {
         throw new Error("Proxy pool entry is already assigned.");
       }
       account.proxy = entry.url;
+      assertUniqueAccountEgress(state.accounts, account, accountId);
       account.proxyPoolEntryId = entry.id;
       account.updatedAt = new Date().toISOString();
       return structuredClone(account);

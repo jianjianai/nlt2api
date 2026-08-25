@@ -2,7 +2,7 @@ import { defineHandler } from "nitro";
 import { accountScheduler } from "~/server/utils/account-scheduler.ts";
 import { HttpError, jsonResponse, openAIErrorResponse, requireAdminAuth } from "~/server/utils/http.ts";
 import { adminHttpError } from "~/server/utils/route-helpers.ts";
-import { portalClient } from "~/server/utils/portal-client.ts";
+import { deepInfraClient } from "~/server/utils/deepinfra-client.ts";
 import { stateStore } from "~/server/utils/state-store.ts";
 
 export default defineHandler(async (event) => {
@@ -16,7 +16,7 @@ export default defineHandler(async (event) => {
     if (!account) {
       throw new HttpError(404, "Account not found.", "invalid_request_error", "id");
     }
-    await portalClient.verifyAccount(account);
+    await deepInfraClient.verifyAccount(account);
     accountScheduler.markSuccess(id);
     accountScheduler.notifyStateChanged();
     const saved = await stateStore.getAccount(id);

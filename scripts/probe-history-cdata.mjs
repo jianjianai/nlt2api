@@ -1,8 +1,8 @@
 // Two-turn end-to-end check: turn 1 forces a markup-bearing edit_file call;
 // turn 2 sends the tool result back and forces another call. The turn-2
 // upstream request must carry the turn-1 call re-encoded with CDATA values.
-const baseUrl = process.env.NEURALWATT_PROBE_BASE_URL || "http://localhost:3100";
-const clientKey = process.env.NEURALWATT_PROBE_CLIENT_KEY;
+const baseUrl = process.env.DEEPINFRA_PROBE_BASE_URL || "http://localhost:3100";
+const clientKey = process.env.DEEPINFRA_PROBE_CLIENT_KEY;
 const model = process.argv[2] || "deepseek-v4-pro";
 const runId = `hist-${crypto.randomUUID().replaceAll("-", "").slice(0, 12)}`;
 

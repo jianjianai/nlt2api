@@ -1,17 +1,17 @@
 import { createHash } from "node:crypto";
 import type { PriceDefinition, TokenUsage } from "~/server/utils/analytics-types.ts";
 
-export const PORTAL_MODEL_CATALOG_URL = "https://portal.neuralwatt.com/api/models";
+export const DEEPINFRA_MODEL_CATALOG_URL = "https://api.deepinfra.com/models/list";
 const NANO_USD_PER_USD = 1_000_000_000;
 const NANO_USD_PER_MICRO_USD = 1_000;
 
-export interface PortalModelPrice {
+export interface DeepInfraModelPrice {
   id: string;
   name: string;
   provider: string;
-  promptPricePer1k: number;
-  completionPricePer1k: number;
-  cachedInputPricePer1k: number | null;
+  inputPricePerMillion: number;
+  outputPricePerMillion: number;
+  cachedInputPricePerMillion: number | null;
 }
 
 export interface CostBreakdown {
@@ -25,8 +25,8 @@ function nonNegativeFinite(value: unknown): number | undefined {
   return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : undefined;
 }
 
-function nanoPerTokenFromPer1k(value: number): number {
-  const normalized = Math.round(value * NANO_USD_PER_USD / 1_000);
+function nanoPerTokenFromPerMillion(value: number): number {
+  const normalized = Math.round(value * NANO_USD_PER_USD / 1_000_000);
   if (!Number.isSafeInteger(normalized) || normalized < 0) {
     throw new Error("The model price exceeds supported integer precision.");
   }
@@ -38,39 +38,43 @@ function hashPrice(value: Omit<PriceDefinition, "id" | "contentHash">): string {
   return createHash("sha256").update(JSON.stringify(economicTerms)).digest("hex");
 }
 
-export function portalModelPrice(value: Record<string, unknown>): PortalModelPrice | undefined {
-  const id = typeof value.id === "string" ? value.id.trim() : "";
-  const name = typeof value.name === "string" ? value.name.trim() : id;
-  const provider = typeof value.provider === "string" ? value.provider.trim() : "Unknown";
-  const prompt = nonNegativeFinite(value.prompt_price_per_1k);
-  const completion = nonNegativeFinite(value.completion_price_per_1k);
-  const cached = value.cached_input_price_per_1k === null
+export function deepInfraModelPrice(value: Record<string, unknown>): DeepInfraModelPrice | undefined {
+  const id = typeof value.model_name === "string" ? value.model_name.trim() : "";
+  const pricing = value.pricing && typeof value.pricing === "object" && !Array.isArray(value.pricing)
+    ? value.pricing as Record<string, unknown>
+    : {};
+  // Complete catalog rates are cents per token. Convert to USD per million.
+  const inputCents = nonNegativeFinite(pricing.cents_per_input_token);
+  const outputCents = nonNegativeFinite(pricing.cents_per_output_token);
+  const cachedRate = pricing.rate_per_input_token_cached === null || pricing.rate_per_input_token_cached === undefined
     ? null
-    : nonNegativeFinite(value.cached_input_price_per_1k);
-  if (!id || prompt === undefined || completion === undefined || cached === undefined) return undefined;
+    : nonNegativeFinite(pricing.rate_per_input_token_cached);
+  if (!id || inputCents === undefined || outputCents === undefined || cachedRate === undefined) return undefined;
+  const provider = id.includes("/") ? id.slice(0, id.indexOf("/")) : "DeepInfra";
+  const inputPerMillion = inputCents * 10_000;
   return {
     id,
-    name: name || id,
-    provider: provider || "Unknown",
-    promptPricePer1k: prompt,
-    completionPricePer1k: completion,
-    cachedInputPricePer1k: cached,
+    name: id,
+    provider,
+    inputPricePerMillion: inputPerMillion,
+    outputPricePerMillion: outputCents * 10_000,
+    cachedInputPricePerMillion: cachedRate === null ? null : inputPerMillion * cachedRate,
   };
 }
 
-export function portalPriceDefinition(model: PortalModelPrice, fetchedAt: string): PriceDefinition {
+export function deepInfraPriceDefinition(model: DeepInfraModelPrice, fetchedAt: string): PriceDefinition {
   const value: Omit<PriceDefinition, "id" | "contentHash"> = {
     modelId: model.id,
     provider: model.provider,
     displayName: model.name,
-    source: "portal_catalog",
-    sourceUrl: PORTAL_MODEL_CATALOG_URL,
+    source: "deepinfra_catalog",
+    sourceUrl: DEEPINFRA_MODEL_CATALOG_URL,
     currency: "USD",
-    inputNanoUsdPerToken: nanoPerTokenFromPer1k(model.promptPricePer1k),
-    cachedInputNanoUsdPerToken: model.cachedInputPricePer1k === null
+    inputNanoUsdPerToken: nanoPerTokenFromPerMillion(model.inputPricePerMillion),
+    cachedInputNanoUsdPerToken: model.cachedInputPricePerMillion === null
       ? null
-      : nanoPerTokenFromPer1k(model.cachedInputPricePer1k),
-    outputNanoUsdPerToken: nanoPerTokenFromPer1k(model.completionPricePer1k),
+      : nanoPerTokenFromPerMillion(model.cachedInputPricePerMillion),
+    outputNanoUsdPerToken: nanoPerTokenFromPerMillion(model.outputPricePerMillion),
     effectiveAt: fetchedAt,
     fetchedAt,
     verifiedAt: fetchedAt,

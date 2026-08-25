@@ -1,7 +1,7 @@
 // Small focused test: can the upstream model actually READ a `role: "tool"`
 // (tool-result) message?
 //
-// The gateway forwards client history to the NeuralWatt portal, including tool
+// The gateway forwards client history to the DeepInfra portal, including tool
 // result messages. If the portal model silently ignores `tool` role messages,
 // it will re-ask for information that already arrived (e.g. re-reading the
 // same file). This probe puts a unique secret ONLY inside a tool message and
@@ -9,12 +9,12 @@
 // user message so we can tell "cannot see tool messages" apart from "cannot
 // follow the instruction".
 
-const baseUrl = process.env.NEURALWATT_PROBE_BASE_URL || "http://localhost:3000";
-const model = process.env.NEURALWATT_PROBE_MODEL || process.env.NEURALWATT_DEFAULT_MODEL || "kimi-k3-fast";
-const clientKey = process.env.NEURALWATT_PROBE_CLIENT_KEY || process.env.NEURALWATT_API_KEY;
+const baseUrl = process.env.DEEPINFRA_PROBE_BASE_URL || "http://localhost:3000";
+const model = process.env.DEEPINFRA_PROBE_MODEL || process.env.DEEPINFRA_GATEWAY_DEFAULT_MODEL || "kimi-k3-fast";
+const clientKey = process.env.DEEPINFRA_PROBE_CLIENT_KEY || process.env.DEEPINFRA_GATEWAY_API_KEY;
 
 if (!clientKey) {
-  throw new Error("Missing NEURALWATT_PROBE_CLIENT_KEY (or NEURALWATT_API_KEY).");
+  throw new Error("Missing DEEPINFRA_PROBE_CLIENT_KEY (or DEEPINFRA_GATEWAY_API_KEY).");
 }
 
 const secret = `NW_TOOL_SECRET_${crypto.randomUUID().replaceAll("-", "").slice(0, 12)}`;

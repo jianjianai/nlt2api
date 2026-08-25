@@ -16,14 +16,10 @@ function account(overrides: Partial<Account> = {}): Account {
   return {
     id: "account-1",
     label: "Kimi 主账号",
-    email: "kimi@example.com",
-    password: "secret",
-    enabled: true,
+        enabled: true,
     weight: 1,
     proxy: null,
     models: ["kimi-k3"],
-    hasSession: true,
-    sessionExpiresAt: null,
     createdAt: "2026-08-23T00:00:00.000Z",
     updatedAt: "2026-08-23T00:00:00.000Z",
     runtime: {
@@ -67,7 +63,7 @@ function overview(account: Account): AccountOverview {
   return {
     total: 1,
     enabled: account.enabled ? 1 : 0,
-    sessions: account.hasSession ? 1 : 0,
+    sessions: 1,
     direct: account.proxy ? 0 : 1,
     inFlight: account.runtime.inFlight,
     cooling: accountIssues.length,

@@ -32,21 +32,21 @@ async function call(handler: unknown, event: TestEvent): Promise<Response> {
 }
 
 async function withAnalyticsApi<T>(run: () => Promise<T>): Promise<T> {
-  const dir = await mkdtemp(join(tmpdir(), "neuralwatt-analytics-api-test-"));
-  const previousDir = process.env.NEURALWATT_DATA_DIR;
-  const previousToken = process.env.NEURALWATT_ADMIN_TOKEN;
-  process.env.NEURALWATT_DATA_DIR = dir;
-  process.env.NEURALWATT_ADMIN_TOKEN = "test-admin";
+  const dir = await mkdtemp(join(tmpdir(), "deepinfra-analytics-api-test-"));
+  const previousDir = process.env.DEEPINFRA_GATEWAY_DATA_DIR;
+  const previousToken = process.env.DEEPINFRA_GATEWAY_ADMIN_TOKEN;
+  process.env.DEEPINFRA_GATEWAY_DATA_DIR = dir;
+  process.env.DEEPINFRA_GATEWAY_ADMIN_TOKEN = "test-admin";
   resetProxyConfigForTests();
   await usageAnalytics.resetForTests();
   try {
     return await run();
   } finally {
     await usageAnalytics.resetForTests();
-    if (previousDir === undefined) delete process.env.NEURALWATT_DATA_DIR;
-    else process.env.NEURALWATT_DATA_DIR = previousDir;
-    if (previousToken === undefined) delete process.env.NEURALWATT_ADMIN_TOKEN;
-    else process.env.NEURALWATT_ADMIN_TOKEN = previousToken;
+    if (previousDir === undefined) delete process.env.DEEPINFRA_GATEWAY_DATA_DIR;
+    else process.env.DEEPINFRA_GATEWAY_DATA_DIR = previousDir;
+    if (previousToken === undefined) delete process.env.DEEPINFRA_GATEWAY_ADMIN_TOKEN;
+    else process.env.DEEPINFRA_GATEWAY_ADMIN_TOKEN = previousToken;
     resetProxyConfigForTests();
     await rm(dir, { recursive: true, force: true });
   }

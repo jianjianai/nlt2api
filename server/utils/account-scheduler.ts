@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import type { ForecastConstraint, SchedulerAnalyticsEvent } from "~/server/utils/analytics-types.ts";
 import { usageAnalytics } from "~/server/utils/usage-analytics.ts";
 import { HttpError } from "~/server/utils/http.ts";
+import { modelIdMatches } from "~/server/utils/model-id.ts";
 import { egressIdentity, type EgressIdentity } from "~/server/utils/proxy.ts";
 import { stateStore } from "~/server/utils/state-store.ts";
 import { DEFAULT_SCHEDULER_SETTINGS } from "~/server/utils/types.ts";
@@ -43,7 +44,7 @@ interface InternalEgressRuntime {
 }
 
 export interface AccountLease {
-  /** Immutable account/egress snapshot used for this real portal attempt. */
+  /** Immutable account/egress snapshot used for this real DeepInfra attempt. */
   account: ManagedAccount;
   model: string;
   egressId: string;
@@ -293,8 +294,6 @@ export class AccountScheduler {
     return {
       id: account.id,
       label: account.label,
-      email: account.email,
-      password: account.password,
       enabled: account.enabled,
       weight: account.weight,
       proxy: account.proxy ?? null,
@@ -302,8 +301,6 @@ export class AccountScheduler {
       groupIds: [...account.groupIds],
       models: [...account.models],
       ...(account.schedulerOverrides ? { schedulerOverrides: structuredClone(account.schedulerOverrides) } : {}),
-      hasSession: Boolean(account.session),
-      sessionExpiresAt: account.session?.expiresAt ?? null,
       createdAt: account.createdAt,
       updatedAt: account.updatedAt,
       runtime: this.publicRuntime(runtime, accountRpm, now),
@@ -511,10 +508,10 @@ export class AccountScheduler {
     const accounts = sourceAccounts
       .filter((account) => account.enabled)
       .filter((account) => !waiter.options.groupId || account.groupIds.includes(waiter.options.groupId))
-      .filter((account) => account.models.includes(waiter.options.model))
+      .filter((account) => account.models.some((model) => modelIdMatches(model, waiter.options.model)))
       .filter((account) => !excluded.has(account.id));
     if (accounts.length === 0) {
-      return { kind: "impossible", error: new Error("No enabled NeuralWatt account is currently available.") };
+      return { kind: "impossible", error: new Error("No enabled DeepInfra account is currently available.") };
     }
 
     const stickyHash = waiter.options.stickyKey ? assignmentKey(waiter.options.stickyKey) : undefined;
@@ -533,7 +530,11 @@ export class AccountScheduler {
         const difference = score(stickyHash, left) - score(stickyHash, right);
         if (difference !== 0) return difference;
       }
-      const difference = this.effectiveLoad(left) - this.effectiveLoad(right);
+      // Include recent completed admissions, not just current concurrency. Without this,
+      // serial traffic always falls through to createdAt and pins every request to the
+      // oldest account. The rolling request count yields weighted fair distribution
+      // across every eligible provider and preserves account.weight semantics.
+      const difference = this.effectiveLoad(left, now) - this.effectiveLoad(right, now);
       return difference !== 0 ? difference : left.createdAt.localeCompare(right.createdAt);
     });
     ranked.push(...remaining);
@@ -683,9 +684,14 @@ export class AccountScheduler {
     };
   }
 
-  private effectiveLoad(account: ManagedAccount): number {
-    const inFlight = [...this.runtimeFor(account.id).modelInFlight.values()].reduce((total, count) => total + count, 0);
-    return inFlight / Math.max(1, account.weight);
+  private effectiveLoad(account: ManagedAccount, now: number): number {
+    const runtime = this.runtimeFor(account.id);
+    this.pruneTimes(runtime.requestTimes, now);
+    const inFlight = [...runtime.modelInFlight.values()].reduce((total, count) => total + count, 0);
+    // Every current admission is already present in requestTimes. `max` avoids
+    // double-counting normal in-flight requests while retaining pressure from a
+    // long-running request after it ages out of the one-minute request window.
+    return Math.max(inFlight, runtime.requestTimes.length) / Math.max(1, account.weight);
   }
 
   private pruneTimes(times: number[], now: number): void {

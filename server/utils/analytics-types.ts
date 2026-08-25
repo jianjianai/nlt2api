@@ -1,4 +1,4 @@
-export type PriceSource = "vendor_official" | "portal_catalog";
+export type PriceSource = "vendor_official" | "deepinfra_catalog" | "legacy_catalog" | "upstream_billed";
 export type AnalyticsHealthStatus = "healthy" | "degraded";
 export type ForecastConstraint =
   | "account_rpm"
@@ -48,6 +48,12 @@ export interface AttemptSettlement {
   status: number;
   outcome: "success" | "failure" | "aborted";
   usage: TokenUsage;
+  billingAuthoritative: boolean;
+  energyConsumedNanoKwh: number;
+  energyChargedNanoKwh: number;
+  upstreamCostMicroUsd?: number;
+  serviceTier?: string;
+  accountingMethod?: "energy" | "token";
 }
 
 export interface ExecutionSettlement {
@@ -62,10 +68,13 @@ export interface ExecutionSettlement {
   attempts: AttemptSettlement[];
   usage: TokenUsage;
   price?: PriceDefinition;
+  costSource: "catalog_estimate" | "upstream_billed" | "unpriced";
   inputCostMicroUsd: number;
   cachedInputCostMicroUsd: number;
   outputCostMicroUsd: number;
   totalCostMicroUsd: number;
+  energyConsumedNanoKwh: number;
+  energyChargedNanoKwh: number;
   priced: boolean;
   payloadHash: string;
 }
@@ -93,6 +102,9 @@ export interface ModelAnalyticsRow {
   inputCostMicroUsd: number;
   cachedInputCostMicroUsd: number;
   outputCostMicroUsd: number;
+  energyConsumedNanoKwh: number;
+  energyChargedNanoKwh: number;
+  upstreamBilledRequests: number;
   unpricedRequests: number;
   priceSource?: PriceSource;
   priceVerifiedAt?: string;
@@ -144,6 +156,8 @@ export interface AnalyticsOverview {
   trend15m: number;
   todayCostMicroUsd: number;
   monthCostMicroUsd: number;
+  todayEnergyConsumedNanoKwh: number;
+  monthEnergyConsumedNanoKwh: number;
   pricedCoverage: number;
   unpricedRequests: number;
   unpricedTokens: number;
@@ -175,6 +189,8 @@ export interface AnalyticsQueryResult {
   inputCostMicroUsd: number;
   cachedInputCostMicroUsd: number;
   outputCostMicroUsd: number;
+  energyConsumedNanoKwh: number;
+  energyChargedNanoKwh: number;
   pricedRequests: number;
   unpricedRequests: number;
   promptTokens: number;

@@ -6,7 +6,6 @@ import {
   ClientDisconnectedError,
   executeChatRequest,
   modelFromRequest,
-  resolveToolCallPolicy,
   stickyKeyFrom,
   validateChatRequest,
 } from "~/server/utils/chat-service.ts";
@@ -67,8 +66,9 @@ export default defineHandler(async (event) => {
     // shape errors stay ordinary HTTP 4xx responses, exactly like the chat
     // endpoint. Execution reuses the validated chat request.
     const { chatRequest, context } = await validateResponseRequest(requestBody, access);
-    const toolCallPolicy = await resolveToolCallPolicy(modelFromRequest(chatRequest));
-    const validated = validateChatRequest(chatRequest, toolCallPolicy);
+    const validated = validateChatRequest(chatRequest);
+    chatRequest.model = validated.model;
+    context.model = validated.model;
     await assertModelSupported(validated.model, groupId);
 
     if (requestBody.stream === true) {

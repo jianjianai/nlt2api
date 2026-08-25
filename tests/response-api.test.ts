@@ -22,17 +22,17 @@ import { validateChatRequest, type ChatExecution } from "../server/utils/chat-se
 import type { JsonObject, JsonValue, ManagedAccount } from "../server/utils/types.ts";
 
 async function withTempDataDir<T>(run: () => Promise<T>): Promise<T> {
-  const dir = await mkdtemp(join(tmpdir(), "neuralwatt-response-api-test-"));
-  const previous = process.env.NEURALWATT_DATA_DIR;
-  process.env.NEURALWATT_DATA_DIR = dir;
+  const dir = await mkdtemp(join(tmpdir(), "deepinfra-response-api-test-"));
+  const previous = process.env.DEEPINFRA_GATEWAY_DATA_DIR;
+  process.env.DEEPINFRA_GATEWAY_DATA_DIR = dir;
   resetProxyConfigForTests();
   try {
     return await run();
   } finally {
     if (previous === undefined) {
-      delete process.env.NEURALWATT_DATA_DIR;
+      delete process.env.DEEPINFRA_GATEWAY_DATA_DIR;
     } else {
-      process.env.NEURALWATT_DATA_DIR = previous;
+      process.env.DEEPINFRA_GATEWAY_DATA_DIR = previous;
     }
     resetProxyConfigForTests();
     await rm(dir, { recursive: true, force: true });

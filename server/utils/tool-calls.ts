@@ -824,7 +824,7 @@ function stripToolContract(content: string): string {
   // Only messages carrying a full fixed contract can be adapter output; a
   // caller prompt merely quoting the marker sentence (or the schema-block
   // phrase alone) is preserved verbatim. Every wire-format variant is
-  // stripped, so switching NEURALWATT_TOOL_CALL_FORMAT never strands a stale
+  // stripped, so switching the configured tool-call format never strands a stale
   // contract in the history.
   // Every format × verbosity variant ever emitted, so a settings switch or a
   // version upgrade never strands a stale contract in the history.

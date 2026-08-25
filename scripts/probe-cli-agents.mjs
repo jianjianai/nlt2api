@@ -7,23 +7,23 @@ import { dirname, join, relative, sep } from "node:path";
 import { Readable } from "node:stream";
 import { fileURLToPath } from "node:url";
 
-const baseUrl = process.env.NEURALWATT_PROBE_BASE_URL || "http://localhost:3000";
-const adminToken = process.env.NEURALWATT_PROBE_ADMIN_TOKEN;
-const clientKey = process.env.NEURALWATT_PROBE_CLIENT_KEY;
-const email = process.env.NEURALWATT_PROBE_EMAIL;
-const password = process.env.NEURALWATT_PROBE_PASSWORD;
-const requestedAccountId = process.env.NEURALWATT_PROBE_ACCOUNT_ID;
-const runsPerCli = Number.parseInt(process.env.NEURALWATT_CLI_PROBE_RUNS || "1", 10);
-const taskDelayMs = Number.parseInt(process.env.NEURALWATT_CLI_PROBE_DELAY_MS || "30000", 10);
+const baseUrl = process.env.DEEPINFRA_PROBE_BASE_URL || "http://localhost:3000";
+const adminToken = process.env.DEEPINFRA_PROBE_ADMIN_TOKEN;
+const clientKey = process.env.DEEPINFRA_PROBE_CLIENT_KEY;
+const email = process.env.DEEPINFRA_PROBE_EMAIL;
+const password = process.env.DEEPINFRA_PROBE_PASSWORD;
+const requestedAccountId = process.env.DEEPINFRA_PROBE_ACCOUNT_ID;
+const runsPerCli = Number.parseInt(process.env.DEEPINFRA_GATEWAY_CLI_PROBE_RUNS || "1", 10);
+const taskDelayMs = Number.parseInt(process.env.DEEPINFRA_GATEWAY_CLI_PROBE_DELAY_MS || "30000", 10);
 
 for (const [name, value] of Object.entries({ adminToken, clientKey, email, password })) {
   if (!value) throw new Error(`Missing required probe setting: ${name}`);
 }
 if (!Number.isInteger(runsPerCli) || runsPerCli < 1 || runsPerCli > 10) {
-  throw new Error("NEURALWATT_CLI_PROBE_RUNS must be an integer from 1 to 10.");
+  throw new Error("DEEPINFRA_GATEWAY_CLI_PROBE_RUNS must be an integer from 1 to 10.");
 }
 if (!Number.isInteger(taskDelayMs) || taskDelayMs < 0 || taskDelayMs > 120_000) {
-  throw new Error("NEURALWATT_CLI_PROBE_DELAY_MS must be an integer from 0 to 120000.");
+  throw new Error("DEEPINFRA_GATEWAY_CLI_PROBE_DELAY_MS must be an integer from 0 to 120000.");
 }
 
 const adminHeaders = { "content-type": "application/json", "x-admin-token": adminToken };
@@ -31,7 +31,7 @@ const appData = process.env.APPDATA;
 if (!appData) throw new Error("APPDATA is required to locate the installed CLIs.");
 const codexEntrypoint = join(appData, "npm", "node_modules", "@openai", "codex", "bin", "codex.js");
 const openCodeEntrypoint = join(appData, "npm", "node_modules", "opencode-ai", "bin", "opencode.exe");
-const scratch = await mkdtemp(join(tmpdir(), "neuralwatt-cli-agent-probe-"));
+const scratch = await mkdtemp(join(tmpdir(), "deepinfra-cli-agent-probe-"));
 const codexHome = join(scratch, "codex-home");
 let accountId;
 let ownsAccount = false;
@@ -344,7 +344,7 @@ async function runCodex(workspace, seed, gateway, wireApi = "chat") {
   ].join("\n"), "utf8");
   const env = await safeChildEnvironment(join(scratch, "codex-user"), {
     CODEX_HOME: codexHome,
-    NEURALWATT_CLI_TEST_KEY: gateway.token,
+    DEEPINFRA_GATEWAY_CLI_TEST_KEY: gateway.token,
   });
   const args = [
     codexEntrypoint,
@@ -359,9 +359,9 @@ async function runCodex(workspace, seed, gateway, wireApi = "chat") {
     "-C", workspace,
     "-m", "kimi-k3-fast",
     "-c", 'model_provider="neuralwatt"',
-    "-c", 'model_providers.neuralwatt.name="NeuralWatt local gateway"',
+    "-c", 'model_providers.neuralwatt.name="DeepInfra local gateway"',
     "-c", `model_providers.neuralwatt.base_url="${gateway.baseUrl}/v1"`,
-    "-c", 'model_providers.neuralwatt.env_key="NEURALWATT_CLI_TEST_KEY"',
+    "-c", 'model_providers.neuralwatt.env_key="DEEPINFRA_GATEWAY_CLI_TEST_KEY"',
     "-c", `model_providers.neuralwatt.wire_api="${wireApi}"`,
     "-c", "model_providers.neuralwatt.requires_openai_auth=false",
     taskPrompt(seed),
@@ -419,8 +419,8 @@ async function runOpenCode(workspace, seed, gateway) {
     provider: {
       neuralwatt: {
         npm: "@ai-sdk/openai-compatible",
-        name: "NeuralWatt local gateway",
-        options: { baseURL: `${gateway.baseUrl}/v1`, apiKey: "{env:NEURALWATT_CLI_TEST_KEY}" },
+        name: "DeepInfra local gateway",
+        options: { baseURL: `${gateway.baseUrl}/v1`, apiKey: "{env:DEEPINFRA_GATEWAY_CLI_TEST_KEY}" },
         models: { "kimi-k3-fast": { name: "Kimi K3 Fast", limit: { context: 131_072, output: 8_192 } } },
       },
     },
@@ -428,7 +428,7 @@ async function runOpenCode(workspace, seed, gateway) {
   const env = await safeChildEnvironment(childHome, {
     ...xdg,
     CODEX_HOME: sandboxCodexHome,
-    NEURALWATT_CLI_TEST_KEY: gateway.token,
+    DEEPINFRA_GATEWAY_CLI_TEST_KEY: gateway.token,
     OPENCODE_CONFIG_CONTENT: JSON.stringify(config),
   });
   const args = [
@@ -496,7 +496,7 @@ try {
     "codex-responses": { name: "codex-responses", run: (workspace, seed, gateway) => runCodex(workspace, seed, gateway, "responses"), seedBase: 300 },
     opencode: { name: "opencode", run: runOpenCode, seedBase: 200 },
   };
-  const selectedNames = (process.env.NEURALWATT_CLI_PROBE_CLIENTS || "codex,opencode").split(",").map((name) => name.trim()).filter(Boolean);
+  const selectedNames = (process.env.DEEPINFRA_GATEWAY_CLI_PROBE_CLIENTS || "codex,opencode").split(",").map((name) => name.trim()).filter(Boolean);
   const clients = selectedNames.map((name) => {
     const client = allClients[name];
     if (!client) throw new Error(`Unknown probe client: ${name}`);
@@ -641,7 +641,7 @@ try {
   if (cliGatewayProxy) {
     await cliGatewayProxy.close().catch(() => undefined);
   }
-  const expectedPrefix = `${tmpdir()}${sep}neuralwatt-cli-agent-probe-`;
+  const expectedPrefix = `${tmpdir()}${sep}deepinfra-cli-agent-probe-`;
   if (scratch.startsWith(expectedPrefix) && relative(tmpdir(), scratch) && dirname(scratch) === tmpdir()) {
     await rm(scratch, { recursive: true, force: true });
   }

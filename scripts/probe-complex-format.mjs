@@ -10,23 +10,23 @@
  * parse + schema validation outcome), plus a client-side semantic check that
  * the returned arguments match what the prompt requested.
  *
- * Required env: NEURALWATT_PROBE_ADMIN_TOKEN, NEURALWATT_PROBE_CLIENT_KEY,
- * NEURALWATT_PROBE_EMAIL, NEURALWATT_PROBE_PASSWORD.
- * Optional env: NEURALWATT_PROBE_BASE_URL, NEURALWATT_PROBE_ACCOUNT_ID (reuse
- * an existing account instead of creating one), NEURALWATT_PROBE_MODEL,
- * NEURALWATT_PROBE_TURNS, NEURALWATT_PROBE_DELAY_MS,
- * NEURALWATT_PROBE_TEMPERATURE, NEURALWATT_PROBE_REQUIRE_FIRST_PASS.
+ * Required env: DEEPINFRA_PROBE_ADMIN_TOKEN, DEEPINFRA_PROBE_CLIENT_KEY,
+ * DEEPINFRA_PROBE_EMAIL, DEEPINFRA_PROBE_PASSWORD.
+ * Optional env: DEEPINFRA_PROBE_BASE_URL, DEEPINFRA_PROBE_ACCOUNT_ID (reuse
+ * an existing account instead of creating one), DEEPINFRA_PROBE_MODEL,
+ * DEEPINFRA_PROBE_TURNS, DEEPINFRA_PROBE_DELAY_MS,
+ * DEEPINFRA_PROBE_TEMPERATURE, DEEPINFRA_PROBE_REQUIRE_FIRST_PASS.
  */
-const baseUrl = process.env.NEURALWATT_PROBE_BASE_URL || "http://localhost:3000";
-const adminToken = process.env.NEURALWATT_PROBE_ADMIN_TOKEN;
-const clientKey = process.env.NEURALWATT_PROBE_CLIENT_KEY;
-const email = process.env.NEURALWATT_PROBE_EMAIL;
-const password = process.env.NEURALWATT_PROBE_PASSWORD;
-const total = Number.parseInt(process.env.NEURALWATT_PROBE_TURNS || "20", 10);
-const delayMs = Number.parseInt(process.env.NEURALWATT_PROBE_DELAY_MS || "3000", 10);
-const model = process.env.NEURALWATT_PROBE_MODEL || "kimi-k3-fast";
-const temperature = Number(process.env.NEURALWATT_PROBE_TEMPERATURE ?? "0");
-const requireFirstPassThreshold = process.env.NEURALWATT_PROBE_REQUIRE_FIRST_PASS !== "false";
+const baseUrl = process.env.DEEPINFRA_PROBE_BASE_URL || "http://localhost:3000";
+const adminToken = process.env.DEEPINFRA_PROBE_ADMIN_TOKEN;
+const clientKey = process.env.DEEPINFRA_PROBE_CLIENT_KEY;
+const email = process.env.DEEPINFRA_PROBE_EMAIL;
+const password = process.env.DEEPINFRA_PROBE_PASSWORD;
+const total = Number.parseInt(process.env.DEEPINFRA_PROBE_TURNS || "20", 10);
+const delayMs = Number.parseInt(process.env.DEEPINFRA_PROBE_DELAY_MS || "3000", 10);
+const model = process.env.DEEPINFRA_PROBE_MODEL || "kimi-k3-fast";
+const temperature = Number(process.env.DEEPINFRA_PROBE_TEMPERATURE ?? "0");
+const requireFirstPassThreshold = process.env.DEEPINFRA_PROBE_REQUIRE_FIRST_PASS !== "false";
 
 for (const [name, value] of Object.entries({ adminToken, clientKey, email, password })) {
   if (!value) {
@@ -34,7 +34,7 @@ for (const [name, value] of Object.entries({ adminToken, clientKey, email, passw
   }
 }
 if (!Number.isInteger(total) || total < 1 || total > 100) {
-  throw new Error("NEURALWATT_PROBE_TURNS must be an integer from 1 to 100.");
+  throw new Error("DEEPINFRA_PROBE_TURNS must be an integer from 1 to 100.");
 }
 
 const adminHeaders = {
@@ -291,7 +291,7 @@ const runStartedAt = new Date(Date.now() - 10_000).toISOString();
 try {
   const settingsBeforeProbe = await jsonRequest("/api/admin/settings", { headers: adminHeaders });
   previousRecordMessages = Boolean(settingsBeforeProbe?.settings?.recordMessages);
-  const requestedAccountId = process.env.NEURALWATT_PROBE_ACCOUNT_ID;
+  const requestedAccountId = process.env.DEEPINFRA_PROBE_ACCOUNT_ID;
   if (requestedAccountId) {
     const existing = await jsonRequest("/api/admin/accounts", { headers: adminHeaders });
     if (!existing.accounts?.some((account) => account.id === requestedAccountId)) {

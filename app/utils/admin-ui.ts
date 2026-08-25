@@ -10,8 +10,8 @@ import type {
 
 export const DEFAULT_WORKSPACE: WorkspaceId = "overview";
 export const DEFAULT_THEME: import("../types/admin.ts").ThemeId = "light";
-export const WORKSPACE_STORAGE_KEY = "neuralwatt-admin-workspace";
-export const THEME_STORAGE_KEY = "neuralwatt-admin-theme";
+export const WORKSPACE_STORAGE_KEY = "deepinfra-gateway-admin-workspace";
+export const THEME_STORAGE_KEY = "deepinfra-gateway-admin-theme";
 
 const WORKSPACES = new Set<WorkspaceId>([
   "overview",

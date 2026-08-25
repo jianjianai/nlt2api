@@ -50,9 +50,7 @@ function account(id: string, models = ["m1"], proxy?: string): ManagedAccount {
   return {
     id,
     label: id,
-    email: `${id}@example.com`,
-    password: "secret",
-    enabled: true,
+        enabled: true,
     weight: 1,
     ...(proxy ? { proxy } : {}),
     groupIds: [],
@@ -158,6 +156,41 @@ test("proxy aliases and credentials share one normalized egress identity", () =>
   assert.equal(egressIdentity("socks4://a@proxy.example").key, egressIdentity("socks4a://b@PROXY.example:1080").key);
 });
 
+test("one DeepInfra gateway schedules independent egress accounts", async () => {
+  const direct = account("direct", ["shared-model"], "socks5h://egress-a.example:1080");
+  const proxy = account("proxy", ["shared-model"], "socks5h://egress-b.example:1080");
+  const { scheduler } = harness([direct, proxy], {
+    accountModelConcurrency: 1,
+    accountRpm: 100,
+    proxyRpm: 100,
+  });
+
+  // The caller asks only for a model; the scheduler chooses an egress account.
+  const first = await resolved(scheduler.acquire({ model: "shared-model" }));
+  const second = await resolved(scheduler.acquire({ model: "shared-model" }));
+  assert.notEqual(first.account.id, second.account.id);
+  assert.notEqual(first.egressId, second.egressId);
+
+  first.release();
+  second.release();
+
+  // Completed serial requests remain part of the rolling weighted load, so equal
+  // accounts rotate instead of pinning every request to the oldest account.
+  const serialFirst = await resolved(scheduler.acquire({ model: "shared-model" }));
+  serialFirst.release();
+  const serialSecond = await resolved(scheduler.acquire({ model: "shared-model" }));
+  serialSecond.release();
+  assert.notEqual(serialFirst.account.id, serialSecond.account.id);
+  assert.notEqual(serialFirst.egressId, serialSecond.egressId);
+
+  // A failed egress cools down that account; the next request spills to the
+  // other DeepInfra account without changing either account's proxy.
+  scheduler.markFailure(direct.id, "egress unavailable");
+  const fallback = await resolved(scheduler.acquire({ model: "shared-model" }));
+  assert.equal(fallback.account.id, proxy.id);
+  fallback.release();
+});
+
 test("proxy RPM is shared across credentials while different proxies stay independent", async () => {
   const sharedA = account("a", ["m1"], "http://first:one@proxy.example:8080");
   const sharedB = account("b", ["m1"], "http://second:two@PROXY.example:8080");
@@ -199,6 +232,23 @@ test("direct egress limiting is optional and shared when enabled", async () => {
   assert.equal(await pending(waiting), true);
   limited.scheduler.resetForTests();
   await assert.rejects(waiting, (error: unknown) => error instanceof DOMException && error.name === "AbortError");
+});
+
+test("model busy cools only that model, not the account", async () => {
+  const { scheduler, clock } = harness([account("a", ["m1", "m2"])], {
+    accountModelConcurrency: 2,
+    accountRpm: 100,
+  });
+  scheduler.markModelCapacityFailure("a", "m1", "Model busy, retry later", 30);
+  const blocked = scheduler.acquire({ model: "m1" });
+  assert.equal(await pending(blocked), true);
+  const other = await resolved(scheduler.acquire({ model: "m2" }));
+  assert.equal(other.account.id, "a");
+  other.release();
+  await clock.advance(30_000);
+  const recovered = await resolved(blocked);
+  assert.equal(recovered.account.id, "a");
+  recovered.release();
 });
 
 test("a success from an earlier admission cannot clear a later failure cooldown", async () => {
@@ -272,7 +322,7 @@ test("group-scoped admission cannot select accounts outside the group", async ()
   lease.release();
   await assert.rejects(
     scheduler.acquire({ model: "m1", groupId: "missing-group" }),
-    /No enabled NeuralWatt account/,
+    /No enabled DeepInfra account/,
   );
 });
 

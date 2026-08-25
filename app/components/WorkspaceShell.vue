@@ -95,7 +95,7 @@ onUnmounted(() => window.removeEventListener("keydown", onGlobalShortcut));
     <header class="workspace-topbar">
       <div class="workspace-brand">
         <span class="workspace-brand-mark"><AppIcon name="activity" :size="16" /></span>
-        <span class="workspace-brand-name">NeuralWatt 网关</span>
+        <span class="workspace-brand-name">DeepInfra 网关</span>
       </div>
       <div class="workspace-top-actions">
         <AppTooltip text="打开快速操作"><button ref="commandTrigger" class="command-trigger" type="button" aria-label="打开快速操作" @click="setCommandOpen(true)"><AppIcon name="search" :size="15" /><span>快速操作</span></button></AppTooltip>

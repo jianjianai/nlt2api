@@ -27,7 +27,7 @@ export default defineHandler(async (event) => {
     const accountOverview = {
       total: publicAccounts.length,
       enabled: publicAccounts.filter((account) => account.enabled).length,
-      sessions: publicAccounts.filter((account) => account.hasSession).length,
+      sessions: publicAccounts.length,
       direct: publicAccounts.filter((account) => !account.proxy).length,
       inFlight: publicAccounts.reduce((total, account) => total + account.runtime.inFlight, 0),
       cooling: accountIssues.length,

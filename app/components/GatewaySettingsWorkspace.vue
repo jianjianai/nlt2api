@@ -234,7 +234,8 @@ function analyticsDate(value?: string): string {
       <div class="gateway-analytics-summary">
         <div><span>精确账本起点</span><strong>{{ analyticsDate(analytics?.ledgerStartedAt) }}</strong></div>
         <div><span>价格目录</span><strong>{{ analytics?.priceStatus === "current" ? "最新" : analytics?.priceStatus === "stale" ? "已陈旧" : "不可用" }}</strong><small>{{ analyticsDate(analytics?.priceUpdatedAt) }}</small></div>
-        <div><span>定价覆盖率</span><strong>{{ Math.round((analytics?.pricedCoverage ?? 0) * 100) }}%</strong><small>{{ analytics?.unpricedRequests ?? 0 }} 个未定价请求</small></div>
+        <div><span>账单覆盖率</span><strong>{{ Math.round((analytics?.pricedCoverage ?? 0) * 100) }}%</strong><small>{{ analytics?.unpricedRequests ?? 0 }} 个未结算请求</small></div>
+        <div><span>本月目录估算</span><strong>{{ formatMicroUsd(analytics?.monthCostMicroUsd ?? 0) }}</strong><small>基于 DeepInfra 公开价格目录</small></div>
         <button class="button button-quiet" type="button" :disabled="refreshingPrices" :aria-busy="refreshingPrices" @click="emit('refreshPrices')"><span v-if="refreshingPrices" class="spinner" aria-hidden="true"></span><AppIcon v-else name="refresh-cw" :size="14" />{{ refreshingPrices ? "刷新中" : "刷新价格" }}</button>
       </div>
 

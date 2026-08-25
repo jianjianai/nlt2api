@@ -1,9 +1,9 @@
 // Error-prone file-editing tool-call probe: complex payloads, embedded markup,
 // parallel calls, CJK, regex, long files. Usage:
 //   node scripts/probe-editing.mjs <model> <turnsPerScenario>
-// Requires NEURALWATT_PROBE_CLIENT_KEY; optional NEURALWATT_PROBE_BASE_URL.
-const baseUrl = process.env.NEURALWATT_PROBE_BASE_URL || "http://localhost:3000";
-const clientKey = process.env.NEURALWATT_PROBE_CLIENT_KEY;
+// Requires DEEPINFRA_PROBE_CLIENT_KEY; optional DEEPINFRA_PROBE_BASE_URL.
+const baseUrl = process.env.DEEPINFRA_PROBE_BASE_URL || "http://localhost:3000";
+const clientKey = process.env.DEEPINFRA_PROBE_CLIENT_KEY;
 const model = process.argv[2] || "deepseek-v4-pro";
 const turnsPerScenario = Number(process.argv[3] || "1");
 const runId = `editing-${crypto.randomUUID().replaceAll("-", "").slice(0, 12)}`;

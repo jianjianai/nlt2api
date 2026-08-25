@@ -8,18 +8,14 @@ import { UsageAnalyticsService } from "../server/utils/usage-analytics.ts";
 
 async function withAnalytics<T>(
   run: (service: UsageAnalyticsService, database: AnalyticsDatabase) => Promise<T>,
-  loadPortalModels: () => Promise<Record<string, unknown>[]> = async () => [{
+  loadCatalogModels: () => Promise<Record<string, unknown>[]> = async () => [{
     id: "test-model",
-    name: "Test Model",
-    provider: "Test Provider",
-    prompt_price_per_1k: 0.001,
-    completion_price_per_1k: 0.002,
-    cached_input_price_per_1k: 0.0001,
+    metadata: { pricing: { input_tokens: 0.001 * 1_000, output_tokens: 0.002 * 1_000, cache_read_tokens: 0.0001 * 1_000 } },
   }],
 ): Promise<T> {
-  const dir = await mkdtemp(join(tmpdir(), "neuralwatt-analytics-test-"));
+  const dir = await mkdtemp(join(tmpdir(), "deepinfra-analytics-test-"));
   const database = new AnalyticsDatabase(join(dir, "analytics.sqlite"));
-  const service = new UsageAnalyticsService(database, loadPortalModels);
+  const service = new UsageAnalyticsService(database, loadCatalogModels);
   try {
     await service.initialize();
     return await run(service, database);
@@ -32,7 +28,7 @@ async function withAnalytics<T>(
 test("analytics migrations reopen with WAL and preserve price versions", async () => {
   await withAnalytics(async (service, database) => {
     assert.equal(database.get<{ journal_mode: string }>("PRAGMA journal_mode")?.journal_mode, "wal");
-    assert.equal(database.get<{ count: number }>("SELECT COUNT(*) AS count FROM schema_migrations")?.count, 4);
+    assert.equal(database.get<{ count: number }>("SELECT COUNT(*) AS count FROM schema_migrations")?.count, 6);
     assert.ok(service.priceFor("test-model"));
     await service.close();
     database.connection();
@@ -46,7 +42,7 @@ test("same-price catalog refresh keeps immutable price rows and advances sync st
     await new Promise((resolve) => setTimeout(resolve, 5));
     await service.refreshPrices(true);
     const after = database.get<Record<string, unknown>>("SELECT * FROM price_versions WHERE model_id = 'test-model'")!;
-    const sync = database.get<{ status: string; checked_at: string }>("SELECT status, checked_at FROM catalog_sync WHERE source = 'portal_catalog'")!;
+    const sync = database.get<{ status: string; checked_at: string }>("SELECT status, checked_at FROM catalog_sync WHERE source = 'deepinfra_catalog'")!;
     assert.deepEqual(after, before);
     assert.equal(database.get<{ count: number }>("SELECT COUNT(*) AS count FROM price_versions WHERE model_id = 'test-model'")?.count, 1);
     assert.equal(sync.status, "ok");
@@ -69,11 +65,7 @@ test("catalog price A to B to A reactivates the original immutable version", asy
     assert.equal(database.get<{ count: number }>("SELECT COUNT(*) AS count FROM price_versions WHERE model_id = 'test-model'")?.count, 2);
   }, async () => [{
     id: "test-model",
-    name: "Test Model",
-    provider: "Test Provider",
-    prompt_price_per_1k: promptPrice,
-    completion_price_per_1k: 0.002,
-    cached_input_price_per_1k: 0.0001,
+    metadata: { pricing: { input_tokens: promptPrice * 1_000, output_tokens: 0.002 * 1_000, cache_read_tokens: 0.0001 * 1_000 } },
   }]);
 });
 
@@ -183,6 +175,45 @@ test("one execution settles every attempt exactly once with frozen cost", async 
   });
 });
 
+test("authoritative API billing overrides catalog estimates and persists energy", async () => {
+  await withAnalytics(async (service, database) => {
+    const tracker = service.beginExecution("/v1/chat/completions", "test-model");
+    const attempt = tracker.startAttempt({
+      type: "initial",
+      model: "test-model",
+      accountId: "api-account",
+      billingAuthoritative: true,
+      now: 1_000,
+    });
+    tracker.finishAttempt(attempt, {
+      status: 200,
+      outcome: "success",
+      now: 2_000,
+      usage: { prompt_tokens: 1_000, completion_tokens: 500, total_tokens: 1_500 },
+      billing: {
+        energy: { energy_kwh: 0.000012, energy_kwh_charged: 0.0000078 },
+        cost: { request_cost_usd: 0.000078, accounting_method: "energy" },
+        serviceTier: "flex",
+      },
+    });
+    await tracker.settle({ status: 200, outcome: "success", now: 3_000 });
+    const execution = database.get<Record<string, unknown>>("SELECT * FROM executions")!;
+    const storedAttempt = database.get<Record<string, unknown>>("SELECT * FROM execution_attempts")!;
+    assert.equal(execution.cost_source, "upstream_billed");
+    assert.equal(execution.total_cost_micro_usd, 78);
+    assert.equal(execution.input_cost_micro_usd, 0);
+    assert.equal(execution.output_cost_micro_usd, 0);
+    assert.equal(execution.energy_consumed_nano_kwh, 12_000);
+    assert.equal(execution.energy_charged_nano_kwh, 7_800);
+    assert.equal(storedAttempt.service_tier, "flex");
+    assert.equal(storedAttempt.accounting_method, "energy");
+    const totals = service.query("1970-01-01T00:00:00.000Z", "1970-01-02T00:00:00.000Z", { granularity: "hour", sort: "cost", direction: "desc" });
+    assert.equal(totals.totalCostMicroUsd, 78);
+    assert.equal(totals.energyConsumedNanoKwh, 12_000);
+    assert.equal(totals.models[0]?.upstreamBilledRequests, 1);
+  });
+});
+
 test("compensation retry preserves the price frozen in its settlement payload", async () => {
   await withAnalytics(async (service, database) => {
     const frozenPrice = service.priceFor("test-model")!;
@@ -211,7 +242,7 @@ test("compensation retry preserves the price frozen in its settlement payload", 
       model_id, provider, display_name, source, source_url, currency,
       input_nano_usd_per_token, cached_input_nano_usd_per_token, output_nano_usd_per_token,
       effective_at, fetched_at, verified_at, content_hash
-    ) VALUES ('test-model', 'Test Provider', 'Test Model V2', 'portal_catalog', 'https://example.test', 'USD',
+    ) VALUES ('test-model', 'Test Provider', 'Test Model V2', 'deepinfra_catalog', 'https://api.deepinfra.com/v1/openai/models', 'USD',
       9000, 900, 18000, ?, ?, ?, 'different-price-version')`,
     new Date().toISOString(), new Date().toISOString(), new Date().toISOString());
     const newer = database.get<{ id: number }>("SELECT id FROM price_versions WHERE content_hash = 'different-price-version'")!;

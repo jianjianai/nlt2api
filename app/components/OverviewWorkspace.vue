@@ -62,7 +62,8 @@ const modelOptions = computed(() => [...new Set([
 ])].sort());
 const totalTokens = (row: { promptTokens: number; completionTokens: number }) => row.promptTokens + row.completionTokens;
 const dateLabel = (value?: string) => value ? new Date(value).toLocaleString("zh-CN", { hour12: false }) : "尚未开始";
-const priceSourceLabel = (value?: "vendor_official" | "portal_catalog") => value === "vendor_official" ? "厂商官方" : value === "portal_catalog" ? "门户目录" : "未定价";
+const priceSourceLabel = (value?: "vendor_official" | "portal_catalog" | "upstream_billed") => value === "upstream_billed" ? "上游实账" : value === "vendor_official" ? "厂商官方" : value === "portal_catalog" ? "门户目录" : "未定价";
+const formatEnergy = (nanoKwh: number | undefined) => `${((nanoKwh ?? 0) / 1_000_000_000).toLocaleString("zh-CN", { maximumFractionDigits: 6 })} kWh`;
 </script>
 
 <template>
@@ -99,9 +100,9 @@ const priceSourceLabel = (value?: "vendor_official" | "portal_catalog") => value
       </div>
       <div class="analytics-quick-metrics">
         <article :class="{ warn: utilization >= .8 }"><span>容量使用率</span><strong>{{ Math.round(utilization * 100) }}%</strong><small>{{ utilization >= .8 ? "接近安全阈值" : "当前容量可用" }}</small></article>
-        <article><span>今日消费</span><strong>{{ formatMicroUsd(analytics.todayCostMicroUsd) }}</strong><small>{{ pricedCoverageLabel }}</small></article>
+        <article><span>今日消费</span><strong>{{ formatMicroUsd(analytics.todayCostMicroUsd) }}</strong><small>{{ formatEnergy(analytics.todayEnergyConsumedNanoKwh) }} · {{ pricedCoverageLabel }}</small></article>
         <article :class="{ warn: (recommendation?.recommendedAccounts ?? 0) > 0 }"><span>{{ recommendation?.bindingConstraint === "shared_egress_rpm" ? "出口建议" : "建议账号" }}</span><strong>{{ recommendation?.bindingConstraint === "shared_egress_rpm" ? "新增出口" : `+${recommendation?.recommendedAccounts ?? 0}` }}</strong><small>{{ recommendation?.model || "暂无压力模型" }}</small></article>
-        <article><span>本月消费</span><strong>{{ formatMicroUsd(analytics.monthCostMicroUsd) }}</strong><small>精确账本</small></article>
+        <article><span>本月消费</span><strong>{{ formatMicroUsd(analytics.monthCostMicroUsd) }}</strong><small>{{ formatEnergy(analytics.monthEnergyConsumedNanoKwh) }}</small></article>
       </div>
     </section>
 
@@ -164,9 +165,9 @@ const priceSourceLabel = (value?: "vendor_official" | "portal_catalog") => value
         <template v-else-if="detail">
           <div class="cost-breakdown">
             <div><span>总消费</span><strong>{{ formatMicroUsd(detail.totalCostMicroUsd) }}</strong></div>
-            <div><span>普通输入</span><strong>{{ formatMicroUsd(detail.inputCostMicroUsd) }}</strong></div>
-            <div><span>缓存输入</span><strong>{{ formatMicroUsd(detail.cachedInputCostMicroUsd) }}</strong></div>
-            <div><span>输出</span><strong>{{ formatMicroUsd(detail.outputCostMicroUsd) }}</strong></div>
+            <div><span>实际能耗</span><strong>{{ formatEnergy(detail.energyConsumedNanoKwh) }}</strong></div>
+            <div><span>计费能耗</span><strong>{{ formatEnergy(detail.energyChargedNanoKwh) }}</strong></div>
+            <div><span>Token 价拆分</span><strong>{{ formatMicroUsd(detail.inputCostMicroUsd + detail.cachedInputCostMicroUsd + detail.outputCostMicroUsd) }}</strong></div>
           </div>
           <p class="analytics-footnote">精确账本始于 {{ dateLabel(analytics.ledgerStartedAt) }}。价格目录状态：{{ analytics.priceStatus === "current" ? "最新" : analytics.priceStatus === "stale" ? "已陈旧" : "不可用" }}；未定价请求 {{ detail.unpricedRequests }} 个，不计入已定价总消费。</p>
         </template>        <div v-else class="mini-empty">选择时间范围后加载消费拆分。</div>
@@ -177,7 +178,7 @@ const priceSourceLabel = (value?: "vendor_official" | "portal_catalog") => value
           <div class="analytics-model-head" role="row"><span role="columnheader">模型</span><span role="columnheader">客户端 / 上游 RPM</span><span role="columnheader">放大率</span><span role="columnheader">24h 消费</span><span role="columnheader">利用率</span><span role="columnheader">建议</span></div>
           <div v-for="model in displayedModels" :key="model.model" class="analytics-model-row" role="row">
             <code role="cell" :title="model.model">{{ model.model }}</code><span role="cell" data-label="客户端 / 上游 RPM">{{ model.clientRpm }} / {{ model.upstreamRpm }}</span><span role="cell" data-label="调用放大">{{ model.amplification.toFixed(2) }}×</span><span role="cell" data-label="消费">{{ formatMicroUsd(model.totalCostMicroUsd) }}</span><span role="cell" data-label="利用率"><b class="utilization-bar"><i :style="{ width: `${Math.min(100, Math.round(model.utilization * 100))}%` }"></i></b>{{ Math.round(model.utilization * 100) }}%</span><span role="cell" data-label="建议">{{ model.recommendedAccounts ? `+${model.recommendedAccounts} 账号` : forecastConstraintLabel(model.bindingConstraint) }}</span>
-            <small>{{ totalTokens(model).toLocaleString() }} tokens · 输入 {{ formatMicroUsd(model.inputCostMicroUsd) }} · 缓存 {{ formatMicroUsd(model.cachedInputCostMicroUsd) }} · 输出 {{ formatMicroUsd(model.outputCostMicroUsd) }} · 当前价源 {{ priceSourceLabel(model.priceSource) }}<template v-if="model.priceVerifiedAt">（核验 {{ dateLabel(model.priceVerifiedAt) }}）</template> · {{ confidenceLabel(model.confidence) }}</small>
+            <small>{{ totalTokens(model).toLocaleString() }} tokens · <template v-if="model.upstreamBilledRequests">实账 {{ model.upstreamBilledRequests }} 次 · {{ formatEnergy(model.energyConsumedNanoKwh) }} consumed / {{ formatEnergy(model.energyChargedNanoKwh) }} charged · 当前价源 上游实账</template><template v-else>输入 {{ formatMicroUsd(model.inputCostMicroUsd) }} · 缓存 {{ formatMicroUsd(model.cachedInputCostMicroUsd) }} · 输出 {{ formatMicroUsd(model.outputCostMicroUsd) }} · 当前价源 {{ priceSourceLabel(model.priceSource) }}<template v-if="model.priceVerifiedAt">（核验 {{ dateLabel(model.priceVerifiedAt) }}）</template></template> · {{ confidenceLabel(model.confidence) }}</small>
           </div>
         </div>
         <div v-else class="mini-empty">暂无单模型精确用量。</div>

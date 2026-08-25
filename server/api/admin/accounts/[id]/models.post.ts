@@ -2,7 +2,7 @@ import { defineHandler } from "nitro";
 import { accountScheduler } from "~/server/utils/account-scheduler.ts";
 import { HttpError, jsonResponse, openAIErrorResponse, requireAdminAuth } from "~/server/utils/http.ts";
 import { adminHttpError } from "~/server/utils/route-helpers.ts";
-import { portalClient } from "~/server/utils/portal-client.ts";
+import { deepInfraClient } from "~/server/utils/deepinfra-client.ts";
 import { stateStore } from "~/server/utils/state-store.ts";
 
 export default defineHandler(async (event) => {
@@ -16,10 +16,9 @@ export default defineHandler(async (event) => {
     if (!account) {
       throw new HttpError(404, "Account not found.", "invalid_request_error", "id");
     }
-    // Fetch the account's current model list from the portal and append it to
-    // the stored list (deduplicated), never replacing manual entries.
-    const models = await portalClient.listAccountModels(account);
-    const saved = await stateStore.mergeAccountModels(id, models);
+    // Fetch the current anonymous DeepInfra model list through this account's egress.
+    const models = await deepInfraClient.listAccountModels(account);
+    const saved = await stateStore.replaceAccountModels(id, models);
     accountScheduler.markSuccess(id);
     accountScheduler.notifyStateChanged();
     return jsonResponse({ account: accountScheduler.publicState(saved), models });

@@ -23,17 +23,17 @@ function timestamp(offsetSeconds: number): string {
 }
 
 async function withTempStore<T>(run: (store: StateStore, dir: string) => Promise<T>): Promise<T> {
-  const dir = await mkdtemp(join(tmpdir(), "neuralwatt-state-test-"));
-  const previous = process.env.NEURALWATT_DATA_DIR;
-  process.env.NEURALWATT_DATA_DIR = dir;
+  const dir = await mkdtemp(join(tmpdir(), "deepinfra-state-test-"));
+  const previous = process.env.DEEPINFRA_GATEWAY_DATA_DIR;
+  process.env.DEEPINFRA_GATEWAY_DATA_DIR = dir;
   resetProxyConfigForTests();
   try {
     return await run(new StateStore(), dir);
   } finally {
     if (previous === undefined) {
-      delete process.env.NEURALWATT_DATA_DIR;
+      delete process.env.DEEPINFRA_GATEWAY_DATA_DIR;
     } else {
-      process.env.NEURALWATT_DATA_DIR = previous;
+      process.env.DEEPINFRA_GATEWAY_DATA_DIR = previous;
     }
     resetProxyConfigForTests();
     await rm(dir, { recursive: true, force: true });
@@ -49,7 +49,7 @@ async function recordFiles(dir: string): Promise<string[]> {
   }
 }
 
-test("v1 state migrates to v2 without assigning legacy accounts to groups", async () => {
+test("v1 state migrates to v3 and removes legacy NeuralWatt accounts", async () => {
   await withTempStore(async (store, dir) => {
     const file = join(dir, "accounts.json");
     await writeFile(file, JSON.stringify({
@@ -58,9 +58,7 @@ test("v1 state migrates to v2 without assigning legacy accounts to groups", asyn
       accounts: [{
         id: "legacy-account",
         label: "Legacy",
-        email: "legacy@example.com",
-        password: "secret",
-        enabled: true,
+                enabled: true,
         weight: 1,
         models: ["model-a"],
         createdAt: timestamp(0),
@@ -70,12 +68,45 @@ test("v1 state migrates to v2 without assigning legacy accounts to groups", asyn
     }), "utf8");
 
     const state = await store.getState();
-    assert.equal(state.version, 2);
+    assert.equal(state.version, 3);
     assert.deepEqual(state.accountGroups, []);
     assert.deepEqual(state.groupApiKeys, []);
-    assert.deepEqual(state.accounts[0]?.groupIds, []);
-    const persisted = JSON.parse(await readFile(file, "utf8")) as { version: number };
-    assert.equal(persisted.version, 2);
+    assert.deepEqual(state.accounts, []);
+    const persisted = JSON.parse(await readFile(file, "utf8")) as { version: number; accounts: unknown[] };
+    assert.equal(persisted.version, 3);
+    assert.deepEqual(persisted.accounts, []);
+  });
+});
+
+test("one egress cannot be assigned to multiple accounts", async () => {
+  await withTempStore(async (store) => {
+    await store.addAccount({ label: "First", proxy: "socks5h://proxy.local:1080" });
+    await assert.rejects(
+      store.addAccount({ label: "Second", proxy: "socks://proxy.local:1080" }),
+      /one IP may serve only one account/,
+    );
+    await store.addAccount({ label: "Direct First" });
+    await assert.rejects(
+      store.addAccount({ label: "Direct Second" }),
+      /one IP may serve only one account/,
+    );
+  });
+});
+
+test("DeepInfra accounts persist only routing and scheduling fields", async () => {
+  await withTempStore(async (store) => {
+    const account = await store.addAccount({
+      label: "DeepInfra Direct",
+      models: ["moonshotai/Kimi-K3"],
+      proxy: "socks5h://proxy.local:1080",
+      weight: 3,
+    });
+    const reloaded = await new StateStore().getAccount(account.id);
+    assert.equal(reloaded?.id, account.id);
+    assert.equal(reloaded?.label, "DeepInfra Direct");
+    assert.equal(reloaded?.proxy, "socks5h://proxy.local:1080");
+    assert.equal(reloaded?.weight, 3);
+    assert.deepEqual(reloaded?.models, ["moonshotai/Kimi-K3"]);
   });
 });
 
@@ -83,15 +114,13 @@ test("groups own account membership and store only API key digests", async () =>
   await withTempStore(async (store, dir) => {
     const first = await store.createAccountGroup({ name: "Primary", description: "Main capacity" });
     const second = await store.createAccountGroup({ name: "Overflow" });
-    const account = await store.addAccount({
-      email: "grouped@example.com",
-      password: "secret",
+    const account = await store.addAccount({ label: "grouped@example.com",
       groupIds: [first.id, second.id, first.id],
     });
     assert.deepEqual(account.groupIds, [first.id, second.id]);
 
     const created = await store.createGroupApiKey(first.id, "Production");
-    assert.match(created.secret, /^nwg_/);
+    assert.match(created.secret, /^dig_/);
     assert.equal((await store.authenticateGroupApiKey(created.secret))?.group.id, first.id);
     const persisted = await readFile(join(dir, "accounts.json"), "utf8");
     assert.equal(persisted.includes(created.secret), false);
@@ -114,10 +143,9 @@ test("account pagination uses stable sorting and group filters", async () => {
     const group = await store.createAccountGroup({ name: "Paged" });
     for (let index = 0; index < 21; index += 1) {
       await store.addAccount({
-        email: `account-${String(index).padStart(2, "0")}@example.com`,
-        password: "secret",
         label: `Account ${String(index).padStart(2, "0")}`,
-        groupIds: index < 20 ? [group.id] : [],
+        proxy: `socks5h://proxy-${index}.local:1080`,
+      groupIds: index < 20 ? [group.id] : [],
       });
     }
 
@@ -147,7 +175,7 @@ test("proxy pool settings and empty pool default for legacy state", async () => 
   });
 });
 
-test("proxy pool import, binding, health and deletion preserve account session", async () => {
+test("proxy pool import, binding, health and deletion preserve account identity", async () => {
   await withTempStore(async (store) => {
     const [created, duplicate] = await store.importProxyPool([
       { url: "socks5://user:pass@proxy.local:1080", kind: "socks5" },
@@ -158,12 +186,11 @@ test("proxy pool import, binding, health and deletion preserve account session",
     assert.equal(created?.entry.id, duplicate?.entry.id);
     assert.equal((await store.listProxyPool()).length, 1);
 
-    const account = await store.addAccount({ email: "pool@example.com", password: "secret" });
-    await store.updateSession(account.id, { cookie: "nw_session=kept", expiresAt: null, updatedAt: timestamp(0) });
+    const account = await store.addAccount({ label: "pool@example.com" });
     const bound = await store.bindProxyPoolEntry(account.id, created!.entry.id);
     assert.equal(bound.proxyPoolEntryId, created?.entry.id);
     assert.equal(bound.proxy, created?.entry.url);
-    assert.equal(bound.session?.cookie, "nw_session=kept");
+    assert.equal(bound.id, account.id);
     await assert.rejects(store.deleteProxyPoolEntry(created!.entry.id), /assigned/);
 
     const failed = await store.updateProxyPoolHealth(created!.entry.id, {
@@ -179,22 +206,21 @@ test("proxy pool import, binding, health and deletion preserve account session",
     const unbound = await store.unbindProxyPoolEntry(account.id, created!.entry.id);
     assert.equal(unbound.proxy, undefined);
     assert.equal(unbound.proxyPoolEntryId, undefined);
-    assert.equal(unbound.session?.cookie, "nw_session=kept");
+    assert.equal(unbound.id, account.id);
     await store.deleteProxyPoolEntry(created!.entry.id);
     assert.deepEqual(await store.listProxyPool(), []);
   });
 });
 
-test("manual proxy updates clear pool ownership but preserve session", async () => {
+test("manual proxy updates clear pool ownership and preserve account identity", async () => {
   await withTempStore(async (store) => {
     const [pool] = await store.importProxyPool([{ url: "http://pool.local:8080/", kind: "http" }]);
-    const account = await store.addAccount({ email: "manual@example.com", password: "secret" });
-    await store.updateSession(account.id, { cookie: "nw_session=kept", expiresAt: null, updatedAt: timestamp(0) });
+    const account = await store.addAccount({ label: "manual@example.com" });
     await store.bindProxyPoolEntry(account.id, pool!.entry.id);
     const updated = await store.updateAccount(account.id, { proxy: "http://manual.local:8080/" });
     assert.equal(updated.proxyPoolEntryId, undefined);
     assert.equal(updated.proxy, "http://manual.local:8080/");
-    assert.equal(updated.session?.cookie, "nw_session=kept");
+    assert.equal(updated.id, account.id);
   });
 });
 
@@ -239,7 +265,7 @@ test("scheduler settings default, persist and normalize invalid legacy values", 
 
 test("account scheduler overrides persist, clear, and prune removed models", async () => {
   await withTempStore(async (store) => {
-    const account = await store.addAccount({ email: "limits@example.com", password: "secret", models: ["m1", "m2"] });
+    const account = await store.addAccount({ label: "limits@example.com", models: ["m1", "m2"] });
     const updated = await store.updateAccount(account.id, { schedulerOverrides: {
       accountRpm: 12,
       accountModelConcurrency: 4,

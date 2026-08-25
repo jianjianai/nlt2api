@@ -1,7 +1,6 @@
 <script setup lang="ts">
 import { computed, ref, watch } from "vue";
 import AppIcon from "./ui/AppIcon.vue";
-import SecretValue from "./ui/SecretValue.vue";
 import type {
   Account,
   AccountGroup,
@@ -28,8 +27,6 @@ const props = defineProps<{
   expandedId: string | null;
   busyIds: Set<string>;
   loading: boolean;
-  secretResetToken: number;
-  copySecret: (value: string, label: string) => void | Promise<void>;
 }>();
 const emit = defineEmits<{
   "update:query": [value: string];
@@ -76,10 +73,8 @@ function runtimeState(account: Account): { text: string; tone: string } {
   if (account.runtime.inFlight > 0) return { text: `${account.runtime.inFlight} 个请求处理中`, tone: "good" };
   return { text: "可用", tone: "good" };
 }
-function sessionText(account: Account): string {
-  if (!account.hasSession) return "未登录";
-  if (account.sessionExpiresAt && account.sessionExpiresAt < Date.now()) return "已过期";
-  return "会话有效";
+function sessionText(): string {
+  return "匿名票据 · 按请求现铸";
 }
 function poolEntry(account: Account): ProxyPoolEntry | undefined {
   return account.proxyPoolEntryId ? props.proxies.find((proxy) => proxy.id === account.proxyPoolEntryId) : undefined;
@@ -144,7 +139,7 @@ function saveMembership(account: Account): void {
         </div>
 
         <div class="workspace-toolbar account-toolbar">
-          <label class="search-field"><AppIcon name="search" :size="14" /><span class="sr-only">搜索账号</span><input :value="query" type="search" placeholder="搜索名称、邮箱或代理" @input="emit('update:query', ($event.target as HTMLInputElement).value)" /></label>
+          <label class="search-field"><AppIcon name="search" :size="14" /><span class="sr-only">搜索账号</span><input :value="query" type="search" placeholder="搜索名称或代理" @input="emit('update:query', ($event.target as HTMLInputElement).value)" /></label>
           <div class="account-filter-row">
             <label><span class="sr-only">账号状态</span><select :value="statusFilter" @change="emit('setStatus', ($event.target as HTMLSelectElement).value as AccountStatusFilter)"><option value="all">全部状态</option><option value="enabled">仅启用</option><option value="disabled">仅禁用</option></select></label>
             <label><span class="sr-only">排序</span><select :value="sort" @change="emit('setSort', ($event.target as HTMLSelectElement).value as AccountSort)"><option value="created_desc">最新添加</option><option value="created_asc">最早添加</option><option value="label_asc">名称升序</option><option value="label_desc">名称降序</option></select></label>
@@ -157,17 +152,16 @@ function saveMembership(account: Account): void {
 
         <div v-else class="account-compact-grid">
           <article v-for="account in accounts" :id="`account-${account.id}`" :key="account.id" class="account-compact-card" :class="{ disabled: !account.enabled, expanded: expandedId === account.id, busy: busyIds.has(account.id) }" :aria-busy="busyIds.has(account.id)">
-            <div class="account-compact-head"><div class="account-title"><strong>{{ account.label }}</strong><span>{{ account.email }}</span></div><span class="badge" :class="runtimeState(account).tone">{{ runtimeState(account).text }}</span></div>
-            <div class="account-runtime-grid"><div><span>出口</span><strong>{{ egressText(account) }}</strong></div><div><span>60 秒请求</span><strong>{{ account.runtime.requestsLastMinute }} / {{ account.schedulerOverrides?.accountRpm ?? scheduler.accountRpm }}</strong></div><div><span>模型在途</span><strong>{{ account.runtime.inFlight }} / {{ account.schedulerOverrides?.accountModelConcurrency ?? scheduler.accountModelConcurrency }}</strong></div><div><span>会话</span><strong>{{ sessionText(account) }}</strong></div></div>
+            <div class="account-compact-head"><div class="account-title"><strong>{{ account.label }}</strong><span>DeepInfra 匿名出口账号</span></div><span class="badge" :class="runtimeState(account).tone">{{ runtimeState(account).text }}</span></div>
+            <div class="account-runtime-grid"><div><span>出口</span><strong>{{ egressText(account) }}</strong></div><div><span>60 秒请求</span><strong>{{ account.runtime.requestsLastMinute }} / {{ account.schedulerOverrides?.accountRpm ?? scheduler.accountRpm }}</strong></div><div><span>模型在途</span><strong>{{ account.runtime.inFlight }} / {{ account.schedulerOverrides?.accountModelConcurrency ?? scheduler.accountModelConcurrency }}</strong></div><div><span>鉴权</span><strong>{{ sessionText() }}</strong></div></div>
             <div class="account-meter" role="meter" aria-label="账号 RPM 使用率" :aria-valuenow="Math.min(100, account.runtime.requestsLastMinute / (account.schedulerOverrides?.accountRpm ?? scheduler.accountRpm) * 100)" aria-valuemin="0" aria-valuemax="100"><i :style="{ width: `${Math.min(100, account.runtime.requestsLastMinute / (account.schedulerOverrides?.accountRpm ?? scheduler.accountRpm) * 100)}%` }"></i></div>
             <div class="account-card-meta"><span>{{ account.models.length }} 个模型 · {{ account.groupIds.length }} 个分组</span><span>{{ nextAvailability(account) }}</span></div>
             <p v-if="account.runtime.lastError" class="inline-error">{{ account.runtime.lastError }}</p>
-            <footer class="account-card-footer"><span class="card-footer-state"><span v-if="busyIds.has(account.id)" class="spinner" aria-hidden="true"></span>{{ busyIds.has(account.id) ? '操作处理中' : expandedId === account.id ? '配置已展开' : '查看凭据、分组与限额' }}</span><button class="button button-quiet" type="button" :aria-expanded="expandedId === account.id" :disabled="busyIds.has(account.id)" @click="toggleExpanded(account)">{{ expandedId === account.id ? '收起' : '管理' }}<AppIcon :name="expandedId === account.id ? 'chevron-up' : 'chevron-down'" :size="13" /></button></footer>
+            <footer class="account-card-footer"><span class="card-footer-state"><span v-if="busyIds.has(account.id)" class="spinner" aria-hidden="true"></span>{{ busyIds.has(account.id) ? '操作处理中' : expandedId === account.id ? '配置已展开' : '查看出口、分组与限额' }}</span><button class="button button-quiet" type="button" :aria-expanded="expandedId === account.id" :disabled="busyIds.has(account.id)" @click="toggleExpanded(account)">{{ expandedId === account.id ? '收起' : '管理' }}<AppIcon :name="expandedId === account.id ? 'chevron-up' : 'chevron-down'" :size="13" /></button></footer>
 
             <div v-if="expandedId === account.id" class="account-expanded">
-              <section><h2>凭据</h2><div class="detail-row"><span>登录邮箱</span><code>{{ account.email }}</code></div><div class="detail-row"><span>账号密码</span><SecretValue :value="account.password" :label="`${account.label} 的账号密码`" :reset-token="secretResetToken" :copy="copySecret" /></div></section>
               <section><h2>账号分组</h2><p>账号可同时属于多个分组；账号容量和限额仍全局共享。</p><div class="membership-list"><label v-for="group in groups" :key="group.id"><input type="checkbox" :checked="draftGroups(account).includes(group.id)" :disabled="busyIds.has(account.id)" @change="setDraftGroup(account, group.id, ($event.target as HTMLInputElement).checked)" /><span>{{ group.name }}</span><small>{{ group.enabled ? `${group.apiKeyCount} 个 Key` : '已停用' }}</small></label><span v-if="groups.length === 0" class="muted">尚未创建分组</span></div><div class="detail-actions"><button class="button button-primary" type="button" :disabled="busyIds.has(account.id)" @click="saveMembership(account)">保存分组</button></div></section>
-              <section><h2>出口</h2><div class="detail-row"><span>当前出口</span><code>{{ poolEntry(account)?.maskedUrl ?? (account.proxy ? '自定义代理（凭据已保护）' : '直连') }}</code></div><p>更换出口不会主动退出账号；门户拒绝现有会话时才重新登录。</p><div class="detail-actions"><button v-if="!account.proxy" class="button button-quiet" type="button" :disabled="busyIds.has(account.id)" @click="emit('assignProxy', account)"><AppIcon name="globe" :size="13" />从代理池分配</button><button class="button button-quiet" type="button" :disabled="busyIds.has(account.id)" @click="emit('manageProxy', account)"><AppIcon name="settings" :size="13" />管理代理</button></div></section>
+              <section><h2>出口</h2><div class="detail-row"><span>当前出口</span><code>{{ poolEntry(account)?.maskedUrl ?? (account.proxy ? '自定义代理（凭据已保护）' : '直连') }}</code></div><p>账号代表一个稳定出口；出口失败时账号进入冷却，调度器自动选择其他账号。</p><div class="detail-actions"><button v-if="!account.proxy" class="button button-quiet" type="button" :disabled="busyIds.has(account.id)" @click="emit('assignProxy', account)"><AppIcon name="globe" :size="13" />从代理池分配</button><button class="button button-quiet" type="button" :disabled="busyIds.has(account.id)" @click="emit('manageProxy', account)"><AppIcon name="settings" :size="13" />管理代理</button></div></section>
               <section><h2>模型</h2><div class="model-chips"><span v-for="model in account.models" :key="model" class="model-chip">{{ model }}</span><span v-if="!account.models.length" class="muted">未配置模型</span></div><div class="detail-actions"><button class="button button-quiet" type="button" :disabled="busyIds.has(account.id)" @click="emit('fetchModels', account)"><AppIcon name="refresh-cw" :size="13" />自动获取</button><button class="button button-quiet" type="button" :disabled="busyIds.has(account.id)" @click="emit('editModels', account)"><AppIcon name="file-text" :size="13" />编辑列表</button></div></section>
               <section><h2>限额与状态</h2><p>账号 RPM 和模型并发留空时继承全局调度设置。</p><div class="detail-actions"><button class="button button-quiet" type="button" :disabled="busyIds.has(account.id)" @click="emit('editLimits', account)"><AppIcon name="gauge" :size="13" />编辑限额</button><button class="button button-quiet" type="button" :disabled="busyIds.has(account.id)" @click="emit('verify', account)"><AppIcon name="activity" :size="13" />验证账号</button><button class="button button-quiet" type="button" :disabled="busyIds.has(account.id)" @click="emit('toggle', account)">{{ account.enabled ? '禁用' : '启用' }}</button><button class="button button-danger" type="button" :disabled="busyIds.has(account.id)" @click="emit('remove', account)">移除</button></div></section>
             </div>

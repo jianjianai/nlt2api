@@ -97,8 +97,6 @@ export interface ProxyImportLineResult {
 export interface Account {
   id: string;
   label: string;
-  email: string;
-  password: string;
   enabled: boolean;
   weight: number;
   proxy: string | null;
@@ -106,8 +104,6 @@ export interface Account {
   groupIds: string[];
   models: string[];
   schedulerOverrides?: AccountSchedulerOverrides;
-  hasSession: boolean;
-  sessionExpiresAt: number | null;
   createdAt: string;
   updatedAt: string;
   runtime: RuntimeState;
@@ -366,8 +362,11 @@ export interface ModelAnalyticsRow {
   inputCostMicroUsd: number;
   cachedInputCostMicroUsd: number;
   outputCostMicroUsd: number;
+  energyConsumedNanoKwh: number;
+  energyChargedNanoKwh: number;
+  upstreamBilledRequests: number;
   unpricedRequests: number;
-  priceSource?: "vendor_official" | "portal_catalog";
+  priceSource?: "vendor_official" | "portal_catalog" | "upstream_billed";
   priceVerifiedAt?: string;
   p95DurationMs: number;
   effectiveCapacityRpm: number;
@@ -390,6 +389,8 @@ export interface AnalyticsOverview {
   trend15m: number;
   todayCostMicroUsd: number;
   monthCostMicroUsd: number;
+  todayEnergyConsumedNanoKwh: number;
+  monthEnergyConsumedNanoKwh: number;
   pricedCoverage: number;
   unpricedRequests: number;
   unpricedTokens: number;
@@ -414,6 +415,8 @@ export interface AnalyticsQueryResult {
   inputCostMicroUsd: number;
   cachedInputCostMicroUsd: number;
   outputCostMicroUsd: number;
+  energyConsumedNanoKwh: number;
+  energyChargedNanoKwh: number;
   pricedRequests: number;
   unpricedRequests: number;
   promptTokens: number;
