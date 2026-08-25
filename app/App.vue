@@ -94,12 +94,7 @@ const config = reactive({
   toolCallFormat: "auto" as ToolCallFormat,
   preambleVerbosity: "milestone" as PreambleVerbosity,
 });
-const newAccount = reactive({
-  label: "",
-  weight: 1,
-  proxy: "",
-  groupIds: [] as string[],
-});
+const accountCreateCount = ref(1);
 const isLoading = ref(false);
 const isConnected = ref(false);
 const currentTime = ref(Date.now());
@@ -204,7 +199,7 @@ const isSavingGroupKey = ref(false);
 const showClearConfirm = ref(false);
 const dialogOpen = computed(() => Boolean(showAddAccount.value || proxyEditor.value || modelEditor.value || limitEditor.value || pendingRemoval.value || groupEditor.value || pendingGroupRemoval.value || keyManagerGroup.value || pendingKeyRemoval.value || showClearConfirm.value || showCleanupConfirm.value));
 function openAddAccount(): void {
-  newAccount.groupIds = accountGroupFilter.value !== "all" && accountGroupFilter.value !== "ungrouped" ? [accountGroupFilter.value] : [];
+  accountCreateCount.value = 1;
   showAddAccount.value = true;
 }
 const busyAccountIds = ref(new Set<string>());
@@ -583,25 +578,23 @@ async function selectView(next: WorkspaceId) {
 
 async function addAccount() {
   if (isSaving.value) return;
-  if (!newAccount.proxy.trim() && accountOverview.direct > 0) {
-    pushToast("error", "服务器直连 IP 已绑定账号，请填写一个唯一代理出口。");
+  const count = Number(accountCreateCount.value);
+  if (!Number.isInteger(count) || count < 1 || count > 500) {
+    pushToast("error", "创建数量必须是 1 到 500 的整数。");
     return;
   }
   isSaving.value = true;
   try {
-    await api("/api/admin/accounts", {
+    const payload = await api("/api/admin/accounts", {
       method: "POST",
-      body: JSON.stringify(newAccount),
+      body: JSON.stringify({ count }),
     });
-    newAccount.label = "";
-    newAccount.weight = 1;
-    newAccount.proxy = "";
-    newAccount.groupIds = [];
+    const created = Number(payload.created ?? 0);
     showAddAccount.value = false;
-    pushToast("success", "DeepInfra 出口账号已验证并添加");
+    pushToast(created === count ? "success" : "error", payload.message ?? `已创建 ${created}/${count} 个账号`);
     await Promise.all([loadDashboard({ silent: true }), refreshAccountWorkspace()]);
   } catch (error) {
-    pushToast("error", errorText(error, "无法添加账号。"));
+    pushToast("error", errorText(error, "无法从代理池创建账号。"));
   } finally {
     isSaving.value = false;
   }
@@ -2088,19 +2081,14 @@ onUnmounted(() => {
       </Transition>
     </WorkspaceShell>
 
-    <AppDialog :open="showAddAccount" title="添加 DeepInfra 出口账号" description="匿名免费线路无需 Key；每个请求现铸一次性挑战票据。" :busy="isSaving" @update:open="showAddAccount = $event">
+    <AppDialog :open="showAddAccount" title="从代理池创建账号" description="输入要创建的数量；系统会为每个账号分配一个健康唯一 IP，并完成 DeepInfra 目录与最小 Chat 测活。" :busy="isSaving" @update:open="showAddAccount = $event">
       <form class="modal-form" @submit.prevent="addAccount">
         <div class="modal-body">
-          <label for="account-label">账号名称</label>
-          <input id="account-label" v-model="newAccount.label" type="text" maxlength="120" placeholder="DeepInfra 出口账号" />
-          <p class="modal-note">匿名免费线路无需凭据。每个账号必须拥有唯一出口；服务器直连只能绑定一个账号，其余账号必须填写代理。</p>
-          <fieldset v-if="accountGroups.length" class="modal-checkbox-group"><legend>账号分组</legend><label v-for="group in accountGroups" :key="group.id"><input v-model="newAccount.groupIds" type="checkbox" :value="group.id" /><span>{{ group.name }}</span></label></fieldset>
-          <div class="field-row">
-            <div><label for="account-weight">权重</label><input id="account-weight" v-model.number="newAccount.weight" type="number" min="1" max="100" step="1" required /></div>
-            <div><label for="account-proxy">出口代理{{ accountOverview.direct > 0 ? "（必填）" : "（首个账号可留空直连）" }}</label><input id="account-proxy" v-model="newAccount.proxy" type="text" maxlength="2048" autocomplete="off" spellcheck="false" :required="accountOverview.direct > 0" placeholder="socks5://user:pass@host:1080" /></div>
-          </div>
+          <label for="account-count">创建数量</label>
+          <input id="account-count" v-model.number="accountCreateCount" type="number" min="1" max="500" step="1" required />
+          <p class="modal-note">每个成功创建的账号会绑定一个健康空闲代理，账号 ID 创建后保持稳定。代理不足时只创建可用数量，不会生成空账号。</p>
         </div>
-        <footer class="modal-foot"><button class="button button-quiet" type="button" :disabled="isSaving" @click="showAddAccount = false">取消</button><button class="button button-primary" type="submit" :disabled="isSaving" :aria-busy="isSaving"><span v-if="isSaving" class="spinner" aria-hidden="true"></span>{{ isSaving ? '验证中' : '验证并添加' }}</button></footer>
+        <footer class="modal-foot"><button class="button button-quiet" type="button" :disabled="isSaving" @click="showAddAccount = false">取消</button><button class="button button-primary" type="submit" :disabled="isSaving || accountCreateCount < 1" :aria-busy="isSaving"><span v-if="isSaving" class="spinner" aria-hidden="true"></span>{{ isSaving ? '分配并测活中' : '创建账号' }}</button></footer>
       </form>
     </AppDialog>
 

@@ -40,24 +40,22 @@ function event(body: Record<string, unknown>): { req: Request; context: Record<s
   return { req: new Request("http://localhost/api/admin/accounts", { method: "POST", headers: { "x-admin-token": "test-admin", "content-type": "application/json" }, body: JSON.stringify(body) }), context: {} };
 }
 
-test("account creation rejects a second direct account with a clear conflict", async () => {
+test("account creation validates count", async () => {
   await withAdminStore(async (handler) => {
-    assert.equal((await handler(event({ label: "Direct" }))).status, 201);
-    const duplicate = await handler(event({ label: "Duplicate direct" }));
-    assert.equal(duplicate.status, 409);
-    const payload = await duplicate.json() as { error?: { code?: string; param?: string } };
-    assert.equal(payload.error?.code, "egress_already_assigned");
-    assert.equal(payload.error?.param, "proxy");
+    const invalid = await handler(event({ count: 0 }));
+    assert.equal(invalid.status, 400);
+    const payload = await invalid.json() as { error?: { param?: string } };
+    assert.equal(payload.error?.param, "count");
   });
 });
 
-test("account creation succeeds with a unique proxy after direct is occupied", async () => {
+test("account creation reports insufficient healthy proxies without creating empty accounts", async () => {
   await withAdminStore(async (handler) => {
-    assert.equal((await handler(event({ label: "Direct" }))).status, 201);
-    const response = await handler(event({ label: "Proxy", proxy: "socks5h://proxy.example:1080" }));
-    assert.equal(response.status, 201);
-    const payload = await response.json() as { account?: { proxy?: string; models?: string[] } };
-    assert.equal(payload.account?.proxy, "socks5h://proxy.example:1080");
-    assert.deepEqual(payload.account?.models, ["moonshotai/Kimi-K3"]);
+    const response = await handler(event({ count: 2 }));
+    assert.equal(response.status, 409);
+    const payload = await response.json() as { requested?: number; created?: number; accounts?: unknown[] };
+    assert.equal(payload.requested, 2);
+    assert.equal(payload.created, 0);
+    assert.deepEqual(payload.accounts, []);
   });
 });

@@ -61,7 +61,7 @@ export interface RuntimeState {
 }
 
 export type ProxyKind = "http" | "socks4" | "socks5";
-export type ProxyPoolStatus = "idle" | "checking" | "in_use" | "error";
+export type ProxyPoolStatus = "untested" | "idle" | "checking" | "in_use" | "error";
 
 export interface ProxySyncSettings {
   enabled: boolean;

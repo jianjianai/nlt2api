@@ -11,7 +11,7 @@ import type {
 
 const MAX_IMPORT_BYTES = 16 * 1024 * 1024;
 
-export type ProxyPoolStatus = "idle" | "checking" | "in_use" | "error";
+export type ProxyPoolStatus = "untested" | "idle" | "checking" | "in_use" | "error";
 
 export interface ProxyPoolPublicEntry {
   id: string;
@@ -121,7 +121,9 @@ export class ProxyPoolService {
           ? "error"
           : account
             ? "in_use"
-            : "idle";
+            : entry.lastHealthyAt
+              ? "idle"
+              : "untested";
       return {
         id: entry.id,
         kind: entry.kind,
@@ -170,6 +172,45 @@ export class ProxyPoolService {
       }
     }
     return results;
+  }
+
+  async createAccounts(count: number, signal?: AbortSignal): Promise<{ accounts: ManagedAccount[]; requested: number; failed: Array<{ proxy: string; error: string }> }> {
+    const requested = Math.max(1, Math.min(500, Math.floor(count)));
+    const accounts: ManagedAccount[] = [];
+    const failed: Array<{ proxy: string; error: string }> = [];
+    const excluded = new Set<string>();
+    const inheritedModels = (await this.dependencies.store.listAccounts()).find((account) => account.models.length > 0)?.models ?? [];
+    const maxAttempts = Math.max(requested * 3, requested + 5);
+    let attempts = 0;
+    let requireHealthy = true;
+    while (accounts.length < requested && attempts < maxAttempts && !signal?.aborted) {
+      const candidate = await this.reserveCandidate(excluded, requireHealthy);
+      if (!candidate && requireHealthy) {
+        requireHealthy = false;
+        continue;
+      }
+      if (!candidate) break;
+      attempts += 1;
+      excluded.add(candidate.id);
+      try {
+        if (!candidate.lastHealthyAt) await this.checkReserved(candidate, signal);
+        await deepInfraClient.probeProxy(candidate.url, signal);
+        const models = inheritedModels.length > 0
+          ? [...inheritedModels]
+          : (await deepInfraClient.models(signal, candidate.url)).filter((model) => model.freeForAnonymous).map((model) => model.id);
+        if (models.length === 0) throw new Error("DeepInfra returned no anonymous models for this proxy.");
+        const account = await this.dependencies.store.createProxyAccountFromEntry(candidate.id, `Proxy account ${accounts.length + 1}`, models);
+        accounts.push(account);
+      } catch (error) {
+        const message = errorText(error);
+        failed.push({ proxy: maskProxyUrl(candidate.url), error: message });
+        await this.markError(candidate, error);
+      } finally {
+        this.reservations.delete(candidate.id);
+      }
+    }
+    if (accounts.length > 0) this.dependencies.notifyScheduler();
+    return { accounts, requested, failed };
   }
 
   async assignIdle(accountId: string, options?: {
@@ -303,7 +344,7 @@ export class ProxyPoolService {
     this.reservations.clear();
   }
 
-  private async reserveCandidate(excluded: ReadonlySet<string>): Promise<ProxyPoolEntry | undefined> {
+  private async reserveCandidate(excluded: ReadonlySet<string>, requireHealthy = false): Promise<ProxyPoolEntry | undefined> {
     const [entries, accounts, settings] = await Promise.all([
       this.dependencies.store.listProxyPool(),
       this.dependencies.store.listAccounts(),
@@ -313,7 +354,9 @@ export class ProxyPoolService {
     const now = this.dependencies.now();
     const candidates = entries
       .filter((entry) => !assigned.has(entry.id) && !this.reservations.has(entry.id) && !excluded.has(entry.id))
-      .filter((entry) => !entry.lastError || (entry.retryAfter ?? 0) <= now)
+      .filter((entry) => requireHealthy
+        ? entry.lifecycle === "active" && Boolean(entry.lastHealthyAt) && !entry.lastError
+        : !entry.lastError || (entry.retryAfter ?? 0) <= now)
       .sort((left, right) => {
         // Healthy/never-failed idle proxies always precede recovered error
         // candidates. Error entries are fallback probes after normal idle pool.

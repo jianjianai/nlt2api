@@ -1,58 +1,27 @@
 import { defineHandler } from "nitro";
-import { accountScheduler } from "~/server/utils/account-scheduler.ts";
-import { asNumber, asString, jsonResponse, openAIErrorResponse, readJsonObject, requireAdminAuth, HttpError } from "~/server/utils/http.ts";
+import { HttpError, jsonResponse, openAIErrorResponse, readJsonObject, requireAdminAuth } from "~/server/utils/http.ts";
+import { proxyPoolService } from "~/server/utils/proxy-pool.ts";
 import { adminHttpError } from "~/server/utils/route-helpers.ts";
-import { deepInfraClient } from "~/server/utils/deepinfra-client.ts";
-import { normalizeProxyUrl } from "~/server/utils/proxy.ts";
-import { stateStore } from "~/server/utils/state-store.ts";
 
 export default defineHandler(async (event) => {
-  let accountId: string | undefined;
   try {
     requireAdminAuth(event.req);
     const body = await readJsonObject(event.req);
-    const label = asString(body.label, "label", { optional: true, maxLength: 120 });
-    const weight = asNumber(body.weight, "weight", { optional: true, min: 1, max: 100 });
-    if (weight !== undefined && !Number.isInteger(weight)) {
-      throw new HttpError(400, "`weight` must be an integer.", "invalid_request_error", "weight");
+    const count = body.count;
+    if (typeof count !== "number" || !Number.isInteger(count) || count < 1 || count > 500) {
+      throw new HttpError(400, "`count` must be an integer from 1 through 500.", "invalid_request_error", "count");
     }
-    const groupIds = body.groupIds === undefined ? [] : body.groupIds;
-    if (!Array.isArray(groupIds) || groupIds.some((groupId) => typeof groupId !== "string")) {
-      throw new HttpError(400, "`groupIds` must be an array of account group ids.", "invalid_request_error", "groupIds");
-    }
-    // The add-account form always submits a proxy field; an empty or
-    // whitespace-only value means a direct connection.
-    const proxyInput = asString(body.proxy, "proxy", { optional: true, allowEmpty: true, maxLength: 2_048 });
-    const proxy = proxyInput?.trim() ? normalizeProxyUrl(proxyInput) : undefined;
-    if (!proxy && (await stateStore.listAccounts()).some((account) => !account.proxy)) {
-      throw new HttpError(409, "The direct server IP is already assigned; provide a unique proxy for this account.", "invalid_request_error", "proxy", "egress_already_assigned");
-    }
-
-    let account = await stateStore.addAccount({
-      label,
-      weight,
-      groupIds: groupIds as string[],
-      ...(proxy ? { proxy } : {}),
-    });
-    accountId = account.id;
-    try {
-      await deepInfraClient.verifyAccount(account);
-      accountScheduler.markSuccess(account.id);
-      account = (await stateStore.getAccount(account.id)) ?? account;
-      const models = await deepInfraClient.listAccountModels(account);
-      await stateStore.replaceAccountModels(account.id, models);
-    } catch (error) {
-      await stateStore.deleteAccount(account.id).catch(() => undefined);
-      accountScheduler.remove(account.id);
-      throw error;
-    }
-
-    const saved = await stateStore.getAccount(account.id);
-    if (!saved) {
-      throw new Error("The account disappeared after verification.");
-    }
-    accountScheduler.notifyStateChanged();
-    return jsonResponse({ account: accountScheduler.publicState(saved) }, 201);
+    const result = await proxyPoolService.createAccounts(count, event.req.signal);
+    const status = result.accounts.length === count ? 201 : result.accounts.length > 0 ? 207 : 409;
+    return jsonResponse({
+      requested: count,
+      created: result.accounts.length,
+      accounts: result.accounts,
+      failed: result.failed,
+      message: result.accounts.length === count
+        ? `Created ${count} proxy accounts.`
+        : `Created ${result.accounts.length} of ${count} requested accounts; not enough healthy idle proxies were available.`,
+    }, status);
   } catch (error) {
     return openAIErrorResponse(adminHttpError(error));
   }
