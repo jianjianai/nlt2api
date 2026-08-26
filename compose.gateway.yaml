@@ -1,0 +1,27 @@
+# 单独运行 gateway（转发服务，无 minter）。
+#
+# 镜像来自 GitHub 自动发布的 GHCR（发布 v* 标签时触发构建），指向 latest。
+# 数据目录 ./data（SQLite）。
+#
+# 用法（.env 示例见 compose.gateway.example.env，仓库根目录）：
+#   cp compose.gateway.example.env .env   # 然后填写三个密钥
+#   docker compose -f compose.gateway.yaml up -d
+#
+# 注意：仅 gateway 时凭证池不会自动补充，导入代理后需自行验证并等待
+# 授权服务接入；完整部署请使用根目录 compose.yaml。
+services:
+  gateway:
+    image: ghcr.io/jianjianai/nlt2api-gateway:latest
+    container_name: nlt-gateway
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${GATEWAY_HOST_PORT:-3000}:3000"
+    environment:
+      GATEWAY_ADMIN_TOKEN: ${GATEWAY_ADMIN_TOKEN:?set GATEWAY_ADMIN_TOKEN}
+      GATEWAY_API_KEY: ${GATEWAY_API_KEY:?set GATEWAY_API_KEY}
+      GATEWAY_ALLOW_ANONYMOUS: ${GATEWAY_ALLOW_ANONYMOUS:-false}
+      MINTER_TOKEN: ${MINTER_TOKEN:?set MINTER_TOKEN}
+      GATEWAY_TURNSTILE_SITEKEY: ${GATEWAY_TURNSTILE_SITEKEY:-}
+      GATEWAY_DATA_DIR: /app/.data
+    volumes:
+      - ./data:/app/.data

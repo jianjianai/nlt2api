@@ -1,10 +1,24 @@
+# 一键启动完整栈：gateway（转发服务）+ minter（授权服务）
+#
+# 镜像来自 GitHub 自动发布的 GHCR（发布 v* 标签时触发构建），指向 latest。
+# 所有数据存于 ./data 目录（含 SQLite 与 minter 浏览器 profile）。
+#
+# 用法（.env 示例见 compose.example.env，仓库根目录）：
+#   cp compose.example.env .env   # 然后填写三个密钥
+#   docker compose up -d
+#
+# 说明：
+#   - gateway 端口映射到 127.0.0.1，公网暴露请自行加 TLS 反代。
+#   - minter 镜像内置 Chromium + Xvfb，无需宿主机安装浏览器。
+#   - MINTER_CONCURRENCY 每 +1 约需 1.6 GB 内存；MINTER_REPLICAS 可横向扩 minter。
+#   - MINTER_TOKEN 等价于代理池读权限（proxy.lease 含明文凭证），
+#     请务必让两者处于同一私有网络（本文件默认如此），或改用 wss。
 services:
   gateway:
-    build: ./gateway
+    image: ghcr.io/jianjianai/nlt2api-gateway:latest
     container_name: nlt-gateway
     restart: unless-stopped
     ports:
-      # Bound to loopback: put a TLS terminator in front for public exposure.
       - "127.0.0.1:${GATEWAY_HOST_PORT:-3000}:3000"
     environment:
       GATEWAY_ADMIN_TOKEN: ${GATEWAY_ADMIN_TOKEN:?set GATEWAY_ADMIN_TOKEN}
@@ -17,17 +31,17 @@ services:
       - ./data:/app/.data
 
   minter:
-    build: ./minter
+    image: ghcr.io/jianjianai/nlt2api-minter:latest
     restart: unless-stopped
     depends_on:
       - gateway
     environment:
-      # The lease reply carries plaintext proxy credentials, so this link must
-      # stay on a private network (or use wss:// with a public gateway).
       GATEWAY_URL: http://gateway:3000
       MINTER_TOKEN: ${MINTER_TOKEN:?set MINTER_TOKEN}
       MINTER_CONCURRENCY: ${MINTER_CONCURRENCY:-1}
       MINTER_LABEL: ${MINTER_LABEL:-compose}
-    # Each concurrent browser costs roughly 1.6 GB; size the host accordingly.
+    volumes:
+      - ./data:/app/.data
+    # 每个并发浏览器约 1.6 GB，按宿主机内存调整副本数。
     deploy:
       replicas: ${MINTER_REPLICAS:-1}

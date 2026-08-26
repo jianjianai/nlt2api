@@ -1,0 +1,27 @@
+# 单独运行 minter（授权服务，需接入已部署的 gateway）。
+#
+# 镜像来自 GitHub 自动发布的 GHCR（发布 v* 标签时触发构建），指向 latest。
+# 数据目录 ./data/minter（浏览器 profile；与 gateway 挂载同一 ./data 也可，
+# 但目录需存在）。镜像内置 Chromium + Xvfb，本机无需安装浏览器。
+#
+# 用法（.env 示例见 compose.minter.example.env，仓库根目录）：
+#   cp compose.minter.example.env .env   # 然后填写 GATEWAY_URL 与 MINTER_TOKEN
+#   docker compose -f compose.minter.yaml up -d
+#
+# 注意：MINTER_TOKEN 等价于代理池读权限（proxy.lease 含明文凭证），
+# 请务必让 minter 与 gateway 处于同一私有网络，或使用 wss://。
+services:
+  minter:
+    image: ghcr.io/jianjianai/nlt2api-minter:latest
+    container_name: nlt-minter
+    restart: unless-stopped
+    environment:
+      GATEWAY_URL: ${GATEWAY_URL:?set GATEWAY_URL}
+      MINTER_TOKEN: ${MINTER_TOKEN:?set MINTER_TOKEN}
+      MINTER_CONCURRENCY: ${MINTER_CONCURRENCY:-1}
+      MINTER_LABEL: ${MINTER_LABEL:-compose}
+    volumes:
+      - ./data/minter:/app/.data
+    # 每个并发浏览器约 1.6 GB，按宿主机内存调整副本数。
+    deploy:
+      replicas: ${MINTER_REPLICAS:-1}
