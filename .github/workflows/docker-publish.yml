@@ -1,7 +1,8 @@
 name: Publish Docker images
 
 # 推送 v* 标签触发：构建并发布 gateway / minter 两个镜像到 GHCR。
-# gateway 与 minter 两条链路（验证 + 构建）完全并行，pnpm 与 Docker 均走缓存。
+# 两个服务、两个架构（amd64/arm64）全部并行构建，构建产物按 digest 推送，
+# 最后合并为多架构 manifest 并打正式标签。pnpm 与 Docker 均走缓存。
 on:
   push:
     tags:
@@ -27,7 +28,7 @@ jobs:
           fi
           echo "release version: $TAG"
 
-  # gateway 链路：验证（pnpm 依赖缓存）→ 构建发布（buildx 缓存）。
+  # ---- 验证（两个服务并行）----
   verify-gateway:
     needs: validate-tag
     runs-on: ubuntu-latest
@@ -55,44 +56,6 @@ jobs:
           pnpm test
           pnpm build
 
-  docker-gateway:
-    needs: verify-gateway
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: write
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Log in to GHCR
-        uses: docker/login-action@v3
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Extract metadata
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ env.GATEWAY_IMAGE }}
-
-      - name: Build and push (cached)
-        uses: docker/build-push-action@v6
-        with:
-          context: ./gateway
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha,scope=gateway
-          cache-to: type=gha,mode=max,scope=gateway
-
-  # minter 链路：验证（pnpm 依赖缓存）→ 构建发布（buildx 缓存）。
   verify-minter:
     needs: validate-tag
     runs-on: ubuntu-latest
@@ -119,12 +82,25 @@ jobs:
           pnpm typecheck
           pnpm test
 
-  docker-minter:
-    needs: verify-minter
+  # ---- 构建（2 镜像 × 2 架构 = 4 个 job 全部并行）----
+  docker-build:
+    needs: [verify-gateway, verify-minter]
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: gateway
+            platform: linux/amd64
+          - image: gateway
+            platform: linux/arm64
+          - image: minter
+            platform: linux/amd64
+          - image: minter
+            platform: linux/arm64
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -143,15 +119,118 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ${{ env.MINTER_IMAGE }}
+          images: ${{ matrix.image == 'gateway' && env.GATEWAY_IMAGE || env.MINTER_IMAGE }}
 
-      - name: Build and push (cached)
+      - name: Build and push by digest
+        id: build
         uses: docker/build-push-action@v6
         with:
-          context: ./minter
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
+          context: ./${{ matrix.image }}
+          platforms: ${{ matrix.platform }}
+          outputs: type=image,name=${{ matrix.image == 'gateway' && env.GATEWAY_IMAGE || env.MINTER_IMAGE }},push-by-digest=true,name-canonical=true,push=true
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha,scope=minter
-          cache-to: type=gha,mode=max,scope=minter
+          cache-from: type=gha,scope=${{ matrix.image }}-${{ matrix.platform }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.image }}-${{ matrix.platform }}
+
+      - name: Export digest
+        run: |
+          mkdir -p /tmp/digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: digest-${{ matrix.image }}-${{ strategy.job-index }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  # ---- 合并 manifest 并打正式标签（两个镜像并行）----
+  merge-gateway:
+    needs: docker-build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: digest-gateway-*
+          merge-multiple: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract image tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.GATEWAY_IMAGE }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest
+
+      - name: Create manifest list and push
+        working-directory: /tmp/digests
+        run: |
+          docker buildx imagetools create $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
+            $(printf "${{ env.GATEWAY_IMAGE }}@sha256:%s " *)
+
+      - name: Inspect image
+        run: |
+          docker buildx imagetools inspect ${{ env.GATEWAY_IMAGE }}:${{ steps.meta.outputs.version }}
+
+  merge-minter:
+    needs: docker-build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: digest-minter-*
+          merge-multiple: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract image tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.MINTER_IMAGE }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest
+
+      - name: Create manifest list and push
+        working-directory: /tmp/digests
+        run: |
+          docker buildx imagetools create $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
+            $(printf "${{ env.MINTER_IMAGE }}@sha256:%s " *)
+
+      - name: Inspect image
+        run: |
+          docker buildx imagetools inspect ${{ env.MINTER_IMAGE }}:${{ steps.meta.outputs.version }}
