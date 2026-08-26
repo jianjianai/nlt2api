@@ -104,6 +104,7 @@ Compose 挂载 `./data:/app/.data`，浏览器 profile 写入 `/app/.data/deepin
 - `DEEPINFRA_BROWSER_PATH`
 - `DEEPINFRA_DISPLAY`
 - `DEEPINFRA_PROFILE_DIR`
+- `DEEPINFRA_BROWSER_OFFSCREEN`（仅 Windows：设为 `1` 可将铸造浏览器窗口移出屏幕）
 - `DEEPINFRA_GATEWAY_UPSTREAM_TIMEOUT_MS`
 - 请求、Responses 状态和上游响应大小限制
 

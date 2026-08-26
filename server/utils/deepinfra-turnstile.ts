@@ -41,11 +41,13 @@ const LEAN_LAUNCH_FLAGS = [
   "--no-default-browser-check",
 ];
 /**
- * Windows keeps the window offscreen so a real desktop never shows it. On Linux the
- * window lives inside an invisible virtual display, so a negative position only risks
- * confusing the challenge's viewport checks.
+ * Windows used to move the window offscreen so a real desktop never shows it, which
+ * looks like the browser "minimized itself" in local development. The window now stays
+ * visible by default; set DEEPINFRA_BROWSER_OFFSCREEN=1 to restore the leaner
+ * offscreen placement. On Linux the window lives inside an invisible virtual display,
+ * so a negative position only risks confusing the challenge's viewport checks.
  */
-const WINDOWS_LAUNCH_FLAGS = ["--window-position=-2400,-2400"];
+const WINDOWS_OFFSCREEN_FLAGS = ["--window-position=-2400,-2400"];
 /**
  * The service runs unprivileged with NoNewPrivileges, so Chromium's setuid sandbox
  * cannot initialize; /dev/shm is also small on most VPS images.
@@ -133,7 +135,10 @@ function detectExecutable(explicit?: string): string {
 
 /** Platform-specific launch flags on top of the verified lean set. */
 function platformLaunchFlags(): string[] {
-  return process.platform === "win32" ? WINDOWS_LAUNCH_FLAGS : LINUX_LAUNCH_FLAGS;
+  if (process.platform === "win32") {
+    return process.env.DEEPINFRA_BROWSER_OFFSCREEN === "1" ? WINDOWS_OFFSCREEN_FLAGS : [];
+  }
+  return LINUX_LAUNCH_FLAGS;
 }
 
 async function listTargets(port: number): Promise<CdpTarget[]> {
