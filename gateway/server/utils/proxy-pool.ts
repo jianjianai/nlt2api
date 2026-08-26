@@ -1,0 +1,348 @@
+import { randomUUID } from "node:crypto";
+import type { DatabaseSync } from "node:sqlite";
+import { allRows, getRow, immediateTransaction } from "~/server/utils/database.ts";
+import { HttpError } from "~/server/utils/http.ts";
+import { evictProxyDispatcher, isMintableProxy, maskProxyUrl, parseProxyImportLine } from "~/server/utils/proxy.ts";
+import type { SettingsStore } from "~/server/utils/settings.ts";
+import type { ProxyKind, ProxyPublic, ProxyRecord, ProxyStatus } from "~/server/utils/types.ts";
+
+interface ProxyRow {
+  id: string;
+  url: string;
+  kind: string;
+  status: string;
+  label: string | null;
+  created_at: number;
+  updated_at: number;
+  checked_at: number | null;
+  healthy_at: number | null;
+  latency_ms: number | null;
+  failure_count: number;
+  last_error: string | null;
+  retry_after: number | null;
+  leased_by: string | null;
+  lease_id: string | null;
+  lease_expires: number | null;
+}
+
+function toRecord(row: ProxyRow): ProxyRecord {
+  return {
+    id: row.id,
+    url: row.url,
+    kind: row.kind as ProxyKind,
+    status: row.status as ProxyStatus,
+    ...(row.label ? { label: row.label } : {}),
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+    ...(row.checked_at !== null ? { checkedAt: row.checked_at } : {}),
+    ...(row.healthy_at !== null ? { healthyAt: row.healthy_at } : {}),
+    ...(row.latency_ms !== null ? { latencyMs: row.latency_ms } : {}),
+    failureCount: row.failure_count,
+    ...(row.last_error ? { lastError: row.last_error } : {}),
+    ...(row.retry_after !== null ? { retryAfter: row.retry_after } : {}),
+    ...(row.leased_by ? { leasedBy: row.leased_by } : {}),
+    ...(row.lease_id ? { leaseId: row.lease_id } : {}),
+    ...(row.lease_expires !== null ? { leaseExpires: row.lease_expires } : {}),
+  };
+}
+
+export interface ProxyLease {
+  leaseId: string;
+  proxyId: string;
+  proxyUrl: string;
+  kind: ProxyKind;
+  expiresAt: number;
+}
+
+export interface ImportSummary {
+  imported: number;
+  duplicates: number;
+  invalid: Array<{ line: string; message: string }>;
+}
+
+export interface ProxyPoolDependencies {
+  db: DatabaseSync;
+  settings: SettingsStore;
+  now?: () => number;
+}
+
+export class ProxyPoolService {
+  private readonly db: DatabaseSync;
+  private readonly settings: SettingsStore;
+  private readonly now: () => number;
+
+  constructor(dependencies: ProxyPoolDependencies) {
+    this.db = dependencies.db;
+    this.settings = dependencies.settings;
+    this.now = dependencies.now ?? Date.now;
+  }
+
+  /** Clears leases left behind by a previous process; nothing survives a restart. */
+  resetLeases(): void {
+    this.db.prepare("UPDATE proxies SET leased_by = NULL, lease_id = NULL, lease_expires = NULL WHERE lease_id IS NOT NULL").run();
+  }
+
+  import(text: string, defaultProtocol: ProxyKind): ImportSummary {
+    const lines = text.split(/\r?\n/).map((line) => line.trim()).filter((line) => line && !line.startsWith("#"));
+    const summary: ImportSummary = { imported: 0, duplicates: 0, invalid: [] };
+    const insert = this.db.prepare(`
+      INSERT INTO proxies (id, url, kind, status, created_at, updated_at, failure_count)
+      VALUES (?, ?, ?, 'pending', ?, ?, 0)
+      ON CONFLICT(url) DO NOTHING
+    `);
+    immediateTransaction(this.db, () => {
+      for (const line of lines) {
+        let parsed;
+        try {
+          parsed = parseProxyImportLine(line, defaultProtocol);
+        } catch (error) {
+          summary.invalid.push({ line, message: error instanceof Error ? error.message : "Invalid proxy line." });
+          continue;
+        }
+        const at = this.now();
+        const result = insert.run(randomUUID(), parsed.url, parsed.kind, at, at);
+        if (result.changes > 0) summary.imported += 1;
+        else summary.duplicates += 1;
+      }
+    });
+    return summary;
+  }
+
+  get(id: string): ProxyRecord | undefined {
+    const row = getRow<ProxyRow>(this.db, "SELECT * FROM proxies WHERE id = ?", id);
+    return row ? toRecord(row) : undefined;
+  }
+
+  require(id: string): ProxyRecord {
+    const record = this.get(id);
+    if (!record) throw new HttpError(404, "Proxy not found.", "invalid_request_error", "id", "proxy_not_found");
+    return record;
+  }
+
+  counts(): Record<ProxyStatus, number> {
+    const rows = allRows<{ status: string; total: number }>(this.db, "SELECT status, COUNT(*) AS total FROM proxies GROUP BY status");
+    const counts: Record<ProxyStatus, number> = { active: 0, pending: 0, unavailable: 0 };
+    for (const row of rows) {
+      if (row.status === "active" || row.status === "pending" || row.status === "unavailable") {
+        counts[row.status] = row.total;
+      }
+    }
+    return counts;
+  }
+
+  mintableActiveCount(): number {
+    return this.listByStatus("active").filter((proxy) => isMintableProxy(proxy.url)).length;
+  }
+
+  listByStatus(status: ProxyStatus): ProxyRecord[] {
+    return allRows<ProxyRow>(this.db, "SELECT * FROM proxies WHERE status = ? ORDER BY updated_at ASC", status)
+      .map(toRecord);
+  }
+
+  /** Active proxies not currently held by any minter session. */
+  idleActiveCount(): number {
+    const row = getRow<{ total: number }>(
+      this.db,
+      "SELECT COUNT(*) AS total FROM proxies WHERE status = 'active' AND (lease_expires IS NULL OR lease_expires < ?)",
+      this.now(),
+    );
+    return row?.total ?? 0;
+  }
+
+  snapshot(options: { status?: ProxyStatus; limit?: number; offset?: number } = {}): { entries: ProxyPublic[]; total: number } {
+    const limit = Math.min(Math.max(options.limit ?? 100, 1), 500);
+    const offset = Math.max(options.offset ?? 0, 0);
+    const now = this.now();
+    const where = options.status ? "WHERE p.status = ?" : "";
+    const params = options.status ? [options.status] : [];
+    const total = getRow<{ total: number }>(this.db, `SELECT COUNT(*) AS total FROM proxies p ${where}`, ...params)?.total ?? 0;
+    const rows = allRows<ProxyRow & { available_tickets: number }>(this.db, `
+      SELECT p.*, (
+        SELECT COUNT(*) FROM tickets t
+        WHERE t.proxy_id = p.id AND t.claimed_at IS NULL AND t.expires_at >= ?
+      ) AS available_tickets
+      FROM proxies p ${where}
+      ORDER BY CASE p.status WHEN 'active' THEN 0 WHEN 'pending' THEN 1 ELSE 2 END, p.updated_at DESC
+      LIMIT ? OFFSET ?
+    `, now, ...params, limit, offset);
+
+    const entries = rows.map((row) => {
+      const record = toRecord(row);
+      return {
+        id: record.id,
+        maskedUrl: maskProxyUrl(record.url),
+        kind: record.kind,
+        status: record.status,
+        ...(record.label ? { label: record.label } : {}),
+        createdAt: record.createdAt,
+        updatedAt: record.updatedAt,
+        ...(record.checkedAt ? { checkedAt: record.checkedAt } : {}),
+        ...(record.healthyAt ? { healthyAt: record.healthyAt } : {}),
+        ...(record.latencyMs !== undefined ? { latencyMs: record.latencyMs } : {}),
+        failureCount: record.failureCount,
+        ...(record.lastError ? { lastError: record.lastError } : {}),
+        ...(record.retryAfter ? { retryAfter: record.retryAfter } : {}),
+        leased: record.leaseExpires !== undefined && record.leaseExpires > now,
+        mintable: isMintableProxy(record.url),
+        availableTickets: row.available_tickets,
+      } satisfies ProxyPublic;
+    });
+    return { entries, total };
+  }
+
+  /** Proxies eligible for a background probe: pending and past their cooldown. */
+  dueForCheck(limit: number): ProxyRecord[] {
+    const now = this.now();
+    return allRows<ProxyRow>(this.db, `
+      SELECT * FROM proxies
+      WHERE status = 'pending' AND (retry_after IS NULL OR retry_after <= ?)
+      ORDER BY COALESCE(checked_at, 0) ASC
+      LIMIT ?
+    `, now, limit).map(toRecord);
+  }
+
+  markHealthy(id: string, latencyMs: number): void {
+    const now = this.now();
+    this.db.prepare(`
+      UPDATE proxies
+      SET status = 'active', failure_count = 0, last_error = NULL, retry_after = NULL,
+          checked_at = ?, healthy_at = ?, latency_ms = ?, updated_at = ?
+      WHERE id = ?
+    `).run(now, now, Math.max(0, Math.round(latencyMs)), now, id);
+  }
+
+  /**
+   * Records one failure. Below the threshold the proxy goes back to `pending`
+   * with a cooldown; at the threshold it becomes `unavailable` and stops being
+   * retried until an operator re-enables it.
+   */
+  markFailure(id: string, message: string): ProxyStatus | undefined {
+    const settings = this.settings.get();
+    const now = this.now();
+    return immediateTransaction(this.db, () => {
+      const row = getRow<{ failure_count: number; url: string }>(this.db, "SELECT failure_count, url FROM proxies WHERE id = ?", id);
+      if (!row) return undefined;
+      const failureCount = row.failure_count + 1;
+      const status: ProxyStatus = failureCount >= settings.proxyFailureThreshold ? "unavailable" : "pending";
+      const retryAfter = status === "pending" ? now + settings.proxyRetryCooldownSeconds * 1_000 : null;
+      this.db.prepare(`
+        UPDATE proxies
+        SET status = ?, failure_count = ?, last_error = ?, retry_after = ?, checked_at = ?, updated_at = ?,
+            leased_by = NULL, lease_id = NULL, lease_expires = NULL
+        WHERE id = ?
+      `).run(status, failureCount, message.slice(0, 500), retryAfter, now, now, id);
+      void evictProxyDispatcher(row.url);
+      return status;
+    });
+  }
+
+  /** Operator action: clear the failure history and queue the proxy for a probe. */
+  reactivate(id: string): void {
+    const now = this.now();
+    this.db.prepare(`
+      UPDATE proxies
+      SET status = 'pending', failure_count = 0, last_error = NULL, retry_after = NULL, updated_at = ?
+      WHERE id = ?
+    `).run(now, id);
+  }
+
+  setLabel(id: string, label: string | undefined): void {
+    this.db.prepare("UPDATE proxies SET label = ?, updated_at = ? WHERE id = ?")
+      .run(label ?? null, this.now(), id);
+  }
+
+  delete(id: string): boolean {
+    const record = this.get(id);
+    if (!record) return false;
+    this.db.prepare("DELETE FROM proxies WHERE id = ?").run(id);
+    void evictProxyDispatcher(record.url);
+    return true;
+  }
+
+  /**
+   * Hands an active proxy to one minter session exclusively. The candidate with
+   * the fewest live tickets wins so capacity spreads across the pool instead of
+   * piling onto whichever proxy was leased last.
+   */
+  lease(sessionId: string, preferProxyId?: string): ProxyLease | { reason: "no_active_proxy" | "all_leased" } {
+    const settings = this.settings.get();
+    const now = this.now();
+    const expiresAt = now + settings.proxyLeaseSeconds * 1_000;
+    return immediateTransaction(this.db, () => {
+      const activeTotal = getRow<{ total: number }>(this.db, "SELECT COUNT(*) AS total FROM proxies WHERE status = 'active'")?.total ?? 0;
+      if (activeTotal === 0) return { reason: "no_active_proxy" as const };
+
+      const renewal = preferProxyId
+        ? getRow<ProxyRow>(this.db, `
+            SELECT * FROM proxies
+            WHERE id = ? AND status = 'active' AND (lease_expires IS NULL OR lease_expires < ? OR leased_by = ?)
+          `, preferProxyId, now, sessionId)
+        : undefined;
+
+      const candidate = renewal ?? getRow<ProxyRow>(this.db, `
+        SELECT p.* FROM proxies p
+        WHERE p.status = 'active' AND (p.lease_expires IS NULL OR p.lease_expires < ?)
+        ORDER BY (
+          SELECT COUNT(*) FROM tickets t
+          WHERE t.proxy_id = p.id AND t.claimed_at IS NULL AND t.expires_at >= ?
+        ) ASC, COALESCE(p.healthy_at, 0) DESC
+        LIMIT 1
+      `, now, now);
+
+      if (!candidate) return { reason: "all_leased" as const };
+      // Chrome cannot authenticate to a SOCKS proxy, so such an entry can carry
+      // forwarded traffic but must never be handed out for minting.
+      if (!isMintableProxy(candidate.url)) return { reason: "no_active_proxy" as const };
+
+      const leaseId = randomUUID();
+      this.db.prepare("UPDATE proxies SET leased_by = ?, lease_id = ?, lease_expires = ?, updated_at = ? WHERE id = ?")
+        .run(sessionId, leaseId, expiresAt, now, candidate.id);
+      return {
+        leaseId,
+        proxyId: candidate.id,
+        proxyUrl: candidate.url,
+        kind: candidate.kind as ProxyKind,
+        expiresAt,
+      };
+    });
+  }
+
+  extendLease(sessionId: string, leaseId: string): number | undefined {
+    const settings = this.settings.get();
+    const now = this.now();
+    const expiresAt = now + settings.proxyLeaseSeconds * 1_000;
+    const result = this.db.prepare(`
+      UPDATE proxies SET lease_expires = ?, updated_at = ?
+      WHERE lease_id = ? AND leased_by = ? AND status = 'active' AND lease_expires >= ?
+    `).run(expiresAt, now, leaseId, sessionId, now);
+    return result.changes > 0 ? expiresAt : undefined;
+  }
+
+  /** Resolves a lease to its proxy, or undefined when it expired or was revoked. */
+  resolveLease(sessionId: string, leaseId: string): ProxyRecord | undefined {
+    const row = getRow<ProxyRow>(this.db, `
+      SELECT * FROM proxies
+      WHERE lease_id = ? AND leased_by = ? AND lease_expires >= ?
+    `, leaseId, sessionId, this.now());
+    return row ? toRecord(row) : undefined;
+  }
+
+  releaseLease(sessionId: string, leaseId: string): void {
+    this.db.prepare("UPDATE proxies SET leased_by = NULL, lease_id = NULL, lease_expires = NULL WHERE lease_id = ? AND leased_by = ?")
+      .run(leaseId, sessionId);
+  }
+
+  releaseSessionLeases(sessionId: string): void {
+    this.db.prepare("UPDATE proxies SET leased_by = NULL, lease_id = NULL, lease_expires = NULL WHERE leased_by = ?")
+      .run(sessionId);
+  }
+
+  /** Any active proxy, used for credential-free calls such as the model catalog. */
+  anyActive(): ProxyRecord | undefined {
+    const row = getRow<ProxyRow>(this.db, `
+      SELECT * FROM proxies WHERE status = 'active'
+      ORDER BY COALESCE(latency_ms, 999999) ASC LIMIT 1
+    `);
+    return row ? toRecord(row) : undefined;
+  }
+}

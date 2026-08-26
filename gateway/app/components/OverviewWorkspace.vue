@@ -1,0 +1,134 @@
+<script setup lang="ts">
+import { computed } from "vue";
+import AppIcon from "./ui/AppIcon.vue";
+import type { AppIconName } from "./ui/AppIcon.vue";
+import type { OverviewSnapshot } from "../types/admin.ts";
+import { poolTone, PROXY_STATUS_LABEL } from "../utils/admin-ui.ts";
+
+const props = defineProps<{ overview: OverviewSnapshot | null }>();
+
+interface Metric {
+  key: string;
+  label: string;
+  value: string;
+  hint: string;
+  icon: AppIconName;
+  tone: "good" | "warn" | "bad" | "";
+}
+
+const metrics = computed<Metric[]>(() => {
+  const snapshot = props.overview;
+  if (!snapshot) return [];
+  const { available, minAvailable, total } = snapshot.tickets;
+  return [
+    {
+      key: "tickets",
+      label: "可用凭证对",
+      value: `${available}`,
+      hint: `水位下限 ${minAvailable} · 池内共 ${total}`,
+      icon: "key",
+      tone: poolTone(available, minAvailable),
+    },
+    {
+      key: "proxies",
+      label: "活跃代理",
+      value: `${snapshot.proxies.active}`,
+      hint: `可铸票 ${snapshot.proxiesMintable} · 待测活 ${snapshot.proxies.pending} · 不可用 ${snapshot.proxies.unavailable}`,
+      icon: "globe",
+      tone: snapshot.proxies.active > 0 ? "good" : "bad",
+    },
+    {
+      key: "minters",
+      label: "在线授权服务",
+      value: `${snapshot.minters.online}`,
+      hint: `进行中铸票 ${snapshot.minters.inflight}`,
+      icon: "server",
+      tone: snapshot.minters.online > 0 ? "good" : "bad",
+    },
+    {
+      key: "rate",
+      label: `近 ${snapshot.mintRate.windowMinutes} 分钟铸票`,
+      value: `${snapshot.mintRate.minted}`,
+      hint: `失败 ${snapshot.mintRate.failed}`,
+      icon: "activity",
+      tone: snapshot.mintRate.failed > snapshot.mintRate.minted ? "warn" : "",
+    },
+  ];
+});
+
+const issues = computed(() => {
+  const snapshot = props.overview;
+  if (!snapshot) return [] as Array<{ id: string; title: string; detail: string; tone: "warn" | "bad" }>;
+  const list: Array<{ id: string; title: string; detail: string; tone: "warn" | "bad" }> = [];
+  if (!snapshot.config.adminTokenConfigured) {
+    list.push({ id: "admin", title: "未配置管理令牌", detail: "GATEWAY_ADMIN_TOKEN 为空，管理接口将拒绝所有请求。", tone: "bad" });
+  }
+  if (!snapshot.config.minterTokenConfigured) {
+    list.push({ id: "minter", title: "未配置授权服务令牌", detail: "MINTER_TOKEN 为空，/ws/minter 一律拒绝连接。", tone: "bad" });
+  }
+  if (snapshot.config.allowAnonymous) {
+    list.push({ id: "anon", title: "转发端点允许匿名访问", detail: "GATEWAY_ALLOW_ANONYMOUS=true，任何人都可调用 /v1 接口。", tone: "bad" });
+  } else if (!snapshot.config.apiKeyConfigured) {
+    list.push({ id: "apikey", title: "未配置客户端密钥", detail: "GATEWAY_API_KEY 为空，/v1 接口会返回 503。", tone: "warn" });
+  }
+  if (snapshot.minters.online === 0) {
+    list.push({ id: "offline", title: "没有在线授权服务", detail: "凭证池无法补充，池耗尽后转发将返回 503。", tone: "bad" });
+  }
+  if (snapshot.proxies.active === 0) {
+    list.push({ id: "noproxy", title: "没有活跃代理", detail: "先导入代理并等待测活通过。", tone: "bad" });
+  } else if (snapshot.proxiesMintable === 0) {
+    list.push({ id: "nomintable", title: "活跃代理均无法用于铸票", detail: "带认证的 SOCKS 代理无法驱动浏览器，请补充 HTTP 代理。", tone: "warn" });
+  }
+  if (snapshot.tickets.available < snapshot.tickets.minAvailable && snapshot.minters.online > 0) {
+    list.push({ id: "lowwater", title: "凭证水位低于下限", detail: "补充任务已下发，若长期不恢复请检查授权服务日志。", tone: "warn" });
+  }
+  return list;
+});
+</script>
+
+<template>
+  <section class="workspace-page">
+    <header class="page-heading">
+      <div>
+        <p class="section-kicker">运行状态</p>
+        <h1>概览</h1>
+        <p>凭证对池由在线授权服务补充；每组凭证与铸造它的代理成对使用。</p>
+      </div>
+    </header>
+
+    <div v-if="metrics.length" class="overview-metrics">
+      <article v-for="metric in metrics" :key="metric.key" :class="metric.tone ? `tone-${metric.tone}` : ''">
+        <div class="metric-head"><span>{{ metric.label }}</span><AppIcon :name="metric.icon" :size="15" /></div>
+        <strong>{{ metric.value }}</strong>
+        <small>{{ metric.hint }}</small>
+      </article>
+    </div>
+    <div v-else class="mini-empty">正在加载运行状态…</div>
+
+    <section class="content-section">
+      <div class="section-heading">
+        <div><h2>待处理事项</h2><p>影响转发可用性的配置与资源问题。</p></div>
+      </div>
+      <div v-if="issues.length === 0 && overview" class="status-empty">
+        <span aria-hidden="true">✓</span>
+        <div><strong>一切正常</strong><p>代理、凭证与授权服务均处于可用状态。</p></div>
+      </div>
+      <ul v-else class="action-list">
+        <li v-for="issue in issues" :key="issue.id" :class="issue.tone === 'bad' ? 'tone-bad' : ''">
+          <span class="action-indicator" aria-hidden="true"></span>
+          <div><strong>{{ issue.title }}</strong><p>{{ issue.detail }}</p></div>
+        </li>
+      </ul>
+    </section>
+
+    <section v-if="overview" class="content-section">
+      <div class="section-heading"><div><h2>代理状态分布</h2><p>只有活跃代理会被授权服务领取。</p></div></div>
+      <div class="overview-table">
+        <div v-for="(count, status) in overview.proxies" :key="status" class="overview-row">
+          <div><strong>{{ PROXY_STATUS_LABEL[status] }}</strong><span>{{ status }}</span></div>
+          <span class="mono">{{ count }}</span>
+        </div>
+      </div>
+    </section>
+  </section>
+</template>

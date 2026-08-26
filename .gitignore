@@ -7,7 +7,6 @@ dist
 .env
 .env.local
 .codegraph
-.env
 
-# Local Breezell handoff notes
-breezell/
+# 运行时数据（compose 挂载）
+data/

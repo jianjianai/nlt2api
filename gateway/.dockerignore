@@ -1,0 +1,9 @@
+.output
+.data
+node_modules
+tests
+docs
+*.md
+.env
+.env.*
+!.env.example
