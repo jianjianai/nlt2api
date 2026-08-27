@@ -39,6 +39,8 @@ export const SETTING_LABEL: Record<SettingKey, { label: string; hint: string }> 
   idleAfterSeconds: { label: "空闲暂停（秒）", hint: "这么久没有请求就停止铸票；0 表示始终保持水位。" },
   queueMaxSize: { label: "排队上限", hint: "凭证不足时可等待的请求数；0 表示不排队直接返回 503。" },
   queueTimeoutSeconds: { label: "排队超时（秒）", hint: "超过该时长仍未拿到凭证则返回 503。" },
+  affinityTtlSeconds: { label: "会话黏滞（秒）", hint: "同一对话在此时长内优先走同一出口 IP；0 表示完全轮转。" },
+  rateLimitCooldownSeconds: { label: "限流冷却（秒）", hint: "出口遭 429 后暂停使用的时长；上游给了 Retry-After 则以它为准。" },
   refillIntervalSeconds: { label: "补充检查周期（秒）", hint: "编排器计算缺口的频率。" },
   mintRequestTimeoutSeconds: { label: "铸票任务超时（秒）", hint: "超时后释放占用的并发计数。" },
   proxyLeaseSeconds: { label: "代理租约（秒）", hint: "授权服务独占一个代理的时长。" },

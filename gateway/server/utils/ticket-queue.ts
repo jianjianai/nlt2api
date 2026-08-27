@@ -7,6 +7,7 @@ interface Waiter {
   resolve(pair: TicketPair): void;
   reject(error: unknown): void;
   settled: boolean;
+  preferProxyId?: string;
   timer?: ReturnType<typeof setTimeout>;
   dispose(): void;
 }
@@ -78,23 +79,23 @@ export class TicketQueue {
    * own latency. Returns undefined rather than waiting, and never cuts ahead of
    * requests that are already queued.
    */
-  tryClaim(): TicketPair | undefined {
+  tryClaim(preferProxyId?: string): TicketPair | undefined {
     if (this.waiters.length > 0) return undefined;
-    return this.dependencies.tickets.claim();
+    return this.dependencies.tickets.claim(preferProxyId);
   }
 
   /**
    * Takes one pair, waiting in line if the pool is empty. Throws `queue_overflow`
    * when the queue is full, `queue_timeout` on expiry, and 499 if the client
-   * disconnects first.
+   * disconnects first. `preferProxyId` is an advisory egress preference.
    */
-  async acquire(signal?: AbortSignal): Promise<TicketPair> {
+  async acquire(signal?: AbortSignal, preferProxyId?: string): Promise<TicketPair> {
     const { settings, tickets } = this.dependencies;
     const config = settings.get();
     if (signal?.aborted) throw clientGone();
     // Only jump the line when nobody is already waiting; otherwise FIFO breaks.
     if (this.waiters.length === 0) {
-      const immediate = tickets.claim();
+      const immediate = tickets.claim(preferProxyId);
       if (immediate) return immediate;
     }
     if (this.waiters.length >= config.queueMaxSize) {
@@ -108,6 +109,7 @@ export class TicketQueue {
         resolve,
         reject,
         settled: false,
+        ...(preferProxyId ? { preferProxyId } : {}),
         dispose: () => {
           if (waiter.timer) clearTimeout(waiter.timer);
           signal?.removeEventListener("abort", onAbort);
@@ -134,7 +136,7 @@ export class TicketQueue {
     let served = 0;
     while (this.waiters.length > 0) {
       const waiter = this.waiters[0]!;
-      const pair = this.dependencies.tickets.claim();
+      const pair = this.dependencies.tickets.claim(waiter.preferProxyId);
       if (!pair) break;
       if (!this.take(waiter)) continue;
       waiter.resolve(pair);

@@ -1,4 +1,5 @@
 import type { DatabaseSync } from "node:sqlite";
+import { SessionAffinity } from "~/server/utils/affinity.ts";
 import { createInMemoryDatabase } from "~/server/utils/database.ts";
 import { DemandTracker } from "~/server/utils/demand.ts";
 import { ProxyPoolService } from "~/server/utils/proxy-pool.ts";
@@ -13,6 +14,7 @@ export interface Harness {
   tickets: TicketPoolService;
   demand: DemandTracker;
   queue: TicketQueue;
+  affinity: SessionAffinity;
   /** Mutable clock; every service reads it through the same closure. */
   clock: { now: number };
   advance(ms: number): void;
@@ -28,6 +30,7 @@ export function createHarness(startAt = 1_700_000_000_000): Harness {
   const tickets = new TicketPoolService({ db, settings, proxies, now });
   const demand = new DemandTracker({ settings, now });
   const queue = new TicketQueue({ settings, tickets, onDemand: () => demand.touch() });
+  const affinity = new SessionAffinity({ settings, now });
   return {
     db,
     settings,
@@ -35,6 +38,7 @@ export function createHarness(startAt = 1_700_000_000_000): Harness {
     tickets,
     demand,
     queue,
+    affinity,
     clock,
     advance(ms) {
       clock.now += ms;

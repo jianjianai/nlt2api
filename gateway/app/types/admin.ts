@@ -19,6 +19,8 @@ export interface ProxyPublic {
   failureCount: number;
   lastError?: string;
   retryAfter?: number;
+  rateLimitedUntil?: number;
+  lastUsedAt?: number;
   leased: boolean;
   mintable: boolean;
   availableTickets: number;
@@ -66,6 +68,8 @@ export interface GatewaySettings {
   idleAfterSeconds: number;
   queueMaxSize: number;
   queueTimeoutSeconds: number;
+  affinityTtlSeconds: number;
+  rateLimitCooldownSeconds: number;
   refillIntervalSeconds: number;
   mintRequestTimeoutSeconds: number;
   proxyLeaseSeconds: number;
@@ -85,6 +89,7 @@ export type SettingBounds = Record<SettingKey, { min: number; max: number }>;
 export interface OverviewSnapshot {
   proxies: Record<ProxyStatus, number>;
   proxiesMintable: number;
+  egress: { usable: number; rateLimited: number; pinned: number };
   tickets: { available: number; total: number; target: number };
   queue: { waiting: number; maxSize: number };
   demand: { claims: number; windowSeconds: number; idleSeconds: number; paused: boolean };

@@ -20,6 +20,8 @@ interface ProxyRow {
   failure_count: number;
   last_error: string | null;
   retry_after: number | null;
+  rate_limited_until: number | null;
+  last_used_at: number | null;
   leased_by: string | null;
   lease_id: string | null;
   lease_expires: number | null;
@@ -40,6 +42,8 @@ function toRecord(row: ProxyRow): ProxyRecord {
     failureCount: row.failure_count,
     ...(row.last_error ? { lastError: row.last_error } : {}),
     ...(row.retry_after !== null ? { retryAfter: row.retry_after } : {}),
+    ...(row.rate_limited_until !== null ? { rateLimitedUntil: row.rate_limited_until } : {}),
+    ...(row.last_used_at !== null ? { lastUsedAt: row.last_used_at } : {}),
     ...(row.leased_by ? { leasedBy: row.leased_by } : {}),
     ...(row.lease_id ? { leaseId: row.lease_id } : {}),
     ...(row.lease_expires !== null ? { leaseExpires: row.lease_expires } : {}),
@@ -139,12 +143,37 @@ export class ProxyPoolService {
       .map(toRecord);
   }
 
-  /** Active proxies not currently held by any minter session. */
+  /** Active proxies not currently held by any minter session and not rate limited. */
   idleActiveCount(): number {
+    const now = this.now();
     const row = getRow<{ total: number }>(
       this.db,
-      "SELECT COUNT(*) AS total FROM proxies WHERE status = 'active' AND (lease_expires IS NULL OR lease_expires < ?)",
-      this.now(),
+      `SELECT COUNT(*) AS total FROM proxies
+       WHERE status = 'active' AND (lease_expires IS NULL OR lease_expires < ?)
+         AND (rate_limited_until IS NULL OR rate_limited_until < ?)`,
+      now,
+      now,
+    );
+    return row?.total ?? 0;
+  }
+
+  /** Egress IPs usable for forwarding right now; the affinity pool size. */
+  forwardableActiveCount(): number {
+    const now = this.now();
+    const row = getRow<{ total: number }>(
+      this.db,
+      "SELECT COUNT(*) AS total FROM proxies WHERE status = 'active' AND (rate_limited_until IS NULL OR rate_limited_until < ?)",
+      now,
+    );
+    return row?.total ?? 0;
+  }
+
+  rateLimitedCount(): number {
+    const now = this.now();
+    const row = getRow<{ total: number }>(
+      this.db,
+      "SELECT COUNT(*) AS total FROM proxies WHERE status = 'active' AND rate_limited_until >= ?",
+      now,
     );
     return row?.total ?? 0;
   }
@@ -182,6 +211,8 @@ export class ProxyPoolService {
         failureCount: record.failureCount,
         ...(record.lastError ? { lastError: record.lastError } : {}),
         ...(record.retryAfter ? { retryAfter: record.retryAfter } : {}),
+        ...(record.rateLimitedUntil && record.rateLimitedUntil > now ? { rateLimitedUntil: record.rateLimitedUntil } : {}),
+        ...(record.lastUsedAt ? { lastUsedAt: record.lastUsedAt } : {}),
         leased: record.leaseExpires !== undefined && record.leaseExpires > now,
         mintable: isMintableProxy(record.url),
         availableTickets: row.available_tickets,
@@ -241,9 +272,30 @@ export class ProxyPoolService {
     const now = this.now();
     this.db.prepare(`
       UPDATE proxies
-      SET status = 'pending', failure_count = 0, last_error = NULL, retry_after = NULL, updated_at = ?
+      SET status = 'pending', failure_count = 0, last_error = NULL, retry_after = NULL,
+          rate_limited_until = NULL, updated_at = ?
       WHERE id = ?
     `).run(now, id);
+  }
+
+  /**
+   * Parks an egress IP that upstream rate limited. The proxy stays `active`
+   * because nothing is wrong with it as a transport; it simply must not carry
+   * traffic until the window passes, so both forwarding and minting skip it.
+   */
+  markRateLimited(id: string, cooldownMs: number): number {
+    const now = this.now();
+    const until = now + Math.max(0, cooldownMs);
+    this.db.prepare(`
+      UPDATE proxies SET rate_limited_until = ?, updated_at = ?
+      WHERE id = ? AND (rate_limited_until IS NULL OR rate_limited_until < ?)
+    `).run(until, now, id, until);
+    return until;
+  }
+
+  /** Stamps the rotation clock so the next request picks a different egress. */
+  markUsed(id: string): void {
+    this.db.prepare("UPDATE proxies SET last_used_at = ? WHERE id = ?").run(this.now(), id);
   }
 
   setLabel(id: string, label: string | undefined): void {
@@ -260,9 +312,11 @@ export class ProxyPoolService {
   }
 
   /**
-   * Hands an active proxy to one minter session exclusively. The candidate with
-   * the fewest live tickets wins so capacity spreads across the pool instead of
-   * piling onto whichever proxy was leased last.
+   * Hands an active proxy to one minter session exclusively. Rate-limited egress
+   * IPs are skipped: a ticket minted there could not be spent until the window
+   * passes, and it would expire first. Among the rest the candidate with the
+   * fewest live tickets wins, then the one idle longest, so capacity spreads
+   * across the pool instead of piling onto whichever proxy was leased last.
    */
   lease(sessionId: string, preferProxyId?: string): ProxyLease | { reason: "no_active_proxy" | "all_leased" } {
     const settings = this.settings.get();
@@ -276,18 +330,20 @@ export class ProxyPoolService {
         ? getRow<ProxyRow>(this.db, `
             SELECT * FROM proxies
             WHERE id = ? AND status = 'active' AND (lease_expires IS NULL OR lease_expires < ? OR leased_by = ?)
-          `, preferProxyId, now, sessionId)
+              AND (rate_limited_until IS NULL OR rate_limited_until < ?)
+          `, preferProxyId, now, sessionId, now)
         : undefined;
 
       const candidate = renewal ?? getRow<ProxyRow>(this.db, `
         SELECT p.* FROM proxies p
         WHERE p.status = 'active' AND (p.lease_expires IS NULL OR p.lease_expires < ?)
+          AND (p.rate_limited_until IS NULL OR p.rate_limited_until < ?)
         ORDER BY (
           SELECT COUNT(*) FROM tickets t
           WHERE t.proxy_id = p.id AND t.claimed_at IS NULL AND t.expires_at >= ?
-        ) ASC, COALESCE(p.healthy_at, 0) DESC
+        ) ASC, COALESCE(p.last_used_at, 0) ASC, COALESCE(p.healthy_at, 0) DESC
         LIMIT 1
-      `, now, now);
+      `, now, now, now);
 
       if (!candidate) return { reason: "all_leased" as const };
       // Chrome cannot authenticate to a SOCKS proxy, so such an entry can carry
@@ -339,10 +395,11 @@ export class ProxyPoolService {
 
   /** Any active proxy, used for credential-free calls such as the model catalog. */
   anyActive(): ProxyRecord | undefined {
+    const now = this.now();
     const row = getRow<ProxyRow>(this.db, `
-      SELECT * FROM proxies WHERE status = 'active'
+      SELECT * FROM proxies WHERE status = 'active' AND (rate_limited_until IS NULL OR rate_limited_until < ?)
       ORDER BY COALESCE(latency_ms, 999999) ASC LIMIT 1
-    `);
+    `, now);
     return row ? toRecord(row) : undefined;
   }
 }

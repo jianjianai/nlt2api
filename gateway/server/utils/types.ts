@@ -23,6 +23,10 @@ export interface ProxyRecord {
   failureCount: number;
   lastError?: string;
   retryAfter?: number;
+  /** Upstream 429 cooldown; the proxy is healthy but must not carry traffic yet. */
+  rateLimitedUntil?: number;
+  /** Last time a request was forwarded through it; drives round-robin rotation. */
+  lastUsedAt?: number;
   leasedBy?: string;
   leaseId?: string;
   leaseExpires?: number;
@@ -43,6 +47,8 @@ export interface ProxyPublic {
   failureCount: number;
   lastError?: string;
   retryAfter?: number;
+  rateLimitedUntil?: number;
+  lastUsedAt?: number;
   leased: boolean;
   /** False when the proxy cannot drive a browser (authenticated SOCKS). */
   mintable: boolean;
@@ -121,6 +127,10 @@ export interface GatewaySettings {
   queueMaxSize: number;
   /** How long a queued request waits before giving up. */
   queueTimeoutSeconds: number;
+  /** How long one conversation stays pinned to its egress IP; 0 disables affinity. */
+  affinityTtlSeconds: number;
+  /** Fallback cooldown for an egress that returned 429 without a Retry-After. */
+  rateLimitCooldownSeconds: number;
   refillIntervalSeconds: number;
   mintRequestTimeoutSeconds: number;
   proxyLeaseSeconds: number;
@@ -137,6 +147,14 @@ export interface GatewaySettings {
 export interface OverviewSnapshot {
   proxies: Record<ProxyStatus, number>;
   proxiesMintable: number;
+  egress: {
+    /** Active proxies usable for forwarding right now. */
+    usable: number;
+    /** Active proxies parked by an upstream 429. */
+    rateLimited: number;
+    /** Conversations currently pinned to an egress. */
+    pinned: number;
+  };
   tickets: {
     available: number;
     total: number;

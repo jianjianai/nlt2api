@@ -137,6 +137,7 @@ const protocols: ProxyKind[] = ["http", "socks5", "socks4"];
             <span class="badge" :class="PROXY_STATUS_TONE[proxy.status]">{{ PROXY_STATUS_LABEL[proxy.status] }}</span>
             <code>{{ proxy.maskedUrl }}</code>
             <span v-if="proxy.leased" class="badge muted">已被领取</span>
+            <span v-if="proxy.rateLimitedUntil" class="badge warn">限流冷却中</span>
             <span v-if="!proxy.mintable" class="badge warn">不可铸票</span>
           </div>
           <dl>
@@ -145,7 +146,9 @@ const protocols: ProxyKind[] = ["http", "socks5", "socks4"];
             <div><dt>可用凭证</dt><dd>{{ proxy.availableTickets }}</dd></div>
             <div><dt>失败次数</dt><dd>{{ proxy.failureCount }}</dd></div>
             <div><dt>最近测活</dt><dd>{{ formatRelative(proxy.checkedAt, now) }}</dd></div>
+            <div><dt>最近使用</dt><dd>{{ formatRelative(proxy.lastUsedAt, now) }}</dd></div>
             <div><dt>最近健康</dt><dd>{{ formatRelative(proxy.healthyAt, now) }}</dd></div>
+            <div v-if="proxy.rateLimitedUntil"><dt>限流解除</dt><dd>{{ formatRelative(proxy.rateLimitedUntil, now) }}</dd></div>
             <div v-if="proxy.retryAfter"><dt>冷却至</dt><dd>{{ formatRelative(proxy.retryAfter, now) }}</dd></div>
             <div v-if="proxy.lastError"><dt>最近错误</dt><dd>{{ proxy.lastError }}</dd></div>
           </dl>

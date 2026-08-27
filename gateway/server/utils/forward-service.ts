@@ -1,4 +1,5 @@
 import { HttpError } from "~/server/utils/http.ts";
+import { conversationKey, type SessionAffinity } from "~/server/utils/affinity.ts";
 import type { DemandTracker } from "~/server/utils/demand.ts";
 import { ProxyTransportError } from "~/server/utils/proxy.ts";
 import type { ProxyPoolService } from "~/server/utils/proxy-pool.ts";
@@ -34,6 +35,7 @@ export interface ForwardDependencies {
   tickets: TicketPoolService;
   queue: TicketQueue;
   demand: DemandTracker;
+  affinity: SessionAffinity;
   chat?: typeof chatCompletions;
   catalog?: typeof modelCatalog;
 }
@@ -46,23 +48,26 @@ export class ForwardService {
   /**
    * Forwards one chat request. Each attempt spends a distinct (proxy, ticket)
    * pair: the ticket is single-use upstream, so a retry must never reuse it.
-   * A pair that is not in the pool yet is waited for through the queue.
+   * A continuation of a known conversation prefers the egress it started on;
+   * a new one takes whichever egress has been idle longest.
    */
   async chat(request: JsonObject, signal?: AbortSignal): Promise<Response> {
-    const { settings, proxies, tickets, queue, demand } = this.dependencies;
+    const { settings, proxies, tickets, queue, demand, affinity } = this.dependencies;
     const chat = this.dependencies.chat ?? chatCompletions;
     const config = settings.get();
     demand.touch();
+    const key = conversationKey(request);
     let lastError: unknown;
 
     for (let attempt = 1; attempt <= config.maxAttempts; attempt += 1) {
+      const prefer = affinity.resolve(key);
       let pair: TicketPair | undefined;
       if (attempt === 1) {
-        pair = await queue.acquire(signal);
+        pair = await queue.acquire(signal, prefer);
       } else {
         // A retry takes a free pair or gives up with the error that caused it;
         // queueing again would let one client wait the timeout several times over.
-        pair = queue.tryClaim();
+        pair = queue.tryClaim(prefer);
         if (!pair) throw lastError ?? poolExhausted();
       }
       demand.record();
@@ -76,13 +81,23 @@ export class ForwardService {
         });
         // Upstream redeemed the ticket; a replay would return 403.
         tickets.drop(pair.ticket.id);
+        affinity.remember(key, pair.ticket.proxyId);
         return response;
       } catch (error) {
         // The pair is spent either way: upstream redeems the ticket on success
         // and on captcha rejection, and a half-used one cannot be trusted.
         tickets.drop(pair.ticket.id);
-        if (error instanceof ProxyTransportError) {
+        if (error instanceof UpstreamError && error.kind === "rate_limit") {
+          // The limit belongs to the egress IP, not to this request: park that IP
+          // and drop the pin so the retry lands somewhere else.
+          proxies.markRateLimited(
+            pair.ticket.proxyId,
+            (error.retryAfterSeconds ?? config.rateLimitCooldownSeconds) * 1_000,
+          );
+          affinity.forget(key);
+        } else if (error instanceof ProxyTransportError) {
           proxies.markFailure(pair.ticket.proxyId, error.message);
+          affinity.forget(key);
         }
         if (signal?.aborted) throw error;
         if (error instanceof UpstreamError && error.status === 499) throw error;

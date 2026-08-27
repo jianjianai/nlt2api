@@ -35,6 +35,11 @@ const groups: Array<{ title: string; description: string; keys: SettingKey[] }> 
     keys: ["queueMaxSize", "queueTimeoutSeconds"],
   },
   {
+    title: "出口轮转",
+    description: "限流绑定在出口 IP 上：新对话取最久未用的出口，同一对话在黏滞窗口内固定出口，遭 429 的出口暂停使用。",
+    keys: ["affinityTtlSeconds", "rateLimitCooldownSeconds"],
+  },
+  {
     title: "补充编排",
     description: "水位不足时向在线授权服务下发铸票任务。",
     keys: ["refillIntervalSeconds", "mintRequestTimeoutSeconds", "proxyLeaseSeconds"],

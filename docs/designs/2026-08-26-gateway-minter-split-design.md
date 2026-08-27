@@ -203,7 +203,7 @@ CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 ### 4.4 凭证对池
 
 - **入池**：`ticket.submit` → 校验 lease 归属 → `INSERT tickets` → 释放 lease → `minted_count+1`。
-- **取用**（转发层）：`BEGIN IMMEDIATE` → 选 `claimed_at IS NULL AND expires_at >= now + minRemaining` 的行，`ORDER BY expires_at ASC LIMIT 1`，且其 `proxy.status = 'active'` → `UPDATE tickets SET claimed_at = now` → 提交。取到即独占，ticket 单次使用语义与上游一致。
+- **取用**（转发层）：`BEGIN IMMEDIATE` → 选 `claimed_at IS NULL AND expires_at >= now + minRemaining` 的行，且其 `proxy.status = 'active'` 且未处于限流冷却（`rate_limited_until`）；排序为 `代理 last_used_at ASC, expires_at ASC`——**先选最久未用的出口**，同一出口内再选最接近过期的凭证 → `UPDATE tickets SET claimed_at = now` 与 `UPDATE proxies SET last_used_at = now` → 提交。可传入 `preferProxyId`（会话亲和，见 §4.6.2），该出口无可用凭证时退回轮转顺序。
 - **失败归还**：若上游返回 403 `Captcha verification failed`，凭证已被上游赎回，不归还（直接删除）；若是**代理传输失败**（连接超时/拒绝），凭证尚未被赎回，但 minRemaining 已被消耗过一次握手时间——保守起见也删除，并把代理计一次失败。这条策略优先保证正确性而非凭证利用率。
 - **清理**：清理器每 `ticketCleanupIntervalSeconds`（默认 15）删除 `expires_at < now` 或 `claimed_at < now - 5min` 的行。
 
@@ -242,11 +242,11 @@ deficit = min(target - available - inflight, idleActiveProxies)
 
 1. `requireClientAuth`：`Authorization: Bearer <GATEWAY_API_KEY>`。未配置 key 时默认拒绝所有请求（`allowAnonymous` 显式开启才放行），避免出现无鉴权的公开转发端点。
 2. 读取并校验 JSON 体（`maxRequestBytes` 上限），只校验 `model` 必须存在且为字符串、`messages` 为非空数组、`stream` 为布尔——其余字段原样透传。
-3. 最多 `maxAttempts`（默认 3）次尝试。首次尝试经**排队器**取凭证对：池中有则立即取走，池空则 FIFO 排队等待（详见 §4.5.1）；随后组装上游请求头（`Origin`/`Referer`/`X-DeepInfra-Turnstile`/`X-Deepinfra-Source`/凭证自带 `User-Agent`）→ 经配对代理发 `POST https://api.deepinfra.com/v1/openai/chat/completions`。
-4. 可重试的失败（传输错误、429、5xx）换一张凭证重试；403 captcha 也换凭证重试（视为凭证损耗）。**重试只取当前空闲的凭证对，不再排队**——否则单个请求可能被排队超时叠加数次。取不到即抛出导致重试的那个错误。
+3. 最多 `maxAttempts`（默认 3）次尝试。首次尝试经**排队器**取凭证对（带会话亲和的出口偏好）：池中有则立即取走，池空则 FIFO 排队等待（详见 §4.6.1）；随后组装上游请求头（`Origin`/`Referer`/`X-DeepInfra-Turnstile`/`X-Deepinfra-Source`/凭证自带 `User-Agent`）→ 经配对代理发 `POST https://api.deepinfra.com/v1/openai/chat/completions`。
+4. 可重试的失败（传输错误、429、5xx）换一张凭证重试；403 captcha 也换凭证重试（视为凭证损耗）。429 额外把该出口标为限流冷却（见 §4.6.2），使重试必然落到另一个 IP。**重试只取当前空闲的凭证对，不再排队**——否则单个请求可能被排队超时叠加数次。取不到即抛出导致重试的那个错误。
 5. 流式：一旦上游返回 200 且开始转发 SSE，就不再重试，错误以 SSE `data: {"error":...}` 帧下发。
 
-#### 4.5.1 排队器
+#### 4.6.1 排队器
 
 凭证不足时请求排队而非直接失败，把突发流量转成延迟：
 
@@ -256,6 +256,16 @@ deficit = min(target - available - inflight, idleActiveProxies)
 - **超时**：`queueTimeoutSeconds`（默认 60）内未拿到凭证返回 503 `queue_timeout`。
 - **唤醒时机**：`ticket.submit` 被接受后、以及每个补充编排周期开头各排空一次队列。
 - **需求信号**：入队即视为需求，会唤醒处于空闲暂停的铸票，并计入目标水位。
+
+#### 4.6.2 出口轮转与会话亲和
+
+上游的匿名限流绑定在**出口 IP** 上，但同一对话中途换 IP 会改变表见客户身份。两个目标靠三个机制调和：
+
+1. **默认轮转**：取用时优先选 `last_used_at` 最早的活跃代理，新对话自然散开到整个池。
+2. **会话亲和**（`affinityTtlSeconds`，默认 900，0 关闭）：以请求体的**对话头部**（system 消息 + 第一条 user 消息，叠加可选的 `user` 字段）的 SHA-256 为键。OpenAI 兼容客户端每轮重发全部历史，因此该头部在同一对话的所有轮次间恒定、在不同对话间不同，无需客户端传会话 ID。映射存内存（LRU，上限 2 万条），因为它指向的凭证本身也不跨重启。亲和是**建议性**的：馒存的出口无票则直接退回轮转，不阻塞请求。
+3. **限流冷却**：上游返回 429 时把那个出口标为 `rate_limited_until = now + (Retry-After 或 rateLimitCooldownSeconds)`，同时丢弃该对话的亲和馒。代理仍为 `active`（它作为传输通道没有问题），但在冷却期内同时被**转发取用和铸票租约**跳过——在被限流的 IP 上铸票没意义，票到解封时已过期。
+
+限流冷却不会被后续更短的冷却覆盖（只向后延长），避免一个带短 `Retry-After` 的回应提前释放一个已知被长时间限流的 IP。
 
 `GET /v1/models`：经任一活跃代理拉 `https://api.deepinfra.com/models/list`（无需凭证），结果缓存 `modelsCacheSeconds`（默认 300），映射为 OpenAI `{object:"list", data:[{id, object:"model", owned_by}]}`。
 
@@ -267,7 +277,7 @@ Admin API：
 
 | 方法 | 路径 | 作用 |
 | --- | --- | --- |
-| GET | `/api/admin/overview` | 汇总：代理三态计数、凭证池水位与自适应目标、排队深度与需求速率、在线授权服务数、近期铸票速率 |
+| GET | `/api/admin/overview` | 汇总：代理三态计数、可用/限流出口数与亲和馒数、凭证池水位与自适应目标、排队深度与需求速率、在线授权服务数、近期铸票速率 |
 | GET | `/api/admin/proxies` | 代理列表（掩码 URL，支持 `status` 过滤、分页） |
 | POST | `/api/admin/proxies/import` | 批量文本导入（支持 `host:port`、`host:port:user:pass`、`user:pass@host:port`、完整 URL） |
 | POST | `/api/admin/proxies/check` | 批量重测（`scope: pending \| unavailable \| active \| all`） |
@@ -284,7 +294,7 @@ Admin API：
 UI 四个工作区（沿用旧 `WorkspaceShell` 布局与 CSS）：
 
 - **概览**：三态代理计数、凭证水位仪表（含自适应目标与暂停状态）、排队请求数、在线授权服务数、最近 5 分钟铸票成功/失败。
-- **代理池**：状态筛选、导入、批量/单条重测、删除、掩码 URL、延迟、失败次数、`retry_after` 倒计时。
+- **代理池**：状态筛选、导入、批量/单条重测、删除、掩码 URL、延迟、失败次数、最近使用时间、限流解除倒计时、`retry_after` 倒计时。
 - **凭证对池**：`(掩码代理, 掩码 token, 剩余秒数, 铸造者)` 列表，剩余时间实时倒计时，清空按钮。
 - **授权服务**：在线列表（agent_id、标签、平台、并发、已铸/失败计数、最后心跳、远端地址）、踢下线、「查看截图」（从空闲且持有常驻浏览器的 worker 取视口/整页 PNG 弹窗展示，15s 超时）、离线历史。
 - **设置**：§4.8 全部参数。
@@ -305,6 +315,8 @@ UI 四个工作区（沿用旧 `WorkspaceShell` 布局与 CSS）：
 | `idleAfterSeconds` | 300 | 无请求多久后暂停铸票；0 表示始终保持水位 |
 | `queueMaxSize` | 64 | 排队上限；0 表示不排队 |
 | `queueTimeoutSeconds` | 60 | 排队等待超时 |
+| `affinityTtlSeconds` | 900 | 同一对话固定出口 IP 的时长；0 表示完全轮转 |
+| `rateLimitCooldownSeconds` | 60 | 出口遭 429 后的默认冷却（上游给了 `Retry-After` 则以它为准） |
 | `refillIntervalSeconds` | 5 | 编排器周期 |
 | `mintRequestTimeoutSeconds` | 180 | 单张铸票任务超时（回收 inflight 计数） |
 | `proxyLeaseSeconds` | 120 | 代理租约时长 |

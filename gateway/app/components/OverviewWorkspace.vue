@@ -43,11 +43,11 @@ const metrics = computed<Metric[]>(() => {
     },
     {
       key: "proxies",
-      label: "活跃代理",
-      value: `${snapshot.proxies.active}`,
-      hint: `可铸票 ${snapshot.proxiesMintable} · 待测活 ${snapshot.proxies.pending} · 不可用 ${snapshot.proxies.unavailable}`,
+      label: "可用出口 IP",
+      value: `${snapshot.egress.usable}`,
+      hint: `活跃 ${snapshot.proxies.active} · 限流冷却 ${snapshot.egress.rateLimited} · 可铸票 ${snapshot.proxiesMintable}`,
       icon: "globe",
-      tone: snapshot.proxies.active > 0 ? "good" : "bad",
+      tone: snapshot.egress.usable === 0 ? "bad" : snapshot.egress.rateLimited > 0 ? "warn" : "good",
     },
     {
       key: "minters",
@@ -89,6 +89,16 @@ const issues = computed(() => {
     list.push({ id: "noproxy", title: "没有活跃代理", detail: "先导入代理并等待测活通过。", tone: "bad" });
   } else if (snapshot.proxiesMintable === 0) {
     list.push({ id: "nomintable", title: "活跃代理均无法用于铸票", detail: "带认证的 SOCKS 代理无法驱动浏览器，请补充 HTTP 代理。", tone: "warn" });
+  }
+  if (snapshot.egress.usable === 0 && snapshot.proxies.active > 0) {
+    list.push({ id: "allthrottled", title: "所有出口都在限流冷却中", detail: "上游按出口 IP 限流，当前无可用 IP。扩充代理数量是唯一有效的缓解手段。", tone: "bad" });
+  } else if (snapshot.egress.rateLimited > 0) {
+    list.push({
+      id: "throttled",
+      title: `${snapshot.egress.rateLimited} 个出口正在限流冷却`,
+      detail: "这些 IP 遭上游 429，已暂停使用并自动转向其他出口。频繁出现说明代理数量相对流量偏少。",
+      tone: "warn",
+    });
   }
   if (!snapshot.demand.paused && snapshot.tickets.available < snapshot.tickets.target && snapshot.minters.online > 0) {
     list.push({ id: "lowwater", title: "凭证水位低于目标", detail: "补充任务已下发，若长期不恢复请检查授权服务日志。", tone: "warn" });

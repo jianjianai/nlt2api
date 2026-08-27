@@ -73,6 +73,7 @@ test("an empty pool returns 503 with a Retry-After hint when queueing is off", a
       tickets: harness.tickets,
       queue: harness.queue,
       demand: harness.demand,
+      affinity: harness.affinity,
       chat: async () => new Response("{}"),
     });
     await assert.rejects(
@@ -95,6 +96,7 @@ test("a successful call consumes exactly one pair", async () => {
       tickets: harness.tickets,
       queue: harness.queue,
       demand: harness.demand,
+      affinity: harness.affinity,
       chat: async (options) => {
         seen.push(options.ticket.token);
         return new Response("{}", { status: 200 });
@@ -125,6 +127,7 @@ test("a captcha rejection retries with a different pair", async () => {
       tickets: harness.tickets,
       queue: harness.queue,
       demand: harness.demand,
+      affinity: harness.affinity,
       chat: async (options) => {
         seen.push(options.ticket.token);
         if (seen.length === 1) throw upstreamErrorFrom(403, JSON.stringify({ error: { message: "Captcha verification failed" } }));
@@ -151,6 +154,7 @@ test("a transport failure records a proxy failure", async () => {
       tickets: harness.tickets,
       queue: harness.queue,
       demand: harness.demand,
+      affinity: harness.affinity,
       chat: async () => {
         throw new ProxyTransportError("Proxy connection was refused.");
       },
@@ -173,6 +177,7 @@ test("a non-retryable upstream error surfaces immediately", async () => {
       tickets: harness.tickets,
       queue: harness.queue,
       demand: harness.demand,
+      affinity: harness.affinity,
       chat: async () => {
         calls += 1;
         throw upstreamErrorFrom(400, JSON.stringify({ error: { message: "bad model" } }));
@@ -203,6 +208,7 @@ test("attempts are capped by maxAttempts", async () => {
       tickets: harness.tickets,
       queue: harness.queue,
       demand: harness.demand,
+      affinity: harness.affinity,
       chat: async () => {
         calls += 1;
         throw upstreamErrorFrom(503, "unavailable");
@@ -224,6 +230,7 @@ test("a request waits for a pair instead of failing on an empty pool", async () 
       tickets: harness.tickets,
       queue: harness.queue,
       demand: harness.demand,
+      affinity: harness.affinity,
       chat: async (options) => new Response(options.ticket.token, { status: 200 }),
     });
     const pending = forward.chat({ model: "m", messages: [] });
@@ -249,6 +256,7 @@ test("a retry gives up with the original error rather than queueing again", asyn
       tickets: harness.tickets,
       queue: harness.queue,
       demand: harness.demand,
+      affinity: harness.affinity,
       chat: async () => {
         calls += 1;
         throw upstreamErrorFrom(503, "unavailable");
@@ -272,6 +280,7 @@ test("the model catalog is cached until its TTL elapses", async () => {
       tickets: harness.tickets,
       queue: harness.queue,
       demand: harness.demand,
+      affinity: harness.affinity,
       catalog: async () => {
         calls += 1;
         return [{ id: "m", freeForAnonymous: true }];

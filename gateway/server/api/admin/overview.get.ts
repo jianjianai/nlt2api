@@ -14,6 +14,11 @@ export default defineHandler((event) => adminRoute(() => {
   const snapshot: OverviewSnapshot = {
     proxies: runtime.proxies.counts(),
     proxiesMintable: runtime.proxies.mintableActiveCount(),
+    egress: {
+      usable: runtime.proxies.forwardableActiveCount(),
+      rateLimited: runtime.proxies.rateLimitedCount(),
+      pinned: runtime.affinity.size(),
+    },
     tickets: {
       available: runtime.tickets.availableCount(),
       total: runtime.tickets.totalCount(),

@@ -97,24 +97,32 @@ export class TicketPoolService {
   }
 
   /**
-   * Takes the ticket closest to expiry that still has enough life left. Burning
-   * the oldest first keeps younger tickets available for later requests and
-   * minimises how many expire unused.
+   * Takes one pair. Rate-limited egress IPs are excluded, and among the rest the
+   * one idle longest wins so traffic rotates instead of hammering a single IP.
+   * Within one proxy the ticket closest to expiry goes first, which minimises how
+   * many expire unused. `preferProxyId` pins a conversation to the egress it
+   * started on when that proxy still has a usable ticket.
    */
-  claim(): TicketPair | undefined {
+  claim(preferProxyId?: string): TicketPair | undefined {
     const settings = this.settings.get();
     const now = this.now();
     const floor = now + settings.ticketMinRemainingSeconds * 1_000;
     return immediateTransaction(this.db, () => {
-      const row = getRow<TicketRow & { proxy_url: string }>(this.db, `
+      const select = (proxyId?: string) => getRow<TicketRow & { proxy_url: string }>(this.db, `
         SELECT t.*, p.url AS proxy_url FROM tickets t
         JOIN proxies p ON p.id = t.proxy_id
         WHERE t.claimed_at IS NULL AND t.expires_at >= ? AND p.status = 'active'
-        ORDER BY t.expires_at ASC
+          AND (p.rate_limited_until IS NULL OR p.rate_limited_until < ?)
+          ${proxyId ? "AND p.id = ?" : ""}
+        ORDER BY COALESCE(p.last_used_at, 0) ASC, t.expires_at ASC
         LIMIT 1
-      `, floor);
+      `, ...(proxyId ? [floor, now, proxyId] : [floor, now]));
+      // Affinity is best-effort: a pinned egress with nothing left must not stall
+      // the request, so fall back to the rotation order.
+      const row = (preferProxyId ? select(preferProxyId) : undefined) ?? select();
       if (!row) return undefined;
       this.db.prepare("UPDATE tickets SET claimed_at = ? WHERE id = ? AND claimed_at IS NULL").run(now, row.id);
+      this.db.prepare("UPDATE proxies SET last_used_at = ? WHERE id = ?").run(now, row.proxy_id);
       return { ticket: toRecord(row), proxyUrl: row.proxy_url };
     });
   }
@@ -126,12 +134,14 @@ export class TicketPoolService {
 
   availableCount(): number {
     const settings = this.settings.get();
-    const floor = this.now() + settings.ticketMinRemainingSeconds * 1_000;
+    const now = this.now();
+    const floor = now + settings.ticketMinRemainingSeconds * 1_000;
     const row = getRow<{ total: number }>(this.db, `
       SELECT COUNT(*) AS total FROM tickets t
       JOIN proxies p ON p.id = t.proxy_id
       WHERE t.claimed_at IS NULL AND t.expires_at >= ? AND p.status = 'active'
-    `, floor);
+        AND (p.rate_limited_until IS NULL OR p.rate_limited_until < ?)
+    `, floor, now);
     return row?.total ?? 0;
   }
 
