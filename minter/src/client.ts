@@ -260,9 +260,13 @@ export class MinterClient {
     }
   }
 
-  /** Answers the admin console's screenshot probe from an idle worker. */
+  /** Answers the admin console's screenshot probe from any live browser. */
   private async handleScreenshotRequest(id: string, kind: "page" | "fullpage"): Promise<void> {
-    const worker = this.workers.find((candidate) => !candidate.busy && candidate.minter.proxyUrl);
+    const withBrowser = this.workers.filter((candidate) => candidate.minter.proxyUrl);
+    // Capturing is read-only, so a busy worker is a valid source — and when
+    // minting keeps failing every worker is busy, which is exactly when the
+    // screenshot is being asked for.
+    const worker = withBrowser.find((candidate) => !candidate.busy) ?? withBrowser[0];
     if (!worker) {
       this.send({ type: "browser.screenshot.reply", id, ok: false, error: "no resident browser available" });
       return;

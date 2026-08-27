@@ -315,9 +315,10 @@ UI 四个工作区（沿用旧 `WorkspaceShell` 布局与 CSS）：
 spawn(browser, --remote-debugging-port=P, --user-data-dir=D, --proxy-server=..., 精简/平台 flags)
   → 附着到 page target 的 CDP WebSocket
   → Page.enable
-  → Fetch.enable({ patterns: [{urlPattern:"https://deepinfra.com/*", requestStage:"Request"}], handleAuthRequests: true })
+  → Fetch.enable({ patterns: [{urlPattern:"*", requestStage:"Request"}], handleAuthRequests: true })
   → Page.navigate("https://deepinfra.com/")
   → Fetch.requestPaused(首个文档) → Fetch.fulfillRequest(trap HTML, 200, text/html; charset=utf-8, body base64)
+  → Fetch.requestPaused(其余请求，含 challenges.cloudflare.com 脚本) → Fetch.continueRequest
   → Fetch.authRequired → Fetch.continueWithAuth(代理凭证)
   → Runtime.evaluate 调 window.__mint(id)（awaitPromise）取 token
   → 取到 token 后立即 turnstile.remove(widgetId) 并移除容器
@@ -371,7 +372,7 @@ window.__mint = (id) => new Promise((res, rej) => {
 凭证必须与代理成对，因此浏览器必须走该代理出网。
 
 - `--proxy-server=<scheme>://<host>:<port>`（**不含凭证**，Chrome 不接受 URL 内嵌凭证）。
-- 带用户名/密码的 HTTP 代理：`Fetch.enable({handleAuthRequests: true})` 后在 `Fetch.authRequired` 事件里 `Fetch.continueWithAuth({response:"ProvideCredentials", username, password})`。
+- 带用户名/密码的 HTTP 代理：`Fetch.enable({handleAuthRequests: true})` 后在 `Fetch.authRequired` 事件里 `Fetch.continueWithAuth({response:"ProvideCredentials", username, password})`。拦截模式**必须是 `*`**：Turnstile 脚本来自 `challenges.cloudflare.com`，只拦 `deepinfra.com/*` 时它的 407 无人应答，页面永远拿不到 `window.turnstile`（铸票以 `page_not_ready` 全量失败）。
 - `--proxy-bypass-list=<-loopback>` 保证 CDP 回环不被代理。
 - **限制**：Chrome 不支持 SOCKS 代理认证。带凭证的 SOCKS 代理无法用于铸票——`proxy.lease` 只会下发 `kind='http'` 或无凭证的 `socks4/socks5` 代理，gateway 侧对带凭证的 SOCKS 条目标记 `mintable=0`（存于 `proxies.kind` 判定逻辑，不额外建列）。
 

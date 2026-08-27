@@ -33,6 +33,8 @@ Nitro v3 项目。`server/` 下 `api/`（/api 前缀）、`routes/`（无前缀�
 - 绝不禁用图片或 Translate/MediaRouter，实测出票率归零。
 - 冷 profile 首次必失败，第一次铸票是丢弃结果的 warm-up。
 - Chrome 无法对 SOCKS 代理做认证，带凭证的 SOCKS 代理不能铸票（gateway 侧已过滤，`src/proxy.ts` 是本地兜底）。
+- `Fetch.enable` 的 `urlPattern` 必须是 `*`：带认证的 HTTP 代理会对 `challenges.cloudflare.com` 的
+  Turnstile 脚本也发 407，只拦 `deepinfra.com/*` 时无人应答，铸票全量 `page_not_ready`。
 
 ## 协议
 

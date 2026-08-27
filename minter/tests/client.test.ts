@@ -38,6 +38,8 @@ class FakeMinter implements Minter {
   readonly calls: string[] = [];
   closed = false;
   screenshotRequests: string[] = [];
+  /** Set to keep `mint` pending, so the worker stays busy during a test. */
+  blockMint: Promise<void> | undefined;
   private counter = 0;
 
   constructor(private readonly behaviour: (call: number) => void = () => {}) {}
@@ -46,6 +48,7 @@ class FakeMinter implements Minter {
     this.counter += 1;
     this.calls.push(proxyUrl);
     this.proxyUrl = proxyUrl;
+    if (this.blockMint) await this.blockMint;
     this.behaviour(this.counter);
     return { token: `token-${this.counter}`, mintedAt: 1_700_000_000_000, userAgent: "UA/1.0" };
   }
@@ -279,6 +282,41 @@ test("a screenshot request without a resident browser fails cleanly", async () =
     assert.ok(String(reply?.error).includes("no resident browser"));
     assert.equal(harness.minters[0]?.screenshotRequests.length, 0);
   } finally {
+    await harness.stop();
+  }
+});
+
+test("a screenshot request is answered while the only worker is minting", async () => {
+  let release: (() => void) | undefined;
+  const harness = createHarness();
+  try {
+    await tick();
+    harness.welcome();
+    // Bind the worker to a proxy, then leave it inside its mint loop — that is
+    // the state a repeatedly failing minter is in when the admin asks for a shot.
+    harness.push({ type: "mint.request", id: "m1", count: 1, deadlineMs: Date.now() + 60_000 });
+    await tick();
+    const lease = harness.socket.last("proxy.lease");
+    harness.minters[0]!.proxyUrl = "http://1.2.3.4:8080";
+    harness.minters[0]!.blockMint = new Promise<void>((resolve) => { release = resolve; });
+    harness.push({
+      type: "proxy.leased",
+      id: lease!.id,
+      leaseId: "L1",
+      proxyId: "P1",
+      proxyUrl: "http://1.2.3.4:8080",
+      kind: "http",
+      expiresAt: Date.now() + 120_000,
+    });
+    await tick();
+
+    harness.push({ type: "browser.screenshot.request", id: "s1", kind: "page" });
+    await tick();
+    const reply = harness.socket.last("browser.screenshot.reply");
+    assert.equal(reply?.ok, true);
+    assert.equal(reply?.pngBase64, "aW1n");
+  } finally {
+    release?.();
     await harness.stop();
   }
 });

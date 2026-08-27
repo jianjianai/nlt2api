@@ -54,7 +54,14 @@ const LINUX_BROWSER_CANDIDATES = [
 ];
 
 const CHALLENGE_ORIGIN = "https://deepinfra.com/";
-const DOCUMENT_PATTERN = "https://deepinfra.com/*";
+/**
+ * Every request must pass through the Fetch domain, not just the document:
+ * Chrome cannot take credentials from --proxy-server, so a 407 on ANY request
+ * has to be answered over Fetch.authRequired. With a narrow pattern the
+ * Turnstile script on challenges.cloudflare.com never authenticates and the
+ * page stays without `window.turnstile` (mint fails with page_not_ready).
+ */
+const INTERCEPT_PATTERN = "*";
 
 /**
  * Resolves the browser binary. A configured path that does not exist falls back
@@ -210,41 +217,56 @@ export class MinterBrowser {
     const page = await this.ensurePage();
     if (!page.webSocketDebuggerUrl) throw new MintError("cdp_unreachable", "The page target is not attachable.");
     const session = await CdpSession.open(page.webSocketDebuggerUrl);
-    await session.send("Page.enable");
-    // handleAuthRequests lets Fetch.authRequired answer HTTP proxy auth, which
-    // Chrome cannot take from the --proxy-server URL.
-    await session.send("Fetch.enable", {
-      patterns: [{ urlPattern: DOCUMENT_PATTERN, requestStage: "Request" }],
-      handleAuthRequests: true,
-    });
-    const body = trapPageBase64(this.siteKey);
-    session.watch({
-      onPaused: (request) => {
-        // Replace the first HTML document; let sub-resources through untouched.
-        if (request.url.startsWith("https://deepinfra.com/") && !request.url.includes("/api/")) {
-          session.post("Fetch.fulfillRequest", {
-            requestId: request.requestId,
-            responseCode: 200,
-            responseHeaders: [{ name: "Content-Type", value: "text/html; charset=utf-8" }],
-            body,
-          });
-          return;
-        }
-        session.post("Fetch.continueRequest", { requestId: request.requestId });
-      },
-      onAuthRequired: (event) => {
-        const target = this.target;
-        session.post("Fetch.continueWithAuth", {
-          requestId: event.requestId,
-          authChallengeResponse: target?.username
-            ? { response: "ProvideCredentials", username: target.username, password: target.password ?? "" }
-            : { response: "Default" },
-        });
-      },
-    });
-    await session.send("Page.navigate", { url: CHALLENGE_ORIGIN });
-    await this.waitForTrapPage(session);
+    // Published before the readiness wait so a page stuck loading is still
+    // visible to the admin screenshot — that is exactly when it is needed.
     this.session = session;
+    try {
+      await session.send("Page.enable");
+      // handleAuthRequests lets Fetch.authRequired answer HTTP proxy auth, which
+      // Chrome cannot take from the --proxy-server URL.
+      await session.send("Fetch.enable", {
+        patterns: [{ urlPattern: INTERCEPT_PATTERN, requestStage: "Request" }],
+        handleAuthRequests: true,
+      });
+      const body = trapPageBase64(this.siteKey);
+      session.watch({
+        onPaused: (request) => {
+          // Replace only the top-level document; sub-resources (including the
+          // Turnstile script) must pass through untouched.
+          if (
+            (request.resourceType === undefined || request.resourceType === "Document")
+            && request.url.startsWith("https://deepinfra.com/")
+            && !request.url.includes("/api/")
+          ) {
+            session.post("Fetch.fulfillRequest", {
+              requestId: request.requestId,
+              responseCode: 200,
+              responseHeaders: [{ name: "Content-Type", value: "text/html; charset=utf-8" }],
+              body,
+            });
+            return;
+          }
+          session.post("Fetch.continueRequest", { requestId: request.requestId });
+        },
+        onAuthRequired: (event) => {
+          const target = this.target;
+          session.post("Fetch.continueWithAuth", {
+            requestId: event.requestId,
+            authChallengeResponse: target?.username
+              ? { response: "ProvideCredentials", username: target.username, password: target.password ?? "" }
+              : { response: "Default" },
+          });
+        },
+      });
+      await session.send("Page.navigate", { url: CHALLENGE_ORIGIN });
+      await this.waitForTrapPage(session);
+    } catch (error) {
+      // Without this the socket would stay attached to the page with its Fetch
+      // handlers live, and every retry would stack another interceptor on it.
+      this.session = undefined;
+      session.close();
+      throw error;
+    }
     return session;
   }
 
