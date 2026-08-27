@@ -1,4 +1,5 @@
 import { defineHandler } from "nitro";
+import { sessionIdFromHeaders } from "~/server/utils/affinity.ts";
 import { toHttpError } from "~/server/utils/error-mapping.ts";
 import { openAIErrorResponse, readJsonObject, requireClientAuth } from "~/server/utils/http.ts";
 import { validateChatRequest } from "~/server/utils/forward-service.ts";
@@ -13,7 +14,8 @@ export default defineHandler(async (event) => {
     requireClientAuth(event.req);
     const body = await readJsonObject(event.req);
     const { stream } = validateChatRequest(body);
-    const upstream = await gatewayRuntime().forward.chat(body, event.req.signal);
+    const sessionId = sessionIdFromHeaders(event.req.headers);
+    const upstream = await gatewayRuntime().forward.chat(body, event.req.signal, sessionId);
 
     const headers = new Headers({
       "Cache-Control": "no-store",

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { conversationKey } from "~/server/utils/affinity.ts";
+import { conversationKey, sessionIdFromHeaders } from "~/server/utils/affinity.ts";
 import { ForwardService } from "~/server/utils/forward-service.ts";
 import { UpstreamError } from "~/server/utils/upstream-http.ts";
 import { upstreamErrorFrom } from "~/server/utils/upstream.ts";
@@ -47,6 +47,47 @@ test("a conversation keeps its key as turns are appended", () => {
   assert.notEqual(first, conversationKey({ ...turn("hello"), user: "bob" }));
   assert.equal(conversationKey({ model: "m", messages: [] }), undefined);
   assert.equal(conversationKey({ model: "m" }), undefined);
+});
+
+test("an explicit session id takes precedence over the message head", () => {
+  const pinned = conversationKey(turn("hello"), "sess-1");
+  assert.ok(pinned);
+  // The same id keys the same conversation even when the history diverges.
+  assert.equal(pinned, conversationKey(turn("completely different"), "sess-1"));
+  // A different id is a different conversation despite an identical history.
+  assert.notEqual(pinned, conversationKey(turn("hello"), "sess-2"));
+  // The head-derived key must not collide with an id-derived one.
+  assert.notEqual(pinned, conversationKey(turn("hello")));
+  // Two callers cannot share a pin by reusing an id.
+  assert.notEqual(pinned, conversationKey({ ...turn("hello"), user: "bob" }, "sess-1"));
+  // An id is enough on its own; no messages are needed.
+  assert.ok(conversationKey({ model: "m" }, "sess-1"));
+});
+
+test("a session id in the body works when headers are unavailable", () => {
+  const fromHeader = conversationKey(turn("hello"), "sess-1");
+  assert.equal(conversationKey({ ...turn("hello"), session_id: "sess-1" }), fromHeader);
+  assert.equal(conversationKey({ ...turn("hello"), conversation_id: "sess-1" }), fromHeader);
+  assert.equal(conversationKey({ ...turn("hello"), metadata: { chat_id: "sess-1" } }), fromHeader);
+  // The header wins over a body field so a proxy cannot be overridden by payload.
+  assert.equal(conversationKey({ ...turn("hello"), session_id: "sess-2" }, "sess-1"), fromHeader);
+});
+
+test("unusable session ids fall back to the message head", () => {
+  const head = conversationKey(turn("hello"));
+  assert.equal(conversationKey(turn("hello"), "   "), head);
+  assert.equal(conversationKey(turn("hello"), "x".repeat(201)), head);
+  assert.equal(conversationKey({ ...turn("hello"), session_id: 42 as never }), head);
+});
+
+test("session ids are read from the accepted headers only", () => {
+  assert.equal(sessionIdFromHeaders(new Headers({ "x-session-id": " sess-1 " })), "sess-1");
+  assert.equal(sessionIdFromHeaders(new Headers({ "x-conversation-id": "sess-2" })), "sess-2");
+  assert.equal(sessionIdFromHeaders(new Headers({ "x-chat-id": "sess-3" })), "sess-3");
+  // x-session-id is preferred when several are present.
+  assert.equal(sessionIdFromHeaders(new Headers({ "x-chat-id": "sess-3", "x-session-id": "sess-1" })), "sess-1");
+  assert.equal(sessionIdFromHeaders(new Headers({ "x-other": "sess-1" })), undefined);
+  assert.equal(sessionIdFromHeaders(new Headers()), undefined);
 });
 
 test("affinity expires and can be disabled outright", () => {
@@ -212,8 +253,39 @@ test("a continuation reuses the egress its first turn was served from", async ()
   }
 });
 
-test("a rate limit on the pinned egress drops the pin", async () => {
+test("a session id pins the egress even when the history changes", async () => {
   const harness = createHarness();
+  try {
+    seedTicket(harness, "1.a", "http://1.1.1.1:8080");
+    seedTicket(harness, "1.b", "http://2.2.2.2:8080");
+    const seen: string[] = [];
+    const forward = new ForwardService({
+      settings: harness.settings,
+      proxies: harness.proxies,
+      tickets: harness.tickets,
+      queue: harness.queue,
+      demand: harness.demand,
+      affinity: harness.affinity,
+      chat: async (options) => {
+        seen.push(options.ticket.proxyId);
+        return new Response("{}", { status: 200 });
+      },
+    });
+    await forward.chat(turn("hello"), undefined, "sess-1");
+    const pinned = seen[0]!;
+    seedTicket(harness, "1.c", "http://1.1.1.1:8080");
+    seedTicket(harness, "1.d", "http://2.2.2.2:8080");
+    harness.proxies.markUsed(pinned);
+    harness.advance(1_000);
+    // A trimmed history would break head-based keying; the id still pins it.
+    await forward.chat(turn("a totally different opening"), undefined, "sess-1");
+    assert.equal(seen[1], pinned);
+  } finally {
+    harness.close();
+  }
+});
+
+test("a rate limit on the pinned egress drops the pin", async () => {  const harness = createHarness();
   try {
     seedTicket(harness, "1.a", "http://1.1.1.1:8080");
     seedTicket(harness, "1.b", "http://2.2.2.2:8080");

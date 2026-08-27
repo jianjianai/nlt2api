@@ -51,12 +51,12 @@ export class ForwardService {
    * A continuation of a known conversation prefers the egress it started on;
    * a new one takes whichever egress has been idle longest.
    */
-  async chat(request: JsonObject, signal?: AbortSignal): Promise<Response> {
+  async chat(request: JsonObject, signal?: AbortSignal, sessionId?: string): Promise<Response> {
     const { settings, proxies, tickets, queue, demand, affinity } = this.dependencies;
     const chat = this.dependencies.chat ?? chatCompletions;
     const config = settings.get();
     demand.touch();
-    const key = conversationKey(request);
+    const key = conversationKey(request, sessionId);
     let lastError: unknown;
 
     for (let attempt = 1; attempt <= config.maxAttempts; attempt += 1) {

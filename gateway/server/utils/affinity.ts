@@ -4,34 +4,76 @@ import type { JsonObject, JsonValue } from "~/server/utils/types.ts";
 
 /** Beyond this the map is trimmed oldest-first; it is a memory bound, not a policy. */
 const MAX_ENTRIES = 20_000;
+/** Anything longer is a client bug or an attempt to bloat the map; ignore it. */
+const MAX_SESSION_ID_LENGTH = 200;
+
+/** Headers clients use to name a conversation, in order of preference. */
+const SESSION_HEADERS = ["x-session-id", "x-conversation-id", "x-chat-id"];
+/** Equivalent body fields, for clients that cannot set headers. */
+const SESSION_FIELDS = ["session_id", "conversation_id", "chat_id"];
 
 interface Entry {
   proxyId: string;
   at: number;
 }
 
+function usableId(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const trimmed = value.trim();
+  return trimmed && trimmed.length <= MAX_SESSION_ID_LENGTH ? trimmed : undefined;
+}
+
+/** Reads an explicit conversation id from the request headers, if the client sent one. */
+export function sessionIdFromHeaders(headers: Headers): string | undefined {
+  for (const name of SESSION_HEADERS) {
+    const value = usableId(headers.get(name));
+    if (value) return value;
+  }
+  return undefined;
+}
+
+function sessionIdFromBody(request: JsonObject): string | undefined {
+  for (const field of SESSION_FIELDS) {
+    const value = usableId(request[field]);
+    if (value) return value;
+  }
+  const metadata = request.metadata;
+  if (metadata && typeof metadata === "object" && !Array.isArray(metadata)) {
+    for (const field of SESSION_FIELDS) {
+      const value = usableId((metadata as JsonObject)[field]);
+      if (value) return value;
+    }
+  }
+  return undefined;
+}
+
 /**
  * Stable identifier for the conversation a request belongs to.
  *
- * OpenAI-compatible clients resend the whole history every turn, so the *head*
- * of the message list — the system messages plus the first user message — is
- * identical across all turns of one conversation while differing between
- * conversations. Keying on the head is therefore stable without asking the
- * client for a session id. The optional `user` field is mixed in when present so
- * two callers opening with the same words do not collide.
+ * An explicit id from the client wins: it is exact, survives history trimming,
+ * and keeps working when a client edits earlier turns. Absent one, the *head* of
+ * the message list — the system messages plus the first user message — is used
+ * instead, because OpenAI-compatible clients resend the whole history every turn,
+ * so the head is identical across all turns of one conversation while differing
+ * between conversations. Either way the `user` field is mixed in when present, so
+ * two callers cannot share a pin by reusing an id or an opening line.
  */
-export function conversationKey(request: JsonObject): string | undefined {
-  const messages = request.messages;
-  if (!Array.isArray(messages) || messages.length === 0) return undefined;
-  const firstUser = messages.findIndex((message) => (
-    Boolean(message) && typeof message === "object" && !Array.isArray(message)
-      && (message as JsonObject).role === "user"
-  ));
-  const head = messages.slice(0, firstUser >= 0 ? firstUser + 1 : messages.length);
-  const material: JsonValue = {
-    ...(typeof request.user === "string" && request.user ? { user: request.user } : {}),
-    head: head as JsonValue,
-  };
+export function conversationKey(request: JsonObject, sessionId?: string): string | undefined {
+  const explicit = usableId(sessionId) ?? sessionIdFromBody(request);
+  const user = usableId(request.user);
+  let material: JsonValue;
+  if (explicit) {
+    material = { kind: "session", id: explicit, ...(user ? { user } : {}) };
+  } else {
+    const messages = request.messages;
+    if (!Array.isArray(messages) || messages.length === 0) return undefined;
+    const firstUser = messages.findIndex((message) => (
+      Boolean(message) && typeof message === "object" && !Array.isArray(message)
+        && (message as JsonObject).role === "user"
+    ));
+    const head = messages.slice(0, firstUser >= 0 ? firstUser + 1 : messages.length);
+    material = { kind: "head", head: head as JsonValue, ...(user ? { user } : {}) };
+  }
   return createHash("sha256").update(JSON.stringify(material)).digest("hex").slice(0, 32);
 }
 
