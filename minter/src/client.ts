@@ -17,6 +17,7 @@ import {
 /** Injection seam so tests can drive the client without a real browser. */
 export interface Minter {
   mint(proxyUrl: string): Promise<MintResult>;
+  screenshot(kind: "page" | "fullpage"): Promise<string>;
   setSiteKey(siteKey: string): void;
   close(): Promise<void>;
   readonly proxyUrl: string | undefined;
@@ -253,6 +254,25 @@ export class MinterClient {
       case "ticket.rejected":
         this.log(`gateway rejected a ticket: ${message.reason}`);
         return;
+      case "browser.screenshot.request":
+        void this.handleScreenshotRequest(message.id, message.kind);
+        return;
+    }
+  }
+
+  /** Answers the admin console's screenshot probe from an idle worker. */
+  private async handleScreenshotRequest(id: string, kind: "page" | "fullpage"): Promise<void> {
+    const worker = this.workers.find((candidate) => !candidate.busy && candidate.minter.proxyUrl);
+    if (!worker) {
+      this.send({ type: "browser.screenshot.reply", id, ok: false, error: "no resident browser available" });
+      return;
+    }
+    try {
+      const pngBase64 = await worker.minter.screenshot(kind);
+      this.send({ type: "browser.screenshot.reply", id, ok: true, pngBase64 });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.send({ type: "browser.screenshot.reply", id, ok: false, error: message.slice(0, 512) });
     }
   }
 

@@ -350,3 +350,30 @@ test("disconnectSession kicks an online minter", () => {
     harness.close();
   }
 });
+
+test("requestScreenshot forwards the request and resolves with the reply", async () => {
+  const harness = createHarness();
+  try {
+    const hub = createHub(harness);
+    const peer = connect(hub);
+    const sessionId = String(peer.last("welcome")?.sessionId);
+
+    const promise = hub.requestScreenshot(sessionId, "page");
+    assert.equal(peer.last("browser.screenshot.request")?.kind, "page");
+
+    hub.message(peer, JSON.stringify({ type: "browser.screenshot.reply", id: String(peer.last("browser.screenshot.request")?.id), ok: true, pngBase64: "cG5n" }));
+    assert.equal(await promise, "cG5n");
+  } finally {
+    harness.close();
+  }
+});
+
+test("requestScreenshot rejects for an unknown session", async () => {
+  const harness = createHarness();
+  try {
+    const hub = createHub(harness);
+    await assert.rejects(() => hub.requestScreenshot("missing", "page"), /No online authorization service/);
+  } finally {
+    harness.close();
+  }
+});

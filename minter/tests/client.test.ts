@@ -37,6 +37,7 @@ class FakeMinter implements Minter {
   siteKey = "0xINITIAL";
   readonly calls: string[] = [];
   closed = false;
+  screenshotRequests: string[] = [];
   private counter = 0;
 
   constructor(private readonly behaviour: (call: number) => void = () => {}) {}
@@ -47,6 +48,11 @@ class FakeMinter implements Minter {
     this.proxyUrl = proxyUrl;
     this.behaviour(this.counter);
     return { token: `token-${this.counter}`, mintedAt: 1_700_000_000_000, userAgent: "UA/1.0" };
+  }
+
+  async screenshot(kind: "page" | "fullpage"): Promise<string> {
+    this.screenshotRequests.push(kind);
+    return "aW1n";
   }
 
   setSiteKey(siteKey: string): void {
@@ -222,6 +228,56 @@ test("proxy.unavailable ends the attempt without a failure report", async () => 
     assert.equal(harness.socket.last("ticket.submit"), undefined);
     assert.equal(harness.socket.last("mint.failed"), undefined);
     assert.equal(harness.minters[0]?.calls.length, 0);
+  } finally {
+    await harness.stop();
+  }
+});
+
+test("a screenshot request is answered from an idle worker", async () => {
+  const harness = createHarness();
+  try {
+    await tick();
+    harness.welcome();
+    // Bind a worker to a proxy first so the browser counts as resident.
+    harness.push({ type: "mint.request", id: "m1", count: 1, deadlineMs: Date.now() + 60_000 });
+    await tick();
+    const lease = harness.socket.last("proxy.lease");
+    harness.push({
+      type: "proxy.leased",
+      id: lease!.id,
+      leaseId: "L1",
+      proxyId: "P1",
+      proxyUrl: "http://1.2.3.4:8080",
+      kind: "http",
+      expiresAt: Date.now() + 120_000,
+    });
+    await tick();
+    await tick();
+
+    harness.push({ type: "browser.screenshot.request", id: "s1", kind: "page" });
+    await tick();
+    const reply = harness.socket.last("browser.screenshot.reply");
+    assert.equal(reply?.id, "s1");
+    assert.equal(reply?.ok, true);
+    assert.equal(reply?.pngBase64, "aW1n");
+    assert.deepEqual(harness.minters[0]?.screenshotRequests, ["page"]);
+  } finally {
+    await harness.stop();
+  }
+});
+
+test("a screenshot request without a resident browser fails cleanly", async () => {
+  const harness = createHarness();
+  try {
+    await tick();
+    harness.welcome();
+    harness.push({ type: "browser.screenshot.request", id: "s1", kind: "fullpage" });
+    await tick();
+    const reply = harness.socket.last("browser.screenshot.reply");
+    assert.equal(reply?.id, "s1");
+    assert.equal(reply?.ok, false);
+    assert.ok(String(reply?.error).includes("no resident browser"));
+    assert.equal(harness.minters[0]?.screenshotRequests.length, 0);
   } finally {
     await harness.stop();
   }

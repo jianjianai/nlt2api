@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed } from "vue";
+import AppDialog from "./ui/AppDialog.vue";
 import AppIcon from "./ui/AppIcon.vue";
 import type { MinterSessionPublic } from "../types/admin.ts";
 import { formatRelative, formatTime } from "../utils/admin-ui.ts";
@@ -10,12 +11,25 @@ const props = defineProps<{
   inflight: number;
   busyIds: Set<string>;
   now: number;
+  screenshotOpen: boolean;
+  screenshotKind: "page" | "fullpage";
+  screenshotBusy: boolean;
+  screenshotError: string | null;
+  screenshotImage: string | null;
 }>();
 
-const emit = defineEmits<{ disconnect: [session: MinterSessionPublic] }>();
+const emit = defineEmits<{
+  disconnect: [session: MinterSessionPublic];
+  screenshot: [session: MinterSessionPublic, kind: "page" | "fullpage"];
+  "close-screenshot": [];
+}>();
 
 const onlineSessions = computed(() => props.sessions.filter((session) => session.online));
 const offlineSessions = computed(() => props.sessions.filter((session) => !session.online));
+
+function requestScreenshot(session: MinterSessionPublic, kind: "page" | "fullpage"): void {
+  emit("screenshot", session, kind);
+}
 </script>
 
 <template>
@@ -65,6 +79,9 @@ const offlineSessions = computed(() => props.sessions.filter((session) => !sessi
             <div v-if="session.lastError"><dt>最近错误</dt><dd>{{ session.lastError }}</dd></div>
           </dl>
           <footer>
+            <button class="text-button" type="button" :disabled="busyIds.has(session.id)" @click="requestScreenshot(session, 'page')">
+              <AppIcon name="camera" :size="14" />查看截图
+            </button>
             <button class="text-button danger" type="button" :disabled="busyIds.has(session.id)" @click="emit('disconnect', session)">
               <AppIcon name="log-out" :size="14" />断开
             </button>
@@ -86,5 +103,29 @@ const offlineSessions = computed(() => props.sessions.filter((session) => !sessi
         </div>
       </div>
     </section>
+
+    <AppDialog
+      :open="screenshotOpen"
+      :title="`浏览器截图`"
+      :description="screenshotKind === 'fullpage' ? '授权服务常驻浏览器（整页）' : '授权服务常驻浏览器（当前视口）'"
+      :busy="screenshotBusy"
+      wide
+      @update:open="(open) => { if (!open) emit('close-screenshot') }"
+    >
+      <div class="screenshot-panel">
+        <div class="screenshot-actions">
+          <button class="text-button" type="button" :disabled="screenshotBusy" @click="requestScreenshot(sessions.find((s) => s.online)!, 'page')">
+            <AppIcon name="camera" :size="14" />当前视口
+          </button>
+          <button class="text-button" type="button" :disabled="screenshotBusy" @click="requestScreenshot(sessions.find((s) => s.online)!, 'fullpage')">
+            <AppIcon name="camera" :size="14" />整页
+          </button>
+        </div>
+        <p v-if="screenshotError" class="screenshot-error">{{ screenshotError }}</p>
+        <p v-else-if="screenshotBusy" class="muted">等待授权服务返回截图…</p>
+        <p v-else-if="!screenshotImage" class="muted">点击「当前视口」或「整页」抓取授权服务浏览器的画面。</p>
+        <img v-else class="screenshot-image" :src="`data:image/png;base64,${screenshotImage}`" alt="授权服务浏览器截图" />
+      </div>
+    </AppDialog>
   </section>
 </template>

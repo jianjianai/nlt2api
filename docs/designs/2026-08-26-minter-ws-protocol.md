@@ -213,6 +213,36 @@ type MintFailureReason =
 
 gateway 处理：`failed_count+1`；若 `reason` 属于代理归因组则按 §4.3 的失败规则更新代理状态；释放 lease（若有）；减少 inflight 计数。
 
+### 4.9 `browser.screenshot.request` / `browser.screenshot.reply`
+
+用于管理后台「查看授权服务浏览器截图」：gateway 向 minter 请求一张常见浏览器（resident worker）当前页面的 PNG 截图，minter 返回 base64 图片。
+
+```ts
+// gateway → minter
+{
+  type: "browser.screenshot.request",
+  id: string,          // 请求方生成的 UUID
+  kind: "page" | "fullpage",
+}
+
+// minter → gateway（对 id 回执）
+{
+  type: "browser.screenshot.reply",
+  id: string,
+  ok: boolean,
+  pngBase64?: string,  // ok=true 时携带，data URI 的 base64 部分（PNG）
+  error?: string,      // ok=false 时携带，≤512 字符
+}
+```
+
+约束：
+
+- `id` 与 `kind` 在 gateway 侧受限字符串校验（`kind` 仅允许 `page` / `fullpage`）；`pngBase64` 上限 `MAX_TOKEN_LENGTH × 8`（与 token 长度同级的合理上限，超出视为非法载荷）。
+- minter 从**空闲**（未在铸票）且持有常驻浏览器的 worker 中选一台执行 `Page.captureScreenshot`；没有空闲 worker 时回 `ok:false, error:"browser_missing"`。
+- `kind=fullpage` 时 `captureBeyondViewport: true` 截整页，否则只截视口。
+- 截图请求**不占 lease**、不影响任何铸票统计，仅用于诊断。
+- gateway 侧 `requestScreenshot` 默认 15s 超时：连接断开回 404、超时回 504、minter 回执失败回 502。
+
 ## 5. 时序示例
 
 ```mermaid

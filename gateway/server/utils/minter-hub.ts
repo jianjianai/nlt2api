@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
 import { getGatewayConfig } from "~/server/utils/config.ts";
 import { allRows } from "~/server/utils/database.ts";
+import { HttpError } from "~/server/utils/http.ts";
 import { redactProxyUrls } from "~/server/utils/proxy.ts";
 import type { ProxyPoolService } from "~/server/utils/proxy-pool.ts";
 import type { SettingsStore } from "~/server/utils/settings.ts";
@@ -19,6 +20,7 @@ import {
   parseMinterMessage,
   type GatewayToMinter,
   type HelloMessage,
+  type ScreenshotReplyMessage,
 } from "~/server/utils/minter-protocol.ts";
 import type { MinterSessionPublic, MinterSessionRecord } from "~/server/utils/types.ts";
 
@@ -36,6 +38,8 @@ interface Connection {
   concurrency: number;
   leases: Set<string>;
   inflight: Map<string, ReturnType<typeof setTimeout>>;
+  /** Screenshot requests awaiting their reply, keyed by request id. */
+  pendingScreenshots: Map<string, (reply: ScreenshotReplyMessage) => void>;
   lastSeenAt: number;
   violations: number;
   helloTimer?: ReturnType<typeof setTimeout>;
@@ -119,6 +123,7 @@ export class MinterHub {
       concurrency: 1,
       leases: new Set(),
       inflight: new Map(),
+      pendingScreenshots: new Map(),
       lastSeenAt: this.now(),
       violations: 0,
     };
@@ -141,6 +146,7 @@ export class MinterHub {
       this.db.prepare("UPDATE minter_sessions SET disconnected_at = ?, last_seen_at = ? WHERE id = ?")
         .run(this.now(), this.now(), connection.sessionId);
     }
+    this.rejectPendingScreenshots(connection.sessionId);
     this.connections.delete(peer);
   }
 
@@ -183,6 +189,9 @@ export class MinterHub {
         return;
       case "mint.failed":
         this.handleFailure(connection, message.id, message.reason, message.leaseId, message.message);
+        return;
+      case "browser.screenshot.reply":
+        this.handleScreenshotReply(connection, message);
         return;
     }
   }
@@ -406,6 +415,54 @@ export class MinterHub {
       }
     }
     return false;
+  }
+
+  /**
+   * Asks one online minter for a screenshot of its resident browser. Resolves
+   * with the base64 PNG, or throws a descriptive HttpError on any failure.
+   */
+  requestScreenshot(
+    sessionId: string,
+    kind: "page" | "fullpage",
+    timeoutMs = 15_000,
+  ): Promise<string> {
+    const connection = [...this.connections.values()].find((candidate) => candidate.sessionId === sessionId);
+    if (!connection) {
+      return Promise.reject(new HttpError(404, "No online authorization service with that session id.", "invalid_request_error", "id", "session_not_found"));
+    }
+    return new Promise<string>((resolve, reject) => {
+      const id = randomUUID();
+      const timer = setTimeout(() => {
+        connection.pendingScreenshots.delete(id);
+        reject(new HttpError(504, "The authorization service did not answer the screenshot request in time.", "server_error", undefined, "screenshot_timeout"));
+      }, timeoutMs);
+      timer.unref?.();
+      connection.pendingScreenshots.set(id, (reply) => {
+        clearTimeout(timer);
+        connection.pendingScreenshots.delete(id);
+        if (reply.ok && reply.pngBase64) resolve(reply.pngBase64);
+        else reject(new HttpError(502, reply.error ?? "The authorization service failed to capture a screenshot.", "server_error", undefined, "screenshot_failed"));
+      });
+      this.send(connection, { type: "browser.screenshot.request", id, kind });
+    });
+  }
+
+  private handleScreenshotReply(connection: Connection, reply: ScreenshotReplyMessage): void {
+    const settle = connection.pendingScreenshots.get(reply.id);
+    if (!settle) return;
+    connection.pendingScreenshots.delete(reply.id);
+    settle(reply);
+  }
+
+  private rejectPendingScreenshots(sessionId: string | undefined): void {
+    if (!sessionId) return;
+    for (const connection of this.connections.values()) {
+      if (connection.sessionId !== sessionId) continue;
+      for (const settle of connection.pendingScreenshots.values()) {
+        settle({ type: "browser.screenshot.reply", id: "", ok: false, error: "connection closed" });
+      }
+      connection.pendingScreenshots.clear();
+    }
   }
 
   onlineCount(): number {

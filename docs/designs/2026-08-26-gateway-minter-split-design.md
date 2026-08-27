@@ -253,6 +253,7 @@ Admin API：
 | DELETE | `/api/admin/tickets` | 清空凭证池 |
 | GET | `/api/admin/minters` | 在线授权服务列表 + 最近离线会话 |
 | POST | `/api/admin/minters/:id/disconnect` | 踢下线 |
+| POST | `/api/admin/minters/:id/screenshot` | 请求该授权服务常驻浏览器截图（body `kind: page \| fullpage`），返回 `{pngBase64}` |
 | GET/PATCH | `/api/admin/settings` | 读写运行参数（见 §4.8） |
 
 UI 四个工作区（沿用旧 `WorkspaceShell` 布局与 CSS）：
@@ -260,7 +261,7 @@ UI 四个工作区（沿用旧 `WorkspaceShell` 布局与 CSS）：
 - **概览**：三态代理计数、凭证水位仪表、在线授权服务数、最近 5 分钟铸票成功/失败。
 - **代理池**：状态筛选、导入、批量/单条重测、删除、掩码 URL、延迟、失败次数、`retry_after` 倒计时。
 - **凭证对池**：`(掩码代理, 掩码 token, 剩余秒数, 铸造者)` 列表，剩余时间实时倒计时，清空按钮。
-- **授权服务**：在线列表（agent_id、标签、平台、并发、已铸/失败计数、最后心跳、远端地址）、踢下线、离线历史。
+- **授权服务**：在线列表（agent_id、标签、平台、并发、已铸/失败计数、最后心跳、远端地址）、踢下线、「查看截图」（从空闲且持有常驻浏览器的 worker 取视口/整页 PNG 弹窗展示，15s 超时）、离线历史。
 - **设置**：§4.8 全部参数。
 
 `GATEWAY_API_KEY`、`GATEWAY_ADMIN_TOKEN`、`MINTER_TOKEN` 只显示「已配置/未配置」，绝不回显明文。代理 URL 与 token 在所有 API 响应中掩码（`maskProxyUrl` / token 只留前 8 位）。
@@ -389,7 +390,7 @@ WebSocket 协议规格独立成文：`docs/designs/2026-08-26-minter-ws-protocol
 
 - 端点 `GET /ws/minter`，`upgrade` 钩子里用常量时间比较校验 `Authorization: Bearer <MINTER_TOKEN>`（Node WS 客户端可设请求头；浏览器不需要连这个端点），失败抛 401。
 - 全部消息为 JSON 文本帧，形如 `{ "type": "...", "id"?: "...", ... }`。
-- 由 gateway 主动 push 任务（`mint.request`），由 minter 主动拉资源（`proxy.lease`）与回传结果（`ticket.submit` / `mint.failed`）。
+- 由 gateway 主动 push 任务（`mint.request`、`browser.screenshot.request`），由 minter 主动拉资源（`proxy.lease`）与回传结果（`ticket.submit` / `mint.failed` / `browser.screenshot.reply`）。
 
 ## 7. 安全边界
 

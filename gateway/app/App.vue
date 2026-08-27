@@ -71,6 +71,13 @@ const pendingTicketClear = ref(false);
 const autoRefresh = ref(true);
 const currentTime = ref(Date.now());
 
+/** Screenshot dialog state for the minters workspace; App owns the API call. */
+const screenshotSession = shallowRef<MinterSessionPublic | null>(null);
+const screenshotKind = ref<"page" | "fullpage">("page");
+const screenshotBusy = ref(false);
+const screenshotError = ref<string | null>(null);
+const screenshotImage = ref<string | null>(null);
+
 interface ToastItem { id: number; kind: "success" | "error"; text: string }
 const toasts = ref<ToastItem[]>([]);
 let toastSeq = 0;
@@ -294,6 +301,41 @@ async function disconnectMinter(session: MinterSessionPublic): Promise<void> {
   }
 }
 
+function openScreenshot(session: MinterSessionPublic, kind: "page" | "fullpage"): void {
+  screenshotSession.value = session;
+  screenshotKind.value = kind;
+  screenshotBusy.value = true;
+  screenshotError.value = null;
+  screenshotImage.value = null;
+  void captureScreenshot(session, kind);
+}
+
+async function captureScreenshot(session: MinterSessionPublic, kind: "page" | "fullpage"): Promise<void> {
+  screenshotSession.value = session;
+  screenshotKind.value = kind;
+  screenshotBusy.value = true;
+  screenshotError.value = null;
+  screenshotImage.value = null;
+  try {
+    const payload = await api<{ pngBase64: string }>(`/api/admin/minters/${session.id}/screenshot`, {
+      method: "POST",
+      body: JSON.stringify({ kind }),
+    });
+    screenshotImage.value = payload.pngBase64;
+  } catch (error) {
+    screenshotError.value = errorText(error, "截图失败。");
+  } finally {
+    screenshotBusy.value = false;
+  }
+}
+
+function closeScreenshot(): void {
+  if (screenshotBusy.value) return;
+  screenshotSession.value = null;
+  screenshotError.value = null;
+  screenshotImage.value = null;
+}
+
 const settingsDirty = computed(() => {
   const draft = settingsDraft.value;
   const saved = settings.value;
@@ -453,7 +495,14 @@ onUnmounted(() => {
         :inflight="minterInflight"
         :busy-ids="busyMinterIds"
         :now="currentTime"
+        :screenshot-open="Boolean(screenshotSession)"
+        :screenshot-kind="screenshotKind"
+        :screenshot-busy="screenshotBusy"
+        :screenshot-error="screenshotError"
+        :screenshot-image="screenshotImage"
         @disconnect="disconnectMinter"
+        @screenshot="openScreenshot"
+        @close-screenshot="closeScreenshot"
       />
 
       <SettingsWorkspace

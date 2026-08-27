@@ -300,6 +300,11 @@ pre { max-height: 520px; margin: 0; overflow: auto; border: 1px solid var(--line
 .modal { width: min(100%, 500px); max-height: calc(100vh - 40px); overflow: auto; border: 1px solid var(--line); border-radius: 10px; background: var(--paper, #fff); box-shadow: var(--shadow-lg); padding: 24px; animation: modal-in .18s ease; }
 .modal[data-state="closed"] { animation: modal-out .12s ease; }
 .modal-wide { width: min(100%, 660px); }
+
+.screenshot-panel { display: grid; gap: 12px; }
+.screenshot-actions { display: flex; gap: 8px; }
+.screenshot-image { max-width: 100%; max-height: 70vh; border: 1px solid var(--line); border-radius: 8px; background: #fff; }
+.screenshot-error { margin: 0; color: var(--danger, #b3261e); font-size: 12.5px; line-height: 1.5; }
 .modal-form { display: contents; }
 .modal-confirm { width: min(100%, 420px); }
 .modal-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 10px; }

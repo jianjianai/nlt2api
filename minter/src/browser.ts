@@ -312,6 +312,26 @@ export class MinterBrowser {
     this.killProcess();
   }
 
+  /**
+   * Captures the resident page for the admin console. Fails fast when the
+   * browser is idle-released or mid-restart: a diagnostic must not spawn or
+   * reload a browser, which would disturb the minting state machine.
+   */
+  async screenshot(kind: "page" | "fullpage"): Promise<string> {
+    if (!this.session || !this.boundProxyUrl) {
+      throw new MintError("browser_missing", "No resident browser is currently running.");
+    }
+    const result = await this.session.send("Page.captureScreenshot", {
+      format: "png",
+      captureBeyondViewport: kind === "fullpage",
+      fromSurface: true,
+    }) as { data?: string };
+    if (typeof result.data !== "string" || !result.data) {
+      throw new MintError("cdp_error", "The browser returned no screenshot data.");
+    }
+    return result.data;
+  }
+
   async close(): Promise<void> {
     this.cancelIdleRelease();
     this.dropSession();

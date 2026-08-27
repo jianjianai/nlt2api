@@ -65,6 +65,13 @@ export interface TicketRejectedMessage { type: "ticket.rejected"; id: string; re
 export interface PingMessage { type: "ping"; id: string }
 export interface PongMessage { type: "pong"; id: string }
 
+export interface ScreenshotRequestMessage {
+  type: "browser.screenshot.request";
+  id: string;
+  /** `page` captures the visible viewport; `fullpage` the whole document. */
+  kind: "page" | "fullpage";
+}
+
 export type GatewayMessage =
   | WelcomeMessage
   | MintRequestMessage
@@ -75,7 +82,8 @@ export type GatewayMessage =
   | TicketAcceptedMessage
   | TicketRejectedMessage
   | PingMessage
-  | PongMessage;
+  | PongMessage
+  | ScreenshotRequestMessage;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
@@ -162,6 +170,12 @@ export function parseGatewayMessage(raw: string): GatewayMessage | undefined {
       const id = str(payload.id);
       if (!id) return undefined;
       return { type: "ticket.rejected", id, reason: str(payload.reason) ?? "invalid_payload" };
+    }
+    case "browser.screenshot.request": {
+      const id = str(payload.id);
+      const kind = str(payload.kind);
+      if (!id || (kind !== "page" && kind !== "fullpage")) return undefined;
+      return { type: "browser.screenshot.request", id, kind };
     }
     case "ping":
     case "pong": {

@@ -2,6 +2,7 @@
  * Wire format for the gateway ↔ minter WebSocket link.
  * Spec: docs/designs/2026-08-26-minter-ws-protocol.md
  */
+import { randomUUID } from "node:crypto";
 
 export const MAX_FRAME_BYTES = 64 * 1024;
 export const HELLO_TIMEOUT_MS = 5_000;
@@ -124,6 +125,23 @@ export interface LeaseLostMessage {
 }
 export interface LeaseReleaseMessage { type: "lease.release"; leaseId: string }
 
+export interface ScreenshotRequestMessage {
+  type: "browser.screenshot.request";
+  id: string;
+  /** `page` captures the visible viewport; `fullpage` the whole document. */
+  kind: "page" | "fullpage";
+}
+
+export interface ScreenshotReplyMessage {
+  type: "browser.screenshot.reply";
+  id: string;
+  ok: boolean;
+  /** Base64-encoded PNG; present when ok is true. */
+  pngBase64?: string;
+  /** Failure detail; present when ok is false. */
+  error?: string;
+}
+
 export interface TicketSubmitMessage {
   type: "ticket.submit";
   id: string;
@@ -163,7 +181,8 @@ export type MinterToGateway =
   | LeaseExtendMessage
   | LeaseReleaseMessage
   | TicketSubmitMessage
-  | MintFailedMessage;
+  | MintFailedMessage
+  | ScreenshotReplyMessage;
 
 export type GatewayToMinter =
   | WelcomeMessage
@@ -175,7 +194,8 @@ export type GatewayToMinter =
   | LeaseExtendedMessage
   | LeaseLostMessage
   | TicketAcceptedMessage
-  | TicketRejectedMessage;
+  | TicketRejectedMessage
+  | ScreenshotRequestMessage;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
@@ -255,6 +275,16 @@ export function parseMinterMessage(raw: string): MinterToGateway | undefined {
         ...(message ? { message } : {}),
       };
     }
+    case "browser.screenshot.reply": {
+      const id = boundedString(payload.id, 64);
+      if (!id || typeof payload.ok !== "boolean") return undefined;
+      if (payload.ok) {
+        const pngBase64 = boundedString(payload.pngBase64, MAX_TOKEN_LENGTH * 8);
+        return pngBase64 ? { type: "browser.screenshot.reply", id, ok: true, pngBase64 } : undefined;
+      }
+      const error = boundedString(payload.error, 512);
+      return error ? { type: "browser.screenshot.reply", id, ok: false, error } : undefined;
+    }
     default:
       // Unknown types are ignored for forward compatibility, not treated as errors.
       return undefined;
@@ -267,8 +297,14 @@ export function isKnownMinterMessageType(raw: string): boolean {
     if (!isRecord(payload) || typeof payload.type !== "string") return false;
     return [
       "hello", "ping", "pong", "proxy.lease", "lease.extend", "lease.release", "ticket.submit", "mint.failed",
+      "browser.screenshot.reply",
     ].includes(payload.type);
   } catch {
     return false;
   }
+}
+
+/** Builds the framed screenshot request the gateway sends to a minter. */
+export function screenshotRequestMessage(kind: "page" | "fullpage", id = randomUUID()): string {
+  return JSON.stringify({ type: "browser.screenshot.request", id, kind });
 }
