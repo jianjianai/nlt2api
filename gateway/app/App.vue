@@ -255,7 +255,16 @@ async function checkProxy(proxy: ProxyPublic): Promise<void> {
   setBusy(busyProxyIds, proxy.id, true);
   try {
     const outcome = await api<CheckOutcome>(`/api/admin/proxies/${proxy.id}/check`, { method: "POST" });
-    pushToast(outcome.healthy > 0 ? "success" : "error", outcome.healthy > 0 ? "测活通过。" : "测活失败，已记录一次故障。");
+    const status = outcome.proxy?.status;
+    if (status === "active") {
+      pushToast("success", "测活通过，已转为活跃。");
+    } else if (status === "rejected") {
+      pushToast("error", `未达条件：${outcome.proxy?.rejectReason ?? "延迟或速度不达标"}。`);
+    } else if (outcome.healthy > 0) {
+      pushToast("success", "测活通过。");
+    } else {
+      pushToast("error", "测活失败，已记录一次故障。");
+    }
     await Promise.all([loadProxies(), loadOverview()]);
   } catch (error) {
     pushToast("error", errorText(error, "测活失败。"));

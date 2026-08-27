@@ -4,7 +4,7 @@ import { jsonResponse } from "~/server/utils/http.ts";
 import { gatewayRuntime } from "~/server/utils/runtime.ts";
 import type { ProxyStatus } from "~/server/utils/types.ts";
 
-const STATUSES: ProxyStatus[] = ["active", "pending", "unavailable"];
+const STATUSES: ProxyStatus[] = ["active", "pending", "unavailable", "rejected"];
 
 export default defineHandler((event) => adminRoute((request) => {
   const url = new URL(request.url);

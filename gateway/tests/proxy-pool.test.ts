@@ -115,6 +115,43 @@ test("a rejected proxy parks with its reason and is re-queued by reactivate", ()
   }
 });
 
+test("a later healthy probe clears the previous rejection reason", () => {
+  const harness = createHarness();
+  try {
+    harness.proxies.import("1.2.3.4:8080", "http");
+    const id = harness.proxies.listByStatus("pending")[0]!.id;
+    harness.proxies.markRejected(id, "速度 200Kbps 低于 1.0 Mbps");
+    harness.proxies.markHealthy(id, 90, 5_000_000);
+    const record = harness.proxies.require(id);
+    assert.equal(record.status, "active");
+    assert.equal(record.rejectReason, undefined);
+    assert.equal(record.latencyMs, 90);
+    assert.equal(record.throughputBps, 5_000_000);
+  } finally {
+    harness.close();
+  }
+});
+
+test("snapshot filters by status and only returns that state", () => {
+  const harness = createHarness();
+  try {
+    seedActiveProxy(harness, "http://1.2.3.4:8080");
+    harness.proxies.import("5.6.7.8:8080", "http");
+    harness.proxies.markRejected(harness.proxies.listByStatus("pending")[0]!.id, "延迟 800ms 超过 500ms");
+
+    const filtered = harness.proxies.snapshot({ status: "rejected", limit: 50 });
+    assert.equal(filtered.total, 1);
+    assert.equal(filtered.entries.length, 1);
+    assert.equal(filtered.entries[0]!.status, "rejected");
+    assert.equal(filtered.entries[0]!.rejectReason, "延迟 800ms 超过 500ms");
+
+    assert.equal(harness.proxies.snapshot({ status: "active", limit: 50 }).total, 1);
+    assert.equal(harness.proxies.snapshot({ limit: 50 }).total, 2);
+  } finally {
+    harness.close();
+  }
+});
+
 test("a lease is exclusive: a second session gets all_leased", () => {
   const harness = createHarness();
   try {

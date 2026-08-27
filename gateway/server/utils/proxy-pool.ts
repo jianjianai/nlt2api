@@ -263,6 +263,7 @@ export class ProxyPoolService {
     this.db.prepare(`
       UPDATE proxies
       SET status = 'active', failure_count = 0, last_error = NULL, retry_after = NULL,
+          reject_reason = NULL,
           checked_at = ?, healthy_at = ?, latency_ms = ?, throughput_bps = ?, updated_at = ?
       WHERE id = ?
     `).run(now, now, Math.max(0, Math.round(latencyMs)), throughputBps && throughputBps > 0 ? Math.round(throughputBps) : null, now, id);

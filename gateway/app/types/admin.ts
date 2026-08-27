@@ -121,4 +121,6 @@ export interface ImportSummary {
 export interface CheckOutcome {
   checked: number;
   healthy: number;
+  /** Present on the single-proxy check; the proxy state right after probing. */
+  proxy?: ProxyPublic | null;
 }
