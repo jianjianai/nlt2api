@@ -114,7 +114,17 @@ async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
     },
   });
   const text = await response.text();
-  const payload = text ? JSON.parse(text) as Record<string, unknown> : {};
+  let payload: Record<string, unknown> = {};
+  if (text) {
+    try {
+      payload = JSON.parse(text) as Record<string, unknown>;
+    } catch {
+      // A proxy or the server may answer with an HTML page (e.g. 404/502 from
+      // an edge layer) instead of JSON. Surface a readable error instead of
+      // leaking the raw parser exception.
+      throw new Error(`服务端返回了非 JSON 响应（HTTP ${response.status}）。`);
+    }
+  }
   if (!response.ok) {
     const error = payload.error as { message?: string; code?: string } | undefined;
     if (response.status === 401) signOut(error?.message ?? "管理令牌无效。");
@@ -500,6 +510,7 @@ onUnmounted(() => {
         :screenshot-busy="screenshotBusy"
         :screenshot-error="screenshotError"
         :screenshot-image="screenshotImage"
+        :screenshot-session="screenshotSession"
         @disconnect="disconnectMinter"
         @screenshot="openScreenshot"
         @close-screenshot="closeScreenshot"

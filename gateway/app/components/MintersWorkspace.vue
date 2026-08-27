@@ -16,6 +16,7 @@ const props = defineProps<{
   screenshotBusy: boolean;
   screenshotError: string | null;
   screenshotImage: string | null;
+  screenshotSession: MinterSessionPublic | null;
 }>();
 
 const emit = defineEmits<{
@@ -114,10 +115,22 @@ function requestScreenshot(session: MinterSessionPublic, kind: "page" | "fullpag
     >
       <div class="screenshot-panel">
         <div class="screenshot-actions">
-          <button class="text-button" type="button" :disabled="screenshotBusy" @click="requestScreenshot(sessions.find((s) => s.online)!, 'page')">
+          <button
+            v-if="screenshotSession"
+            class="text-button"
+            type="button"
+            :disabled="screenshotBusy"
+            @click="requestScreenshot(screenshotSession, 'page')"
+          >
             <AppIcon name="camera" :size="14" />当前视口
           </button>
-          <button class="text-button" type="button" :disabled="screenshotBusy" @click="requestScreenshot(sessions.find((s) => s.online)!, 'fullpage')">
+          <button
+            v-if="screenshotSession"
+            class="text-button"
+            type="button"
+            :disabled="screenshotBusy"
+            @click="requestScreenshot(screenshotSession, 'fullpage')"
+          >
             <AppIcon name="camera" :size="14" />整页
           </button>
         </div>
