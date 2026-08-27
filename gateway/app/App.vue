@@ -46,6 +46,10 @@ const settingsDraft = shallowRef<GatewaySettings | null>(null);
 const settingBounds = shallowRef<SettingBounds | null>(null);
 const proxies = shallowRef<ProxyPublic[]>([]);
 const proxyTotal = ref(0);
+const proxyPage = ref(1);
+const proxyPageSize = ref(50);
+const selectedProxyIds = ref(new Set<string>());
+const pendingBulkRemoval = ref(false);
 const tickets = shallowRef<TicketPublic[]>([]);
 const ticketAvailable = ref(0);
 const ticketTotal = ref(0);
@@ -64,6 +68,7 @@ const isImporting = ref(false);
 const isChecking = ref(false);
 const isClearingTickets = ref(false);
 const isSavingSettings = ref(false);
+const isRemovingProxies = ref(false);
 const busyProxyIds = ref(new Set<string>());
 const busyMinterIds = ref(new Set<string>());
 const pendingProxyRemoval = shallowRef<ProxyPublic | null>(null);
@@ -141,10 +146,14 @@ async function loadOverview(): Promise<void> {
 }
 
 async function loadProxies(): Promise<void> {
-  const query = proxyFilter.value === "all" ? "" : `?status=${proxyFilter.value}`;
-  const payload = await api<{ entries: ProxyPublic[]; total: number }>(`/api/admin/proxies${query}`);
+  const query = new URLSearchParams({ page: String(proxyPage.value), pageSize: String(proxyPageSize.value) });
+  if (proxyFilter.value !== "all") query.set("status", proxyFilter.value);
+  const payload = await api<{ entries: ProxyPublic[]; total: number }>(`/api/admin/proxies?${query}`);
   proxies.value = payload.entries;
   proxyTotal.value = payload.total;
+  // Deselect ids that are no longer on this page (deleted, or filtered elsewhere).
+  const visible = new Set(payload.entries.map((entry) => entry.id));
+  selectedProxyIds.value = new Set([...selectedProxyIds.value].filter((id) => visible.has(id)));
 }
 
 async function loadTickets(): Promise<void> {
@@ -268,6 +277,45 @@ async function reactivateProxy(proxy: ProxyPublic): Promise<void> {
   }
 }
 
+function confirmBulkRemoval(): void {
+  pendingBulkRemoval.value = true;
+}
+
+async function applyBulkRemoval(): Promise<void> {
+  const ids = [...selectedProxyIds.value];
+  if (ids.length === 0) {
+    pendingBulkRemoval.value = false;
+    return;
+  }
+  isRemovingProxies.value = true;
+  try {
+    await api("/api/admin/proxies/bulk", { method: "POST", body: JSON.stringify({ ids, action: "delete" }) });
+    pendingBulkRemoval.value = false;
+    selectedProxyIds.value = new Set();
+    pushToast("success", `已删除 ${ids.length} 个代理，其凭证同时清除。`);
+    await Promise.all([loadProxies(), loadOverview()]);
+  } catch (error) {
+    pushToast("error", errorText(error, "批量删除失败。"));
+  } finally {
+    isRemovingProxies.value = false;
+  }
+}
+
+async function checkSelected(): Promise<void> {
+  const ids = [...selectedProxyIds.value];
+  if (ids.length === 0) return;
+  isChecking.value = true;
+  try {
+    const outcome = await api<CheckOutcome>("/api/admin/proxies/bulk", { method: "POST", body: JSON.stringify({ ids, action: "check" }) });
+    pushToast("success", `批量测活：${outcome.healthy}/${outcome.checked} 通过`);
+    await Promise.all([loadProxies(), loadOverview()]);
+  } catch (error) {
+    pushToast("error", errorText(error, "批量测活失败。"));
+  } finally {
+    isChecking.value = false;
+  }
+}
+
 async function confirmProxyRemoval(): Promise<void> {
   const proxy = pendingProxyRemoval.value;
   if (!proxy) return;
@@ -283,6 +331,7 @@ async function confirmProxyRemoval(): Promise<void> {
     setBusy(busyProxyIds, proxy.id, false);
   }
 }
+
 
 async function confirmTicketClear(): Promise<void> {
   isClearingTickets.value = true;
@@ -403,6 +452,11 @@ watch(view, (next) => {
 });
 watch(theme, (next) => localStorage.setItem(THEME_STORAGE_KEY, next));
 watch(proxyFilter, () => {
+  proxyPage.value = 1;
+  selectedProxyIds.value = new Set();
+  if (view.value === "proxies") void loadProxies();
+});
+watch([proxyPage, proxyPageSize], () => {
   if (view.value === "proxies") void loadProxies();
 });
 
@@ -469,18 +523,28 @@ onUnmounted(() => {
         :counts="proxyCounts"
         :total="proxyGrandTotal"
         :filter="proxyFilter"
+        :page="proxyPage"
+        :page-size="proxyPageSize"
+        :page-total="proxyTotal"
+        :selected-ids="selectedProxyIds"
         :import-text="importText"
         :import-protocol="importProtocol"
         :import-summary="importSummary"
         :busy-ids="busyProxyIds"
         :importing="isImporting"
         :checking="isChecking"
+        :removing="isRemovingProxies"
         :now="currentTime"
         @update:filter="proxyFilter = $event"
+        @update:page="proxyPage = $event"
+        @update:page-size="proxyPageSize = $event"
+        @update:selected-ids="selectedProxyIds = $event"
         @update:import-text="importText = $event"
         @update:import-protocol="importProtocol = $event"
         @import="importProxies"
         @check-scope="checkScope"
+        @check-selected="checkSelected"
+        @delete-selected="confirmBulkRemoval"
         @check="checkProxy"
         @reactivate="reactivateProxy"
         @delete="pendingProxyRemoval = $event"
@@ -540,6 +604,17 @@ onUnmounted(() => {
       :busy="Boolean(pendingProxyRemoval && busyProxyIds.has(pendingProxyRemoval.id))"
       @update:open="pendingProxyRemoval = $event ? pendingProxyRemoval : null"
       @confirm="confirmProxyRemoval"
+    />
+
+    <AppConfirmDialog
+      :open="pendingBulkRemoval"
+      title="批量删除代理"
+      :description="`将删除已勾选的 ${selectedProxyIds.size} 个代理及其全部凭证，此操作不可撤销。`"
+      confirm-label="删除"
+      busy-label="删除中…"
+      :busy="isRemovingProxies"
+      @update:open="pendingBulkRemoval = $event"
+      @confirm="applyBulkRemoval"
     />
 
     <AppConfirmDialog

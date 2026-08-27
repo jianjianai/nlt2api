@@ -56,7 +56,7 @@ cp .env.example .env   # 填写 GATEWAY_URL 与同一个 MINTER_TOKEN
 pnpm start
 ```
 
-进入管理后台后：导入代理 → 等待测活转为「活跃」→ 凭证池自动补充 → 用 `GATEWAY_API_KEY` 调用 `/v1/chat/completions`。
+进入管理后台后：导入代理 → 等待测活转为「活跃」（延迟 ≤ 500ms 且速度 ≥ 1Mbps 才算达标，否则为「不符合条件」并记录原因）→ 凭证池自动补充 → 用 `GATEWAY_API_KEY` 调用 `/v1/chat/completions`。
 
 ## Docker
 

@@ -1,6 +1,7 @@
 import { proxyDispatcher } from "~/server/utils/proxy.ts";
 import {
   discardUpstreamResponse,
+  readUpstreamBytes,
   readUpstreamText,
   retryAfterSeconds,
   UpstreamError,
@@ -139,8 +140,14 @@ export async function modelCatalog(options: CatalogOptions): Promise<UpstreamMod
   return classifyModels(entries);
 }
 
-/** Probes a proxy by fetching the catalog through it. Returns the latency in ms. */
-export async function probeProxy(proxyUrl: string, timeoutMs: number, signal?: AbortSignal): Promise<number> {
+export interface ProxyProbeResult {
+  latencyMs: number;
+  /** Download speed measured from the probe transfer, in bits per second. */
+  throughputBps: number;
+}
+
+/** Probes a proxy by fetching the catalog through it, measuring latency and speed. */
+export async function probeProxy(proxyUrl: string, timeoutMs: number, signal?: AbortSignal): Promise<ProxyProbeResult> {
   const startedAt = Date.now();
   const response = await upstreamFetch(MODELS_URL, {}, {
     timeoutMs,
@@ -150,6 +157,10 @@ export async function probeProxy(proxyUrl: string, timeoutMs: number, signal?: A
   if (!response.ok) {
     throw upstreamErrorFrom(response.status, await readUpstreamText(response), retryAfterSeconds(response));
   }
-  await discardUpstreamResponse(response);
-  return Date.now() - startedAt;
+  const { bytes } = await readUpstreamBytes(response);
+  const elapsedMs = Date.now() - startedAt;
+  return {
+    latencyMs: elapsedMs,
+    throughputBps: elapsedMs > 0 ? Math.round((bytes * 8 * 1_000) / elapsedMs) : 0,
+  };
 }

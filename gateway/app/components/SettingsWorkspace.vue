@@ -46,8 +46,8 @@ const groups: Array<{ title: string; description: string; keys: SettingKey[] }> 
   },
   {
     title: "代理测活",
-    description: "经代理拉取上游模型目录判定健康度。",
-    keys: ["proxyCheckIntervalSeconds", "proxyCheckTimeoutSeconds", "proxyCheckConcurrency", "proxyFailureThreshold", "proxyRetryCooldownSeconds"],
+    description: "待测活与不合格代理经代理拉取上游模型目录判定健康度；延迟/速度不达标的转为「不符合条件」并记录原因。",
+    keys: ["proxyCheckIntervalSeconds", "proxyCheckTimeoutSeconds", "proxyCheckConcurrency", "proxyMaxLatencyMs", "proxyMinThroughputBps", "proxyFailureThreshold", "proxyRetryCooldownSeconds"],
   },
   {
     title: "转发",

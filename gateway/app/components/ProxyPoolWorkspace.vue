@@ -3,28 +3,38 @@ import { computed, ref } from "vue";
 import AppDisclosure from "./ui/AppDisclosure.vue";
 import AppIcon from "./ui/AppIcon.vue";
 import type { ImportSummary, ProxyFilter, ProxyKind, ProxyPublic, ProxyStatus } from "../types/admin.ts";
-import { formatLatency, formatRelative, PROXY_STATUS_LABEL, PROXY_STATUS_TONE } from "../utils/admin-ui.ts";
+import { formatLatency, formatRelative, formatSpeed, PROXY_STATUS_LABEL, PROXY_STATUS_TONE } from "../utils/admin-ui.ts";
 
 const props = defineProps<{
   proxies: ProxyPublic[];
   counts: Record<ProxyStatus, number>;
   total: number;
   filter: ProxyFilter;
+  page: number;
+  pageSize: number;
+  pageTotal: number;
+  selectedIds: Set<string>;
   importText: string;
   importProtocol: ProxyKind;
   importSummary: ImportSummary | null;
   busyIds: Set<string>;
   importing: boolean;
   checking: boolean;
+  removing: boolean;
   now: number;
 }>();
 
 const emit = defineEmits<{
   "update:filter": [value: ProxyFilter];
+  "update:page": [value: number];
+  "update:pageSize": [value: number];
+  "update:selectedIds": [value: Set<string>];
   "update:importText": [value: string];
   "update:importProtocol": [value: ProxyKind];
   import: [];
   checkScope: [scope: "pending" | "unavailable" | "all"];
+  checkSelected: [];
+  deleteSelected: [];
   check: [proxy: ProxyPublic];
   reactivate: [proxy: ProxyPublic];
   delete: [proxy: ProxyPublic];
@@ -36,8 +46,38 @@ const filters = computed<Array<{ id: ProxyFilter; label: string; count: number }
   { id: "active", label: PROXY_STATUS_LABEL.active, count: props.counts.active },
   { id: "pending", label: PROXY_STATUS_LABEL.pending, count: props.counts.pending },
   { id: "unavailable", label: PROXY_STATUS_LABEL.unavailable, count: props.counts.unavailable },
+  { id: "rejected", label: PROXY_STATUS_LABEL.rejected, count: props.counts.rejected },
 ]);
 const protocols: ProxyKind[] = ["http", "socks5", "socks4"];
+const pageSizes = [20, 50, 100, 200];
+
+const pageCount = computed(() => Math.max(1, Math.ceil(props.pageTotal / props.pageSize)));
+const allPageSelected = computed(() => (
+  props.proxies.length > 0 && props.proxies.every((proxy) => props.selectedIds.has(proxy.id))
+));
+
+function toggleAll(): void {
+  const next = new Set(props.selectedIds);
+  if (allPageSelected.value) {
+    for (const proxy of props.proxies) next.delete(proxy.id);
+  } else {
+    for (const proxy of props.proxies) next.add(proxy.id);
+  }
+  emit("update:selectedIds", next);
+}
+
+function toggleOne(id: string): void {
+  const next = new Set(props.selectedIds);
+  if (next.has(id)) next.delete(id);
+  else next.add(id);
+  emit("update:selectedIds", next);
+}
+
+function pageRange(): { from: number; to: number } {
+  const from = props.pageTotal === 0 ? 0 : (props.page - 1) * props.pageSize + 1;
+  const to = Math.min(props.page * props.pageSize, props.pageTotal);
+  return { from, to };
+}
 </script>
 
 <template>
@@ -122,8 +162,23 @@ const protocols: ProxyKind[] = ["http", "socks5", "socks4"];
 
     <section class="content-section">
       <div class="section-heading">
-        <div><h2>代理列表</h2><p>URL 已掩码，凭证不会离开服务端。</p></div>
-        <span class="section-count">{{ proxies.length }}</span>
+        <div><h2>代理列表</h2><p>每页 {{ pageSize }} 条，URL 已掩码，凭证不会离开服务端。</p></div>
+        <div class="table-toolbar">
+          <span v-if="selectedIds.size > 0" class="selection-count">已选 {{ selectedIds.size }} 个</span>
+          <button class="button button-quiet" type="button" :disabled="checking || selectedIds.size === 0" @click="emit('checkSelected')">
+            <AppIcon name="refresh-cw" :size="14" />测活所选
+          </button>
+          <button class="button button-danger" type="button" :disabled="removing || selectedIds.size === 0" @click="emit('deleteSelected')">
+            <span v-if="removing" class="spinner" aria-hidden="true"></span>
+            <AppIcon v-else name="trash-2" :size="14" />删除所选
+          </button>
+          <label class="page-size-label">
+            每页
+            <select :value="pageSize" @change="emit('update:pageSize', Number(($event.target as HTMLSelectElement).value))">
+              <option v-for="size in pageSizes" :key="size" :value="size">{{ size }}</option>
+            </select>
+          </label>
+        </div>
       </div>
 
       <div v-if="proxies.length === 0" class="workspace-empty">
@@ -131,49 +186,92 @@ const protocols: ProxyKind[] = ["http", "socks5", "socks4"];
         <p>导入代理后，后台测活器会在下一个周期内探测它们。</p>
       </div>
 
-      <div v-else class="proxy-resource-list">
-        <article v-for="proxy in proxies" :key="proxy.id">
-          <div class="proxy-address">
-            <span class="badge" :class="PROXY_STATUS_TONE[proxy.status]">{{ PROXY_STATUS_LABEL[proxy.status] }}</span>
+      <div v-else class="proxy-table">
+        <div class="proxy-table-head">
+          <label class="cell-cell" :class="{ checked: allPageSelected }">
+            <input
+              type="checkbox"
+              :checked="allPageSelected"
+              aria-label="勾选本页全部"
+              @change="toggleAll()"
+            />
+          </label>
+          <span>状态</span>
+          <span>代理地址</span>
+          <span>协议</span>
+          <span>延迟</span>
+          <span>速度</span>
+          <span>凭证</span>
+          <span>失败</span>
+          <span>最近使用</span>
+          <span>原因</span>
+          <span>操作</span>
+        </div>
+        <div
+          v-for="proxy in proxies"
+          :key="proxy.id"
+          class="proxy-table-row"
+          :class="{ selected: selectedIds.has(proxy.id) }"
+        >
+          <label class="cell-cell">
+            <input
+              type="checkbox"
+              :checked="selectedIds.has(proxy.id)"
+              :aria-label="`勾选 ${proxy.maskedUrl}`"
+              @change="toggleOne(proxy.id)"
+            />
+          </label>
+          <span class="cell-status">
+            <span class="table-status" :class="proxy.status" aria-hidden="true"></span>
+            {{ PROXY_STATUS_LABEL[proxy.status] }}
+          </span>
+          <span class="cell-url">
             <code>{{ proxy.maskedUrl }}</code>
-            <span v-if="proxy.leased" class="badge muted">已被领取</span>
+            <span v-if="proxy.leased" class="badge muted">已领取</span>
             <span v-if="proxy.rateLimitedUntil" class="badge" :class="proxy.cooldownReason === 'ip_blocked' ? 'bad' : 'warn'">
-              {{ proxy.cooldownReason === "ip_blocked" ? "403 封禁中" : "429 冷却中" }}
+              {{ proxy.cooldownReason === "ip_blocked" ? "403 封禁" : "429 冷却" }}
             </span>
             <span v-if="!proxy.mintable" class="badge warn">不可铸票</span>
-          </div>
-          <dl>
-            <div><dt>协议</dt><dd class="mono">{{ proxy.kind }}</dd></div>
-            <div><dt>延迟</dt><dd>{{ formatLatency(proxy.latencyMs) }}</dd></div>
-            <div><dt>可用凭证</dt><dd>{{ proxy.availableTickets }}</dd></div>
-            <div><dt>失败次数</dt><dd>{{ proxy.failureCount }}</dd></div>
-            <div><dt>最近测活</dt><dd>{{ formatRelative(proxy.checkedAt, now) }}</dd></div>
-            <div><dt>最近使用</dt><dd>{{ formatRelative(proxy.lastUsedAt, now) }}</dd></div>
-            <div><dt>最近铸票</dt><dd>{{ formatRelative(proxy.lastMintedAt, now) }}</dd></div>
-            <div><dt>最近健康</dt><dd>{{ formatRelative(proxy.healthyAt, now) }}</dd></div>
-            <div v-if="proxy.rateLimitedUntil"><dt>冷却解除</dt><dd>{{ formatRelative(proxy.rateLimitedUntil, now) }}</dd></div>
-            <div v-if="proxy.retryAfter"><dt>冷却至</dt><dd>{{ formatRelative(proxy.retryAfter, now) }}</dd></div>
-            <div v-if="proxy.lastError"><dt>最近错误</dt><dd>{{ proxy.lastError }}</dd></div>
-          </dl>
-          <footer>
-            <button class="button button-quiet" type="button" :disabled="busyIds.has(proxy.id)" :aria-busy="busyIds.has(proxy.id)" @click="emit('check', proxy)">
+          </span>
+          <span class="mono" data-label="协议">{{ proxy.kind }}</span>
+          <span class="mono" data-label="延迟">{{ formatLatency(proxy.latencyMs) }}</span>
+          <span class="mono" data-label="速度">{{ formatSpeed(proxy.throughputBps) }}</span>
+          <span class="mono" data-label="可用凭证">{{ proxy.availableTickets }}</span>
+          <span class="mono" data-label="失败次数">{{ proxy.failureCount }}</span>
+          <span class="muted" data-label="最近使用">{{ formatRelative(proxy.lastUsedAt, now) }}</span>
+          <span v-if="proxy.rejectReason" class="cell-reject" data-label="原因">{{ proxy.rejectReason }}</span>
+          <span class="cell-actions">
+            <button class="text-button" type="button" :disabled="busyIds.has(proxy.id)" :aria-busy="busyIds.has(proxy.id)" @click="emit('check', proxy)">
               <span v-if="busyIds.has(proxy.id)" class="spinner" aria-hidden="true"></span>
-              <AppIcon v-else name="refresh-cw" :size="14" />测活
+              <AppIcon v-else name="refresh-cw" :size="13" />测活
             </button>
             <button
               v-if="proxy.status === 'unavailable'"
-              class="button button-quiet"
+              class="text-button"
               type="button"
               :disabled="busyIds.has(proxy.id)"
               @click="emit('reactivate', proxy)"
             >
-              <AppIcon name="check-circle" :size="14" />重新启用
+              <AppIcon name="check-circle" :size="13" />启用
             </button>
             <button class="text-button danger" type="button" :disabled="busyIds.has(proxy.id)" @click="emit('delete', proxy)">
-              <AppIcon name="trash-2" :size="14" />删除
+              <AppIcon name="trash-2" :size="13" />删除
             </button>
-          </footer>
-        </article>
+          </span>
+        </div>
+      </div>
+
+      <div v-if="proxies.length > 0" class="pagination-bar">
+        <span class="muted">第 {{ pageRange().from }}–{{ pageRange().to }} 条，共 {{ pageTotal }} 条</span>
+        <div class="pagination-buttons">
+          <button class="button button-quiet" type="button" :disabled="page <= 1" @click="emit('update:page', page - 1)">
+            <AppIcon name="chevron-left" :size="14" />上一页
+          </button>
+          <span class="page-indicator">{{ page }} / {{ pageCount }}</span>
+          <button class="button button-quiet" type="button" :disabled="page >= pageCount" @click="emit('update:page', page + 1)">
+            下一页<AppIcon name="chevron-right" :size="14" />
+          </button>
+        </div>
       </div>
     </section>
   </section>

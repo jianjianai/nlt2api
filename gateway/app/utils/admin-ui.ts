@@ -20,12 +20,14 @@ export const PROXY_STATUS_LABEL: Record<ProxyStatus, string> = {
   active: "活跃",
   pending: "待测活",
   unavailable: "不可用",
+  rejected: "不符合条件",
 };
 
 export const PROXY_STATUS_TONE: Record<ProxyStatus, "good" | "warn" | "bad"> = {
   active: "good",
   pending: "warn",
   unavailable: "bad",
+  rejected: "bad",
 };
 
 export const SETTING_LABEL: Record<SettingKey, { label: string; hint: string }> = {
@@ -46,9 +48,11 @@ export const SETTING_LABEL: Record<SettingKey, { label: string; hint: string }> 
   refillIntervalSeconds: { label: "补充检查周期（秒）", hint: "编排器计算缺口的频率。" },
   mintRequestTimeoutSeconds: { label: "铸票任务超时（秒）", hint: "超时后释放占用的并发计数。" },
   proxyLeaseSeconds: { label: "代理租约（秒）", hint: "授权服务独占一个代理的时长。" },
-  proxyCheckIntervalSeconds: { label: "测活周期（秒）", hint: "后台批量探测待测活代理的间隔。" },
+  proxyCheckIntervalSeconds: { label: "测活周期（秒）", hint: "后台探测待测活与不合格代理的间隔。" },
   proxyCheckTimeoutSeconds: { label: "单次测活超时（秒）", hint: "经代理拉取上游模型目录的超时。" },
   proxyCheckConcurrency: { label: "测活并发", hint: "同时进行的探测数量。" },
+  proxyMaxLatencyMs: { label: "最大延迟（毫秒）", hint: "测活延迟超过该值则判为不合格；0 表示不限制。" },
+  proxyMinThroughputBps: { label: "最小速度（bps）", hint: "测活下载速度低于该值则判为不合格；1 Mbps = 1048576。0 表示不限制。" },
   proxyFailureThreshold: { label: "失败阈值", hint: "连续失败达到该次数后转为不可用。" },
   proxyRetryCooldownSeconds: { label: "失败冷却（秒）", hint: "失败后等待多久才允许重测。" },
   modelsCacheSeconds: { label: "模型列表缓存（秒）", hint: "上游模型目录的缓存时长。" },
@@ -84,6 +88,13 @@ export function formatRemaining(ms: number): string {
 
 export function formatLatency(value: number | undefined): string {
   return value === undefined ? "—" : `${value} ms`;
+}
+
+export function formatSpeed(bps: number | undefined): string {
+  if (bps === undefined) return "—";
+  if (bps >= 1_048_576) return `${(bps / 1_048_576).toFixed(1)} Mbps`;
+  if (bps >= 1_024) return `${Math.round(bps / 1_024)} Kbps`;
+  return `${bps} bps`;
 }
 
 /** Water-level tone for the ticket pool gauge. */

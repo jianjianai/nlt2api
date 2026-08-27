@@ -178,25 +178,27 @@ CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 
 | 状态 | 含义 | 可被领取 |
 | --- | --- | --- |
-| `active` 活跃 | 最近一次探测通过 | 是 |
+| `active` 活跃 | 最近一次探测通过且满足质量条件（延迟 ≤ `proxyMaxLatencyMs`、速度 ≥ `proxyMinThroughputBps`） | 是 |
 | `pending` 待测活 | 新导入、或刚失败等待重测（`retry_after` 未到） | 否 |
+| `rejected` 不符合条件 | 探测成功但延迟或速度不达标，`reject_reason` 记录具体不达标项；运营重启用后回到 `pending` | 否 |
 | `unavailable` 不可用 | 连续失败达到 `proxyFailureThreshold` | 否 |
 
 转移规则：
 
 ```
 导入            → pending
-探测成功        → active（failure_count=0, healthy_at=now, latency_ms 记录）
+探测成功且达标  → active（failure_count=0, healthy_at=now, latency_ms 与 throughput_bps 记录）
+探测成功不达标  → rejected（reject_reason = 具体超限项）
 探测失败        → failure_count+1
                   failure_count < threshold → pending（retry_after = now + cooldown）
                   failure_count >= threshold → unavailable
 铸票失败(代理归因) → 同「探测失败」
 转发上游传输失败 → 同「探测失败」
 管理员手动重测   → 立即探测，无视 retry_after
-管理员手动启用   → pending（清零 failure_count）
+管理员手动启用   → pending（清零 failure_count，清 reject_reason）
 ```
 
-探测实现沿用旧逻辑：经代理 `GET https://api.deepinfra.com/models/list`，超时 `proxyCheckTimeoutSeconds`（默认 15）。后台探测器每 `proxyCheckIntervalSeconds`（默认 60）挑一批 `pending` 且 `retry_after` 已过的条目，以 `proxyCheckConcurrency`（默认 4）并发探测。
+探测实现沿用旧逻辑：经代理 `GET https://api.deepinfra.com/models/list`，超时 `proxyCheckTimeoutSeconds`（默认 15），同时测量延迟与下载吞吐（探测体字节数 × 8 / 耗时）。后台探测器每 `proxyCheckIntervalSeconds`（默认 60）挑一批 `pending` 或 `rejected` 且 `retry_after` 已过的条目，以 `proxyCheckConcurrency`（默认 4）并发探测；探测成功但延迟 > `proxyMaxLatencyMs`（默认 500ms）或吞吐 < `proxyMinThroughputBps`（默认 1 Mbps）的置为 `rejected` 并写 `reject_reason`。
 
 **领取（lease）语义**：授权服务领取代理是排他的短租约。`BEGIN IMMEDIATE` 内按下列优先级选一条 `status='active'`、未被占用、且未处于冷却的条目，写入 `leased_by/lease_id/lease_expires = now + proxyLeaseSeconds`（默认 120）与 `last_minted_at = now`：
 
@@ -336,6 +338,8 @@ UI 四个工作区（沿用旧 `WorkspaceShell` 布局与 CSS）：
 | `proxyCheckIntervalSeconds` | 60 | 后台探测周期 |
 | `proxyCheckTimeoutSeconds` | 15 | 单次探测超时 |
 | `proxyCheckConcurrency` | 4 | 探测并发 |
+| `proxyMaxLatencyMs` | 500 | 测活延迟上限；超过判为不符合条件（0 不限制） |
+| `proxyMinThroughputBps` | 1048576 | 测活下载速度下限（1 Mbps）；低于判为不符合条件（0 不限制） |
 | `proxyFailureThreshold` | 3 | 连续失败转 `unavailable` 的阈值 |
 | `proxyRetryCooldownSeconds` | 300 | 失败后重测冷却 |
 | `modelsCacheSeconds` | 300 | 模型列表缓存 |

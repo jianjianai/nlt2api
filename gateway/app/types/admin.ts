@@ -1,7 +1,7 @@
 export type WorkspaceId = "overview" | "proxies" | "tickets" | "minters" | "settings";
 export type ThemeId = "light" | "dark";
 
-export type ProxyStatus = "active" | "pending" | "unavailable";
+export type ProxyStatus = "active" | "pending" | "unavailable" | "rejected";
 export type ProxyKind = "http" | "socks4" | "socks5";
 export type ProxyCooldownReason = "rate_limit" | "ip_blocked";
 export type ProxyFilter = "all" | ProxyStatus;
@@ -17,8 +17,10 @@ export interface ProxyPublic {
   checkedAt?: number;
   healthyAt?: number;
   latencyMs?: number;
+  throughputBps?: number;
   failureCount: number;
   lastError?: string;
+  rejectReason?: string;
   retryAfter?: number;
   rateLimitedUntil?: number;
   cooldownReason?: ProxyCooldownReason;
@@ -81,6 +83,8 @@ export interface GatewaySettings {
   proxyCheckIntervalSeconds: number;
   proxyCheckTimeoutSeconds: number;
   proxyCheckConcurrency: number;
+  proxyMaxLatencyMs: number;
+  proxyMinThroughputBps: number;
   proxyFailureThreshold: number;
   proxyRetryCooldownSeconds: number;
   modelsCacheSeconds: number;

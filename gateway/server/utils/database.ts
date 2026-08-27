@@ -99,6 +99,15 @@ const MIGRATIONS: Array<{ version: number; up: (db: DatabaseSync) => void }> = [
       `);
     },
   },
+  {
+    version: 4,
+    up: (db) => {
+      db.exec(`
+        ALTER TABLE proxies ADD COLUMN throughput_bps INTEGER;
+        ALTER TABLE proxies ADD COLUMN reject_reason TEXT;
+      `);
+    },
+  },
 ];
 
 function applyMigrations(db: DatabaseSync): void {

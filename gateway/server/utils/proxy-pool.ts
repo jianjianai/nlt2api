@@ -17,8 +17,10 @@ interface ProxyRow {
   checked_at: number | null;
   healthy_at: number | null;
   latency_ms: number | null;
+  throughput_bps: number | null;
   failure_count: number;
   last_error: string | null;
+  reject_reason: string | null;
   retry_after: number | null;
   rate_limited_until: number | null;
   cooldown_reason: string | null;
@@ -41,8 +43,10 @@ function toRecord(row: ProxyRow): ProxyRecord {
     ...(row.checked_at !== null ? { checkedAt: row.checked_at } : {}),
     ...(row.healthy_at !== null ? { healthyAt: row.healthy_at } : {}),
     ...(row.latency_ms !== null ? { latencyMs: row.latency_ms } : {}),
+    ...(row.throughput_bps !== null ? { throughputBps: row.throughput_bps } : {}),
     failureCount: row.failure_count,
     ...(row.last_error ? { lastError: row.last_error } : {}),
+    ...(row.reject_reason ? { rejectReason: row.reject_reason } : {}),
     ...(row.retry_after !== null ? { retryAfter: row.retry_after } : {}),
     ...(row.rate_limited_until !== null ? { rateLimitedUntil: row.rate_limited_until } : {}),
     ...(row.cooldown_reason ? { cooldownReason: row.cooldown_reason as ProxyCooldownReason } : {}),
@@ -129,9 +133,9 @@ export class ProxyPoolService {
 
   counts(): Record<ProxyStatus, number> {
     const rows = allRows<{ status: string; total: number }>(this.db, "SELECT status, COUNT(*) AS total FROM proxies GROUP BY status");
-    const counts: Record<ProxyStatus, number> = { active: 0, pending: 0, unavailable: 0 };
+    const counts: Record<ProxyStatus, number> = { active: 0, pending: 0, unavailable: 0, rejected: 0 };
     for (const row of rows) {
-      if (row.status === "active" || row.status === "pending" || row.status === "unavailable") {
+      if (row.status === "active" || row.status === "pending" || row.status === "unavailable" || row.status === "rejected") {
         counts[row.status] = row.total;
       }
     }
@@ -207,7 +211,7 @@ export class ProxyPoolService {
         WHERE t.proxy_id = p.id AND t.claimed_at IS NULL AND t.expires_at >= ?
       ) AS available_tickets
       FROM proxies p ${where}
-      ORDER BY CASE p.status WHEN 'active' THEN 0 WHEN 'pending' THEN 1 ELSE 2 END, p.updated_at DESC
+      ORDER BY CASE p.status WHEN 'active' THEN 0 WHEN 'pending' THEN 1 WHEN 'rejected' THEN 2 ELSE 3 END, p.updated_at DESC
       LIMIT ? OFFSET ?
     `, now, ...params, limit, offset);
 
@@ -224,8 +228,10 @@ export class ProxyPoolService {
         ...(record.checkedAt ? { checkedAt: record.checkedAt } : {}),
         ...(record.healthyAt ? { healthyAt: record.healthyAt } : {}),
         ...(record.latencyMs !== undefined ? { latencyMs: record.latencyMs } : {}),
+        ...(record.throughputBps !== undefined ? { throughputBps: record.throughputBps } : {}),
         failureCount: record.failureCount,
         ...(record.lastError ? { lastError: record.lastError } : {}),
+        ...(record.rejectReason ? { rejectReason: record.rejectReason } : {}),
         ...(record.retryAfter ? { retryAfter: record.retryAfter } : {}),
         ...(record.rateLimitedUntil && record.rateLimitedUntil > now ? { rateLimitedUntil: record.rateLimitedUntil } : {}),
         ...(record.rateLimitedUntil && record.rateLimitedUntil > now && record.cooldownReason
@@ -241,25 +247,37 @@ export class ProxyPoolService {
     return { entries, total };
   }
 
-  /** Proxies eligible for a background probe: pending and past their cooldown. */
+  /** Proxies eligible for a background probe: pending (or rejected) and past their cooldown. */
   dueForCheck(limit: number): ProxyRecord[] {
     const now = this.now();
     return allRows<ProxyRow>(this.db, `
       SELECT * FROM proxies
-      WHERE status = 'pending' AND (retry_after IS NULL OR retry_after <= ?)
+      WHERE status IN ('pending', 'rejected') AND (retry_after IS NULL OR retry_after <= ?)
       ORDER BY COALESCE(checked_at, 0) ASC
       LIMIT ?
     `, now, limit).map(toRecord);
   }
 
-  markHealthy(id: string, latencyMs: number): void {
+  markHealthy(id: string, latencyMs: number, throughputBps?: number): void {
     const now = this.now();
     this.db.prepare(`
       UPDATE proxies
       SET status = 'active', failure_count = 0, last_error = NULL, retry_after = NULL,
-          checked_at = ?, healthy_at = ?, latency_ms = ?, updated_at = ?
+          checked_at = ?, healthy_at = ?, latency_ms = ?, throughput_bps = ?, updated_at = ?
       WHERE id = ?
-    `).run(now, now, Math.max(0, Math.round(latencyMs)), now, id);
+    `).run(now, now, Math.max(0, Math.round(latencyMs)), throughputBps && throughputBps > 0 ? Math.round(throughputBps) : null, now, id);
+  }
+
+  /** The proxy answered but failed the quality gate; record why and park it. */
+  markRejected(id: string, reason: string): void {
+    const now = this.now();
+    this.db.prepare(`
+      UPDATE proxies
+      SET status = 'rejected', failure_count = 0, last_error = NULL, retry_after = NULL,
+          reject_reason = ?, checked_at = ?, updated_at = ?,
+          leased_by = NULL, lease_id = NULL, lease_expires = NULL
+      WHERE id = ?
+    `).run(reason.slice(0, 500), now, now, id);
   }
 
   /**
@@ -293,6 +311,7 @@ export class ProxyPoolService {
     this.db.prepare(`
       UPDATE proxies
       SET status = 'pending', failure_count = 0, last_error = NULL, retry_after = NULL,
+          reject_reason = NULL,
           rate_limited_until = NULL, cooldown_reason = NULL, updated_at = ?
       WHERE id = ?
     `).run(now, id);

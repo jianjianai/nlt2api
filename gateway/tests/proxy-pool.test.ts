@@ -7,7 +7,7 @@ test("imported proxies start as pending and duplicates are ignored", () => {
   try {
     const first = harness.proxies.import("1.2.3.4:8080\n5.6.7.8:8080\n# comment\n\n", "http");
     assert.deepEqual({ imported: first.imported, duplicates: first.duplicates }, { imported: 2, duplicates: 0 });
-    assert.deepEqual(harness.proxies.counts(), { active: 0, pending: 2, unavailable: 0 });
+    assert.deepEqual(harness.proxies.counts(), { active: 0, pending: 2, unavailable: 0, rejected: 0 });
 
     const second = harness.proxies.import("1.2.3.4:8080", "http");
     assert.equal(second.imported, 0);
@@ -86,6 +86,29 @@ test("reactivate clears the unavailable state and re-queues a probe", () => {
     const record = harness.proxies.require(id);
     assert.equal(record.status, "pending");
     assert.equal(record.failureCount, 0);
+    assert.equal(harness.proxies.dueForCheck(10).length, 1);
+  } finally {
+    harness.close();
+  }
+});
+
+test("a rejected proxy parks with its reason and is re-queued by reactivate", () => {
+  const harness = createHarness();
+  try {
+    harness.proxies.import("1.2.3.4:8080", "http");
+    const id = harness.proxies.listByStatus("pending")[0]!.id;
+    harness.proxies.markRejected(id, "延迟 800ms 超过 500ms");
+    const record = harness.proxies.require(id);
+    assert.equal(record.status, "rejected");
+    assert.equal(record.failureCount, 0);
+    assert.equal(record.rejectReason, "延迟 800ms 超过 500ms");
+    // Rejected proxies stay out of the lease and claim pipeline…
+    assert.deepEqual(harness.proxies.lease("session-a"), { reason: "no_active_proxy" });
+    // …but can be probed again after the operator re-enables them.
+    harness.proxies.reactivate(id);
+    const revived = harness.proxies.require(id);
+    assert.equal(revived.status, "pending");
+    assert.equal(revived.rejectReason, undefined);
     assert.equal(harness.proxies.dueForCheck(10).length, 1);
   } finally {
     harness.close();

@@ -4,10 +4,12 @@ export type JsonObject = { [key: string]: JsonValue };
 export type ProxyKind = "http" | "socks4" | "socks5";
 
 /**
- * The three states the admin console exposes. `pending` covers both freshly
- * imported proxies and ones cooling down after a failure below the threshold.
+ * The four states the admin console exposes. `pending` covers both freshly
+ * imported proxies and ones cooling down after a failure below the threshold;
+ * `rejected` means the proxy passed its probe but failed the quality gate
+ * (`proxyMaxLatencyMs` / `proxyMinThroughputBps`) and needs operator attention.
  */
-export type ProxyStatus = "active" | "pending" | "unavailable";
+export type ProxyStatus = "active" | "pending" | "unavailable" | "rejected";
 
 /** Why an active egress is parked: upstream 429 versus an outright 403/401. */
 export type ProxyCooldownReason = "rate_limit" | "ip_blocked";
@@ -23,8 +25,12 @@ export interface ProxyRecord {
   checkedAt?: number;
   healthyAt?: number;
   latencyMs?: number;
+  /** Measured download speed through the proxy, in bits per second. */
+  throughputBps?: number;
   failureCount: number;
   lastError?: string;
+  /** Why a pending proxy failed the quality gate and became `rejected`. */
+  rejectReason?: string;
   retryAfter?: number;
   /** Upstream 429 cooldown; the proxy is healthy but must not carry traffic yet. */
   rateLimitedUntil?: number;
@@ -50,8 +56,10 @@ export interface ProxyPublic {
   checkedAt?: number;
   healthyAt?: number;
   latencyMs?: number;
+  throughputBps?: number;
   failureCount: number;
   lastError?: string;
+  rejectReason?: string;
   retryAfter?: number;
   rateLimitedUntil?: number;
   cooldownReason?: ProxyCooldownReason;
@@ -149,6 +157,10 @@ export interface GatewaySettings {
   proxyCheckIntervalSeconds: number;
   proxyCheckTimeoutSeconds: number;
   proxyCheckConcurrency: number;
+  /** Probe pass/fail gate: latency above this (ms) rejects the proxy. */
+  proxyMaxLatencyMs: number;
+  /** Probe pass/fail gate: throughput below this (bps) rejects the proxy. */
+  proxyMinThroughputBps: number;
   proxyFailureThreshold: number;
   proxyRetryCooldownSeconds: number;
   modelsCacheSeconds: number;

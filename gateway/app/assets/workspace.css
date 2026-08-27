@@ -228,6 +228,43 @@ select { width: 100%; min-height: 40px; border: 1px solid var(--line-strong, #cc
 .proxy-resource-list dd { margin: 4px 0 0; font-size: 11.5px; overflow-wrap: anywhere; }
 .proxy-resource-list footer { display: flex; gap: 7px; margin-top: 10px; }
 
+/* ---- Proxy table ---- */
+.table-toolbar { display: flex; align-items: center; gap: 8px; }
+.selection-count { color: var(--navy); font-size: 11.5px; font-weight: 750; }
+.page-size-label { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); font-size: 11px; }
+.page-size-label select { min-width: 64px; min-height: 32px; }
+.proxy-table { display: grid; }
+.proxy-table-head, .proxy-table-row {
+  display: grid;
+  grid-template-columns: 30px 86px minmax(200px, 1.6fr) 58px 62px 74px 50px 50px 92px 150px;
+  align-items: center;
+  gap: 10px;
+  border-top: 1px solid var(--line);
+  padding: 8px 4px;
+  font-size: 11px;
+}
+.proxy-table-head { color: var(--muted); font-weight: 800; }
+.proxy-table-row { min-height: 44px; transition: background .15s ease; }
+.proxy-table-row:hover { background: var(--sunken); }
+.proxy-table-row.selected { background: var(--teal-soft); box-shadow: inset 3px 0 0 var(--teal); }
+.proxy-table-row > span { min-width: 0; }
+.proxy-table-row code { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cell-cell input { width: 15px; height: 15px; margin: 0; accent-color: var(--teal); }
+.cell-status { display: flex; align-items: center; gap: 6px; white-space: nowrap; }
+.cell-url { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.cell-actions { display: flex; align-items: center; gap: 2px; white-space: nowrap; }
+.cell-reject { color: var(--red); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pagination-bar { display: flex; align-items: center; justify-content: space-between; gap: 14px; margin-top: 14px; }
+.pagination-buttons { display: flex; align-items: center; gap: 8px; }
+.pagination-buttons .button { min-height: 32px; padding: 5px 12px; font-size: 11.5px; }
+.page-indicator { min-width: 64px; color: var(--muted); font-size: 11.5px; font-variant-numeric: tabular-nums; text-align: center; }
+
+.table-status { width: 7px; height: 7px; display: inline-block; margin-right: 6px; border-radius: 50%; background: var(--line-strong); vertical-align: 1px; }
+.table-status.active { background: var(--teal); box-shadow: 0 0 0 3px var(--teal-soft); }
+.table-status.pending { background: var(--amber); box-shadow: 0 0 0 3px var(--amber-soft); }
+.table-status.unavailable { background: var(--red); box-shadow: 0 0 0 3px var(--red-soft); }
+.table-status.rejected { background: var(--red); box-shadow: 0 0 0 3px var(--red-soft); }
+
 .runtime-strip { display: grid; grid-template-columns: repeat(3,minmax(0,1fr)); gap: 9px; }
 .runtime-strip > div { border: 1px solid var(--line); border-top: 3px solid var(--navy); border-radius: var(--panel-radius); padding: 12px 13px; background: var(--paper); box-shadow: var(--shadow-sm); }
 .runtime-strip > div.tone-warn { border-top-color: var(--amber); }
@@ -552,6 +589,18 @@ select { width: 100%; min-height: 40px; border: 1px solid var(--line-strong, #cc
   .import-result-list li { grid-template-columns:1fr; }
   .import-result-list small { grid-column:auto; }
   .proxy-address { align-items:flex-start; flex-direction:column; }
+  .proxy-table { display:block; }
+  .proxy-table-head { display:none; }
+  .proxy-table-row { grid-template-columns:auto 1fr auto; gap:8px 12px; border:1px solid var(--line); border-radius:var(--panel-radius); margin-top:8px; padding:12px; background:var(--paper); }
+  .proxy-table-row .cell-url { grid-column:2 / -1; grid-row:1; }
+  .proxy-table-row .cell-status { grid-column:3; grid-row:1; }
+  .proxy-table-row .cell-cell { grid-column:1; grid-row:1; }
+  .proxy-table-row > span:not(.cell-cell):not(.cell-url):not(.cell-status) { display:flex; align-items:center; gap:6px; }
+  .proxy-table-row > span::before { content: attr(data-label); color: var(--muted); font-size: 9px; font-weight: 750; }
+  .proxy-table-row .cell-actions { grid-column:2 / -1; grid-row:2; }
+  .table-toolbar { flex-wrap:wrap; }
+  .pagination-bar { align-items:stretch; flex-direction:column; }
+  .pagination-buttons { justify-content:space-between; }
   .model-override-head { display:none; }
   .model-override-row { grid-template-columns:1fr; gap:8px; padding:13px 0; }
   .model-override-row code { border-left: 3px solid var(--teal); padding-left: 9px; white-space: normal; overflow-wrap: anywhere; }

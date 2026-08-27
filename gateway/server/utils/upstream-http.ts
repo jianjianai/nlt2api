@@ -161,6 +161,23 @@ export async function readUpstreamText(response: Response): Promise<string> {
     return "";
   }
 
+  const { text, bytes } = await readUpstreamBytes(response, maxBytes);
+  void bytes;
+  return text;
+}
+
+/** Drains a response body, returning both the decoded text and the byte count. */
+export async function readUpstreamBytes(response: Response, maxBytes = getGatewayConfig().maxUpstreamBytes): Promise<{ text: string; bytes: number }> {
+  const declared = Number(response.headers.get("content-length") ?? "");
+  if (Number.isFinite(declared) && declared > maxBytes) {
+    await discardUpstreamResponse(response);
+    throw new UpstreamError("The upstream response exceeded the gateway limit.", 502);
+  }
+  if (!response.body) {
+    finishUpstreamResponse(response);
+    return { text: "", bytes: 0 };
+  }
+
   const reader = response.body.getReader();
   const chunks: Uint8Array[] = [];
   let total = 0;
@@ -178,8 +195,8 @@ export async function readUpstreamText(response: Response): Promise<string> {
     }
   } finally {
     reader.releaseLock();
-    finishUpstreamResponse(response);
   }
+  finishUpstreamResponse(response);
 
   const bytes = new Uint8Array(total);
   let offset = 0;
@@ -187,7 +204,7 @@ export async function readUpstreamText(response: Response): Promise<string> {
     bytes.set(chunk, offset);
     offset += chunk.byteLength;
   }
-  return new TextDecoder().decode(bytes);
+  return { text: new TextDecoder().decode(bytes), bytes: total };
 }
 
 export function retryAfterSeconds(response: Response): number | undefined {

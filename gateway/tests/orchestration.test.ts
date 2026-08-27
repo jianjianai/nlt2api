@@ -171,14 +171,42 @@ test("the checker activates healthy proxies and fails the rest", async () => {
       settings: harness.settings,
       proxies: harness.proxies,
       probe: async (url) => {
-        if (url.includes("1.2.3.4")) return 42;
+        if (url.includes("1.2.3.4")) return { latencyMs: 42, throughputBps: 5_000_000 };
         throw new Error("Proxy connection was refused.");
       },
     });
     const outcome = await checker.tick();
     assert.equal(outcome.checked, 2);
     assert.equal(outcome.healthy, 1);
-    assert.deepEqual(harness.proxies.counts(), { active: 1, pending: 1, unavailable: 0 });
+    assert.deepEqual(harness.proxies.counts(), { active: 1, pending: 1, unavailable: 0, rejected: 0 });
+  } finally {
+    harness.close();
+  }
+});
+
+test("a proxy that passes the probe but misses the quality gate is rejected", async () => {
+  const harness = createHarness();
+  try {
+    harness.proxies.import("1.2.3.4:8080\n5.6.7.8:8080\n9.9.9.9:8080", "http");
+    const checker = new ProxyChecker({
+      settings: harness.settings,
+      proxies: harness.proxies,
+      probe: async (url) => {
+        // Defaults: latency must stay under 500ms, speed above 1 Mbps.
+        if (url.includes("1.2.3.4")) return { latencyMs: 100, throughputBps: 8_000_000 };
+        if (url.includes("5.6.7.8")) return { latencyMs: 900, throughputBps: 8_000_000 };
+        return { latencyMs: 100, throughputBps: 200_000 };
+      },
+    });
+    const outcome = await checker.tick();
+    assert.equal(outcome.checked, 3);
+    assert.equal(outcome.healthy, 1);
+    assert.deepEqual(harness.proxies.counts(), { active: 1, pending: 0, unavailable: 0, rejected: 2 });
+
+    const slow = harness.proxies.listByStatus("rejected").find((entry) => entry.url.includes("5.6.7.8"))!;
+    assert.match(slow.rejectReason ?? "", /延迟 900ms/);
+    const thin = harness.proxies.listByStatus("rejected").find((entry) => entry.url.includes("9.9.9.9"))!;
+    assert.match(thin.rejectReason ?? "", /低于 1[\.0]?0? Mbps/);
   } finally {
     harness.close();
   }
@@ -195,7 +223,7 @@ test("the checker skips proxies that are still cooling down", async () => {
       proxies: harness.proxies,
       probe: async () => {
         probes += 1;
-        return 10;
+        return { latencyMs: 10, throughputBps: 9_000_000 };
       },
     });
     assert.deepEqual(await checker.tick(), { checked: 0, healthy: 0 });
