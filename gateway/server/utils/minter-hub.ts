@@ -88,6 +88,8 @@ export interface MinterHubDependencies {
   now?: () => number;
   /** Invoked after a ticket is accepted so a queued request can take it at once. */
   onTicketAccepted?: () => void;
+  /** Egress ids a waiting request needs a ticket for; leases prefer these. */
+  mintPriority?: () => readonly string[];
 }
 
 /**
@@ -102,6 +104,7 @@ export class MinterHub {
   private readonly serverVersion: string;
   private readonly now: () => number;
   private readonly onTicketAccepted: (() => void) | undefined;
+  private readonly mintPriority: (() => readonly string[]) | undefined;
   private readonly connections = new Map<MinterPeer, Connection>();
 
   constructor(dependencies: MinterHubDependencies) {
@@ -112,6 +115,7 @@ export class MinterHub {
     this.serverVersion = dependencies.serverVersion;
     this.now = dependencies.now ?? Date.now;
     this.onTicketAccepted = dependencies.onTicketAccepted;
+    this.mintPriority = dependencies.mintPriority;
   }
 
   /** Marks sessions from a previous process offline and frees their leases. */
@@ -252,7 +256,7 @@ export class MinterHub {
 
   private handleLease(connection: Connection, id: string, preferProxyId?: string): void {
     if (!connection.sessionId) return;
-    const result = this.proxies.lease(connection.sessionId, preferProxyId);
+    const result = this.proxies.lease(connection.sessionId, preferProxyId, this.mintPriority?.());
     if ("reason" in result) {
       this.send(connection, {
         type: "proxy.unavailable",

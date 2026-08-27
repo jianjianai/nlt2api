@@ -15,6 +15,11 @@ test("refillDeficit is bounded by both the shortfall and idle proxies", () => {
   assert.equal(refillDeficit({ target: 0, available: 0, inflight: 0, idleActiveProxies: 10 }), 0);
   // Mints already in flight hold (or will hold) a lease, so they consume capacity.
   assert.equal(refillDeficit({ target: 10, available: 0, inflight: 2, idleActiveProxies: 3 }), 1);
+  // A pinned request needs a ticket on a specific egress even though the pool
+  // as a whole looks full.
+  assert.equal(refillDeficit({ target: 4, available: 9, inflight: 0, idleActiveProxies: 10, priorityWanted: 2 }), 2);
+  // A paused pool still ignores it: nothing is waiting if nothing is happening.
+  assert.equal(refillDeficit({ target: 0, available: 0, inflight: 0, idleActiveProxies: 10, priorityWanted: 3 }), 0);
 });
 
 function hubWithPeer(harness: Harness, concurrency = 4): { hub: MinterHub; peer: MinterPeer & { sent: string[] } } {
@@ -64,6 +69,7 @@ test("the orchestrator stays idle when no minter is connected", () => {
       hub,
       demand: harness.demand,
       queue: harness.queue,
+      mintPriority: harness.mintPriority,
     });
     assert.equal(refill.tick(), 0);
   } finally {
@@ -83,6 +89,7 @@ test("a connection that closes stops receiving mint requests", () => {
       hub,
       demand: harness.demand,
       queue: harness.queue,
+      mintPriority: harness.mintPriority,
     });
     assert.equal(refill.tick(), 1);
     hub.close(peer);
@@ -106,6 +113,7 @@ test("the orchestrator asks for the shortfall, capped by idle proxies", () => {
       hub,
       demand: harness.demand,
       queue: harness.queue,
+      mintPriority: harness.mintPriority,
     });
     // The floor asks for four but only two proxies are idle.
     assert.equal(refill.tick(), 2);
@@ -129,6 +137,7 @@ test("minting pauses after the idle window and resumes on the next request", () 
       hub,
       demand: harness.demand,
       queue: harness.queue,
+      mintPriority: harness.mintPriority,
     });
     harness.advance(harness.settings.get().idleAfterSeconds * 1_000 + 1);
     assert.equal(refill.tick(), 0);

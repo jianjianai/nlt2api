@@ -7,7 +7,7 @@ type UpstreamFetchInit = RequestInit & { dispatcher?: Dispatcher };
 const compatibleFetch = undiciFetch as unknown as (input: string, init?: UpstreamFetchInit) => Promise<Response>;
 const responseFinishes = new WeakMap<Response, () => void>();
 
-export type UpstreamFailureKind = "captcha" | "rate_limit" | "model_capacity" | "upstream";
+export type UpstreamFailureKind = "captcha" | "rate_limit" | "ip_blocked" | "model_capacity" | "upstream";
 
 export class UpstreamError extends Error {
   constructor(

@@ -40,7 +40,10 @@ test("upstreamErrorFrom classifies captcha, capacity and rate limits", () => {
   assert.equal(upstreamErrorFrom(503, JSON.stringify({ error: { message: "Model busy, retry later" } })).kind, "model_capacity");
   assert.equal(upstreamErrorFrom(429, "{}").kind, "rate_limit");
   assert.equal(upstreamErrorFrom(500, "boom").kind, "upstream");
-  assert.equal(upstreamErrorFrom(403, "forbidden").kind, "upstream");
+  // A 403 that does not mention the challenge is the egress being refused.
+  assert.equal(upstreamErrorFrom(403, "forbidden").kind, "ip_blocked");
+  assert.equal(upstreamErrorFrom(403, JSON.stringify({ error: { message: "Not authenticated" } })).kind, "ip_blocked");
+  assert.equal(upstreamErrorFrom(401, "{}").kind, "ip_blocked");
 });
 
 test("upstream and proxy failures keep their status instead of collapsing to 500", () => {

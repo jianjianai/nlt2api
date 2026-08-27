@@ -9,6 +9,9 @@ export type ProxyKind = "http" | "socks4" | "socks5";
  */
 export type ProxyStatus = "active" | "pending" | "unavailable";
 
+/** Why an active egress is parked: upstream 429 versus an outright 403/401. */
+export type ProxyCooldownReason = "rate_limit" | "ip_blocked";
+
 export interface ProxyRecord {
   id: string;
   url: string;
@@ -25,8 +28,11 @@ export interface ProxyRecord {
   retryAfter?: number;
   /** Upstream 429 cooldown; the proxy is healthy but must not carry traffic yet. */
   rateLimitedUntil?: number;
+  cooldownReason?: ProxyCooldownReason;
   /** Last time a request was forwarded through it; drives round-robin rotation. */
   lastUsedAt?: number;
+  /** Last time it was leased for minting; keeps mints spread across egresses. */
+  lastMintedAt?: number;
   leasedBy?: string;
   leaseId?: string;
   leaseExpires?: number;
@@ -48,7 +54,9 @@ export interface ProxyPublic {
   lastError?: string;
   retryAfter?: number;
   rateLimitedUntil?: number;
+  cooldownReason?: ProxyCooldownReason;
   lastUsedAt?: number;
+  lastMintedAt?: number;
   leased: boolean;
   /** False when the proxy cannot drive a browser (authenticated SOCKS). */
   mintable: boolean;
@@ -129,8 +137,12 @@ export interface GatewaySettings {
   queueTimeoutSeconds: number;
   /** How long one conversation stays pinned to its egress IP; 0 disables affinity. */
   affinityTtlSeconds: number;
+  /** How long a pinned request waits for its own egress before accepting another. */
+  affinityWaitSeconds: number;
   /** Fallback cooldown for an egress that returned 429 without a Retry-After. */
   rateLimitCooldownSeconds: number;
+  /** Cooldown for an egress the upstream refused outright (403/401). */
+  ipBlockCooldownSeconds: number;
   refillIntervalSeconds: number;
   mintRequestTimeoutSeconds: number;
   proxyLeaseSeconds: number;
@@ -152,8 +164,12 @@ export interface OverviewSnapshot {
     usable: number;
     /** Active proxies parked by an upstream 429. */
     rateLimited: number;
+    /** Active proxies parked because the upstream refused the IP outright. */
+    blocked: number;
     /** Conversations currently pinned to an egress. */
     pinned: number;
+    /** Egresses a waiting request needs a ticket minted for. */
+    mintWanted: number;
   };
   tickets: {
     available: number;

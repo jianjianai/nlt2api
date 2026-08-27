@@ -1,5 +1,6 @@
 import type { DemandTracker } from "~/server/utils/demand.ts";
 import type { MinterHub } from "~/server/utils/minter-hub.ts";
+import type { MintPriority } from "~/server/utils/mint-priority.ts";
 import type { ProxyPoolService } from "~/server/utils/proxy-pool.ts";
 import type { SettingsStore } from "~/server/utils/settings.ts";
 import type { TicketPoolService } from "~/server/utils/ticket-pool.ts";
@@ -11,6 +12,8 @@ export interface RefillDeficitInput {
   available: number;
   inflight: number;
   idleActiveProxies: number;
+  /** Egresses a queued request needs a ticket for but that have none. */
+  priorityWanted?: number;
 }
 
 /**
@@ -21,11 +24,15 @@ export interface RefillDeficitInput {
  * those have not leased yet, so subtracting them is deliberately conservative:
  * under-dispatching costs one extra refill tick, while over-dispatching burns
  * round trips on `proxy.unavailable` replies.
+ *
+ * A pinned request waiting on a specific egress raises the floor: the pool can
+ * look full while the one ticket that request needs does not exist.
  */
 export function refillDeficit(input: RefillDeficitInput): number {
   const missing = input.target - input.available - input.inflight;
+  const wanted = input.target === 0 ? 0 : (input.priorityWanted ?? 0);
   const capacity = input.idleActiveProxies - input.inflight;
-  return Math.max(0, Math.min(missing, capacity));
+  return Math.max(0, Math.min(Math.max(missing, wanted), capacity));
 }
 
 export interface RefillOrchestratorDependencies {
@@ -35,6 +42,7 @@ export interface RefillOrchestratorDependencies {
   hub: MinterHub;
   demand: DemandTracker;
   queue: TicketQueue;
+  mintPriority: MintPriority;
 }
 
 export class RefillOrchestrator {
@@ -42,15 +50,17 @@ export class RefillOrchestrator {
 
   /** Runs one refill pass. Returns how many mint requests were dispatched. */
   tick(): number {
-    const { proxies, tickets, hub, demand, queue } = this.dependencies;
+    const { proxies, tickets, hub, demand, queue, mintPriority } = this.dependencies;
     // Tickets that landed since the last pass may already have a request waiting.
     queue.drain();
     if (hub.onlineCount() === 0) return 0;
+    const waiting = queue.waiting();
     const deficit = refillDeficit({
-      target: demand.target(queue.waiting()),
+      target: demand.target(waiting),
       available: tickets.availableCount(),
       inflight: hub.inflightTotal(),
       idleActiveProxies: proxies.idleActiveCount(),
+      priorityWanted: tickets.egressesWithoutTicket(mintPriority.ids()).length,
     });
     return hub.dispatchMintRequests(deficit);
   }

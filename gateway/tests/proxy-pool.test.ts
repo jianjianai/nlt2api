@@ -119,23 +119,35 @@ test("an expired lease becomes available again", () => {
   }
 });
 
-test("preferProxyId renews the same proxy so the browser need not restart", () => {
+test("preferProxyId renews the same proxy only while that is still the fair choice", () => {
   const harness = createHarness();
   try {
     const first = seedActiveProxy(harness, "http://1.2.3.4:8080");
-    seedActiveProxy(harness, "http://5.6.7.8:8080");
+    const second = seedActiveProxy(harness, "http://5.6.7.8:8080");
     const initial = harness.proxies.lease("session-a");
     assert.ok(!("reason" in initial));
     harness.proxies.releaseLease("session-a", initial.leaseId);
-    const renewed = harness.proxies.lease("session-a", first);
+
+    // The other egress has never minted, so fairness sends the worker there even
+    // though it asked to keep its current proxy.
+    const rotated = harness.proxies.lease("session-a", initial.proxyId);
+    assert.ok(!("reason" in rotated));
+    assert.notEqual(rotated.proxyId, initial.proxyId);
+    harness.proxies.releaseLease("session-a", rotated.leaseId);
+
+    // Both have now minted equally recently, so the preference is honoured and
+    // the browser does not have to restart just to change --proxy-server.
+    harness.advance(1_000);
+    const renewed = harness.proxies.lease("session-a", rotated.proxyId);
     assert.ok(!("reason" in renewed));
-    assert.equal(renewed.proxyId, first);
+    assert.equal(renewed.proxyId, rotated.proxyId);
+    assert.deepEqual([first, second].sort(), [initial.proxyId, rotated.proxyId].sort());
   } finally {
     harness.close();
   }
 });
 
-test("lease prefers the active proxy with the fewest live tickets", () => {
+test("lease spreads mints over egresses before weighing ticket counts", () => {
   const harness = createHarness();
   try {
     const loaded = seedActiveProxy(harness, "http://1.2.3.4:8080");
@@ -152,9 +164,18 @@ test("lease prefers the active proxy with the fewest live tickets", () => {
     });
     harness.proxies.releaseLease("session-a", lease.leaseId);
 
+    // `loaded` just minted, so the untouched egress is next regardless of tickets.
     const next = harness.proxies.lease("session-b");
     assert.ok(!("reason" in next));
     assert.equal(next.proxyId, empty);
+    harness.proxies.releaseLease("session-b", next.leaseId);
+
+    // With mint recency equal, the egress holding fewer live tickets wins.
+    harness.proxies.markMinted(loaded, harness.clock.now);
+    harness.proxies.markMinted(empty, harness.clock.now);
+    const tiebreak = harness.proxies.lease("session-c");
+    assert.ok(!("reason" in tiebreak));
+    assert.equal(tiebreak.proxyId, empty);
   } finally {
     harness.close();
   }

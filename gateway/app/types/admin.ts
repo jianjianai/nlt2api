@@ -3,6 +3,7 @@ export type ThemeId = "light" | "dark";
 
 export type ProxyStatus = "active" | "pending" | "unavailable";
 export type ProxyKind = "http" | "socks4" | "socks5";
+export type ProxyCooldownReason = "rate_limit" | "ip_blocked";
 export type ProxyFilter = "all" | ProxyStatus;
 
 export interface ProxyPublic {
@@ -20,7 +21,9 @@ export interface ProxyPublic {
   lastError?: string;
   retryAfter?: number;
   rateLimitedUntil?: number;
+  cooldownReason?: ProxyCooldownReason;
   lastUsedAt?: number;
+  lastMintedAt?: number;
   leased: boolean;
   mintable: boolean;
   availableTickets: number;
@@ -69,7 +72,9 @@ export interface GatewaySettings {
   queueMaxSize: number;
   queueTimeoutSeconds: number;
   affinityTtlSeconds: number;
+  affinityWaitSeconds: number;
   rateLimitCooldownSeconds: number;
+  ipBlockCooldownSeconds: number;
   refillIntervalSeconds: number;
   mintRequestTimeoutSeconds: number;
   proxyLeaseSeconds: number;
@@ -89,7 +94,7 @@ export type SettingBounds = Record<SettingKey, { min: number; max: number }>;
 export interface OverviewSnapshot {
   proxies: Record<ProxyStatus, number>;
   proxiesMintable: number;
-  egress: { usable: number; rateLimited: number; pinned: number };
+  egress: { usable: number; rateLimited: number; blocked: number; pinned: number; mintWanted: number };
   tickets: { available: number; total: number; target: number };
   queue: { waiting: number; maxSize: number };
   demand: { claims: number; windowSeconds: number; idleSeconds: number; paused: boolean };

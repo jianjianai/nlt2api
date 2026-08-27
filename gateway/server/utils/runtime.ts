@@ -4,6 +4,7 @@ import { gatewayDatabase } from "~/server/utils/database.ts";
 import { DemandTracker } from "~/server/utils/demand.ts";
 import { ForwardService } from "~/server/utils/forward-service.ts";
 import { MinterHub } from "~/server/utils/minter-hub.ts";
+import { MintPriority } from "~/server/utils/mint-priority.ts";
 import { ProxyChecker } from "~/server/utils/proxy-checker.ts";
 import { ProxyPoolService } from "~/server/utils/proxy-pool.ts";
 import { RefillOrchestrator } from "~/server/utils/refill-orchestrator.ts";
@@ -18,6 +19,7 @@ export interface GatewayRuntime {
   queue: TicketQueue;
   demand: DemandTracker;
   affinity: SessionAffinity;
+  mintPriority: MintPriority;
   hub: MinterHub;
   checker: ProxyChecker;
   refill: RefillOrchestrator;
@@ -43,8 +45,15 @@ export function gatewayRuntime(): GatewayRuntime {
   const tickets = new TicketPoolService({ db, settings, proxies });
   const demand = new DemandTracker({ settings });
   const affinity = new SessionAffinity({ settings });
+  const mintPriority = new MintPriority();
   // The refill loop reads the queue depth, so the queue only has to nudge demand.
-  const queue = new TicketQueue({ settings, tickets, onDemand: () => demand.touch() });
+  const queue = new TicketQueue({
+    settings,
+    tickets,
+    onDemand: () => demand.touch(),
+    onEgressWanted: (proxyId) => mintPriority.request(proxyId),
+    onEgressServed: (proxyId) => mintPriority.clear(proxyId),
+  });
   const hub = new MinterHub({
     db,
     settings,
@@ -52,11 +61,12 @@ export function gatewayRuntime(): GatewayRuntime {
     tickets,
     serverVersion: serverVersion(),
     onTicketAccepted: () => queue.drain(),
+    mintPriority: () => mintPriority.ids(),
   });
   const checker = new ProxyChecker({ settings, proxies });
-  const refill = new RefillOrchestrator({ settings, proxies, tickets, hub, demand, queue });
+  const refill = new RefillOrchestrator({ settings, proxies, tickets, hub, demand, queue, mintPriority });
   const forward = new ForwardService({ settings, proxies, tickets, queue, demand, affinity });
-  runtime = { settings, proxies, tickets, queue, demand, affinity, hub, checker, refill, forward };
+  runtime = { settings, proxies, tickets, queue, demand, affinity, mintPriority, hub, checker, refill, forward };
   return runtime;
 }
 

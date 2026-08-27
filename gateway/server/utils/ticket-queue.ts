@@ -8,6 +8,8 @@ interface Waiter {
   reject(error: unknown): void;
   settled: boolean;
   preferProxyId?: string;
+  /** While in the future the pin is mandatory; after it any egress will do. */
+  strictUntil: number;
   timer?: ReturnType<typeof setTimeout>;
   dispose(): void;
 }
@@ -51,8 +53,13 @@ function clientGone(): HttpError {
 export interface TicketQueueDependencies {
   settings: SettingsStore;
   tickets: TicketPoolService;
+  now?: () => number;
   /** Called when a request starts waiting, so the orchestrator can mint sooner. */
   onDemand?: () => void;
+  /** Called with the egress a waiting request needs a ticket for. */
+  onEgressWanted?: (proxyId: string) => void;
+  /** Called once that egress delivered, so it stops being prioritised. */
+  onEgressServed?: (proxyId: string) => void;
 }
 
 /**
@@ -66,8 +73,11 @@ export interface TicketQueueDependencies {
  */
 export class TicketQueue {
   private readonly waiters: Waiter[] = [];
+  private readonly now: () => number;
 
-  constructor(private readonly dependencies: TicketQueueDependencies) {}
+  constructor(private readonly dependencies: TicketQueueDependencies) {
+    this.now = dependencies.now ?? Date.now;
+  }
 
   waiting(): number {
     return this.waiters.length;
@@ -85,17 +95,22 @@ export class TicketQueue {
   }
 
   /**
-   * Takes one pair, waiting in line if the pool is empty. Throws `queue_overflow`
-   * when the queue is full, `queue_timeout` on expiry, and 499 if the client
-   * disconnects first. `preferProxyId` is an advisory egress preference.
+   * Takes one pair, waiting in line if the pool has nothing usable.
+   *
+   * A pinned conversation waits for *its* egress rather than silently moving to
+   * another IP: minting for that egress is requested immediately, and only after
+   * `affinityWaitSeconds` does the pin relax so a slow mint cannot hold the
+   * request hostage. Throws `queue_overflow` when the queue is full,
+   * `queue_timeout` on expiry, and 499 if the client disconnects first.
    */
   async acquire(signal?: AbortSignal, preferProxyId?: string): Promise<TicketPair> {
     const { settings, tickets } = this.dependencies;
     const config = settings.get();
     if (signal?.aborted) throw clientGone();
+    const strictMs = preferProxyId ? config.affinityWaitSeconds * 1_000 : 0;
     // Only jump the line when nobody is already waiting; otherwise FIFO breaks.
     if (this.waiters.length === 0) {
-      const immediate = tickets.claim(preferProxyId);
+      const immediate = tickets.claim(preferProxyId, strictMs > 0);
       if (immediate) return immediate;
     }
     if (this.waiters.length >= config.queueMaxSize) {
@@ -104,12 +119,14 @@ export class TicketQueue {
     }
 
     this.dependencies.onDemand?.();
+    if (preferProxyId) this.dependencies.onEgressWanted?.(preferProxyId);
     return await new Promise<TicketPair>((resolve, reject) => {
       const waiter: Waiter = {
         resolve,
         reject,
         settled: false,
         ...(preferProxyId ? { preferProxyId } : {}),
+        strictUntil: this.now() + strictMs,
         dispose: () => {
           if (waiter.timer) clearTimeout(waiter.timer);
           signal?.removeEventListener("abort", onAbort);
@@ -129,17 +146,27 @@ export class TicketQueue {
   }
 
   /**
-   * Hands available pairs to the head of the queue. Called after every mint and
-   * on every refill tick; stops as soon as the pool runs dry again.
+   * Hands available pairs to whoever can use them, oldest waiter first. A waiter
+   * still holding a strict pin is skipped rather than blocking the queue: the
+   * ticket it needs is being minted, and meanwhile someone behind it can be served.
    */
   drain(): number {
+    const now = this.now();
     let served = 0;
-    while (this.waiters.length > 0) {
-      const waiter = this.waiters[0]!;
-      const pair = this.dependencies.tickets.claim(waiter.preferProxyId);
-      if (!pair) break;
+    let dry = false;
+    for (const waiter of [...this.waiters]) {
+      if (dry) break;
+      const strict = Boolean(waiter.preferProxyId) && waiter.strictUntil > now;
+      const pair = this.dependencies.tickets.claim(waiter.preferProxyId, strict);
+      if (!pair) {
+        // Only an unpinned waiter finding nothing proves the pool is empty.
+        if (!strict) dry = true;
+        else if (waiter.preferProxyId) this.dependencies.onEgressWanted?.(waiter.preferProxyId);
+        continue;
+      }
       if (!this.take(waiter)) continue;
       waiter.resolve(pair);
+      if (waiter.preferProxyId) this.dependencies.onEgressServed?.(waiter.preferProxyId);
       served += 1;
     }
     return served;

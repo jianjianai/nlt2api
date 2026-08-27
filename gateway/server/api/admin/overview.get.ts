@@ -16,8 +16,10 @@ export default defineHandler((event) => adminRoute(() => {
     proxiesMintable: runtime.proxies.mintableActiveCount(),
     egress: {
       usable: runtime.proxies.forwardableActiveCount(),
-      rateLimited: runtime.proxies.rateLimitedCount(),
+      rateLimited: runtime.proxies.cooldownCount("rate_limit"),
+      blocked: runtime.proxies.cooldownCount("ip_blocked"),
       pinned: runtime.affinity.size(),
+      mintWanted: runtime.mintPriority.size(),
     },
     tickets: {
       available: runtime.tickets.availableCount(),

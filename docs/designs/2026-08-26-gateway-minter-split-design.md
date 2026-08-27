@@ -198,7 +198,13 @@ CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 
 探测实现沿用旧逻辑：经代理 `GET https://api.deepinfra.com/models/list`，超时 `proxyCheckTimeoutSeconds`（默认 15）。后台探测器每 `proxyCheckIntervalSeconds`（默认 60）挑一批 `pending` 且 `retry_after` 已过的条目，以 `proxyCheckConcurrency`（默认 4）并发探测。
 
-**领取（lease）语义**：授权服务领取代理是排他的短租约。`BEGIN IMMEDIATE` 内选一条 `status='active' AND (lease_expires IS NULL OR lease_expires < now)` 且**当前池中该代理的可用凭证数最少**的条目，写入 `leased_by/lease_id/lease_expires = now + proxyLeaseSeconds`（默认 120）。租约到期或收到 `lease.release` 即释放。进程启动时清空所有过期租约。
+**领取（lease）语义**：授权服务领取代理是排他的短租约。`BEGIN IMMEDIATE` 内按下列优先级选一条 `status='active'`、未被占用、且未处于冷却的条目，写入 `leased_by/lease_id/lease_expires = now + proxyLeaseSeconds`（默认 120）与 `last_minted_at = now`：
+
+1. **排队请求指定的出口**（亸和等待，见 §4.6.2）——有人在等这个 IP 的票，公平让位给时延。
+2. **`last_minted_at` 最早的出口**——铸票均匀摄到每个 IP。worker 传的 `preferProxyId`（避免重启浏览器）只在它仍是公平选择时才被尊重，否则一个 worker 会永远在同一个 IP 上铸票。
+3. 同一铸票时间下，**可用凭证数最少**的出口，再次是最近健康的。
+
+租约到期或收到 `lease.release` 即释放。进程启动时清空所有过期租约。
 
 ### 4.4 凭证对池
 
@@ -243,14 +249,14 @@ deficit = min(target - available - inflight, idleActiveProxies)
 1. `requireClientAuth`：`Authorization: Bearer <GATEWAY_API_KEY>`。未配置 key 时默认拒绝所有请求（`allowAnonymous` 显式开启才放行），避免出现无鉴权的公开转发端点。
 2. 读取并校验 JSON 体（`maxRequestBytes` 上限），只校验 `model` 必须存在且为字符串、`messages` 为非空数组、`stream` 为布尔——其余字段原样透传。
 3. 最多 `maxAttempts`（默认 3）次尝试。首次尝试经**排队器**取凭证对（带会话亲和的出口偏好）：池中有则立即取走，池空则 FIFO 排队等待（详见 §4.6.1）；随后组装上游请求头（`Origin`/`Referer`/`X-DeepInfra-Turnstile`/`X-Deepinfra-Source`/凭证自带 `User-Agent`）→ 经配对代理发 `POST https://api.deepinfra.com/v1/openai/chat/completions`。
-4. 可重试的失败（传输错误、429、5xx）换一张凭证重试；403 captcha 也换凭证重试（视为凭证损耗）。429 额外把该出口标为限流冷却（见 §4.6.2），使重试必然落到另一个 IP。**重试只取当前空闲的凭证对，不再排队**——否则单个请求可能被排队超时叠加数次。取不到即抛出导致重试的那个错误。
+4. 可重试的失败（传输错误、429、5xx）换一张凭证重试；403 captcha 也换凭证重试（视为凭证损耗）。429 与非 captcha 的 403/401 额外把该出口标为冷却（见 §4.6.2），使重试必然落到另一个 IP。**重试只取当前空闲的凭证对，不再排队**——否则单个请求可能被排队超时叠加数次。取不到即抛出导致重试的那个错误。
 5. 流式：一旦上游返回 200 且开始转发 SSE，就不再重试，错误以 SSE `data: {"error":...}` 帧下发。
 
 #### 4.6.1 排队器
 
 凭证不足时请求排队而非直接失败，把突发流量转成延迟：
 
-- **FIFO 且不可插队**：队列非空时新到的请求一律入队，即使此刻池里有票，避免排队者被后来者饿死。
+- **FIFO 且不可插队**：队列非空时新到的请求一律入队，即使此刻池里有票，避免排队者被后来者饿死。但一个持严格亸和馒的等待者**不会阻塞它后面的人**：`drain` 遇到它时跳过（并重新登记铸票优先项），继续服务后续可服务的请求。
 - **客户端断开即出队**：`AbortSignal` 触发时立刻移出队列并返回 499 `client_closed_request`，不会为已离开的调用方消耗任何凭证。
 - **上限**：`queueMaxSize`（默认 64）。超出返回 503 `queue_overflow` 且 `Retry-After: 1`。设为 0 即关闭排队，池空时直接返回 503 `ticket_pool_empty`。
 - **超时**：`queueTimeoutSeconds`（默认 60）内未拿到凭证返回 503 `queue_timeout`。
@@ -259,13 +265,18 @@ deficit = min(target - available - inflight, idleActiveProxies)
 
 #### 4.6.2 出口轮转与会话亲和
 
-上游的匿名限流绑定在**出口 IP** 上，但同一对话中途换 IP 会改变表见客户身份。两个目标靠三个机制调和：
+上游的匿名限流绑定在**出口 IP** 上，但同一对话中途换 IP 会改变表见客户身份。两个目标靠四个机制调和：
 
-1. **默认轮转**：取用时优先选 `last_used_at` 最早的活跃代理，新对话自然散开到整个池。
-2. **会话亲和**（`affinityTtlSeconds`，默认 900，0 关闭）：会话键优先取客户端显式提供的会话 ID —— 请求头 `X-Session-Id` / `X-Conversation-Id` / `X-Chat-Id`（按此优先级），或请求体的 `session_id` / `conversation_id` / `chat_id`（也支持嵌在 `metadata` 下），请求头优先于请求体。显式 ID 更精确：裁剪历史、编辑早期轮次都不会破坏它。没有 ID 时回退到**对话头部**（system 消息 + 第一条 user 消息）的 SHA-256——OpenAI 兼容客户端每轮重发全部历史，因此该头部在同一对话的所有轮次间恒定、在不同对话间不同。两种路径都混入可选的 `user` 字段并各自加上类型前缀，因此不同调用方无法通过复用 ID 或开场白共用同一个钉。映射存内存（LRU，上限 2 万条），因为它指向的凭证本身也不跨重启。亲和是**建议性**的：钉存的出口无票则直接退回轮转，不阻塞请求。
-3. **限流冷却**：上游返回 429 时把那个出口标为 `rate_limited_until = now + (Retry-After 或 rateLimitCooldownSeconds)`，同时丢弃该对话的亲和馒。代理仍为 `active`（它作为传输通道没有问题），但在冷却期内同时被**转发取用和铸票租约**跳过——在被限流的 IP 上铸票没意义，票到解封时已过期。
+1. **默认轮转**：取用时优先选 `last_used_at` 最早的活跃代理，新对话自然散开到整个池；铸票同理，按 `last_minted_at` 最早的出口领租约（见 §4.3），因此凭证本身也均匀分布在所有 IP 上。
+2. **会话亸和**（`affinityTtlSeconds`，默认 900，0 关闭）：会话键优先取客户端显式提供的会话 ID —— 请求头 `X-Session-Id` / `X-Conversation-Id` / `X-Chat-Id`（按此优先级），或请求体的 `session_id` / `conversation_id` / `chat_id`（也支持嵌在 `metadata` 下），请求头优先于请求体。显式 ID 更精确：裁剪历史、编辑早期轮次都不会破坏它。没有 ID 时回退到**对话头部**（system 消息 + 第一条 user 消息）的 SHA-256——OpenAI 兼容客户端每轮重发全部历史，因此该头部在同一对话的所有轮次间恒定、在不同对话间不同。两种路径都混入可选的 `user` 字段并各自加上类型前缀，因此不同调用方无法通过复用 ID 或开场白共用同一个馒。映射存内存（LRU，上限 2 万条），因为它指向的凭证本身也不跨重启。
+3. **亸和等待**（`affinityWaitSeconds`，默认 30）：馒住的出口没票时，请求**不会默默换 IP**，而是入队等候属于自己的出口，同时把该出口登记为**铸票优先项**：下一个租约优先发给它，并且即使池整体看上去充足，补充编排也会为它开一张票（见 §4.5）。超过这个窗口亸和降为建议性，接受任意出口，以免慢铸票把请求扣死。设为 0 即回到纯建议性亸和。
+4. **出口冷却**：标为 `rate_limited_until`，并记录原因：
+   - `rate_limit`（429）：`Retry-After` 或 `rateLimitCooldownSeconds`（默认 60）。
+   - `ip_blocked`（非 captcha 的 403/401，如 `Not authenticated`）：固定用 `ipBlockCooldownSeconds`（默认 900）。这类回应意味着**上游拒绝这个 IP 本身**（而不是凭证无效），恢复得比限流窗口慢得多，因此故意忽略上游可能给出的短 `Retry-After`。
 
-限流冷却不会被后续更短的冷却覆盖（只向后延长），避免一个带短 `Retry-After` 的回应提前释放一个已知被长时间限流的 IP。
+   两种情况都同时丢弃该对话的亸和馒。代理仍为 `active`（它作为传输通道没有问题），但在冷却期内同时被**转发取用和铸票租约**跳过——在被拒绝的 IP 上铸票没意义，票到解封时已过期。
+
+冷却不会被后续更短的冷却覆盖（只向后延长，原因也随更长的那个保留），避免一个 429 把一个已知被 403 封禁的 IP 提前释放。
 
 `GET /v1/models`：经任一活跃代理拉 `https://api.deepinfra.com/models/list`（无需凭证），结果缓存 `modelsCacheSeconds`（默认 300），映射为 OpenAI `{object:"list", data:[{id, object:"model", owned_by}]}`。
 
@@ -316,7 +327,9 @@ UI 四个工作区（沿用旧 `WorkspaceShell` 布局与 CSS）：
 | `queueMaxSize` | 64 | 排队上限；0 表示不排队 |
 | `queueTimeoutSeconds` | 60 | 排队等待超时 |
 | `affinityTtlSeconds` | 900 | 同一对话固定出口 IP 的时长；0 表示完全轮转 |
+| `affinityWaitSeconds` | 30 | 黏滞请求等候专属出口铸票的时长；超时后接受其他出口 |
 | `rateLimitCooldownSeconds` | 60 | 出口遭 429 后的默认冷却（上游给了 `Retry-After` 则以它为准） |
+| `ipBlockCooldownSeconds` | 900 | 出口遭非 captcha 的 403/401 后的冷却，应明显长于 429 |
 | `refillIntervalSeconds` | 5 | 编排器周期 |
 | `mintRequestTimeoutSeconds` | 180 | 单张铸票任务超时（回收 inflight 计数） |
 | `proxyLeaseSeconds` | 120 | 代理租约时长 |
@@ -342,23 +355,25 @@ flowchart TB
     R1["鉴权 + 校验 model/messages/stream"] --> R2["demand.touch<br/>唤醒空闲暂停中的铸票"]
     R2 --> R3["会话键 key<br/>① 显式 ID：X-Session-Id / session_id<br/>② 回退：对话头部 SHA-256"]
     R3 --> R4["prefer = affinity.resolve(key)"]
-    R4 --> R5{"队列空<br/>且池中有票？"}
-    R5 -->|是| R6["取走一对<br/>优先 prefer，否则 last_used_at 最早<br/>跳过限流冷却中的出口"]
+    R4 --> R5{"队列空<br/>且本对话出口有票？"}
+    R5 -->|是| R6["取走一对<br/>优先 prefer，否则 last_used_at 最早<br/>跳过冷却中的出口"]
     R5 -->|否| Q1{"排队"}
     Q1 -->|"关闭排队 / 队列已满"| QE1["503<br/>ticket_pool_empty<br/>queue_overflow"]
-    Q1 -->|"入队 FIFO 不可插队"| Q2(["等待"])
+    Q1 -->|"入队 FIFO 不可插队<br/>登记本出口为铸票优先项"| Q2(["等待"])
     Q2 -->|"客户端断开 → 出队"| QE2["499 client_closed_request"]
     Q2 -->|"queueTimeoutSeconds"| QE3["503 queue_timeout"]
-    Q2 -->|"被 drain 唤醒"| R6
+    Q2 -->|"本出口有票，或超 affinityWaitSeconds 后任意票"| R6
     R6 --> R7["demand.record<br/>stamp 出口 last_used_at"]
     R7 --> R8["经配对代理请求上游<br/>注入 Turnstile 凭证与配对 UA"]
     R8 -->|200| R9["删除凭证<br/>affinity.remember(key, 出口)"] --> ROK["透传响应 / SSE"]
     R8 -->|失败| F0["删除凭证 · 一次性语义"] --> F1{"归类"}
-    F1 -->|429| F2["markRateLimited 该出口<br/>Retry-After 或 rateLimitCooldownSeconds<br/>affinity.forget"]
+    F1 -->|429| F2["markCooldown rate_limit<br/>Retry-After 或 rateLimitCooldownSeconds<br/>affinity.forget"]
+    F1 -->|"403/401 非 captcha"| F2B["markCooldown ip_blocked<br/>ipBlockCooldownSeconds（明显更长）<br/>affinity.forget"]
     F1 -->|代理传输错误| F3["markFailure 该出口<br/>affinity.forget"]
     F1 -->|403 captcha / 5xx / 408| F4["仅记录"]
     F1 -->|其他 4xx| FE0["原状返回"]
     F2 --> RT{"未达 maxAttempts ?"}
+    F2B --> RT
     F3 --> RT
     F4 --> RT
     RT -->|否| FE1["返回最后一次错误"]
@@ -376,14 +391,14 @@ flowchart TB
     O1 -->|有| O2{"idleAfterSeconds 内<br/>有请求或有人排队？"}
     O2 -->|否| O2B["target = 0 · 暂停铸票"] --> O4
     O2 -->|是| O3["rate = 窗口取用数 / demandWindowSeconds<br/>target = clamp(⌈rate × targetLeadSeconds⌉ + waiting,<br/>min…, maxAvailableTickets)"] --> O4
-    O4["deficit = min(target − available − inflight,<br/>空闲且未限流的活跃代理数)"]
+    O4["deficit = min(max(target − available − inflight,<br/>无票的铸票优先出口数),<br/>空闲且未冷却的活跃代理数)"]
     O4 -->|"≤ 0"| OE0
     O4 -->|"> 0"| O5["按在线会话轮转下发 mint.request<br/>单会话上限 = concurrency − 其 inflight"]
   end
 
   R6 -.->|claim| POOL
   POOL -.->|available| O4
-  O5 ==>|WS| M["授权服务：领代理 → 劫持 HTML 铸票"]
+  O5 ==>|WS| M["授权服务：领代理 → 劫持 HTML 铸票<br/>租约优先级：排队指定出口 > last_minted_at 最早"]
   M ==>|ticket.submit| S1["校验 lease → 入池 → 释放 lease"]
   S1 --> POOL
   S1 -.->|"立即 queue.drain"| Q2
@@ -393,16 +408,19 @@ flowchart TB
 
 - **进程启动记为一次「有活动」**，因此冷启动会预热到水位下限，首个请求不必等冷铸票。
 - **重试不排队**（`tryClaim` 而非 `acquire`）：否则单个请求可能被 `queueTimeoutSeconds` 叠加 `maxAttempts` 次。
-- **限流冷却同时挡住转发取用和铸票租约**：在被限流的 IP 上铸票没有意义，票到解封时早已过期。
+- **冷却同时挡住转发取用和铸票租约**：在被拒绝的 IP 上铸票没有意义，票到解封时早已过期。
+- **铸票也轮转**：租约按 `last_minted_at` 最早排序，worker 的 `preferProxyId` 只在仍属公平选择时生效，否则一个 worker 会把票全铸在自己绑定的那个 IP 上。
+- **严格亸和等待不阻塞后面的人**：`drain` 跳过持严格馒且无票的等待者，并重新登记它的铸票优先项。
 - **排队深度直接加进 `target`**：它是速率窗口尚未观测到的未满足需求，比纯速率反馈快一个周期。
-- **亲和是建议性的**：钉住的出口无票则退回轮转，绝不因为保持 IP 一致而阻塞请求。
+- **亸和馒住的出口无票时会单独要票**：即使池整体看上去充足，`deficit` 也会为它抬到至少 1。
 
-出口 IP 在调度中的可用性由两个正交维度决定——健康度（三态，§4.3）与限流冷却（§4.6.2）：
+出口 IP 在调度中的可用性由两个正交维度决定——健康度（三态，§4.3）与出口冷却（§4.6.2）：
 
-| 健康状态 | 限流冷却中 | 可被转发取用 | 可被铸票领取 |
+| 健康状态 | 冷却中 | 可被转发取用 | 可被铸票领取 |
 | --- | --- | --- | --- |
 | `active` | 否 | 是 | 是 |
-| `active` | 是 | 否 | 否 |
+| `active` | `rate_limit`（429） | 否 | 否 |
+| `active` | `ip_blocked`（403/401） | 否 | 否 |
 | `pending` / `unavailable` | — | 否 | 否 |
 
 ## 5. 授权服务（minter）设计

@@ -42,13 +42,17 @@ export function upstreamErrorFrom(status: number, body: string, retryAfter?: num
   } catch {
     // Non-JSON upstream body; the truncated text is the best message available.
   }
+  // A 403 that does not mention the challenge is the upstream refusing the
+  // egress itself ("Not authenticated"), not a bad ticket: the IP must rest.
   const kind: UpstreamFailureKind = status === 403 && CAPTCHA_PATTERN.test(`${message} ${body}`)
     ? "captcha"
-    : MODEL_CAPACITY_PATTERN.test(message) || MODEL_CAPACITY_PATTERN.test(body)
-      ? "model_capacity"
-      : status === 429
-        ? "rate_limit"
-        : "upstream";
+    : status === 403 || status === 401
+      ? "ip_blocked"
+      : MODEL_CAPACITY_PATTERN.test(message) || MODEL_CAPACITY_PATTERN.test(body)
+        ? "model_capacity"
+        : status === 429
+          ? "rate_limit"
+          : "upstream";
   return new UpstreamError(`Upstream failed: ${message}`, status, retryAfter ?? retryAfterFromPayload(payload), payload, kind);
 }
 

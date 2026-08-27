@@ -89,6 +89,16 @@ const MIGRATIONS: Array<{ version: number; up: (db: DatabaseSync) => void }> = [
       `);
     },
   },
+  {
+    version: 3,
+    up: (db) => {
+      db.exec(`
+        ALTER TABLE proxies ADD COLUMN last_minted_at INTEGER;
+        ALTER TABLE proxies ADD COLUMN cooldown_reason TEXT;
+        CREATE INDEX proxies_mint_rotation ON proxies (status, last_minted_at);
+      `);
+    },
+  },
 ];
 
 function applyMigrations(db: DatabaseSync): void {

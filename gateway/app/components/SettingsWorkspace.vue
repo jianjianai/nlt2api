@@ -36,8 +36,8 @@ const groups: Array<{ title: string; description: string; keys: SettingKey[] }> 
   },
   {
     title: "出口轮转",
-    description: "限流绑定在出口 IP 上：新对话取最久未用的出口，同一对话在黏滞窗口内固定出口，遭 429 的出口暂停使用。",
-    keys: ["affinityTtlSeconds", "rateLimitCooldownSeconds"],
+    description: "限流绑定在出口 IP 上：新对话取最久未用的出口，同一对话在黏滞窗口内固定出口，遭 429/403 的出口分别按各自的时长暂停使用。",
+    keys: ["affinityTtlSeconds", "affinityWaitSeconds", "rateLimitCooldownSeconds", "ipBlockCooldownSeconds"],
   },
   {
     title: "补充编排",

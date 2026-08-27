@@ -16,9 +16,11 @@ export function toHttpError(error: unknown): HttpError {
       ? "captcha_rejected"
       : error.kind === "rate_limit"
         ? "rate_limit_exceeded"
-        : error.kind === "model_capacity"
-          ? "model_busy"
-          : "upstream_error";
+        : error.kind === "ip_blocked"
+          ? "egress_blocked"
+          : error.kind === "model_capacity"
+            ? "model_busy"
+            : "upstream_error";
     return new HttpError(error.status, error.message, "server_error", undefined, code, error.retryAfterSeconds);
   }
   return new HttpError(500, "Internal gateway error.", "server_error");

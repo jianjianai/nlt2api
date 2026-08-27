@@ -87,12 +87,17 @@ export class ForwardService {
         // The pair is spent either way: upstream redeems the ticket on success
         // and on captcha rejection, and a half-used one cannot be trusted.
         tickets.drop(pair.ticket.id);
-        if (error instanceof UpstreamError && error.kind === "rate_limit") {
-          // The limit belongs to the egress IP, not to this request: park that IP
-          // and drop the pin so the retry lands somewhere else.
-          proxies.markRateLimited(
+        if (error instanceof UpstreamError && (error.kind === "rate_limit" || error.kind === "ip_blocked")) {
+          // The refusal belongs to the egress IP, not to this request: park that
+          // IP and drop the pin so the retry lands somewhere else. An outright
+          // 403 means the IP itself is refused, which takes far longer to clear
+          // than a rate-limit window.
+          const blocked = error.kind === "ip_blocked";
+          const fallback = blocked ? config.ipBlockCooldownSeconds : config.rateLimitCooldownSeconds;
+          proxies.markCooldown(
             pair.ticket.proxyId,
-            (error.retryAfterSeconds ?? config.rateLimitCooldownSeconds) * 1_000,
+            (blocked ? fallback : error.retryAfterSeconds ?? fallback) * 1_000,
+            blocked ? "ip_blocked" : "rate_limit",
           );
           affinity.forget(key);
         } else if (error instanceof ProxyTransportError) {
@@ -112,6 +117,8 @@ export class ForwardService {
     if (error instanceof ProxyTransportError) return true;
     if (!(error instanceof UpstreamError)) return false;
     if (error.kind === "captcha") return true;
+    // The egress is now parked, so a retry gets a different IP and may succeed.
+    if (error.kind === "ip_blocked") return true;
     return error.status === 408 || error.status === 429 || (error.status >= 500 && error.status <= 599);
   }
 
