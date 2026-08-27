@@ -329,6 +329,82 @@ UI 四个工作区（沿用旧 `WorkspaceShell` 布局与 CSS）：
 | `maxAttempts` | 3 | 转发重试次数 |
 | `upstreamTimeoutMs` | 120000 | 上游超时 |
 
+### 4.9 调度全景
+
+调度由两个独立的循环组成，它们只通过凭证对池耦合：**请求路径**是消费者，**补充回路**是生产者。
+两者不直接互相调用——请求路径入队时给需求追踪器留一个信号，补充回路下一轮读到它；补充回路铸出票后
+排空队列，请求路径就被唤醒。这种单向耦合是刻意的：铸票慢到数十秒，任何同步等待都会把它压回请求延迟。
+
+```mermaid
+flowchart TB
+  subgraph REQ["请求路径 · 消费者"]
+    direction TB
+    R1["鉴权 + 校验 model/messages/stream"] --> R2["demand.touch<br/>唤醒空闲暂停中的铸票"]
+    R2 --> R3["会话键 key<br/>① 显式 ID：X-Session-Id / session_id<br/>② 回退：对话头部 SHA-256"]
+    R3 --> R4["prefer = affinity.resolve(key)"]
+    R4 --> R5{"队列空<br/>且池中有票？"}
+    R5 -->|是| R6["取走一对<br/>优先 prefer，否则 last_used_at 最早<br/>跳过限流冷却中的出口"]
+    R5 -->|否| Q1{"排队"}
+    Q1 -->|"关闭排队 / 队列已满"| QE1["503<br/>ticket_pool_empty<br/>queue_overflow"]
+    Q1 -->|"入队 FIFO 不可插队"| Q2(["等待"])
+    Q2 -->|"客户端断开 → 出队"| QE2["499 client_closed_request"]
+    Q2 -->|"queueTimeoutSeconds"| QE3["503 queue_timeout"]
+    Q2 -->|"被 drain 唤醒"| R6
+    R6 --> R7["demand.record<br/>stamp 出口 last_used_at"]
+    R7 --> R8["经配对代理请求上游<br/>注入 Turnstile 凭证与配对 UA"]
+    R8 -->|200| R9["删除凭证<br/>affinity.remember(key, 出口)"] --> ROK["透传响应 / SSE"]
+    R8 -->|失败| F0["删除凭证 · 一次性语义"] --> F1{"归类"}
+    F1 -->|429| F2["markRateLimited 该出口<br/>Retry-After 或 rateLimitCooldownSeconds<br/>affinity.forget"]
+    F1 -->|代理传输错误| F3["markFailure 该出口<br/>affinity.forget"]
+    F1 -->|403 captcha / 5xx / 408| F4["仅记录"]
+    F1 -->|其他 4xx| FE0["原状返回"]
+    F2 --> RT{"未达 maxAttempts ?"}
+    F3 --> RT
+    F4 --> RT
+    RT -->|否| FE1["返回最后一次错误"]
+    RT -->|是| RT2["tryClaim(prefer)<br/>只取空闲票，不再排队"]
+    RT2 -->|取到| R7
+    RT2 -->|取不到| FE1
+  end
+
+  POOL[("凭证对池<br/>proxy + ticket 成对")]
+
+  subgraph FILL["补充回路 · 生产者 · 每 refillIntervalSeconds"]
+    direction TB
+    O0["queue.drain<br/>上轮铸出的票先给排队者"] --> O1{"有在线授权服务？"}
+    O1 -->|无| OE0(["本轮结束"])
+    O1 -->|有| O2{"idleAfterSeconds 内<br/>有请求或有人排队？"}
+    O2 -->|否| O2B["target = 0 · 暂停铸票"] --> O4
+    O2 -->|是| O3["rate = 窗口取用数 / demandWindowSeconds<br/>target = clamp(⌈rate × targetLeadSeconds⌉ + waiting,<br/>min…, maxAvailableTickets)"] --> O4
+    O4["deficit = min(target − available − inflight,<br/>空闲且未限流的活跃代理数)"]
+    O4 -->|"≤ 0"| OE0
+    O4 -->|"> 0"| O5["按在线会话轮转下发 mint.request<br/>单会话上限 = concurrency − 其 inflight"]
+  end
+
+  R6 -.->|claim| POOL
+  POOL -.->|available| O4
+  O5 ==>|WS| M["授权服务：领代理 → 劫持 HTML 铸票"]
+  M ==>|ticket.submit| S1["校验 lease → 入池 → 释放 lease"]
+  S1 --> POOL
+  S1 -.->|"立即 queue.drain"| Q2
+```
+
+几个容易忽略的设计点：
+
+- **进程启动记为一次「有活动」**，因此冷启动会预热到水位下限，首个请求不必等冷铸票。
+- **重试不排队**（`tryClaim` 而非 `acquire`）：否则单个请求可能被 `queueTimeoutSeconds` 叠加 `maxAttempts` 次。
+- **限流冷却同时挡住转发取用和铸票租约**：在被限流的 IP 上铸票没有意义，票到解封时早已过期。
+- **排队深度直接加进 `target`**：它是速率窗口尚未观测到的未满足需求，比纯速率反馈快一个周期。
+- **亲和是建议性的**：钉住的出口无票则退回轮转，绝不因为保持 IP 一致而阻塞请求。
+
+出口 IP 在调度中的可用性由两个正交维度决定——健康度（三态，§4.3）与限流冷却（§4.6.2）：
+
+| 健康状态 | 限流冷却中 | 可被转发取用 | 可被铸票领取 |
+| --- | --- | --- | --- |
+| `active` | 否 | 是 | 是 |
+| `active` | 是 | 否 | 否 |
+| `pending` / `unavailable` | — | 否 | 否 |
+
 ## 5. 授权服务（minter）设计
 
 ### 5.1 形态
