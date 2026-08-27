@@ -2,6 +2,7 @@ import type { DatabaseSync } from "node:sqlite";
 import { SessionAffinity } from "~/server/utils/affinity.ts";
 import { createInMemoryDatabase } from "~/server/utils/database.ts";
 import { DemandTracker } from "~/server/utils/demand.ts";
+import { ErrorLogService } from "~/server/utils/error-log.ts";
 import { MintPriority } from "~/server/utils/mint-priority.ts";
 import { ProxyPoolService } from "~/server/utils/proxy-pool.ts";
 import { SettingsStore } from "~/server/utils/settings.ts";
@@ -11,6 +12,7 @@ import { TicketQueue } from "~/server/utils/ticket-queue.ts";
 export interface Harness {
   db: DatabaseSync;
   settings: SettingsStore;
+  errors: ErrorLogService;
   proxies: ProxyPoolService;
   tickets: TicketPoolService;
   demand: DemandTracker;
@@ -28,6 +30,7 @@ export function createHarness(startAt = 1_700_000_000_000): Harness {
   const clock = { now: startAt };
   const now = () => clock.now;
   const settings = new SettingsStore(db);
+  const errors = new ErrorLogService(db, { now });
   const proxies = new ProxyPoolService({ db, settings, now });
   const tickets = new TicketPoolService({ db, settings, proxies, now });
   const demand = new DemandTracker({ settings, now });
@@ -44,6 +47,7 @@ export function createHarness(startAt = 1_700_000_000_000): Harness {
   return {
     db,
     settings,
+    errors,
     proxies,
     tickets,
     demand,

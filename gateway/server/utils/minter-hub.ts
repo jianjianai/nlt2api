@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
 import { getGatewayConfig } from "~/server/utils/config.ts";
 import { allRows } from "~/server/utils/database.ts";
+import type { ErrorLogService } from "~/server/utils/error-log.ts";
 import { HttpError } from "~/server/utils/http.ts";
 import { redactProxyUrls } from "~/server/utils/proxy.ts";
 import type { ProxyPoolService } from "~/server/utils/proxy-pool.ts";
@@ -85,6 +86,8 @@ export interface MinterHubDependencies {
   proxies: ProxyPoolService;
   tickets: TicketPoolService;
   serverVersion: string;
+  /** Optional error journal; failed mint attempts land here. */
+  errors?: ErrorLogService;
   now?: () => number;
   /** Invoked after a ticket is accepted so a queued request can take it at once. */
   onTicketAccepted?: () => void;
@@ -102,6 +105,7 @@ export class MinterHub {
   private readonly proxies: ProxyPoolService;
   private readonly tickets: TicketPoolService;
   private readonly serverVersion: string;
+  private readonly errors: ErrorLogService | undefined;
   private readonly now: () => number;
   private readonly onTicketAccepted: (() => void) | undefined;
   private readonly mintPriority: (() => readonly string[]) | undefined;
@@ -113,6 +117,7 @@ export class MinterHub {
     this.proxies = dependencies.proxies;
     this.tickets = dependencies.tickets;
     this.serverVersion = dependencies.serverVersion;
+    this.errors = dependencies.errors;
     this.now = dependencies.now ?? Date.now;
     this.onTicketAccepted = dependencies.onTicketAccepted;
     this.mintPriority = dependencies.mintPriority;
@@ -321,12 +326,14 @@ export class MinterHub {
   private handleFailure(connection: Connection, _id: string, reason: string, leaseId?: string, message?: string): void {
     if (!connection.sessionId) return;
     const detail = redactProxyUrls(message ?? reason).slice(0, 500);
+    let blamedProxyId: string | undefined;
     if (leaseId) {
       const proxy = this.proxies.resolveLease(connection.sessionId, leaseId);
       // Only transport-level reasons say anything about the proxy; a local
       // browser failure must not push a healthy proxy toward `unavailable`.
       if (proxy && blamesProxy(reason as never)) {
         this.proxies.markFailure(proxy.id, `mint: ${reason}`);
+        blamedProxyId = proxy.id;
       } else {
         this.proxies.releaseLease(connection.sessionId, leaseId);
       }
@@ -334,6 +341,15 @@ export class MinterHub {
     }
     this.db.prepare("UPDATE minter_sessions SET failed_count = failed_count + 1, last_error = ? WHERE id = ?")
       .run(detail, connection.sessionId);
+    this.errors?.record({
+      at: this.now(),
+      kind: "minter",
+      status: "failed",
+      message: detail,
+      sessionId: connection.sessionId,
+      agentId: connection.agentId,
+      ...(blamedProxyId ? { proxyId: blamedProxyId } : {}),
+    });
     this.recordEvent("failed", connection.sessionId, reason);
     this.settleInflight(connection);
   }

@@ -1,6 +1,7 @@
 import { HttpError } from "~/server/utils/http.ts";
 import { conversationKey, type SessionAffinity } from "~/server/utils/affinity.ts";
 import type { DemandTracker } from "~/server/utils/demand.ts";
+import type { ErrorLogService } from "~/server/utils/error-log.ts";
 import { ProxyTransportError } from "~/server/utils/proxy.ts";
 import type { ProxyPoolService } from "~/server/utils/proxy-pool.ts";
 import type { SettingsStore } from "~/server/utils/settings.ts";
@@ -36,6 +37,9 @@ export interface ForwardDependencies {
   queue: TicketQueue;
   demand: DemandTracker;
   affinity: SessionAffinity;
+  /** Optional error journal; forwarding failures land here. */
+  errors?: ErrorLogService;
+  now?: () => number;
   chat?: typeof chatCompletions;
   catalog?: typeof modelCatalog;
 }
@@ -44,6 +48,17 @@ export class ForwardService {
   private modelsCache: { at: number; models: UpstreamModel[] } | undefined;
 
   constructor(private readonly dependencies: ForwardDependencies) {}
+
+  /** One journal row for a failed forward request or attempt. */
+  private recordFailure(message: string, options: { proxyId?: string; attempt?: number } = {}): void {
+    this.dependencies.errors?.record({
+      at: (this.dependencies.now ?? Date.now)(),
+      kind: "forward",
+      status: "failed",
+      message,
+      ...options,
+    });
+  }
 
   /**
    * Forwards one chat request. Each attempt spends a distinct (proxy, ticket)
@@ -62,13 +77,26 @@ export class ForwardService {
     for (let attempt = 1; attempt <= config.maxAttempts; attempt += 1) {
       const prefer = affinity.resolve(key);
       let pair: TicketPair | undefined;
-      if (attempt === 1) {
-        pair = await queue.acquire(signal, prefer);
-      } else {
-        // A retry takes a free pair or gives up with the error that caused it;
-        // queueing again would let one client wait the timeout several times over.
-        pair = queue.tryClaim(prefer);
-        if (!pair) throw lastError ?? poolExhausted();
+      try {
+        if (attempt === 1) {
+          pair = await queue.acquire(signal, prefer);
+        } else {
+          // A retry takes a free pair or gives up with the error that caused it;
+          // queueing again would let one client wait the timeout several times over.
+          pair = queue.tryClaim(prefer);
+          if (!pair) throw lastError ?? poolExhausted();
+        }
+      } catch (error) {
+        // The request failed before any attempt ran: pool empty, queue full,
+        // queue timeout or the client leaving. Every failure is journaled, except
+        // a retry rethrowing the error its failed attempt already recorded.
+        if (attempt === 1 || error !== lastError) {
+          this.recordFailure(
+            error instanceof Error ? error.message : "No usable credential pair.",
+            { attempt },
+          );
+        }
+        throw error;
       }
       demand.record();
       try {
@@ -104,6 +132,12 @@ export class ForwardService {
           proxies.markFailure(pair.ticket.proxyId, error.message);
           affinity.forget(key);
         }
+        // Every failure is journaled: upstream refusals, transport errors and
+        // client aborts alike, so the trace shows the full attempt history.
+        this.recordFailure(error instanceof Error ? error.message : "Upstream request failed.", {
+          proxyId: pair.ticket.proxyId,
+          attempt,
+        });
         if (signal?.aborted) throw error;
         if (error instanceof UpstreamError && error.status === 499) throw error;
         if (!this.retryable(error) || attempt >= config.maxAttempts) throw error;
@@ -131,13 +165,18 @@ export class ForwardService {
       return this.modelsCache.models;
     }
     const proxy = proxies.anyActive();
-    const models = await catalog({
-      timeoutMs: config.upstreamTimeoutMs,
-      ...(proxy ? { proxyUrl: proxy.url } : {}),
-      ...(signal ? { signal } : {}),
-    });
-    this.modelsCache = { at: now, models };
-    return models;
+    try {
+      const models = await catalog({
+        timeoutMs: config.upstreamTimeoutMs,
+        ...(proxy ? { proxyUrl: proxy.url } : {}),
+        ...(signal ? { signal } : {}),
+      });
+      this.modelsCache = { at: now, models };
+      return models;
+    } catch (error) {
+      this.recordFailure(error instanceof Error ? error.message : "Model catalog request failed.", proxy ? { proxyId: proxy.id } : {});
+      throw error;
+    }
   }
 
   invalidateModelsCache(): void {

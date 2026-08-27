@@ -2,6 +2,7 @@ import { readFileSync } from "node:fs";
 import { SessionAffinity } from "~/server/utils/affinity.ts";
 import { gatewayDatabase } from "~/server/utils/database.ts";
 import { DemandTracker } from "~/server/utils/demand.ts";
+import { ErrorLogService } from "~/server/utils/error-log.ts";
 import { ForwardService } from "~/server/utils/forward-service.ts";
 import { MinterHub } from "~/server/utils/minter-hub.ts";
 import { MintPriority } from "~/server/utils/mint-priority.ts";
@@ -14,6 +15,7 @@ import { TicketQueue } from "~/server/utils/ticket-queue.ts";
 
 export interface GatewayRuntime {
   settings: SettingsStore;
+  errors: ErrorLogService;
   proxies: ProxyPoolService;
   tickets: TicketPoolService;
   queue: TicketQueue;
@@ -41,6 +43,7 @@ export function gatewayRuntime(): GatewayRuntime {
   if (runtime) return runtime;
   const db = gatewayDatabase();
   const settings = new SettingsStore(db);
+  const errors = new ErrorLogService(db);
   const proxies = new ProxyPoolService({ db, settings });
   const tickets = new TicketPoolService({ db, settings, proxies });
   const demand = new DemandTracker({ settings });
@@ -59,14 +62,15 @@ export function gatewayRuntime(): GatewayRuntime {
     settings,
     proxies,
     tickets,
+    errors,
     serverVersion: serverVersion(),
     onTicketAccepted: () => queue.drain(),
     mintPriority: () => mintPriority.ids(),
   });
   const checker = new ProxyChecker({ settings, proxies });
   const refill = new RefillOrchestrator({ settings, proxies, tickets, hub, demand, queue, mintPriority });
-  const forward = new ForwardService({ settings, proxies, tickets, queue, demand, affinity });
-  runtime = { settings, proxies, tickets, queue, demand, affinity, mintPriority, hub, checker, refill, forward };
+  const forward = new ForwardService({ settings, proxies, tickets, queue, demand, affinity, errors });
+  runtime = { settings, errors, proxies, tickets, queue, demand, affinity, mintPriority, hub, checker, refill, forward };
   return runtime;
 }
 

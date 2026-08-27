@@ -39,6 +39,7 @@ function createHub(harness: Harness): MinterHub {
     settings: harness.settings,
     proxies: harness.proxies,
     tickets: harness.tickets,
+    errors: harness.errors,
     serverVersion: "1.0.0",
     now: () => harness.clock.now,
   });
@@ -245,6 +246,13 @@ test("failure messages never persist proxy credentials", () => {
     const session = hub.snapshot().at(0);
     assert.ok(session?.lastError);
     assert.ok(!session.lastError.includes("secret"));
+    // The journal gets one minter row with the session/agent attached, and the
+    // credential stays out of it as well.
+    const rows = harness.errors.list({ kind: "minter" }).entries;
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0]?.sessionId, session.id);
+    assert.equal(rows[0]?.agentId, "agent-1");
+    assert.ok(!rows[0]!.message.includes("secret"));
   } finally {
     harness.close();
   }

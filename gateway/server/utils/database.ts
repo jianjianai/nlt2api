@@ -108,6 +108,28 @@ const MIGRATIONS: Array<{ version: number; up: (db: DatabaseSync) => void }> = [
       `);
     },
   },
+  {
+    version: 5,
+    up: (db) => {
+      db.exec(`
+        CREATE TABLE error_logs (
+          id          INTEGER PRIMARY KEY AUTOINCREMENT,
+          at          INTEGER NOT NULL,
+          kind        TEXT NOT NULL,
+          status      TEXT NOT NULL,
+          message     TEXT NOT NULL,
+          session_id  TEXT,
+          proxy_id    TEXT,
+          agent_id    TEXT,
+          attempt     INTEGER
+        );
+        CREATE INDEX error_logs_at ON error_logs (at);
+        CREATE INDEX error_logs_kind ON error_logs (kind, status);
+        CREATE INDEX error_logs_session ON error_logs (session_id);
+        CREATE INDEX error_logs_proxy ON error_logs (proxy_id);
+      `);
+    },
+  },
 ];
 
 function applyMigrations(db: DatabaseSync): void {

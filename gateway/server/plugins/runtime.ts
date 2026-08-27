@@ -57,6 +57,7 @@ export default definePlugin((nitro) => {
         runtime.tickets.cleanup();
         runtime.hub.sweepHeartbeats();
         runtime.hub.pruneEvents();
+        runtime.errors.prune();
       },
     ),
   ];

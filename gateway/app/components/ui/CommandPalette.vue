@@ -48,6 +48,7 @@ const workspaceActions: Array<Omit<PaletteAction, "active">> = [
   { id: "workspace:proxies", group: "工作区", label: "代理池", description: "导入、测活与三态管理", icon: "globe" },
   { id: "workspace:tickets", group: "工作区", label: "凭证对池", description: "查看 (代理, 凭证) 对与剩余寿命", icon: "key" },
   { id: "workspace:minters", group: "工作区", label: "授权服务", description: "在线授权服务与铸票统计", icon: "server" },
+  { id: "workspace:errors", group: "工作区", label: "错误记录", description: "代理、铸票、转发与测活失败日志", icon: "alert-triangle" },
   { id: "workspace:settings", group: "工作区", label: "运行参数", description: "凭证寿命、水位与测活策略", icon: "settings" },
 ];
 const actions = computed<PaletteAction[]>(() => [

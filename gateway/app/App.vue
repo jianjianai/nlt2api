@@ -8,6 +8,7 @@ import WorkspaceShell from "./components/WorkspaceShell.vue";
 const ProxyPoolWorkspace = defineAsyncComponent(() => import("./components/ProxyPoolWorkspace.vue"));
 const TicketPoolWorkspace = defineAsyncComponent(() => import("./components/TicketPoolWorkspace.vue"));
 const MintersWorkspace = defineAsyncComponent(() => import("./components/MintersWorkspace.vue"));
+const ErrorsWorkspace = defineAsyncComponent(() => import("./components/ErrorsWorkspace.vue"));
 const SettingsWorkspace = defineAsyncComponent(() => import("./components/SettingsWorkspace.vue"));
 import {
   DEFAULT_THEME,
@@ -19,6 +20,10 @@ import {
 } from "./utils/admin-ui.ts";
 import type {
   CheckOutcome,
+  ErrorLogEntry,
+  ErrorLogKind,
+  ErrorLogStatus,
+  ErrorLogSummary,
   GatewaySettings,
   ImportSummary,
   MinterSessionPublic,
@@ -56,6 +61,17 @@ const ticketTotal = ref(0);
 const minters = shallowRef<MinterSessionPublic[]>([]);
 const minterOnline = ref(0);
 const minterInflight = ref(0);
+const errors = shallowRef<ErrorLogEntry[]>([]);
+const errorTotal = ref(0);
+const errorSummary = shallowRef<ErrorLogSummary | null>(null);
+const errorKind = ref<ErrorLogKind | "all">("all");
+const errorStatus = ref<ErrorLogStatus | "all">("all");
+const errorSessionId = ref("");
+const errorPage = ref(1);
+const errorPageSize = ref(50);
+const pendingErrorClearOlder = ref(false);
+const pendingErrorClearAll = ref(false);
+const isClearingErrors = ref(false);
 
 const proxyFilter = ref<ProxyFilter>("all");
 const importText = ref("");
@@ -170,6 +186,17 @@ async function loadMinters(): Promise<void> {
   minterInflight.value = payload.inflight;
 }
 
+async function loadErrors(): Promise<void> {
+  const query = new URLSearchParams({ page: String(errorPage.value), pageSize: String(errorPageSize.value) });
+  if (errorKind.value !== "all") query.set("kind", errorKind.value);
+  if (errorStatus.value !== "all") query.set("status", errorStatus.value);
+  if (errorSessionId.value) query.set("sessionId", errorSessionId.value);
+  const payload = await api<{ entries: ErrorLogEntry[]; total: number; summary: ErrorLogSummary }>(`/api/admin/errors?${query}`);
+  errors.value = payload.entries;
+  errorTotal.value = payload.total;
+  errorSummary.value = payload.summary;
+}
+
 async function loadSettings(): Promise<void> {
   const payload = await api<{ settings: GatewaySettings; bounds: SettingBounds }>("/api/admin/settings");
   settings.value = payload.settings;
@@ -186,6 +213,7 @@ async function refresh(): Promise<void> {
     if (view.value === "proxies") await loadProxies();
     else if (view.value === "tickets") await loadTickets();
     else if (view.value === "minters") await loadMinters();
+    else if (view.value === "errors") await loadErrors();
     else if (view.value === "settings") await loadSettings();
     isConnected.value = true;
   } catch (error) {
@@ -369,6 +397,24 @@ async function disconnectMinter(session: MinterSessionPublic): Promise<void> {
   }
 }
 
+async function clearErrors(scope: "older" | "all"): Promise<void> {
+  isClearingErrors.value = true;
+  try {
+    const payload = await api<{ removed: number }>("/api/admin/errors", {
+      method: "DELETE",
+      body: JSON.stringify(scope === "all" ? { all: true } : { olderThanDays: 1 }),
+    });
+    pendingErrorClearAll.value = false;
+    pendingErrorClearOlder.value = false;
+    pushToast("success", `已清除 ${payload.removed} 条错误记录。`);
+    await loadErrors();
+  } catch (error) {
+    pushToast("error", errorText(error, "清除失败。"));
+  } finally {
+    isClearingErrors.value = false;
+  }
+}
+
 function openScreenshot(session: MinterSessionPublic, kind: "page" | "fullpage"): void {
   screenshotSession.value = session;
   screenshotKind.value = kind;
@@ -467,6 +513,9 @@ watch(proxyFilter, () => {
 });
 watch([proxyPage, proxyPageSize], () => {
   if (view.value === "proxies") void loadProxies();
+});
+watch([errorKind, errorStatus, errorSessionId, errorPage, errorPageSize], () => {
+  if (view.value === "errors") void loadErrors();
 });
 
 let refreshTimer: number | undefined;
@@ -591,6 +640,27 @@ onUnmounted(() => {
         @close-screenshot="closeScreenshot"
       />
 
+      <ErrorsWorkspace
+        v-else-if="view === 'errors'"
+        :entries="errors"
+        :total="errorTotal"
+        :summary="errorSummary"
+        :kind="errorKind"
+        :status="errorStatus"
+        :session-id="errorSessionId"
+        :page="errorPage"
+        :page-size="errorPageSize"
+        :clearing="isClearingErrors"
+        :now="currentTime"
+        @update:kind="errorKind = $event"
+        @update:status="errorStatus = $event"
+        @update:session-id="errorSessionId = $event"
+        @update:page="errorPage = $event"
+        @update:page-size="errorPageSize = $event"
+        @clear-older="pendingErrorClearOlder = true"
+        @clear-all="pendingErrorClearAll = true"
+      />
+
       <SettingsWorkspace
         v-else-if="view === 'settings' && settingsDraft"
         :draft="settingsDraft"
@@ -635,6 +705,28 @@ onUnmounted(() => {
       :busy="isClearingTickets"
       @update:open="pendingTicketClear = $event"
       @confirm="confirmTicketClear"
+    />
+
+    <AppConfirmDialog
+      :open="pendingErrorClearAll"
+      title="清空全部错误记录"
+      description="将删除错误记录中的全部条目，此操作不可撤销。"
+      confirm-label="清空"
+      busy-label="清空中…"
+      :busy="isClearingErrors"
+      @update:open="pendingErrorClearAll = $event"
+      @confirm="clearErrors('all')"
+    />
+
+    <AppConfirmDialog
+      :open="pendingErrorClearOlder"
+      title="清除 24 小时前记录"
+      description="删除 24 小时前的错误记录，保留近期条目以便排查当前故障。"
+      confirm-label="清除"
+      busy-label="清除中…"
+      :busy="isClearingErrors"
+      @update:open="pendingErrorClearOlder = $event"
+      @confirm="clearErrors('older')"
     />
 
     <div class="toast-stack" aria-live="polite">

@@ -168,6 +168,27 @@ export interface GatewaySettings {
   upstreamTimeoutMs: number;
 }
 
+export type ErrorLogKind = "minter" | "forward";
+export type ErrorLogStatus = "failed" | "rejected";
+
+/** One row of the error journal shown in the admin console. */
+export interface ErrorLogEntry {
+  id: number;
+  at: number;
+  kind: ErrorLogKind;
+  status: ErrorLogStatus;
+  message: string;
+  /** Which minter session owns the failure; links back to the minters page. */
+  sessionId?: string;
+  /** Which proxy failed; links back to the proxies page. */
+  proxyId?: string;
+  agentId?: string;
+  /** Forward attempt number (1..N) when the failure was a retried attempt. */
+  attempt?: number;
+}
+
+export type ErrorLogSummary = Record<ErrorLogKind, Record<ErrorLogStatus, number>>;
+
 export interface OverviewSnapshot {
   proxies: Record<ProxyStatus, number>;
   proxiesMintable: number;

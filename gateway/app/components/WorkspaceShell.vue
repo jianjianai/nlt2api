@@ -57,6 +57,7 @@ const operationalItems: Array<{ id: Exclude<WorkspaceId, "settings">; label: str
   { id: "proxies", label: "代理池", icon: "globe" },
   { id: "tickets", label: "凭证对池", icon: "key" },
   { id: "minters", label: "授权服务", icon: "server" },
+  { id: "errors", label: "错误记录", icon: "alert-triangle" },
 ];
 const workspaceShortcuts: WorkspaceId[] = [...operationalItems.map((item) => item.id), "settings"];
 
@@ -76,7 +77,7 @@ function onGlobalShortcut(event: KeyboardEvent): void {
     return;
   }
   if (commandOpen.value || editable || activeModal) return;
-  if (event.altKey && /^[1-5]$/.test(event.key)) {
+  if (event.altKey && /^[1-6]$/.test(event.key)) {
     event.preventDefault();
     emit("select", workspaceShortcuts[Number(event.key) - 1]!);
   } else if (event.altKey && key === "r" && !props.loading) {

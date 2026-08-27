@@ -1,4 +1,4 @@
-export type WorkspaceId = "overview" | "proxies" | "tickets" | "minters" | "settings";
+export type WorkspaceId = "overview" | "proxies" | "tickets" | "minters" | "errors" | "settings";
 export type ThemeId = "light" | "dark";
 
 export type ProxyStatus = "active" | "pending" | "unavailable" | "rejected";
@@ -111,6 +111,24 @@ export interface OverviewSnapshot {
     allowAnonymous: boolean;
   };
 }
+
+export type ErrorLogKind = "minter" | "forward";
+export type ErrorLogStatus = "failed" | "rejected";
+
+/** One row of the error journal shown in the admin console. */
+export interface ErrorLogEntry {
+  id: number;
+  at: number;
+  kind: ErrorLogKind;
+  status: ErrorLogStatus;
+  message: string;
+  sessionId?: string;
+  proxyId?: string;
+  agentId?: string;
+  attempt?: number;
+}
+
+export type ErrorLogSummary = Record<ErrorLogKind, Record<ErrorLogStatus, number>>;
 
 export interface ImportSummary {
   imported: number;

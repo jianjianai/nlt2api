@@ -158,12 +158,75 @@ test("a transport failure records a proxy failure", async () => {
       queue: harness.queue,
       demand: harness.demand,
       affinity: harness.affinity,
+      errors: harness.errors,
+      now: () => harness.clock.now,
       chat: async () => {
         throw new ProxyTransportError("Proxy connection was refused.");
       },
     });
     await assert.rejects(() => forward.chat({ model: "m", messages: [] }), ProxyTransportError);
     assert.equal(harness.proxies.require(proxyId).failureCount, 1);
+    // Transport failures land in the journal too, with the proxy id attached.
+    const rows = harness.errors.list({ kind: "forward" }).entries;
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0]?.proxyId, proxyId);
+    assert.equal(rows[0]?.attempt, 1);
+    assert.ok(rows[0]!.message.includes("refused"));
+  } finally {
+    harness.close();
+  }
+});
+
+test("client-side failures are journaled as well", async () => {
+  const harness = createHarness();
+  try {
+    seedTicket(harness, "1.token");
+    const forward = new ForwardService({
+      settings: harness.settings,
+      proxies: harness.proxies,
+      tickets: harness.tickets,
+      queue: harness.queue,
+      demand: harness.demand,
+      affinity: harness.affinity,
+      errors: harness.errors,
+      now: () => harness.clock.now,
+      chat: async () => {
+        throw new UpstreamError("Upstream failed: bad model", 400);
+      },
+    });
+    await assert.rejects(() => forward.chat({ model: "m", messages: [] }), UpstreamError);
+    const rows = harness.errors.list({ kind: "forward" }).entries;
+    assert.equal(rows.length, 1);
+    assert.ok(rows[0]!.message.includes("bad model"));
+    assert.equal(rows[0]?.attempt, 1);
+  } finally {
+    harness.close();
+  }
+});
+
+test("an empty pool is journaled with a Retry-After hint when queueing is off", async () => {
+  const harness = createHarness();
+  try {
+    harness.settings.patch({ queueMaxSize: 0 });
+    const forward = new ForwardService({
+      settings: harness.settings,
+      proxies: harness.proxies,
+      tickets: harness.tickets,
+      queue: harness.queue,
+      demand: harness.demand,
+      affinity: harness.affinity,
+      errors: harness.errors,
+      now: () => harness.clock.now,
+      chat: async () => new Response("{}"),
+    });
+    await assert.rejects(
+      () => forward.chat({ model: "m", messages: [] }),
+      (error: unknown) => error instanceof HttpError && error.status === 503 && error.code === "ticket_pool_empty",
+    );
+    const rows = harness.errors.list({ kind: "forward" }).entries;
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0]?.attempt, 1);
+    assert.ok(rows[0]!.message.includes("No usable proxy/ticket pair"));
   } finally {
     harness.close();
   }
@@ -212,6 +275,8 @@ test("attempts are capped by maxAttempts", async () => {
       queue: harness.queue,
       demand: harness.demand,
       affinity: harness.affinity,
+      errors: harness.errors,
+      now: () => harness.clock.now,
       chat: async () => {
         calls += 1;
         throw upstreamErrorFrom(503, "unavailable");
@@ -219,6 +284,9 @@ test("attempts are capped by maxAttempts", async () => {
     });
     await assert.rejects(() => forward.chat({ model: "m", messages: [] }), UpstreamError);
     assert.equal(calls, 2);
+    // Every retried attempt lands in the journal, so the trace shows the count.
+    const rows = harness.errors.list({ kind: "forward" }).entries;
+    assert.deepEqual(rows.map((row) => row.attempt), [2, 1]);
   } finally {
     harness.close();
   }

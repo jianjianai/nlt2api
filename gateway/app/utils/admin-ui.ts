@@ -1,4 +1,4 @@
-import type { ProxyStatus, SettingKey, ThemeId, WorkspaceId } from "../types/admin.ts";
+import type { ErrorLogKind, ErrorLogStatus, ProxyStatus, SettingKey, ThemeId, WorkspaceId } from "../types/admin.ts";
 
 export const DEFAULT_WORKSPACE: WorkspaceId = "overview";
 export const DEFAULT_THEME: ThemeId = "light";
@@ -6,7 +6,7 @@ export const TOKEN_STORAGE_KEY = "gateway-admin-token";
 export const WORKSPACE_STORAGE_KEY = "gateway-admin-workspace";
 export const THEME_STORAGE_KEY = "gateway-admin-theme";
 
-const WORKSPACES = new Set<WorkspaceId>(["overview", "proxies", "tickets", "minters", "settings"]);
+const WORKSPACES = new Set<WorkspaceId>(["overview", "proxies", "tickets", "minters", "errors", "settings"]);
 
 export function parseTheme(value: unknown): ThemeId {
   return value === "dark" || value === "light" ? value : DEFAULT_THEME;
@@ -28,6 +28,21 @@ export const PROXY_STATUS_TONE: Record<ProxyStatus, "good" | "warn" | "bad"> = {
   pending: "warn",
   unavailable: "bad",
   rejected: "bad",
+};
+
+export const ERROR_KIND_LABEL: Record<ErrorLogKind, string> = {
+  minter: "铸票",
+  forward: "转发",
+};
+
+export const ERROR_KIND_TONE: Record<ErrorLogKind, "warn" | "bad"> = {
+  forward: "warn",
+  minter: "bad",
+};
+
+export const ERROR_STATUS_LABEL: Record<ErrorLogStatus, string> = {
+  failed: "失败",
+  rejected: "不达标",
 };
 
 export const SETTING_LABEL: Record<SettingKey, { label: string; hint: string }> = {

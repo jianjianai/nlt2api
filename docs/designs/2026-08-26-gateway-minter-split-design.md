@@ -244,6 +244,17 @@ deficit = min(target - available - inflight, idleActiveProxies)
 
 进程启动记为一次「有活动」，因此冷启动会预热到水位下限，首个请求不必等待冷铸票。
 
+### 4.5.1 错误日志
+
+铸票失败（`mint.failed`）与转发失败统一写入 `error_logs` 表；拒绝（`ticket.rejected`）也在其中。
+转发失败的每一次尝试都会记录——上游 5xx/429/403、代理传输错误、客户端 4xx/499、池空/排队
+超时、模型目录拉取失败——行包含 `kind/status/message/session_id/proxy_id/agent_id/attempt`
+（`failed|rejected` 两种状态，`attempt` 记录转发重试序号 1..N），自由文本在写入前经过
+`redactProxyUrls` 脱敏并截断到 500 字符，管理后台「错误记录」页支持按来源、状态与会话筛选、
+分页查看和清空（可只清 24 小时前）。清理器每 `ticketCleanupIntervalSeconds` 同时按保留 7 天
+与 2000 行上限清理错误日志，避免长期运行膨胀。代理自身失败（`markFailure`/`markRejected`）
+与后台测活失败只反映在代理池状态上，不写入该日志。
+
 ### 4.6 转发层
 
 `POST /v1/chat/completions`：
