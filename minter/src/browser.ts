@@ -1,6 +1,6 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { existsSync } from "node:fs";
-import { mkdir } from "node:fs/promises";
+import { mkdir, rm } from "node:fs/promises";
 import { setTimeout as delay } from "node:timers/promises";
 import { CdpSession, findPageTarget, MintError } from "./cdp.ts";
 import { browserProxyTarget, type BrowserProxyTarget } from "./proxy.ts";
@@ -275,6 +275,17 @@ export class MinterBrowser {
   private async launch(): Promise<void> {
     const executablePath = detectExecutable(this.options.executablePath);
     await mkdir(this.options.profileDir, { recursive: true });
+    // A crashed/killed instance leaves Singleton* lock files behind; Chromium
+    // then refuses to start ("profile appears to be in use") and mints never
+    // produce a page target. The profile dir is bound to a volume that
+    // survives container restarts, so the locks must be cleared here.
+    for (const lock of [
+      "SingletonLock",
+      "SingletonCookie",
+      "SingletonSocket",
+    ] satisfies string[]) {
+      await rm(`${this.options.profileDir}/${lock}`, { force: true }).catch(() => undefined);
+    }
     const args = [
       `--remote-debugging-port=${this.options.port}`,
       `--user-data-dir=${this.options.profileDir}`,
