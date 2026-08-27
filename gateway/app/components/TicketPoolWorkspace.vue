@@ -7,7 +7,9 @@ defineProps<{
   tickets: TicketPublic[];
   available: number;
   total: number;
-  minAvailable: number;
+  target: number;
+  waiting: number;
+  paused: boolean;
   ticketTtlSeconds: number;
   clearing: boolean;
   now: number;
@@ -37,7 +39,8 @@ const emit = defineEmits<{ clear: [] }>();
     <div class="resource-summary">
       <button type="button" disabled><strong>{{ available }}</strong><span>可用</span></button>
       <button type="button" disabled><strong>{{ total }}</strong><span>池内总数</span></button>
-      <button type="button" disabled><strong>{{ minAvailable }}</strong><span>水位下限</span></button>
+      <button type="button" disabled><strong>{{ paused ? "—" : target }}</strong><span>{{ paused ? "铸票已暂停" : "目标水位" }}</span></button>
+      <button type="button" disabled><strong>{{ waiting }}</strong><span>排队请求</span></button>
     </div>
 
     <section class="content-section">
@@ -48,7 +51,8 @@ const emit = defineEmits<{ clear: [] }>();
 
       <div v-if="tickets.length === 0" class="workspace-empty">
         <strong>凭证池为空</strong>
-        <p>确认有在线授权服务且存在可铸票的活跃代理；补充任务会在下一个检查周期自动下发。</p>
+        <p v-if="paused">长时间无请求，铸票已暂停以避免浪费；下一个请求到达时会自动恢复。</p>
+        <p v-else>确认有在线授权服务且存在可铸票的活跃代理；补充任务会在下一个检查周期自动下发。</p>
       </div>
 
       <div v-else class="proxy-resource-list">

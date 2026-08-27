@@ -25,9 +25,19 @@ const groups: Array<{ title: string; description: string; keys: SettingKey[] }> 
     keys: ["ticketTtlSeconds", "ticketMinRemainingSeconds", "ticketCleanupIntervalSeconds"],
   },
   {
+    title: "自适应水位",
+    description: "按实测消耗速率 × 备货时长动态决定常备量，并在 下限~上限 之间取值。长时间无请求则暂停铸票。",
+    keys: ["minAvailableTickets", "maxAvailableTickets", "targetLeadSeconds", "demandWindowSeconds", "idleAfterSeconds"],
+  },
+  {
+    title: "请求排队",
+    description: "凭证不足时请求排队等待而不直接失败；客户端断开即刻退出队列。",
+    keys: ["queueMaxSize", "queueTimeoutSeconds"],
+  },
+  {
     title: "补充编排",
     description: "水位不足时向在线授权服务下发铸票任务。",
-    keys: ["minAvailableTickets", "refillIntervalSeconds", "mintRequestTimeoutSeconds", "proxyLeaseSeconds"],
+    keys: ["refillIntervalSeconds", "mintRequestTimeoutSeconds", "proxyLeaseSeconds"],
   },
   {
     title: "代理测活",

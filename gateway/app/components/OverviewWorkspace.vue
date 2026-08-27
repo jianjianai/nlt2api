@@ -19,15 +19,27 @@ interface Metric {
 const metrics = computed<Metric[]>(() => {
   const snapshot = props.overview;
   if (!snapshot) return [];
-  const { available, minAvailable, total } = snapshot.tickets;
+  const { available, target, total } = snapshot.tickets;
   return [
     {
       key: "tickets",
       label: "可用凭证对",
       value: `${available}`,
-      hint: `水位下限 ${minAvailable} · 池内共 ${total}`,
+      hint: snapshot.demand.paused
+        ? `池内共 ${total} · 无请求，铸票已暂停`
+        : `目标水位 ${target} · 池内共 ${total}`,
       icon: "key",
-      tone: poolTone(available, minAvailable),
+      tone: snapshot.demand.paused ? "" : poolTone(available, target),
+    },
+    {
+      key: "queue",
+      label: "排队请求",
+      value: `${snapshot.queue.waiting}`,
+      hint: snapshot.queue.maxSize === 0
+        ? "未启用排队，凭证不足直接返回 503"
+        : `上限 ${snapshot.queue.maxSize} · 近 ${snapshot.demand.windowSeconds} 秒消耗 ${snapshot.demand.claims}`,
+      icon: "activity",
+      tone: snapshot.queue.waiting === 0 ? "" : snapshot.queue.waiting >= snapshot.queue.maxSize ? "bad" : "warn",
     },
     {
       key: "proxies",
@@ -73,14 +85,21 @@ const issues = computed(() => {
   }
   if (snapshot.minters.online === 0) {
     list.push({ id: "offline", title: "没有在线授权服务", detail: "凭证池无法补充，池耗尽后转发将返回 503。", tone: "bad" });
-  }
-  if (snapshot.proxies.active === 0) {
+  }  if (snapshot.proxies.active === 0) {
     list.push({ id: "noproxy", title: "没有活跃代理", detail: "先导入代理并等待测活通过。", tone: "bad" });
   } else if (snapshot.proxiesMintable === 0) {
     list.push({ id: "nomintable", title: "活跃代理均无法用于铸票", detail: "带认证的 SOCKS 代理无法驱动浏览器，请补充 HTTP 代理。", tone: "warn" });
   }
-  if (snapshot.tickets.available < snapshot.tickets.minAvailable && snapshot.minters.online > 0) {
-    list.push({ id: "lowwater", title: "凭证水位低于下限", detail: "补充任务已下发，若长期不恢复请检查授权服务日志。", tone: "warn" });
+  if (!snapshot.demand.paused && snapshot.tickets.available < snapshot.tickets.target && snapshot.minters.online > 0) {
+    list.push({ id: "lowwater", title: "凭证水位低于目标", detail: "补充任务已下发，若长期不恢复请检查授权服务日志。", tone: "warn" });
+  }
+  if (snapshot.queue.waiting > 0) {
+    list.push({
+      id: "queue",
+      title: `${snapshot.queue.waiting} 个请求正在排队`,
+      detail: "铸票速度跟不上消耗，可提高备货时长或补充可铸票代理。",
+      tone: snapshot.queue.maxSize > 0 && snapshot.queue.waiting >= snapshot.queue.maxSize ? "bad" : "warn",
+    });
   }
   return list;
 });

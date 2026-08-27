@@ -14,7 +14,13 @@ const BOUNDS: Record<keyof GatewaySettings, Bound> = {
   ticketTtlSeconds: { min: 30, max: 178 },
   ticketMinRemainingSeconds: { min: 5, max: 60 },
   ticketCleanupIntervalSeconds: { min: 5, max: 300 },
-  minAvailableTickets: { min: 1, max: 200 },
+  minAvailableTickets: { min: 0, max: 200 },
+  maxAvailableTickets: { min: 1, max: 500 },
+  targetLeadSeconds: { min: 5, max: 600 },
+  demandWindowSeconds: { min: 10, max: 3_600 },
+  idleAfterSeconds: { min: 0, max: 86_400 },
+  queueMaxSize: { min: 0, max: 10_000 },
+  queueTimeoutSeconds: { min: 1, max: 600 },
   refillIntervalSeconds: { min: 1, max: 120 },
   mintRequestTimeoutSeconds: { min: 30, max: 900 },
   proxyLeaseSeconds: { min: 30, max: 900 },
@@ -32,7 +38,13 @@ export const DEFAULT_SETTINGS: GatewaySettings = {
   ticketTtlSeconds: 170,
   ticketMinRemainingSeconds: 20,
   ticketCleanupIntervalSeconds: 15,
-  minAvailableTickets: 4,
+  minAvailableTickets: 2,
+  maxAvailableTickets: 40,
+  targetLeadSeconds: 60,
+  demandWindowSeconds: 120,
+  idleAfterSeconds: 300,
+  queueMaxSize: 64,
+  queueTimeoutSeconds: 60,
   refillIntervalSeconds: 5,
   mintRequestTimeoutSeconds: 180,
   proxyLeaseSeconds: 120,
@@ -63,6 +75,10 @@ function normalize(raw: unknown): GatewaySettings {
   // A ticket must outlive the freshness floor, otherwise nothing is ever claimable.
   if (result.ticketMinRemainingSeconds >= result.ticketTtlSeconds) {
     result.ticketMinRemainingSeconds = Math.max(BOUNDS.ticketMinRemainingSeconds.min, Math.floor(result.ticketTtlSeconds / 2));
+  }
+  // An inverted water band would make the adaptive target collapse to the floor.
+  if (result.maxAvailableTickets < result.minAvailableTickets) {
+    result.maxAvailableTickets = result.minAvailableTickets;
   }
   return result;
 }
@@ -108,6 +124,14 @@ export class SettingsStore {
         "`ticketMinRemainingSeconds` must be smaller than `ticketTtlSeconds`.",
         "invalid_request_error",
         "ticketMinRemainingSeconds",
+      );
+    }
+    if (next.maxAvailableTickets < next.minAvailableTickets) {
+      throw new HttpError(
+        400,
+        "`maxAvailableTickets` must be greater than or equal to `minAvailableTickets`.",
+        "invalid_request_error",
+        "maxAvailableTickets",
       );
     }
     this.db.prepare("INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value")

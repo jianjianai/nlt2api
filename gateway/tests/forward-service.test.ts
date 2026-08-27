@@ -63,13 +63,16 @@ test("upstream and proxy failures keep their status instead of collapsing to 500
   assert.equal(toHttpError(new Error("boom")).status, 500);
 });
 
-test("an empty pool returns 503 with a Retry-After hint", async () => {
+test("an empty pool returns 503 with a Retry-After hint when queueing is off", async () => {
   const harness = createHarness();
   try {
+    harness.settings.patch({ queueMaxSize: 0 });
     const forward = new ForwardService({
       settings: harness.settings,
       proxies: harness.proxies,
       tickets: harness.tickets,
+      queue: harness.queue,
+      demand: harness.demand,
       chat: async () => new Response("{}"),
     });
     await assert.rejects(
@@ -90,6 +93,8 @@ test("a successful call consumes exactly one pair", async () => {
       settings: harness.settings,
       proxies: harness.proxies,
       tickets: harness.tickets,
+      queue: harness.queue,
+      demand: harness.demand,
       chat: async (options) => {
         seen.push(options.ticket.token);
         return new Response("{}", { status: 200 });
@@ -118,6 +123,8 @@ test("a captcha rejection retries with a different pair", async () => {
       settings: harness.settings,
       proxies: harness.proxies,
       tickets: harness.tickets,
+      queue: harness.queue,
+      demand: harness.demand,
       chat: async (options) => {
         seen.push(options.ticket.token);
         if (seen.length === 1) throw upstreamErrorFrom(403, JSON.stringify({ error: { message: "Captcha verification failed" } }));
@@ -142,6 +149,8 @@ test("a transport failure records a proxy failure", async () => {
       settings: harness.settings,
       proxies: harness.proxies,
       tickets: harness.tickets,
+      queue: harness.queue,
+      demand: harness.demand,
       chat: async () => {
         throw new ProxyTransportError("Proxy connection was refused.");
       },
@@ -162,6 +171,8 @@ test("a non-retryable upstream error surfaces immediately", async () => {
       settings: harness.settings,
       proxies: harness.proxies,
       tickets: harness.tickets,
+      queue: harness.queue,
+      demand: harness.demand,
       chat: async () => {
         calls += 1;
         throw upstreamErrorFrom(400, JSON.stringify({ error: { message: "bad model" } }));
@@ -190,6 +201,8 @@ test("attempts are capped by maxAttempts", async () => {
       settings: harness.settings,
       proxies: harness.proxies,
       tickets: harness.tickets,
+      queue: harness.queue,
+      demand: harness.demand,
       chat: async () => {
         calls += 1;
         throw upstreamErrorFrom(503, "unavailable");
@@ -197,6 +210,53 @@ test("attempts are capped by maxAttempts", async () => {
     });
     await assert.rejects(() => forward.chat({ model: "m", messages: [] }), UpstreamError);
     assert.equal(calls, 2);
+  } finally {
+    harness.close();
+  }
+});
+
+test("a request waits for a pair instead of failing on an empty pool", async () => {
+  const harness = createHarness();
+  try {
+    const forward = new ForwardService({
+      settings: harness.settings,
+      proxies: harness.proxies,
+      tickets: harness.tickets,
+      queue: harness.queue,
+      demand: harness.demand,
+      chat: async (options) => new Response(options.ticket.token, { status: 200 }),
+    });
+    const pending = forward.chat({ model: "m", messages: [] });
+    // The pool is empty, so the request is parked rather than rejected.
+    await Promise.resolve();
+    assert.equal(harness.queue.waiting(), 1);
+    seedTicket(harness, "1.minted");
+    harness.queue.drain();
+    assert.equal(await (await pending).text(), "1.minted");
+  } finally {
+    harness.close();
+  }
+});
+
+test("a retry gives up with the original error rather than queueing again", async () => {
+  const harness = createHarness();
+  try {
+    seedTicket(harness, "1.only");
+    let calls = 0;
+    const forward = new ForwardService({
+      settings: harness.settings,
+      proxies: harness.proxies,
+      tickets: harness.tickets,
+      queue: harness.queue,
+      demand: harness.demand,
+      chat: async () => {
+        calls += 1;
+        throw upstreamErrorFrom(503, "unavailable");
+      },
+    });
+    await assert.rejects(() => forward.chat({ model: "m", messages: [] }), UpstreamError);
+    assert.equal(calls, 1);
+    assert.equal(harness.queue.waiting(), 0);
   } finally {
     harness.close();
   }
@@ -210,6 +270,8 @@ test("the model catalog is cached until its TTL elapses", async () => {
       settings: harness.settings,
       proxies: harness.proxies,
       tickets: harness.tickets,
+      queue: harness.queue,
+      demand: harness.demand,
       catalog: async () => {
         calls += 1;
         return [{ id: "m", freeForAnonymous: true }];

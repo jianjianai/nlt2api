@@ -1,5 +1,6 @@
 import { definePlugin } from "nitro";
 import { closeGatewayDatabase } from "~/server/utils/database.ts";
+import { HttpError } from "~/server/utils/http.ts";
 import { gatewayRuntime, resetGatewayRuntimeForTests } from "~/server/utils/runtime.ts";
 
 interface Loop {
@@ -62,6 +63,7 @@ export default definePlugin((nitro) => {
 
   nitro.hooks.hook("close", () => {
     for (const loop of loops) loop.stop();
+    runtime.queue.rejectAll(new HttpError(503, "The gateway is shutting down.", "server_error", undefined, "shutting_down"));
     closeGatewayDatabase();
     resetGatewayRuntimeForTests();
   });

@@ -1,11 +1,13 @@
 import { HttpError } from "~/server/utils/http.ts";
+import type { DemandTracker } from "~/server/utils/demand.ts";
 import { ProxyTransportError } from "~/server/utils/proxy.ts";
 import type { ProxyPoolService } from "~/server/utils/proxy-pool.ts";
 import type { SettingsStore } from "~/server/utils/settings.ts";
 import type { TicketPoolService } from "~/server/utils/ticket-pool.ts";
+import { poolExhausted, type TicketQueue } from "~/server/utils/ticket-queue.ts";
 import { chatCompletions, modelCatalog, type UpstreamModel } from "~/server/utils/upstream.ts";
 import { UpstreamError } from "~/server/utils/upstream-http.ts";
-import type { JsonObject } from "~/server/utils/types.ts";
+import type { JsonObject, TicketPair } from "~/server/utils/types.ts";
 
 const MAX_MESSAGES = 10_000;
 
@@ -26,21 +28,12 @@ export function validateChatRequest(body: JsonObject): { model: string; stream: 
   return { model, stream: body.stream === true };
 }
 
-function poolExhausted(): HttpError {
-  return new HttpError(
-    503,
-    "No usable proxy/ticket pair is available. The authorization service is still replenishing the pool.",
-    "server_error",
-    undefined,
-    "ticket_pool_empty",
-    5,
-  );
-}
-
 export interface ForwardDependencies {
   settings: SettingsStore;
   proxies: ProxyPoolService;
   tickets: TicketPoolService;
+  queue: TicketQueue;
+  demand: DemandTracker;
   chat?: typeof chatCompletions;
   catalog?: typeof modelCatalog;
 }
@@ -53,21 +46,26 @@ export class ForwardService {
   /**
    * Forwards one chat request. Each attempt spends a distinct (proxy, ticket)
    * pair: the ticket is single-use upstream, so a retry must never reuse it.
+   * A pair that is not in the pool yet is waited for through the queue.
    */
   async chat(request: JsonObject, signal?: AbortSignal): Promise<Response> {
-    const { settings, proxies, tickets } = this.dependencies;
+    const { settings, proxies, tickets, queue, demand } = this.dependencies;
     const chat = this.dependencies.chat ?? chatCompletions;
     const config = settings.get();
+    demand.touch();
     let lastError: unknown;
 
     for (let attempt = 1; attempt <= config.maxAttempts; attempt += 1) {
-      const pair = tickets.claim();
-      if (!pair) {
-        // Surface why the previous attempt failed rather than masking a real
-        // upstream/proxy error behind "the pool is empty".
-        if (lastError) throw lastError;
-        throw poolExhausted();
+      let pair: TicketPair | undefined;
+      if (attempt === 1) {
+        pair = await queue.acquire(signal);
+      } else {
+        // A retry takes a free pair or gives up with the error that caused it;
+        // queueing again would let one client wait the timeout several times over.
+        pair = queue.tryClaim();
+        if (!pair) throw lastError ?? poolExhausted();
       }
+      demand.record();
       try {
         const response = await chat({
           request,

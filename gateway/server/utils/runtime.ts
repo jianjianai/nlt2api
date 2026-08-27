@@ -1,5 +1,6 @@
 import { readFileSync } from "node:fs";
 import { gatewayDatabase } from "~/server/utils/database.ts";
+import { DemandTracker } from "~/server/utils/demand.ts";
 import { ForwardService } from "~/server/utils/forward-service.ts";
 import { MinterHub } from "~/server/utils/minter-hub.ts";
 import { ProxyChecker } from "~/server/utils/proxy-checker.ts";
@@ -7,11 +8,14 @@ import { ProxyPoolService } from "~/server/utils/proxy-pool.ts";
 import { RefillOrchestrator } from "~/server/utils/refill-orchestrator.ts";
 import { SettingsStore } from "~/server/utils/settings.ts";
 import { TicketPoolService } from "~/server/utils/ticket-pool.ts";
+import { TicketQueue } from "~/server/utils/ticket-queue.ts";
 
 export interface GatewayRuntime {
   settings: SettingsStore;
   proxies: ProxyPoolService;
   tickets: TicketPoolService;
+  queue: TicketQueue;
+  demand: DemandTracker;
   hub: MinterHub;
   checker: ProxyChecker;
   refill: RefillOrchestrator;
@@ -35,11 +39,21 @@ export function gatewayRuntime(): GatewayRuntime {
   const settings = new SettingsStore(db);
   const proxies = new ProxyPoolService({ db, settings });
   const tickets = new TicketPoolService({ db, settings, proxies });
-  const hub = new MinterHub({ db, settings, proxies, tickets, serverVersion: serverVersion() });
+  const demand = new DemandTracker({ settings });
+  // The refill loop reads the queue depth, so the queue only has to nudge demand.
+  const queue = new TicketQueue({ settings, tickets, onDemand: () => demand.touch() });
+  const hub = new MinterHub({
+    db,
+    settings,
+    proxies,
+    tickets,
+    serverVersion: serverVersion(),
+    onTicketAccepted: () => queue.drain(),
+  });
   const checker = new ProxyChecker({ settings, proxies });
-  const refill = new RefillOrchestrator({ settings, proxies, tickets, hub });
-  const forward = new ForwardService({ settings, proxies, tickets });
-  runtime = { settings, proxies, tickets, hub, checker, refill, forward };
+  const refill = new RefillOrchestrator({ settings, proxies, tickets, hub, demand, queue });
+  const forward = new ForwardService({ settings, proxies, tickets, queue, demand });
+  runtime = { settings, proxies, tickets, queue, demand, hub, checker, refill, forward };
   return runtime;
 }
 

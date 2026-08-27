@@ -60,6 +60,12 @@ export interface GatewaySettings {
   ticketMinRemainingSeconds: number;
   ticketCleanupIntervalSeconds: number;
   minAvailableTickets: number;
+  maxAvailableTickets: number;
+  targetLeadSeconds: number;
+  demandWindowSeconds: number;
+  idleAfterSeconds: number;
+  queueMaxSize: number;
+  queueTimeoutSeconds: number;
   refillIntervalSeconds: number;
   mintRequestTimeoutSeconds: number;
   proxyLeaseSeconds: number;
@@ -79,7 +85,9 @@ export type SettingBounds = Record<SettingKey, { min: number; max: number }>;
 export interface OverviewSnapshot {
   proxies: Record<ProxyStatus, number>;
   proxiesMintable: number;
-  tickets: { available: number; total: number; minAvailable: number };
+  tickets: { available: number; total: number; target: number };
+  queue: { waiting: number; maxSize: number };
+  demand: { claims: number; windowSeconds: number; idleSeconds: number; paused: boolean };
   minters: { online: number; inflight: number };
   mintRate: { minted: number; failed: number; windowMinutes: number };
   config: {

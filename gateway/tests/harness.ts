@@ -1,14 +1,18 @@
 import type { DatabaseSync } from "node:sqlite";
 import { createInMemoryDatabase } from "~/server/utils/database.ts";
+import { DemandTracker } from "~/server/utils/demand.ts";
 import { ProxyPoolService } from "~/server/utils/proxy-pool.ts";
 import { SettingsStore } from "~/server/utils/settings.ts";
 import { TicketPoolService } from "~/server/utils/ticket-pool.ts";
+import { TicketQueue } from "~/server/utils/ticket-queue.ts";
 
 export interface Harness {
   db: DatabaseSync;
   settings: SettingsStore;
   proxies: ProxyPoolService;
   tickets: TicketPoolService;
+  demand: DemandTracker;
+  queue: TicketQueue;
   /** Mutable clock; every service reads it through the same closure. */
   clock: { now: number };
   advance(ms: number): void;
@@ -22,11 +26,15 @@ export function createHarness(startAt = 1_700_000_000_000): Harness {
   const settings = new SettingsStore(db);
   const proxies = new ProxyPoolService({ db, settings, now });
   const tickets = new TicketPoolService({ db, settings, proxies, now });
+  const demand = new DemandTracker({ settings, now });
+  const queue = new TicketQueue({ settings, tickets, onDemand: () => demand.touch() });
   return {
     db,
     settings,
     proxies,
     tickets,
+    demand,
+    queue,
     clock,
     advance(ms) {
       clock.now += ms;

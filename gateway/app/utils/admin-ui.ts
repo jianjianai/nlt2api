@@ -32,7 +32,13 @@ export const SETTING_LABEL: Record<SettingKey, { label: string; hint: string }> 
   ticketTtlSeconds: { label: "凭证存活（秒）", hint: "实测上游约 3~4 分钟失效，上限 178 秒。" },
   ticketMinRemainingSeconds: { label: "取用最小剩余（秒）", hint: "低于此剩余寿命的凭证不再分配给请求。" },
   ticketCleanupIntervalSeconds: { label: "清理周期（秒）", hint: "过期凭证与滞留占用的回收间隔。" },
-  minAvailableTickets: { label: "最低可用凭证", hint: "低于此数量即向在线授权服务下发补充任务。" },
+  minAvailableTickets: { label: "水位下限", hint: "空闲期与低流量下的常备凭证数，0 表示完全按需铸票。" },
+  maxAvailableTickets: { label: "水位上限", hint: "需求再高也不会超过该常备数量，防止无限铸票。" },
+  targetLeadSeconds: { label: "备货时长（秒）", hint: "按实测消耗速率预备多少秒的用量，铸票越慢应设越大。" },
+  demandWindowSeconds: { label: "需求统计窗口（秒）", hint: "消耗速率的统计窗口，越大越平滑、响应越慢。" },
+  idleAfterSeconds: { label: "空闲暂停（秒）", hint: "这么久没有请求就停止铸票；0 表示始终保持水位。" },
+  queueMaxSize: { label: "排队上限", hint: "凭证不足时可等待的请求数；0 表示不排队直接返回 503。" },
+  queueTimeoutSeconds: { label: "排队超时（秒）", hint: "超过该时长仍未拿到凭证则返回 503。" },
   refillIntervalSeconds: { label: "补充检查周期（秒）", hint: "编排器计算缺口的频率。" },
   mintRequestTimeoutSeconds: { label: "铸票任务超时（秒）", hint: "超时后释放占用的并发计数。" },
   proxyLeaseSeconds: { label: "代理租约（秒）", hint: "授权服务独占一个代理的时长。" },
@@ -77,7 +83,7 @@ export function formatLatency(value: number | undefined): string {
 }
 
 /** Water-level tone for the ticket pool gauge. */
-export function poolTone(available: number, minAvailable: number): "good" | "warn" | "bad" {
-  if (available >= minAvailable) return "good";
+export function poolTone(available: number, target: number): "good" | "warn" | "bad" {
+  if (available >= target) return "good";
   return available === 0 ? "bad" : "warn";
 }

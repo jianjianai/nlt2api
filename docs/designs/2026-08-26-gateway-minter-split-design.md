@@ -207,20 +207,34 @@ CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 - **失败归还**：若上游返回 403 `Captcha verification failed`，凭证已被上游赎回，不归还（直接删除）；若是**代理传输失败**（连接超时/拒绝），凭证尚未被赎回，但 minRemaining 已被消耗过一次握手时间——保守起见也删除，并把代理计一次失败。这条策略优先保证正确性而非凭证利用率。
 - **清理**：清理器每 `ticketCleanupIntervalSeconds`（默认 15）删除 `expires_at < now` 或 `claimed_at < now - 5min` 的行。
 
-### 4.5 补充编排器
+### 4.5 补充编排器（自适应水位）
+
+固定水位在高峰不够、在空闲浪费，因此目标水位按**实测消耗速率 × 备货时长**动态计算，并夹在
+`minAvailableTickets`~`maxAvailableTickets` 之间：
+
+```
+rate   = 近 demandWindowSeconds 秒内的取用次数 / demandWindowSeconds   （内存滑窗，不持久化）
+target = clamp(ceil(rate × targetLeadSeconds) + queue.waiting, minAvailableTickets, maxAvailableTickets)
+若最近 idleAfterSeconds 秒无任何请求且无人排队 → target = 0（暂停铸票）
+```
 
 每 `refillIntervalSeconds`（默认 5）执行一次：
 
 ```
+queue.drain()                        # 上一轮铸出的票先交给排队中的请求
 available = count(tickets: claimed_at IS NULL AND expires_at >= now + minRemaining)
 inflight  = 已下发但未回执的 mint 请求张数（内存计数，带超时回收）
 idleActiveProxies = count(proxies: status='active' AND 无有效 lease)
-deficit = min(minAvailableTickets - available - inflight, idleActiveProxies)
+deficit = min(target - available - inflight, idleActiveProxies)
 若 deficit <= 0 → 结束
 按在线会话轮转下发 mint.request{count}，单会话 count 上限 = session.concurrency - 该会话 inflight
 ```
 
-`minAvailableTickets` 默认 4，可在后台调整。`inflight` 计数在 `mint.request` 下发时增加，在 `ticket.submit` / `mint.failed` / 下发超时（`mintRequestTimeoutSeconds`，默认 180）时减少。
+`inflight` 计数在 `mint.request` 下发时增加，在 `ticket.submit` / `mint.failed` / 下发超时
+（`mintRequestTimeoutSeconds`，默认 180）时减少。`ticket.submit` 被接受后立即触发一次
+`queue.drain()`，排队请求无需等到下一个编排周期。
+
+进程启动记为一次「有活动」，因此冷启动会预热到水位下限，首个请求不必等待冷铸票。
 
 ### 4.6 转发层
 
@@ -228,9 +242,20 @@ deficit = min(minAvailableTickets - available - inflight, idleActiveProxies)
 
 1. `requireClientAuth`：`Authorization: Bearer <GATEWAY_API_KEY>`。未配置 key 时默认拒绝所有请求（`allowAnonymous` 显式开启才放行），避免出现无鉴权的公开转发端点。
 2. 读取并校验 JSON 体（`maxRequestBytes` 上限），只校验 `model` 必须存在且为字符串、`messages` 为非空数组、`stream` 为布尔——其余字段原样透传。
-3. 最多 `maxAttempts`（默认 3）次尝试，每次尝试：取一张凭证对 → 组装上游请求头（`Origin`/`Referer`/`X-DeepInfra-Turnstile`/`X-Deepinfra-Source`/凭证自带 `User-Agent`）→ 经配对代理发 `POST https://api.deepinfra.com/v1/openai/chat/completions`。
-4. 可重试的失败（传输错误、429、5xx）换一张凭证重试；403 captcha 也换凭证重试（视为凭证损耗）。凭证池空 → 返回 503 `ticket_pool_empty` 并附 `Retry-After`。
+3. 最多 `maxAttempts`（默认 3）次尝试。首次尝试经**排队器**取凭证对：池中有则立即取走，池空则 FIFO 排队等待（详见 §4.5.1）；随后组装上游请求头（`Origin`/`Referer`/`X-DeepInfra-Turnstile`/`X-Deepinfra-Source`/凭证自带 `User-Agent`）→ 经配对代理发 `POST https://api.deepinfra.com/v1/openai/chat/completions`。
+4. 可重试的失败（传输错误、429、5xx）换一张凭证重试；403 captcha 也换凭证重试（视为凭证损耗）。**重试只取当前空闲的凭证对，不再排队**——否则单个请求可能被排队超时叠加数次。取不到即抛出导致重试的那个错误。
 5. 流式：一旦上游返回 200 且开始转发 SSE，就不再重试，错误以 SSE `data: {"error":...}` 帧下发。
+
+#### 4.5.1 排队器
+
+凭证不足时请求排队而非直接失败，把突发流量转成延迟：
+
+- **FIFO 且不可插队**：队列非空时新到的请求一律入队，即使此刻池里有票，避免排队者被后来者饿死。
+- **客户端断开即出队**：`AbortSignal` 触发时立刻移出队列并返回 499 `client_closed_request`，不会为已离开的调用方消耗任何凭证。
+- **上限**：`queueMaxSize`（默认 64）。超出返回 503 `queue_overflow` 且 `Retry-After: 1`。设为 0 即关闭排队，池空时直接返回 503 `ticket_pool_empty`。
+- **超时**：`queueTimeoutSeconds`（默认 60）内未拿到凭证返回 503 `queue_timeout`。
+- **唤醒时机**：`ticket.submit` 被接受后、以及每个补充编排周期开头各排空一次队列。
+- **需求信号**：入队即视为需求，会唤醒处于空闲暂停的铸票，并计入目标水位。
 
 `GET /v1/models`：经任一活跃代理拉 `https://api.deepinfra.com/models/list`（无需凭证），结果缓存 `modelsCacheSeconds`（默认 300），映射为 OpenAI `{object:"list", data:[{id, object:"model", owned_by}]}`。
 
@@ -242,7 +267,7 @@ Admin API：
 
 | 方法 | 路径 | 作用 |
 | --- | --- | --- |
-| GET | `/api/admin/overview` | 汇总：代理三态计数、凭证池水位、在线授权服务数、近期铸票速率 |
+| GET | `/api/admin/overview` | 汇总：代理三态计数、凭证池水位与自适应目标、排队深度与需求速率、在线授权服务数、近期铸票速率 |
 | GET | `/api/admin/proxies` | 代理列表（掩码 URL，支持 `status` 过滤、分页） |
 | POST | `/api/admin/proxies/import` | 批量文本导入（支持 `host:port`、`host:port:user:pass`、`user:pass@host:port`、完整 URL） |
 | POST | `/api/admin/proxies/check` | 批量重测（`scope: pending \| unavailable \| active \| all`） |
@@ -258,7 +283,7 @@ Admin API：
 
 UI 四个工作区（沿用旧 `WorkspaceShell` 布局与 CSS）：
 
-- **概览**：三态代理计数、凭证水位仪表、在线授权服务数、最近 5 分钟铸票成功/失败。
+- **概览**：三态代理计数、凭证水位仪表（含自适应目标与暂停状态）、排队请求数、在线授权服务数、最近 5 分钟铸票成功/失败。
 - **代理池**：状态筛选、导入、批量/单条重测、删除、掩码 URL、延迟、失败次数、`retry_after` 倒计时。
 - **凭证对池**：`(掩码代理, 掩码 token, 剩余秒数, 铸造者)` 列表，剩余时间实时倒计时，清空按钮。
 - **授权服务**：在线列表（agent_id、标签、平台、并发、已铸/失败计数、最后心跳、远端地址）、踢下线、「查看截图」（从空闲且持有常驻浏览器的 worker 取视口/整页 PNG 弹窗展示，15s 超时）、离线历史。
@@ -273,7 +298,13 @@ UI 四个工作区（沿用旧 `WorkspaceShell` 布局与 CSS）：
 | `ticketTtlSeconds` | 170 | 凭证在池中的存活时长（实测上游上界 ~178s） |
 | `ticketMinRemainingSeconds` | 20 | 取用时要求的最小剩余寿命 |
 | `ticketCleanupIntervalSeconds` | 15 | 过期清理周期 |
-| `minAvailableTickets` | 4 | 最低可用凭证数，低于即发任务 |
+| `minAvailableTickets` | 2 | 自适应水位下限（空闲/低流量下的常备数），0 即完全按需 |
+| `maxAvailableTickets` | 40 | 自适应水位上限，防止需求尖峰无限铸票 |
+| `targetLeadSeconds` | 60 | 备货时长：按实测速率预留多少秒的用量 |
+| `demandWindowSeconds` | 120 | 消耗速率的统计窗口 |
+| `idleAfterSeconds` | 300 | 无请求多久后暂停铸票；0 表示始终保持水位 |
+| `queueMaxSize` | 64 | 排队上限；0 表示不排队 |
+| `queueTimeoutSeconds` | 60 | 排队等待超时 |
 | `refillIntervalSeconds` | 5 | 编排器周期 |
 | `mintRequestTimeoutSeconds` | 180 | 单张铸票任务超时（回收 inflight 计数） |
 | `proxyLeaseSeconds` | 120 | 代理租约时长 |

@@ -6,13 +6,15 @@ import { MinterHub, type MinterPeer } from "~/server/utils/minter-hub.ts";
 import { createHarness, seedActiveProxy, type Harness } from "~/tests/harness.ts";
 
 test("refillDeficit is bounded by both the shortfall and idle proxies", () => {
-  assert.equal(refillDeficit({ minAvailable: 4, available: 0, inflight: 0, idleActiveProxies: 10 }), 4);
-  assert.equal(refillDeficit({ minAvailable: 4, available: 0, inflight: 0, idleActiveProxies: 2 }), 2);
-  assert.equal(refillDeficit({ minAvailable: 4, available: 2, inflight: 2, idleActiveProxies: 10 }), 0);
-  assert.equal(refillDeficit({ minAvailable: 4, available: 9, inflight: 0, idleActiveProxies: 10 }), 0);
-  assert.equal(refillDeficit({ minAvailable: 4, available: 0, inflight: 0, idleActiveProxies: 0 }), 0);
+  assert.equal(refillDeficit({ target: 4, available: 0, inflight: 0, idleActiveProxies: 10 }), 4);
+  assert.equal(refillDeficit({ target: 4, available: 0, inflight: 0, idleActiveProxies: 2 }), 2);
+  assert.equal(refillDeficit({ target: 4, available: 2, inflight: 2, idleActiveProxies: 10 }), 0);
+  assert.equal(refillDeficit({ target: 4, available: 9, inflight: 0, idleActiveProxies: 10 }), 0);
+  assert.equal(refillDeficit({ target: 4, available: 0, inflight: 0, idleActiveProxies: 0 }), 0);
+  // A paused pool asks for nothing no matter how much capacity is idle.
+  assert.equal(refillDeficit({ target: 0, available: 0, inflight: 0, idleActiveProxies: 10 }), 0);
   // Mints already in flight hold (or will hold) a lease, so they consume capacity.
-  assert.equal(refillDeficit({ minAvailable: 10, available: 0, inflight: 2, idleActiveProxies: 3 }), 1);
+  assert.equal(refillDeficit({ target: 10, available: 0, inflight: 2, idleActiveProxies: 3 }), 1);
 });
 
 function hubWithPeer(harness: Harness, concurrency = 4): { hub: MinterHub; peer: MinterPeer & { sent: string[] } } {
@@ -60,6 +62,8 @@ test("the orchestrator stays idle when no minter is connected", () => {
       proxies: harness.proxies,
       tickets: harness.tickets,
       hub,
+      demand: harness.demand,
+      queue: harness.queue,
     });
     assert.equal(refill.tick(), 0);
   } finally {
@@ -77,6 +81,8 @@ test("a connection that closes stops receiving mint requests", () => {
       proxies: harness.proxies,
       tickets: harness.tickets,
       hub,
+      demand: harness.demand,
+      queue: harness.queue,
     });
     assert.equal(refill.tick(), 1);
     hub.close(peer);
@@ -89,6 +95,7 @@ test("a connection that closes stops receiving mint requests", () => {
 test("the orchestrator asks for the shortfall, capped by idle proxies", () => {
   const harness = createHarness();
   try {
+    harness.settings.patch({ minAvailableTickets: 4 });
     seedActiveProxy(harness, "http://1.2.3.4:8080");
     seedActiveProxy(harness, "http://5.6.7.8:8080");
     const { hub } = hubWithPeer(harness, 4);
@@ -97,12 +104,36 @@ test("the orchestrator asks for the shortfall, capped by idle proxies", () => {
       proxies: harness.proxies,
       tickets: harness.tickets,
       hub,
+      demand: harness.demand,
+      queue: harness.queue,
     });
-    // minAvailableTickets defaults to 4 but only two proxies are idle.
+    // The floor asks for four but only two proxies are idle.
     assert.equal(refill.tick(), 2);
     assert.equal(hub.inflightTotal(), 2);
     // The inflight count now covers the remaining gap, so a second pass is a no-op.
     assert.equal(refill.tick(), 0);
+  } finally {
+    harness.close();
+  }
+});
+
+test("minting pauses after the idle window and resumes on the next request", () => {
+  const harness = createHarness();
+  try {
+    seedActiveProxy(harness);
+    const { hub } = hubWithPeer(harness, 4);
+    const refill = new RefillOrchestrator({
+      settings: harness.settings,
+      proxies: harness.proxies,
+      tickets: harness.tickets,
+      hub,
+      demand: harness.demand,
+      queue: harness.queue,
+    });
+    harness.advance(harness.settings.get().idleAfterSeconds * 1_000 + 1);
+    assert.equal(refill.tick(), 0);
+    harness.demand.touch();
+    assert.equal(refill.tick(), 1);
   } finally {
     harness.close();
   }

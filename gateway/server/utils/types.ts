@@ -107,8 +107,20 @@ export interface GatewaySettings {
   /** A ticket must still have this much life left to be handed to a request. */
   ticketMinRemainingSeconds: number;
   ticketCleanupIntervalSeconds: number;
-  /** Refill is triggered while fewer than this many tickets are available. */
+  /** Floor of the adaptive water mark; the pool never aims lower while active. */
   minAvailableTickets: number;
+  /** Ceiling of the adaptive water mark, so a demand spike cannot mint forever. */
+  maxAvailableTickets: number;
+  /** Seconds of measured demand the pool keeps pre-minted ahead of requests. */
+  targetLeadSeconds: number;
+  /** Trailing window the claim rate is measured over. */
+  demandWindowSeconds: number;
+  /** Minting pauses after this long without a request; 0 keeps it always on. */
+  idleAfterSeconds: number;
+  /** Requests allowed to wait for a pair; 0 rejects instead of queueing. */
+  queueMaxSize: number;
+  /** How long a queued request waits before giving up. */
+  queueTimeoutSeconds: number;
   refillIntervalSeconds: number;
   mintRequestTimeoutSeconds: number;
   proxyLeaseSeconds: number;
@@ -128,7 +140,19 @@ export interface OverviewSnapshot {
   tickets: {
     available: number;
     total: number;
-    minAvailable: number;
+    /** Adaptive water mark right now; 0 means minting is paused for lack of demand. */
+    target: number;
+  };
+  queue: {
+    waiting: number;
+    maxSize: number;
+  };
+  demand: {
+    claims: number;
+    windowSeconds: number;
+    idleSeconds: number;
+    /** True while minting is paused because no request arrived recently. */
+    paused: boolean;
   };
   minters: {
     online: number;

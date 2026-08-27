@@ -86,6 +86,8 @@ export interface MinterHubDependencies {
   tickets: TicketPoolService;
   serverVersion: string;
   now?: () => number;
+  /** Invoked after a ticket is accepted so a queued request can take it at once. */
+  onTicketAccepted?: () => void;
 }
 
 /**
@@ -99,6 +101,7 @@ export class MinterHub {
   private readonly tickets: TicketPoolService;
   private readonly serverVersion: string;
   private readonly now: () => number;
+  private readonly onTicketAccepted: (() => void) | undefined;
   private readonly connections = new Map<MinterPeer, Connection>();
 
   constructor(dependencies: MinterHubDependencies) {
@@ -108,6 +111,7 @@ export class MinterHub {
     this.tickets = dependencies.tickets;
     this.serverVersion = dependencies.serverVersion;
     this.now = dependencies.now ?? Date.now;
+    this.onTicketAccepted = dependencies.onTicketAccepted;
   }
 
   /** Marks sessions from a previous process offline and frees their leases. */
@@ -307,6 +311,7 @@ export class MinterHub {
     this.db.prepare("UPDATE minter_sessions SET minted_count = minted_count + 1 WHERE id = ?").run(connection.sessionId);
     this.recordEvent("minted", connection.sessionId);
     this.send(connection, { type: "ticket.accepted", id: message.id, ticketId: result.ticketId, expiresAt: result.expiresAt });
+    this.onTicketAccepted?.();
   }
 
   private handleFailure(connection: Connection, _id: string, reason: string, leaseId?: string, message?: string): void {

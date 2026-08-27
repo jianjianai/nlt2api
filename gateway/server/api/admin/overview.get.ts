@@ -9,13 +9,25 @@ export default defineHandler((event) => adminRoute(() => {
   const runtime = gatewayRuntime();
   const config = getGatewayConfig();
   const settings = runtime.settings.get();
+  const waiting = runtime.queue.waiting();
+  const demand = runtime.demand.snapshot(waiting);
   const snapshot: OverviewSnapshot = {
     proxies: runtime.proxies.counts(),
     proxiesMintable: runtime.proxies.mintableActiveCount(),
     tickets: {
       available: runtime.tickets.availableCount(),
       total: runtime.tickets.totalCount(),
-      minAvailable: settings.minAvailableTickets,
+      target: demand.target,
+    },
+    queue: {
+      waiting,
+      maxSize: settings.queueMaxSize,
+    },
+    demand: {
+      claims: demand.claims,
+      windowSeconds: demand.windowSeconds,
+      idleSeconds: demand.idleSeconds,
+      paused: demand.paused,
     },
     minters: {
       online: runtime.hub.onlineCount(),
