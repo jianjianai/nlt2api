@@ -2,7 +2,8 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { MintError } from "~/src/cdp.ts";
 import { blamesProxy, classifyMintFailure } from "~/src/failure.ts";
-import { browserProxyTarget, maskProxyUrl, redactProxyUrls } from "~/src/proxy.ts";
+import { parseUpstreamTarget } from "~/src/local-proxy.ts";
+import { maskProxyUrl, redactProxyUrls } from "~/src/proxy.ts";
 import { platformLaunchFlags } from "~/src/browser.ts";
 import { trapPageBase64, trapPageHtml, trapPageScript } from "~/src/trap-page.ts";
 
@@ -107,27 +108,37 @@ function runTrapPage(siteKey: string): TrapPage {
   };
 }
 
-test("browserProxyTarget keeps credentials out of --proxy-server", () => {
-  assert.deepEqual(browserProxyTarget("http://bob:secret@1.2.3.4:8080"), {
-    server: "http://1.2.3.4:8080",
+test("parseUpstreamTarget accepts credentialed http and socks proxies", () => {
+  // The forwarder owns upstream auth, so credentialed SOCKS is fine now.
+  assert.deepEqual(parseUpstreamTarget("http://bob:secret@1.2.3.4:8080"), {
+    kind: "http",
+    host: "1.2.3.4",
+    port: 8080,
     username: "bob",
     password: "secret",
   });
-  assert.deepEqual(browserProxyTarget("http://1.2.3.4:8080"), { server: "http://1.2.3.4:8080" });
+  assert.deepEqual(parseUpstreamTarget("http://1.2.3.4:8080"), { kind: "http", host: "1.2.3.4", port: 8080 });
+  assert.deepEqual(parseUpstreamTarget("socks5://bob:secret@1.2.3.4:1080"), {
+    kind: "socks5",
+    host: "1.2.3.4",
+    port: 1080,
+    username: "bob",
+    password: "secret",
+  });
 });
 
-test("browserProxyTarget defaults ports per scheme and maps aliases", () => {
-  assert.equal(browserProxyTarget("http://1.2.3.4")?.server, "http://1.2.3.4:80");
-  assert.equal(browserProxyTarget("https://1.2.3.4")?.server, "http://1.2.3.4:80");
-  assert.equal(browserProxyTarget("socks5h://1.2.3.4")?.server, "socks5://1.2.3.4:1080");
-  assert.equal(browserProxyTarget("socks4a://1.2.3.4:1080")?.server, "socks4://1.2.3.4:1080");
+test("parseUpstreamTarget defaults ports per scheme and maps aliases", () => {
+  assert.equal(parseUpstreamTarget("http://1.2.3.4")?.port, 80);
+  assert.equal(parseUpstreamTarget("https://1.2.3.4")?.kind, "http");
+  assert.equal(parseUpstreamTarget("socks5h://1.2.3.4")?.kind, "socks5");
+  assert.equal(parseUpstreamTarget("socks4a://1.2.3.4:1080")?.kind, "socks4");
+  assert.equal(parseUpstreamTarget("socks4a://1.2.3.4")?.port, 1080);
 });
 
-test("an authenticated SOCKS proxy cannot drive a browser", () => {
-  // Chrome offers no CDP path to answer SOCKS auth.
-  assert.equal(browserProxyTarget("socks5://bob:secret@1.2.3.4:1080"), undefined);
-  assert.equal(browserProxyTarget("ftp://1.2.3.4:21"), undefined);
-  assert.equal(browserProxyTarget("garbage"), undefined);
+test("parseUpstreamTarget rejects non-proxy URLs", () => {
+  assert.equal(parseUpstreamTarget("ftp://1.2.3.4:21"), undefined);
+  assert.equal(parseUpstreamTarget("garbage"), undefined);
+  assert.equal(parseUpstreamTarget("http://"), undefined);
 });
 
 test("maskProxyUrl never leaks the password", () => {

@@ -23,7 +23,8 @@ export interface CdpHandlers {
   onAuthRequired?: (event: AuthRequired) => void;
 }
 
-interface CdpTarget {
+export interface CdpTarget {
+  id: string;
   type: string;
   url: string;
   webSocketDebuggerUrl?: string;

@@ -3,7 +3,8 @@ import { existsSync } from "node:fs";
 import { mkdir, rm } from "node:fs/promises";
 import { setTimeout as delay } from "node:timers/promises";
 import { CdpSession, findPageTarget, MintError } from "./cdp.ts";
-import { browserProxyTarget, type BrowserProxyTarget } from "./proxy.ts";
+import type { CdpTarget } from "./cdp.ts";
+import { LocalForwardProxy, parseUpstreamTarget } from "./local-proxy.ts";
 import { trapPageBase64 } from "./trap-page.ts";
 
 /**
@@ -55,11 +56,11 @@ const LINUX_BROWSER_CANDIDATES = [
 
 const CHALLENGE_ORIGIN = "https://deepinfra.com/";
 /**
- * Every request must pass through the Fetch domain, not just the document:
- * Chrome cannot take credentials from --proxy-server, so a 407 on ANY request
- * has to be answered over Fetch.authRequired. With a narrow pattern the
- * Turnstile script on challenges.cloudflare.com never authenticates and the
- * page stays without `window.turnstile` (mint fails with page_not_ready).
+ * Every request must pass through the Fetch domain so the trap page can be
+ * substituted for the deepinfra document. Proxy auth is NO LONGER answered
+ * here: the loopback forward proxy injects upstream credentials itself, so
+ * `Fetch.enable` does not need handleAuthRequests and any stray authRequired
+ * is answered with Default.
  */
 const INTERCEPT_PATTERN = "*";
 
@@ -86,6 +87,7 @@ export function platformLaunchFlags(platform: string = process.platform): string
 }
 
 export interface BrowserOptions {
+  /** CDP port this browser listens on. */
   port: number;
   profileDir: string;
   display: string;
@@ -110,8 +112,10 @@ export interface MintResult {
 export class MinterBrowser {
   private process: ChildProcess | undefined;
   private session: CdpSession | undefined;
+  /** CDP target id of the challenge tab; used to close just that tab on proxy switch. */
+  private tabId: string | undefined;
+  private readonly forwardProxy = new LocalForwardProxy();
   private boundProxyUrl: string | undefined;
-  private target: BrowserProxyTarget | undefined;
   private warmed = false;
   private widgetSeq = 0;
   private siteKey: string;
@@ -135,17 +139,17 @@ export class MinterBrowser {
     return this.boundProxyUrl;
   }
 
-  /** Mints one token through `proxyUrl`, restarting the browser if it changed. */
+  /**
+   * Mints one token through `proxyUrl`. The browser process stays up across
+   * proxy changes: only the tab, cookies and the forward proxy's upstream are
+   * swapped, which is dramatically cheaper than a process restart.
+   */
   async mint(proxyUrl: string): Promise<MintResult> {
     this.minting = true;
     this.cancelIdleRelease();
     try {
       if (this.boundProxyUrl !== proxyUrl) {
-        await this.close();
-        const target = browserProxyTarget(proxyUrl);
-        if (!target) throw new MintError("proxy_auth_failed", "The leased proxy cannot drive a browser.");
-        this.target = target;
-        this.boundProxyUrl = proxyUrl;
+        await this.switchUpstream(proxyUrl);
       }
       const session = await this.ensureSession();
       if (!this.warmed) {
@@ -216,8 +220,9 @@ export class MinterBrowser {
 
   private async ensureSession(): Promise<CdpSession> {
     if (this.session) return this.session;
-    const page = await this.ensurePage();
+    const page = await this.ensureTab();
     if (!page.webSocketDebuggerUrl) throw new MintError("cdp_unreachable", "The page target is not attachable.");
+    this.tabId = page.id;
     const session = await CdpSession.open(page.webSocketDebuggerUrl);
     // Published before the readiness wait so a page stuck loading is still
     // visible to the admin screenshot — that is exactly when it is needed.
@@ -228,7 +233,6 @@ export class MinterBrowser {
       // Chrome cannot take from the --proxy-server URL.
       await session.send("Fetch.enable", {
         patterns: [{ urlPattern: INTERCEPT_PATTERN, requestStage: "Request" }],
-        handleAuthRequests: true,
       });
       const body = trapPageBase64(this.siteKey);
       session.watch({
@@ -250,13 +254,12 @@ export class MinterBrowser {
           }
           session.post("Fetch.continueRequest", { requestId: request.requestId });
         },
+        // The loopback forward proxy injects upstream credentials, so any
+        // authRequired reaching here has nothing to answer — just continue.
         onAuthRequired: (event) => {
-          const target = this.target;
           session.post("Fetch.continueWithAuth", {
             requestId: event.requestId,
-            authChallengeResponse: target?.username
-              ? { response: "ProvideCredentials", username: target.username, password: target.password ?? "" }
-              : { response: "Default" },
+            authChallengeResponse: { response: "Default" },
           });
         },
       });
@@ -283,28 +286,67 @@ export class MinterBrowser {
     throw new MintError("page_not_ready", "The trap page did not load the Turnstile script in time.");
   }
 
-  private async ensurePage(): Promise<{ webSocketDebuggerUrl?: string }> {
+  /**
+   * Finds the challenge tab, or opens one on the resident browser. Launches
+   * the process itself when it is not running yet.
+   */
+  private async ensureTab(): Promise<CdpTarget> {
+    await this.launch();
     const existing = await findPageTarget(this.options.port);
     if (existing) return existing;
-    this.killProcess();
+    return this.openTab();
+  }
+
+  /**
+   * The user flow for a proxy change: close the challenge tab, clear cookies
+   * and cache, point the loopback forwarder at the new lease, then reopen the
+   * tab. The browser process itself never restarts.
+   */
+  private async switchUpstream(proxyUrl: string): Promise<void> {
+    if (!parseUpstreamTarget(proxyUrl)) {
+      throw new MintError("proxy_auth_failed", "The leased proxy cannot drive a browser.");
+    }
+    const session = this.session;
+    this.session = undefined;
+    try {
+      if (session) {
+        // Close the tab so no request rides out over the OLD upstream. Cached
+        // and credentialed state would otherwise leak across proxies.
+        if (this.tabId) await session.send("Target.closeTarget", { targetId: this.tabId }).catch(() => undefined);
+        this.tabId = undefined;
+        await session.send("Network.clearBrowserCookies").catch(() => undefined);
+        await session.send("Network.clearBrowserCache").catch(() => undefined);
+      }
+    } finally {
+      session?.close();
+    }
+    this.forwardProxy.setUpstream(proxyUrl);
+    this.boundProxyUrl = proxyUrl;
+    // A proxy swap always lands on a fresh tab: warm-up runs again for it.
+    this.warmed = false;
+    await this.openTab();
+  }
+
+  /** Opens a fresh tab on the resident browser so minting has a clean page. */
+  private async openTab(): Promise<CdpTarget> {
     await this.launch();
-    // Chrome prints "DevTools listening on ws://…" to stderr the moment the
-    // socket accepts connections — that is the earliest safe moment to attach.
-    // A page target still needs /json/list, so read one there before polling.
-    if (this.devtoolsReady) {
-      await this.devtoolsReady.catch(() => undefined);
-      const page = await findPageTarget(this.options.port);
-      if (page) return page;
-    }
-    for (let attempt = 0; attempt < 30; attempt += 1) {
-      await delay(1_000);
-      const page = await findPageTarget(this.options.port);
-      if (page) return page;
-    }
-    throw new MintError("browser_timeout", "The browser did not expose a page target.");
+    const port = this.options.port;
+    const response = await fetch(`http://127.0.0.1:${port}/json/new?about:blank`, { method: "PUT" });
+    if (!response.ok) throw new MintError("cdp_unreachable", `Opening a tab failed with ${response.status}.`);
+    const target = await response.json() as CdpTarget;
+    if (!target.webSocketDebuggerUrl) throw new MintError("cdp_unreachable", "The new tab is not attachable.");
+    return target;
   }
 
   private async launch(): Promise<void> {
+    if (this.process && this.devtoolsReady) {
+      // Already running; nothing to do.
+      return;
+    }
+    this.killProcess();
+    await this.forwardProxy.start();
+    const proxyPort = this.forwardProxy.port;
+    if (proxyPort === undefined) throw new MintError("cdp_unreachable", "The local forward proxy did not start.");
     const executablePath = detectExecutable(this.options.executablePath);
     await mkdir(this.options.profileDir, { recursive: true });
     // A crashed/killed instance leaves Singleton* lock files behind; Chromium
@@ -323,13 +365,12 @@ export class MinterBrowser {
       `--user-data-dir=${this.options.profileDir}`,
       ...LEAN_LAUNCH_FLAGS,
       ...platformLaunchFlags(),
+      // The browser always talks to the loopback forwarder; upstream changes
+      // are a `setUpstream` call away and never touch this flag.
+      `--proxy-server=http://127.0.0.1:${proxyPort}`,
+      "--proxy-bypass-list=<-loopback>",
+      "about:blank",
     ];
-    if (this.target) {
-      args.push(`--proxy-server=${this.target.server}`);
-      // Keep the CDP loopback connection off the proxy.
-      args.push("--proxy-bypass-list=<-loopback>");
-    }
-    args.push(CHALLENGE_ORIGIN);
 
     this.process = spawn(executablePath, args, {
       detached: false,
@@ -341,6 +382,15 @@ export class MinterBrowser {
         : { ...process.env, DISPLAY: process.env.DISPLAY ?? this.options.display },
     });
     this.watchDevtoolsLine(this.process);
+    // Wait for the CDP socket to accept connections. /json/list needs a moment
+    // longer to register the page target, so the caller polls findPageTarget.
+    await this.devtoolsReady?.catch(() => undefined);
+    for (let attempt = 0; attempt < 30; attempt += 1) {
+      const target = await findPageTarget(this.options.port);
+      if (target) return;
+      await delay(500);
+    }
+    throw new MintError("browser_timeout", "The browser did not expose a page target.");
   }
 
   private watchDevtoolsLine(child: ChildProcess): void {
@@ -375,35 +425,42 @@ export class MinterBrowser {
   private dropSession(): void {
     this.session?.close();
     this.session = undefined;
+    this.tabId = undefined;
     this.warmed = false;
     this.widgetSeq = 0;
     this.killProcess();
+    void this.forwardProxy.close().catch(() => undefined);
   }
 
   /**
-   * Captures the resident page for the admin console. Fails fast when the
-   * browser is idle-released or mid-restart: a diagnostic must not spawn or
-   * reload a browser, which would disturb the minting state machine.
+   * Captures the resident page for the admin console. A worker that is between
+   * mints has no tab yet, so open one: diagnosing several browsers at once is
+   * exactly the multi-instance case the admin is asking about.
    */
   async screenshot(kind: "page" | "fullpage"): Promise<string> {
-    if (!this.session || !this.boundProxyUrl) {
-      throw new MintError("browser_missing", "No resident browser is currently running.");
+    this.cancelIdleRelease();
+    try {
+      if (!this.process && !this.boundProxyUrl) {
+        throw new MintError("browser_missing", "No resident browser is currently running.");
+      }
+      const session = await this.ensureSession();
+      const result = await session.send("Page.captureScreenshot", {
+        format: "png",
+        captureBeyondViewport: kind === "fullpage",
+        fromSurface: true,
+      }) as { data?: string };
+      if (typeof result.data !== "string" || !result.data) {
+        throw new MintError("cdp_error", "The browser returned no screenshot data.");
+      }
+      return result.data;
+    } finally {
+      this.scheduleIdleRelease();
     }
-    const result = await this.session.send("Page.captureScreenshot", {
-      format: "png",
-      captureBeyondViewport: kind === "fullpage",
-      fromSurface: true,
-    }) as { data?: string };
-    if (typeof result.data !== "string" || !result.data) {
-      throw new MintError("cdp_error", "The browser returned no screenshot data.");
-    }
-    return result.data;
   }
 
   async close(): Promise<void> {
     this.cancelIdleRelease();
     this.dropSession();
     this.boundProxyUrl = undefined;
-    this.target = undefined;
   }
 }
