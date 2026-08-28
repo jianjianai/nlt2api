@@ -269,24 +269,44 @@ export class MinterClient {
     }
   }
 
-  /** Answers the admin console's screenshot probe from any live browser. */
+  /**
+   * Answers the admin console's screenshot probe. Every worker that currently
+   * has a resident browser contributes one shot, so a multi-browser deployment
+   * comes back as several images instead of a single arbitrary one. The reply
+   * keeps pngBase64 for single-browser deployments and older gateways.
+   */
   private async handleScreenshotRequest(id: string, kind: "page" | "fullpage"): Promise<void> {
     const withBrowser = this.workers.filter((candidate) => candidate.minter.proxyUrl);
     // Capturing is read-only, so a busy worker is a valid source — and when
     // minting keeps failing every worker is busy, which is exactly when the
     // screenshot is being asked for.
-    const worker = withBrowser.find((candidate) => !candidate.busy) ?? withBrowser[0];
-    if (!worker) {
+    if (withBrowser.length === 0) {
       this.send({ type: "browser.screenshot.reply", id, ok: false, error: "no resident browser available" });
       return;
     }
-    try {
-      const pngBase64 = await worker.minter.screenshot(kind);
-      this.send({ type: "browser.screenshot.reply", id, ok: true, pngBase64 });
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      this.send({ type: "browser.screenshot.reply", id, ok: false, error: message.slice(0, 512) });
+    const instances: Array<{ proxyUrl?: string; pngBase64: string }> = [];
+    for (const worker of withBrowser) {
+      try {
+        const pngBase64 = await worker.minter.screenshot(kind);
+        instances.push({
+          ...(worker.minter.proxyUrl ? { proxyUrl: worker.minter.proxyUrl } : {}),
+          pngBase64,
+        });
+      } catch (error) {
+        this.log(`screenshot skipped worker ${worker.index}: ${error instanceof Error ? error.message : String(error)}`);
+      }
     }
+    if (instances.length === 0) {
+      this.send({ type: "browser.screenshot.reply", id, ok: false, error: "every resident browser failed to capture" });
+      return;
+    }
+    this.send({
+      type: "browser.screenshot.reply",
+      id,
+      ok: true,
+      pngBase64: instances[0]?.pngBase64,
+      instances,
+    });
   }
 
   private startHeartbeat(): void {

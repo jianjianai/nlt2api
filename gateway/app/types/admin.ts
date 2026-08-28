@@ -86,6 +86,17 @@ export interface MinterSessionPublic {
   leases: number;
 }
 
+export interface ScreenshotInstance {
+  maskedProxyUrl?: string;
+  pngBase64: string;
+}
+
+export interface ScreenshotResponse {
+  kind: "page" | "fullpage";
+  pngBase64: string;
+  instances: ScreenshotInstance[];
+}
+
 export interface GatewaySettings {
   ticketTtlSeconds: number;
   ticketMinRemainingSeconds: number;

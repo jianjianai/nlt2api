@@ -234,7 +234,8 @@ gateway 处理：`failed_count+1`；若 `reason` 属于代理归因组则按 §4
   type: "browser.screenshot.reply",
   id: string,
   ok: boolean,
-  pngBase64?: string,  // ok=true 时携带，data URI 的 base64 部分（PNG）
+  pngBase64?: string,  // ok=true 时携带，第一张截图（instances[0]），向后兼容
+  instances?: Array<{ proxyUrl?: string; pngBase64: string }>,  // 每个常驻浏览器一张
   error?: string,      // ok=false 时携带，≤512 字符
 }
 ```
@@ -242,7 +243,9 @@ gateway 处理：`failed_count+1`；若 `reason` 属于代理归因组则按 §4
 约束：
 
 - `id` 与 `kind` 在 gateway 侧受限字符串校验（`kind` 仅允许 `page` / `fullpage`）；`pngBase64` 上限 `MAX_TOKEN_LENGTH × 8`（与 token 长度同级的合理上限，超出视为非法载荷）。
-- minter 从**空闲**（未在铸票）且持有常驻浏览器的 worker 中选一台执行 `Page.captureScreenshot`；没有空闲 worker 时回 `ok:false, error:"browser_missing"`。
+- minter 聚合**所有**当前持有常驻浏览器的 worker，逐台执行 `Page.captureScreenshot`；某一台失败仅跳过该 worker，不影响其他 worker 的回执。没有任何一台可用时回 `ok:false, error:"no resident browser available"`。
+- `instances[i].proxyUrl` 是该 worker 当前租约的代理 URL，minter 回执保留明文（`browser.screenshot.reply` 与 `proxy.leased` 同级信任），gateway 必须在写到 admin 接口响应前用 `maskProxyUrl` 脱敏。
+- 旧 minter 只回 `pngBase64` 时 gateway 把它折叠为单元素 `instances`，前端得以用同一种形状渲染。
 - `kind=fullpage` 时 `captureBeyondViewport: true` 截整页，否则只截视口。
 - 截图请求**不占 lease**、不影响任何铸票统计，仅用于诊断。
 - gateway 侧 `requestScreenshot` 默认 15s 超时：连接断开回 404、超时回 504、minter 回执失败回 502。

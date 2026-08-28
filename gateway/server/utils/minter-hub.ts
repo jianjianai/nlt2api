@@ -4,7 +4,7 @@ import { getGatewayConfig } from "~/server/utils/config.ts";
 import { allRows } from "~/server/utils/database.ts";
 import type { ErrorLogService } from "~/server/utils/error-log.ts";
 import { HttpError } from "~/server/utils/http.ts";
-import { redactProxyUrls } from "~/server/utils/proxy.ts";
+import { maskProxyUrl, redactProxyUrls } from "~/server/utils/proxy.ts";
 import type { ProxyPoolService } from "~/server/utils/proxy-pool.ts";
 import type { SettingsStore } from "~/server/utils/settings.ts";
 import type { TicketPoolService } from "~/server/utils/ticket-pool.ts";
@@ -93,6 +93,19 @@ export interface MinterHubDependencies {
   onTicketAccepted?: () => void;
   /** Egress ids a waiting request needs a ticket for; leases prefer these. */
   mintPriority?: () => readonly string[];
+}
+
+export interface ScreenshotInstance {
+  /** Present for multi-browser minters; already masked for display. */
+  maskedProxyUrl?: string;
+  pngBase64: string;
+}
+
+export interface ScreenshotResult {
+  kind: "page" | "fullpage";
+  /** First instance's image, kept so single-browser minters stay simple. */
+  pngBase64: string;
+  instances: ScreenshotInstance[];
 }
 
 /**
@@ -446,19 +459,20 @@ export class MinterHub {
   }
 
   /**
-   * Asks one online minter for a screenshot of its resident browser. Resolves
-   * with the base64 PNG, or throws a descriptive HttpError on any failure.
+   * Asks one online minter for a screenshot of each of its resident browsers.
+   * Old minters reply with a single pngBase64; that is folded into a
+   * one-element instances list so callers have one shape to render.
    */
   requestScreenshot(
     sessionId: string,
     kind: "page" | "fullpage",
     timeoutMs = 15_000,
-  ): Promise<string> {
+  ): Promise<ScreenshotResult> {
     const connection = [...this.connections.values()].find((candidate) => candidate.sessionId === sessionId);
     if (!connection) {
       return Promise.reject(new HttpError(404, "No online authorization service with that session id.", "invalid_request_error", "id", "session_not_found"));
     }
-    return new Promise<string>((resolve, reject) => {
+    return new Promise<ScreenshotResult>((resolve, reject) => {
       const id = randomUUID();
       const timer = setTimeout(() => {
         connection.pendingScreenshots.delete(id);
@@ -468,8 +482,21 @@ export class MinterHub {
       connection.pendingScreenshots.set(id, (reply) => {
         clearTimeout(timer);
         connection.pendingScreenshots.delete(id);
-        if (reply.ok && reply.pngBase64) resolve(reply.pngBase64);
-        else reject(new HttpError(502, reply.error ?? "The authorization service failed to capture a screenshot.", "server_error", undefined, "screenshot_failed"));
+        if (!(reply.ok && reply.pngBase64)) {
+          reject(new HttpError(502, reply.error ?? "The authorization service failed to capture a screenshot.", "server_error", undefined, "screenshot_failed"));
+          return;
+        }
+        const raw = reply.instances && reply.instances.length > 0
+          ? reply.instances
+          : [{ pngBase64: reply.pngBase64 }];
+        resolve({
+          kind,
+          pngBase64: reply.pngBase64,
+          instances: raw.map((instance) => ({
+            ...(instance.proxyUrl ? { maskedProxyUrl: maskProxyUrl(instance.proxyUrl) } : {}),
+            pngBase64: instance.pngBase64,
+          })),
+        });
       });
       this.send(connection, { type: "browser.screenshot.request", id, kind });
     });

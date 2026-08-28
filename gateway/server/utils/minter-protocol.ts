@@ -139,12 +139,20 @@ export interface ScreenshotRequestMessage {
   kind: "page" | "fullpage";
 }
 
+export interface ScreenshotInstanceImage {
+  /** Masked proxy URL of the browser instance this shot came from. */
+  proxyUrl?: string;
+  pngBase64: string;
+}
+
 export interface ScreenshotReplyMessage {
   type: "browser.screenshot.reply";
   id: string;
   ok: boolean;
-  /** Base64-encoded PNG; present when ok is true. */
+  /** Base64-encoded PNG; present when ok is true (first instance). */
   pngBase64?: string;
+  /** One image per resident browser when the minter runs several. */
+  instances?: ScreenshotInstanceImage[];
   /** Failure detail; present when ok is false. */
   error?: string;
 }
@@ -287,7 +295,26 @@ export function parseMinterMessage(raw: string): MinterToGateway | undefined {
       if (!id || typeof payload.ok !== "boolean") return undefined;
       if (payload.ok) {
         const pngBase64 = boundedString(payload.pngBase64, MAX_TOKEN_LENGTH * 8);
-        return pngBase64 ? { type: "browser.screenshot.reply", id, ok: true, pngBase64 } : undefined;
+        if (!pngBase64) return undefined;
+        let instances: ScreenshotInstanceImage[] | undefined;
+        if (Array.isArray(payload.instances)) {
+          const parsed: ScreenshotInstanceImage[] = [];
+          for (const entry of payload.instances) {
+            if (!isRecord(entry)) continue;
+            const instancePng = boundedString(entry.pngBase64, MAX_TOKEN_LENGTH * 8);
+            if (!instancePng) continue;
+            const instanceProxy = boundedString(entry.proxyUrl, 512);
+            parsed.push({ ...(instanceProxy ? { proxyUrl: instanceProxy } : {}), pngBase64: instancePng });
+          }
+          if (parsed.length > 0) instances = parsed;
+        }
+        return {
+          type: "browser.screenshot.reply",
+          id,
+          ok: true,
+          pngBase64,
+          ...(instances ? { instances } : {}),
+        };
       }
       const error = boundedString(payload.error, 512);
       return error ? { type: "browser.screenshot.reply", id, ok: false, error } : undefined;

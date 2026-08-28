@@ -303,6 +303,9 @@ pre { max-height: 520px; margin: 0; overflow: auto; border: 1px solid var(--line
 
 .screenshot-panel { display: grid; gap: 12px; }
 .screenshot-actions { display: flex; gap: 8px; }
+.screenshot-list { display: grid; gap: 12px; }
+.screenshot-item { display: grid; gap: 4px; margin: 0; }
+.screenshot-caption { font-size: 12px; }
 .screenshot-image { max-width: 100%; max-height: 70vh; border: 1px solid var(--line); border-radius: 8px; background: #fff; }
 .screenshot-error { margin: 0; color: var(--danger, #b3261e); font-size: 12.5px; line-height: 1.5; }
 .modal-form { display: contents; }

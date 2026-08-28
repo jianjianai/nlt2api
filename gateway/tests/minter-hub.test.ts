@@ -386,7 +386,41 @@ test("requestScreenshot forwards the request and resolves with the reply", async
     assert.equal(peer.last("browser.screenshot.request")?.kind, "page");
 
     hub.message(peer, JSON.stringify({ type: "browser.screenshot.reply", id: String(peer.last("browser.screenshot.request")?.id), ok: true, pngBase64: "cG5n" }));
-    assert.equal(await promise, "cG5n");
+    assert.deepEqual(await promise, {
+      kind: "page",
+      pngBase64: "cG5n",
+      instances: [{ pngBase64: "cG5n" }],
+    });
+  } finally {
+    harness.close();
+  }
+});
+
+test("requestScreenshot masks every instance's proxy URL", async () => {
+  const harness = createHarness();
+  try {
+    const hub = createHub(harness);
+    const peer = connect(hub);
+    const sessionId = String(peer.last("welcome")?.sessionId);
+
+    const promise = hub.requestScreenshot(sessionId, "page");
+    const id = String(peer.last("browser.screenshot.request")?.id);
+    hub.message(peer, JSON.stringify({
+      type: "browser.screenshot.reply",
+      id,
+      ok: true,
+      pngBase64: "Zm9v",
+      instances: [
+        { proxyUrl: "http://bobby:secret@1.2.3.4:8080", pngBase64: "Zm9v" },
+        { proxyUrl: "http://carol:hunter2@5.6.7.8:8081", pngBase64: "YmFy" },
+      ],
+    }));
+    const result = await promise;
+    assert.equal(result.pngBase64, "Zm9v");
+    assert.deepEqual(result.instances, [
+      { maskedProxyUrl: "http://bo***@1.2.3.4:8080", pngBase64: "Zm9v" },
+      { maskedProxyUrl: "http://ca***@5.6.7.8:8081", pngBase64: "YmFy" },
+    ]);
   } finally {
     harness.close();
   }

@@ -28,6 +28,8 @@ import type {
   ImportSummary,
   MinterSessionPublic,
   OverviewSnapshot,
+  ScreenshotInstance,
+  ScreenshotResponse,
   ProxyFilter,
   ProxyKind,
   ProxyPublic,
@@ -97,7 +99,7 @@ const screenshotSession = shallowRef<MinterSessionPublic | null>(null);
 const screenshotKind = ref<"page" | "fullpage">("page");
 const screenshotBusy = ref(false);
 const screenshotError = ref<string | null>(null);
-const screenshotImage = ref<string | null>(null);
+const screenshotInstances = ref<ScreenshotInstance[]>([]);
 
 interface ToastItem { id: number; kind: "success" | "error"; text: string }
 const toasts = ref<ToastItem[]>([]);
@@ -420,7 +422,7 @@ function openScreenshot(session: MinterSessionPublic, kind: "page" | "fullpage")
   screenshotKind.value = kind;
   screenshotBusy.value = true;
   screenshotError.value = null;
-  screenshotImage.value = null;
+  screenshotInstances.value = [];
   void captureScreenshot(session, kind);
 }
 
@@ -429,13 +431,17 @@ async function captureScreenshot(session: MinterSessionPublic, kind: "page" | "f
   screenshotKind.value = kind;
   screenshotBusy.value = true;
   screenshotError.value = null;
-  screenshotImage.value = null;
+  screenshotInstances.value = [];
   try {
-    const payload = await api<{ pngBase64: string }>(`/api/admin/minters/${session.id}/screenshot`, {
+    const payload = await api<ScreenshotResponse>(`/api/admin/minters/${session.id}/screenshot`, {
       method: "POST",
       body: JSON.stringify({ kind }),
     });
-    screenshotImage.value = payload.pngBase64;
+    // Old minters (or single-browser deployments) may only send pngBase64;
+    // fold that into a one-item list so the panel has a single shape.
+    screenshotInstances.value = payload.instances && payload.instances.length > 0
+      ? payload.instances
+      : [{ pngBase64: payload.pngBase64 }];
   } catch (error) {
     screenshotError.value = errorText(error, "截图失败。");
   } finally {
@@ -447,7 +453,7 @@ function closeScreenshot(): void {
   if (screenshotBusy.value) return;
   screenshotSession.value = null;
   screenshotError.value = null;
-  screenshotImage.value = null;
+  screenshotInstances.value = [];
 }
 
 const settingsDirty = computed(() => {
@@ -633,7 +639,7 @@ onUnmounted(() => {
         :screenshot-kind="screenshotKind"
         :screenshot-busy="screenshotBusy"
         :screenshot-error="screenshotError"
-        :screenshot-image="screenshotImage"
+        :screenshot-instances="screenshotInstances"
         :screenshot-session="screenshotSession"
         @disconnect="disconnectMinter"
         @screenshot="openScreenshot"

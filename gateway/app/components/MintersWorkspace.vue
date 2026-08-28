@@ -2,7 +2,7 @@
 import { computed } from "vue";
 import AppDialog from "./ui/AppDialog.vue";
 import AppIcon from "./ui/AppIcon.vue";
-import type { MinterSessionPublic } from "../types/admin.ts";
+import type { MinterSessionPublic, ScreenshotInstance } from "../types/admin.ts";
 import { formatRelative, formatTime } from "../utils/admin-ui.ts";
 
 const props = defineProps<{
@@ -15,7 +15,7 @@ const props = defineProps<{
   screenshotKind: "page" | "fullpage";
   screenshotBusy: boolean;
   screenshotError: string | null;
-  screenshotImage: string | null;
+  screenshotInstances: ScreenshotInstance[];
   screenshotSession: MinterSessionPublic | null;
 }>();
 
@@ -136,8 +136,13 @@ function requestScreenshot(session: MinterSessionPublic, kind: "page" | "fullpag
         </div>
         <p v-if="screenshotError" class="screenshot-error">{{ screenshotError }}</p>
         <p v-else-if="screenshotBusy" class="muted">等待授权服务返回截图…</p>
-        <p v-else-if="!screenshotImage" class="muted">点击「当前视口」或「整页」抓取授权服务浏览器的画面。</p>
-        <img v-else class="screenshot-image" :src="`data:image/png;base64,${screenshotImage}`" alt="授权服务浏览器截图" />
+        <p v-else-if="screenshotInstances.length === 0" class="muted">点击「当前视口」或「整页」抓取授权服务浏览器的画面。</p>
+        <div v-else class="screenshot-list">
+          <figure v-for="(instance, index) in screenshotInstances" :key="index" class="screenshot-item">
+            <figcaption v-if="instance.maskedProxyUrl" class="muted mono screenshot-caption">{{ instance.maskedProxyUrl }}</figcaption>
+            <img class="screenshot-image" :src="`data:image/png;base64,${instance.pngBase64}`" alt="授权服务浏览器截图" />
+          </figure>
+        </div>
       </div>
     </AppDialog>
   </section>

@@ -11,6 +11,10 @@ export default defineHandler((event) => adminRoute(async (request) => {
   if (!kind) {
     throw new HttpError(400, "`kind` must be page or fullpage.", "invalid_request_error", "kind");
   }
-  const pngBase64 = await gatewayRuntime().hub.requestScreenshot(id, kind);
-  return jsonResponse({ pngBase64, kind });
+  const result = await gatewayRuntime().hub.requestScreenshot(id, kind);
+  return jsonResponse({
+    kind: result.kind,
+    pngBase64: result.pngBase64,
+    instances: result.instances,
+  });
 })(event.req));
