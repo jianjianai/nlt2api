@@ -117,6 +117,8 @@ export class MinterBrowser {
   private siteKey: string;
   private idleTimer: ReturnType<typeof setTimeout> | undefined;
   private minting = false;
+  /** Resolves as soon as the child announces its DevTools socket on stderr. */
+  private devtoolsReady: Promise<void> | undefined;
 
   constructor(private readonly options: BrowserOptions) {
     this.siteKey = options.siteKey;
@@ -286,6 +288,14 @@ export class MinterBrowser {
     if (existing) return existing;
     this.killProcess();
     await this.launch();
+    // Chrome prints "DevTools listening on ws://…" to stderr the moment the
+    // socket accepts connections — that is the earliest safe moment to attach.
+    // A page target still needs /json/list, so read one there before polling.
+    if (this.devtoolsReady) {
+      await this.devtoolsReady.catch(() => undefined);
+      const page = await findPageTarget(this.options.port);
+      if (page) return page;
+    }
     for (let attempt = 0; attempt < 30; attempt += 1) {
       await delay(1_000);
       const page = await findPageTarget(this.options.port);
@@ -323,17 +333,42 @@ export class MinterBrowser {
 
     this.process = spawn(executablePath, args, {
       detached: false,
-      stdio: "ignore",
+      // stderr carries the "DevTools listening on ws://…" line that announces
+      // the CDP socket; the other streams stay ignored.
+      stdio: ["ignore", "ignore", "pipe"],
       env: process.platform === "win32"
         ? process.env
         : { ...process.env, DISPLAY: process.env.DISPLAY ?? this.options.display },
     });
-    this.process.unref();
+    this.watchDevtoolsLine(this.process);
+  }
+
+  private watchDevtoolsLine(child: ChildProcess): void {
+    const stderr = child.stderr;
+    if (!stderr) return;
+    let buffer = "";
+    this.devtoolsReady = new Promise<void>((resolve) => {
+      stderr.setEncoding("utf8");
+      stderr.on("data", (chunk: string) => {
+        buffer += chunk;
+        // Only the readiness line matters; the rest of stderr is dropped so a
+        // chatty browser cannot leak noise into the service log.
+        if (buffer.includes("DevTools listening on ws://")) {
+          stderr.removeAllListeners("data");
+          stderr.resume();
+          resolve();
+        }
+      });
+      stderr.on("end", () => resolve());
+      stderr.on("error", () => resolve());
+      child.on("exit", () => resolve());
+    });
   }
 
   private killProcess(): void {
     this.process?.kill();
     this.process = undefined;
+    this.devtoolsReady = undefined;
   }
 
   /** Tears down the CDP session and browser but keeps the proxy binding. */
