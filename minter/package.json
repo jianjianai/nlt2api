@@ -1,6 +1,6 @@
 {
   "name": "nlt-minter",
-  "version": "3.18.0",
+  "version": "4.0.0",
   "private": true,
   "packageManager": "pnpm@10.34.5",
   "engines": {
