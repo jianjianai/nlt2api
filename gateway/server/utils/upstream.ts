@@ -54,7 +54,15 @@ export function upstreamErrorFrom(status: number, body: string, retryAfter?: num
         : status === 429
           ? "rate_limit"
           : "upstream";
-  return new UpstreamError(`Upstream failed: ${message}`, status, retryAfter ?? retryAfterFromPayload(payload), payload, kind);
+  return new UpstreamError(
+    `Upstream failed: ${message}`,
+    status,
+    retryAfter ?? retryAfterFromPayload(payload),
+    payload,
+    kind,
+    // NB: `body` is bounded by `readUpstreamText`; the error-log store truncates again.
+    body,
+  );
 }
 
 export interface ChatUpstreamOptions {

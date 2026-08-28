@@ -172,6 +172,30 @@ export interface GatewaySettings {
   upstreamTimeoutMs: number;
 }
 
+/** Which subsystem the error belongs to: ticket minting versus request forwarding. */
+export type ErrorLogKind = "minter" | "forward";
+
+/** `failed` is an outright error; `rejected` means a soft refusal by the upstream. */
+export type ErrorLogStatus = "failed" | "rejected";
+
+export interface ErrorLogEntry {
+  id: number;
+  at: number;
+  kind: ErrorLogKind;
+  status: ErrorLogStatus;
+  message: string;
+  sessionId?: string;
+  proxyId?: string;
+  agentId?: string;
+  attempt?: number;
+  /** Upstream HTTP status, when the failure came from the upstream API. */
+  upstreamStatus?: number;
+  /** Upstream response body, verbatim (after redaction) for diagnosis. */
+  upstreamBody?: string;
+}
+
+export interface ErrorLogSummary extends Record<ErrorLogKind, Record<ErrorLogStatus, number>> {}
+
 export interface OverviewSnapshot {
   proxies: Record<ProxyStatus, number>;
   proxiesMintable: number;

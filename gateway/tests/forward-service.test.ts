@@ -204,6 +204,40 @@ test("client-side failures are journaled as well", async () => {
   }
 });
 
+test("upstream refusals journal the HTTP status and verbatim body", async () => {
+  const harness = createHarness();
+  try {
+    const proxyId = seedActiveProxy(harness, "http://1.2.3.4:8080");
+    seedTicket(harness, "1.token", "http://1.2.3.4:8080");
+    const upstreamBody = JSON.stringify({ error: { message: "Not authenticated" } });
+    const forward = new ForwardService({
+      settings: harness.settings,
+      proxies: harness.proxies,
+      tickets: harness.tickets,
+      queue: harness.queue,
+      demand: harness.demand,
+      affinity: harness.affinity,
+      errors: harness.errors,
+      now: () => harness.clock.now,
+      chat: async () => {
+        throw upstreamErrorFrom(403, upstreamBody);
+      },
+    });
+    await assert.rejects(() => forward.chat({ model: "m", messages: [] }), UpstreamError);
+    // The egress is now parked on ip_blocked.
+    assert.equal(harness.proxies.require(proxyId).cooldownReason, "ip_blocked");
+    const rows = harness.errors.list({ kind: "forward" }).entries;
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0]?.proxyId, proxyId);
+    assert.equal(rows[0]?.upstreamStatus, 403);
+    assert.ok(rows[0]!.upstreamBody?.includes("Not authenticated"));
+    // The verbatim body is recorded, not just the parsed message.
+    assert.ok(rows[0]!.upstreamBody?.startsWith("{"));
+  } finally {
+    harness.close();
+  }
+});
+
 test("an empty pool is journaled with a Retry-After hint when queueing is off", async () => {
   const harness = createHarness();
   try {

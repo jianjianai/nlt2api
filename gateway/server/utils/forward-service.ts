@@ -61,6 +61,21 @@ export class ForwardService {
   }
 
   /**
+   * One journal row for a thrown error. An `UpstreamError` also carries the
+   * upstream HTTP status and verbatim response body so the admin can see what
+   * the upstream said, not just that it refused.
+   */
+  private recordError(error: unknown, options: { proxyId?: string; attempt?: number } = {}): void {
+    const extra = error instanceof UpstreamError
+      ? {
+        upstreamStatus: error.status,
+        ...(error.body !== undefined ? { upstreamBody: error.body } : {}),
+      }
+      : {};
+    this.recordFailure(error instanceof Error ? error.message : "Upstream request failed.", { ...options, ...extra });
+  }
+
+  /**
    * Forwards one chat request. Each attempt spends a distinct (proxy, ticket)
    * pair: the ticket is single-use upstream, so a retry must never reuse it.
    * A continuation of a known conversation prefers the egress it started on;
@@ -134,7 +149,7 @@ export class ForwardService {
         }
         // Every failure is journaled: upstream refusals, transport errors and
         // client aborts alike, so the trace shows the full attempt history.
-        this.recordFailure(error instanceof Error ? error.message : "Upstream request failed.", {
+        this.recordError(error, {
           proxyId: pair.ticket.proxyId,
           attempt,
         });
@@ -174,7 +189,7 @@ export class ForwardService {
       this.modelsCache = { at: now, models };
       return models;
     } catch (error) {
-      this.recordFailure(error instanceof Error ? error.message : "Model catalog request failed.", proxy ? { proxyId: proxy.id } : {});
+      this.recordError(error, proxy ? { proxyId: proxy.id } : {});
       throw error;
     }
   }

@@ -130,3 +130,44 @@ test("proxy failures and rejections stay out of the journal", () => {
     harness.close();
   }
 });
+
+test("upstream status and body round-trip, with redaction and truncation", () => {
+  const harness = createHarness();
+  try {
+    record(harness, {
+      kind: "forward",
+      message: "Upstream failed: Not authenticated",
+      upstreamStatus: 403,
+      upstreamBody: JSON.stringify({ error: { message: "Not authenticated", debug: { proxy: "http://bobby:secret@1.2.3.4:8080" } } }),
+    });
+    record(harness, {
+      kind: "forward",
+      message: "Upstream failed: bad model",
+      upstreamStatus: 400,
+      upstreamBody: `prefix ${"y".repeat(5_000)}`,
+    });
+    const entries = harness.errors.list().entries;
+    assert.equal(entries.length, 2);
+
+    const blocked = entries.find((entry) => entry.upstreamStatus === 403);
+    assert.ok(blocked);
+    assert.equal(blocked.kind, "forward");
+    assert.ok(blocked.upstreamBody?.includes("Not authenticated"));
+    // Credentials anywhere in the stored body are still redacted.
+    assert.ok(!blocked.upstreamBody?.includes("secret"));
+    assert.ok(blocked.upstreamBody?.includes("***"));
+
+    const oversized = entries.find((entry) => entry.upstreamStatus === 400);
+    assert.ok(oversized);
+    assert.ok((oversized.upstreamBody?.length ?? 0) <= 2_000);
+
+    // Entries without upstream context still omit the new fields.
+    record(harness, { message: "queue timeout" });
+    const plain = harness.errors.list().entries.find((entry) => entry.message === "queue timeout");
+    assert.ok(plain);
+    assert.equal(plain.upstreamStatus, undefined);
+    assert.equal(plain.upstreamBody, undefined);
+  } finally {
+    harness.close();
+  }
+});

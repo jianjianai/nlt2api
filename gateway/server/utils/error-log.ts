@@ -9,6 +9,8 @@ import type {
 
 /** Longest message kept; anything longer is truncated at the boundary. */
 const MAX_MESSAGE_LENGTH = 500;
+/** Longest upstream response body kept per entry; SSE frames can grow huge. */
+const MAX_UPSTREAM_BODY_LENGTH = 2_000;
 /** Oldest entry kept; this bounds the table regardless of traffic. */
 const DEFAULT_RETENTION_DAYS = 7;
 /** Absolute cap; the prune loop also trims by row count as a safety net. */
@@ -24,6 +26,8 @@ interface ErrorLogRow {
   proxy_id: string | null;
   agent_id: string | null;
   attempt: number | null;
+  upstream_status: number | null;
+  upstream_body: string | null;
 }
 
 export interface ErrorLogEntryInput {
@@ -35,6 +39,10 @@ export interface ErrorLogEntryInput {
   proxyId?: string;
   agentId?: string;
   attempt?: number;
+  /** Upstream HTTP status, when the failure came from the upstream API. */
+  upstreamStatus?: number;
+  /** Upstream response body, verbatim (after redaction) for diagnosis. */
+  upstreamBody?: string;
 }
 
 export interface ErrorLogListOptions {
@@ -57,6 +65,8 @@ function toEntry(row: ErrorLogRow): ErrorLogEntry {
     ...(row.proxy_id ? { proxyId: row.proxy_id } : {}),
     ...(row.agent_id ? { agentId: row.agent_id } : {}),
     ...(row.attempt !== null ? { attempt: row.attempt } : {}),
+    ...(row.upstream_status !== null ? { upstreamStatus: row.upstream_status } : {}),
+    ...(row.upstream_body !== null ? { upstreamBody: row.upstream_body } : {}),
   };
 }
 
@@ -77,9 +87,12 @@ export class ErrorLogService {
 
   record(input: ErrorLogEntryInput): void {
     const message = redactProxyUrls(input.message).slice(0, MAX_MESSAGE_LENGTH);
+    const upstreamBody = input.upstreamBody === undefined
+      ? null
+      : redactProxyUrls(input.upstreamBody).slice(0, MAX_UPSTREAM_BODY_LENGTH);
     this.db.prepare(`
-      INSERT INTO error_logs (at, kind, status, message, session_id, proxy_id, agent_id, attempt)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO error_logs (at, kind, status, message, session_id, proxy_id, agent_id, attempt, upstream_status, upstream_body)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       input.at,
       input.kind,
@@ -89,6 +102,8 @@ export class ErrorLogService {
       input.proxyId ?? null,
       input.agentId ?? null,
       input.attempt ?? null,
+      input.upstreamStatus ?? null,
+      upstreamBody,
     );
   }
 

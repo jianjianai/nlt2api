@@ -16,6 +16,8 @@ export class UpstreamError extends Error {
     readonly retryAfterSeconds?: number,
     readonly payload?: JsonObject,
     readonly kind: UpstreamFailureKind = status === 429 ? "rate_limit" : "upstream",
+    /** Raw upstream response body, kept verbatim for diagnosis. */
+    readonly body?: string,
   ) {
     super(message);
     this.name = "UpstreamError";

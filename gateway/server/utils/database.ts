@@ -130,6 +130,15 @@ const MIGRATIONS: Array<{ version: number; up: (db: DatabaseSync) => void }> = [
       `);
     },
   },
+  {
+    version: 6,
+    up: (db) => {
+      db.exec(`
+        ALTER TABLE error_logs ADD COLUMN upstream_status INTEGER;
+        ALTER TABLE error_logs ADD COLUMN upstream_body TEXT;
+      `);
+    },
+  },
 ];
 
 function applyMigrations(db: DatabaseSync): void {

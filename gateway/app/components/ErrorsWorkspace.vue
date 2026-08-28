@@ -1,5 +1,6 @@
 <script setup lang="ts">
-import { computed } from "vue";
+import { computed, ref } from "vue";
+import AppDialog from "./ui/AppDialog.vue";
 import AppIcon from "./ui/AppIcon.vue";
 import type { ErrorLogEntry, ErrorLogKind, ErrorLogStatus } from "../types/admin.ts";
 import { ERROR_KIND_LABEL, ERROR_KIND_TONE, ERROR_STATUS_LABEL, formatRelative, formatTime } from "../utils/admin-ui.ts";
@@ -26,6 +27,19 @@ const emit = defineEmits<{
   clearOlder: [];
   clearAll: [];
 }>();
+
+const selected = ref<ErrorLogEntry | null>(null);
+const detailOpen = ref(false);
+
+function openDetail(entry: ErrorLogEntry): void {
+  selected.value = entry;
+  detailOpen.value = true;
+}
+
+function closeDetail(open: boolean): void {
+  detailOpen.value = open;
+  if (!open) selected.value = null;
+}
 
 const kinds = computed<Array<{ id: ErrorLogKind | "all"; label: string; count: number }>>(() => {
   const summary = props.summary;
@@ -145,7 +159,17 @@ function clearQuery(): void {
           <span>详情</span>
           <span>归属</span>
         </div>
-        <div v-for="entry in entries" :key="entry.id" class="errors-table-row">
+        <div
+          v-for="entry in entries"
+          :key="entry.id"
+          class="errors-table-row"
+          :class="{ clickable: entry.upstreamStatus !== undefined || entry.upstreamBody }"
+          :role="entry.upstreamStatus !== undefined || entry.upstreamBody ? 'button' : undefined"
+          :tabindex="entry.upstreamStatus !== undefined || entry.upstreamBody ? 0 : undefined"
+          @click="openDetail(entry)"
+          @keydown.enter.prevent="openDetail(entry)"
+          @keydown.space.prevent="openDetail(entry)"
+        >
           <span class="mono" data-label="时间">{{ formatTime(entry.at) }}</span>
           <span data-label="来源">
             <span class="badge" :class="ERROR_KIND_TONE[entry.kind]">{{ ERROR_KIND_LABEL[entry.kind] }}</span>
@@ -156,6 +180,7 @@ function clearQuery(): void {
           </span>
           <span class="errors-message" data-label="详情">
             <code>{{ entry.message }}</code>
+            <span v-if="entry.upstreamStatus !== undefined" class="muted mono">HTTP {{ entry.upstreamStatus }}</span>
             <span v-if="entry.agentId" class="muted mono">agent: {{ entry.agentId }}</span>
           </span>
           <span data-label="归属">
@@ -179,5 +204,36 @@ function clearQuery(): void {
         </div>
       </div>
     </section>
+
+    <AppDialog
+      v-if="selected"
+      :open="detailOpen"
+      :title="`错误详情 #${selected.id}`"
+      :description="`${ERROR_KIND_LABEL[selected.kind]} · ${ERROR_STATUS_LABEL[selected.status]} · ${formatTime(selected.at)}`"
+      wide
+      @update:open="closeDetail"
+    >
+      <div class="error-detail">
+        <dl class="error-detail-meta">
+          <div><dt>时间</dt><dd class="mono">{{ formatTime(selected.at) }}</dd></div>
+          <div><dt>来源</dt><dd>{{ ERROR_KIND_LABEL[selected.kind] }}</dd></div>
+          <div><dt>状态</dt><dd>{{ ERROR_STATUS_LABEL[selected.status] }}</dd></div>
+          <div v-if="selected.attempt"><dt>第几次尝试</dt><dd>{{ selected.attempt }}</dd></div>
+          <div v-if="selected.upstreamStatus !== undefined"><dt>上游状态码</dt><dd class="mono">HTTP {{ selected.upstreamStatus }}</dd></div>
+          <div v-if="selected.proxyId"><dt>代理</dt><dd class="mono">{{ selected.proxyId }}</dd></div>
+          <div v-if="selected.sessionId"><dt>会话</dt><dd class="mono">{{ selected.sessionId }}</dd></div>
+          <div v-if="selected.agentId"><dt>Minter</dt><dd class="mono">{{ selected.agentId }}</dd></div>
+        </dl>
+        <div class="error-detail-block">
+          <h3>错误消息</h3>
+          <pre><code>{{ selected.message }}</code></pre>
+        </div>
+        <div v-if="selected.upstreamBody" class="error-detail-block">
+          <h3>上游响应内容</h3>
+          <pre><code>{{ selected.upstreamBody }}</code></pre>
+        </div>
+        <p v-else-if="selected.upstreamStatus !== undefined" class="muted">没有记录上游响应内容。</p>
+      </div>
+    </AppDialog>
   </section>
 </template>
