@@ -42,7 +42,7 @@ const groups: Array<{ title: string; description: string; keys: SettingKey[] }> 
   {
     title: "补充编排",
     description: "水位不足时向在线授权服务下发铸票任务。",
-    keys: ["refillIntervalSeconds", "mintRequestTimeoutSeconds", "proxyLeaseSeconds"],
+    keys: ["refillIntervalSeconds", "mintRequestTimeoutSeconds", "proxyLeaseSeconds", "stickyMintsMin", "stickyMintsMax"],
   },
   {
     title: "代理测活",

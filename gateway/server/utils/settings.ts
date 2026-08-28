@@ -28,6 +28,10 @@ const BOUNDS: Record<keyof GatewaySettings, Bound> = {
   refillIntervalSeconds: { min: 1, max: 120 },
   mintRequestTimeoutSeconds: { min: 30, max: 900 },
   proxyLeaseSeconds: { min: 30, max: 900 },
+  // How many tickets a minter mints through one proxy before rotating; 0 keeps
+  // the current "reuse until the pool says otherwise" behaviour.
+  stickyMintsMin: { min: 0, max: 1_000 },
+  stickyMintsMax: { min: 0, max: 1_000 },
   proxyCheckIntervalSeconds: { min: 10, max: 3_600 },
   proxyCheckTimeoutSeconds: { min: 3, max: 120 },
   proxyCheckConcurrency: { min: 1, max: 32 },
@@ -58,6 +62,8 @@ export const DEFAULT_SETTINGS: GatewaySettings = {
   refillIntervalSeconds: 5,
   mintRequestTimeoutSeconds: 180,
   proxyLeaseSeconds: 120,
+  stickyMintsMin: 0,
+  stickyMintsMax: 0,
   proxyCheckIntervalSeconds: 60,
   proxyCheckTimeoutSeconds: 15,
   proxyCheckConcurrency: 4,
@@ -92,7 +98,21 @@ function normalize(raw: unknown): GatewaySettings {
   if (result.maxAvailableTickets < result.minAvailableTickets) {
     result.maxAvailableTickets = result.minAvailableTickets;
   }
+  const sticky = normalizeSticky(result.stickyMintsMin, result.stickyMintsMax);
+  result.stickyMintsMin = sticky.min;
+  result.stickyMintsMax = sticky.max;
   return result;
+}
+
+/**
+ * A sticky band is either disabled (0/0) or a well-ordered range; a half-open
+ * band (only one side set) collapses to that single value.
+ */
+function normalizeSticky(min: number, max: number): { min: number; max: number } {
+  if (min === 0 && max === 0) return { min: 0, max: 0 };
+  if (min === 0) return { min: max, max };
+  if (max === 0) return { min, max: min };
+  return min <= max ? { min, max } : { min: max, max: min };
 }
 
 export class SettingsStore {
@@ -146,6 +166,9 @@ export class SettingsStore {
         "maxAvailableTickets",
       );
     }
+    const sticky = normalizeSticky(next.stickyMintsMin, next.stickyMintsMax);
+    next.stickyMintsMin = sticky.min;
+    next.stickyMintsMax = sticky.max;
     this.db.prepare("INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value")
       .run(SETTINGS_KEY, JSON.stringify(next));
     this.cached = next;

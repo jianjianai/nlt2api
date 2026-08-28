@@ -80,6 +80,13 @@ export interface WelcomeMessage {
   heartbeatIntervalMs: number;
   siteKey: string;
   ticketTtlSeconds: number;
+  /**
+   * Sticky-minting band handed down from settings: a minter rotates its proxy
+   * after this many consecutive tickets on it. Both 0 (or absent) disables
+   * stickiness; min equals max pins every rotation to that count.
+   */
+  stickyMintsMin?: number;
+  stickyMintsMax?: number;
 }
 
 export interface PingMessage { type: "ping"; id: string }

@@ -77,7 +77,7 @@ interface Harness {
   stop(): Promise<void>;
 }
 
-function createHarness(options: { concurrency?: number; behaviour?: (call: number) => void } = {}): Harness {
+function createHarness(options: { concurrency?: number; behaviour?: (call: number) => void; sticky?: { min: number; max: number } } = {}): Harness {
   const socket = new FakeSocket();
   const minters: FakeMinter[] = [];
   const config = loadConfig({
@@ -106,7 +106,15 @@ function createHarness(options: { concurrency?: number; behaviour?: (call: numbe
     started,
     push,
     welcome(siteKey = "0xGATEWAY") {
-      push({ type: "welcome", sessionId: "s1", siteKey, serverVersion: "1.0.0", heartbeatIntervalMs: 60_000, ticketTtlSeconds: 170 });
+      push({
+        type: "welcome",
+        sessionId: "s1",
+        siteKey,
+        serverVersion: "1.0.0",
+        heartbeatIntervalMs: 60_000,
+        ticketTtlSeconds: 170,
+        ...(options.sticky ? { stickyMintsMin: options.sticky.min, stickyMintsMax: options.sticky.max } : {}),
+      });
     },
     async stop() {
       await client.stop();
@@ -212,6 +220,109 @@ test("a later lease request prefers the proxy the browser is already bound to", 
     harness.push({ type: "mint.request", id: "m2", count: 1, deadlineMs: Date.now() + 60_000 });
     await tick();
     assert.equal(harness.socket.last("proxy.lease")?.preferProxyId, "P1");
+  } finally {
+    await harness.stop();
+  }
+});
+
+test("a welcome without a sticky band leaves prefer-on-renewal untouched", async () => {
+  const harness = createHarness(); // no sticky option
+  try {
+    await tick();
+    harness.welcome();
+    harness.push({ type: "mint.request", id: "m1", count: 1, deadlineMs: Date.now() + 60_000 });
+    await tick();
+    const lease = harness.socket.last("proxy.lease");
+    harness.push({
+      type: "proxy.leased",
+      id: lease!.id,
+      leaseId: "L1",
+      proxyId: "P1",
+      proxyUrl: "http://1.2.3.4:8080",
+      kind: "http",
+      expiresAt: Date.now() + 120_000,
+    });
+    await tick();
+    await tick();
+
+    harness.push({ type: "mint.request", id: "m2", count: 1, deadlineMs: Date.now() + 60_000 });
+    await tick();
+    assert.equal(harness.socket.last("proxy.lease")?.preferProxyId, "P1");
+  } finally {
+    await harness.stop();
+  }
+});
+
+test("after the sticky target the next lease request stops preferring the bound proxy", async () => {
+  const harness = createHarness({ sticky: { min: 1, max: 1 } });
+  try {
+    await tick();
+    harness.welcome();
+    harness.push({ type: "mint.request", id: "m1", count: 1, deadlineMs: Date.now() + 60_000 });
+    await tick();
+    const first = harness.socket.last("proxy.lease");
+    harness.push({
+      type: "proxy.leased",
+      id: first!.id,
+      leaseId: "L1",
+      proxyId: "P1",
+      proxyUrl: "http://1.2.3.4:8080",
+      kind: "http",
+      expiresAt: Date.now() + 120_000,
+    });
+    await tick();
+    await tick();
+
+    // Target 1 was just hit on P1, so the next request must not prefer it.
+    harness.push({ type: "mint.request", id: "m2", count: 1, deadlineMs: Date.now() + 60_000 });
+    await tick();
+    assert.equal(harness.socket.last("proxy.lease")?.preferProxyId, undefined);
+  } finally {
+    await harness.stop();
+  }
+});
+
+test("a batch rotates proxies mid-flight when the sticky target is reached", async () => {
+  const harness = createHarness({ sticky: { min: 1, max: 1 } });
+  try {
+    await tick();
+    harness.welcome();
+    harness.push({ type: "mint.request", id: "m1", count: 2, deadlineMs: Date.now() + 60_000 });
+    await tick();
+    const first = harness.socket.last("proxy.lease");
+    harness.push({
+      type: "proxy.leased",
+      id: first!.id,
+      leaseId: "L1",
+      proxyId: "P1",
+      proxyUrl: "http://1.2.3.4:8080",
+      kind: "http",
+      expiresAt: Date.now() + 120_000,
+    });
+    // Let the first mint land; the mid-batch rotation then releases L1 and asks anew.
+    await tick();
+    await tick();
+    await tick();
+    const rotated = harness.socket.last("proxy.lease");
+    assert.notEqual(rotated?.id, first?.id);
+    assert.equal(rotated?.preferProxyId, undefined);
+    harness.push({
+      type: "proxy.leased",
+      id: rotated!.id,
+      leaseId: "L2",
+      proxyId: "P2",
+      proxyUrl: "http://5.6.7.8:8080",
+      kind: "http",
+      expiresAt: Date.now() + 120_000,
+    });
+    await tick();
+    await tick();
+
+    const calls = harness.minters[0]?.calls ?? [];
+    assert.equal(calls.length, 2);
+    assert.equal(calls[0], "http://1.2.3.4:8080");
+    assert.equal(calls[1], "http://5.6.7.8:8080");
+    assert.equal(harness.socket.all("lease.release").length, 2);
   } finally {
     await harness.stop();
   }

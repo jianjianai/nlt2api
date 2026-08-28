@@ -68,8 +68,24 @@ test("hello is answered with a welcome carrying the site key and TTL", () => {
     assert.equal(typeof welcome.sessionId, "string");
     assert.equal(welcome.ticketTtlSeconds, harness.settings.get().ticketTtlSeconds);
     assert.equal(typeof welcome.siteKey, "string");
+    assert.equal(typeof welcome.stickyMintsMin, "number");
+    assert.equal(typeof welcome.stickyMintsMax, "number");
     assert.equal(hub.onlineCount(), 1);
     assert.equal(hub.snapshot()[0]?.remoteAddr, "203.0.113.7");
+  } finally {
+    harness.close();
+  }
+});
+
+test("the welcome hands the sticky-minting band down from settings", () => {
+  const harness = createHarness();
+  try {
+    harness.settings.patch({ stickyMintsMin: 2, stickyMintsMax: 5 });
+    const hub = createHub(harness);
+    const peer = connect(hub);
+    const welcome = peer.last("welcome");
+    assert.equal(welcome?.stickyMintsMin, 2);
+    assert.equal(welcome?.stickyMintsMax, 5);
   } finally {
     harness.close();
   }

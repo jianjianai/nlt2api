@@ -54,6 +54,10 @@ interface Worker {
   busy: boolean;
   /** Proxy this worker's browser is currently bound to; renewed when possible. */
   lastProxyId?: string;
+  /** Consecutive tickets minted on `lastProxyId` since the browser bound to it. */
+  stickyMintCount: number;
+  /** Random rotation target for the current proxy; 0 = stickiness disabled. */
+  stickyTarget: number;
 }
 
 async function connectWebSocket(url: string, token: string): Promise<Socket & { attach: (client: MinterClient) => void }> {
@@ -90,6 +94,9 @@ export class MinterClient {
   private socket: Socket | undefined;
   private sessionId: string | undefined;
   private siteKey: string;
+  /** Sticky-minting band handed down by the gateway in `welcome`; 0/0 disables it. */
+  private stickyMintsMin = 0;
+  private stickyMintsMax = 0;
   private heartbeatIntervalMs = DEFAULT_HEARTBEAT_INTERVAL_MS;
   private heartbeatTimer: ReturnType<typeof setInterval> | undefined;
   private silenceTimer: ReturnType<typeof setTimeout> | undefined;
@@ -119,7 +126,7 @@ export class MinterClient {
       ...(this.config.browserPath ? { executablePath: this.config.browserPath } : {}),
     }));
     for (let index = 0; index < this.config.concurrency; index += 1) {
-      this.workers.push({ index, minter: createMinter(index), busy: false });
+      this.workers.push({ index, minter: createMinter(index), busy: false, stickyMintCount: 0, stickyTarget: 0 });
     }
   }
 
@@ -222,6 +229,8 @@ export class MinterClient {
           this.siteKey = message.siteKey;
           for (const worker of this.workers) worker.minter.setSiteKey(message.siteKey);
         }
+        this.stickyMintsMin = message.stickyMintsMin ?? 0;
+        this.stickyMintsMax = message.stickyMintsMax ?? 0;
         this.startHeartbeat();
         this.log(`connected to gateway ${message.serverVersion} as session ${message.sessionId}`);
         return;
@@ -295,9 +304,31 @@ export class MinterClient {
   private async runWorker(worker: Worker, batch: number): Promise<void> {
     worker.busy = true;
     try {
-      const lease = await this.requestLease(worker.lastProxyId);
+      // Sticky minting: once this proxy has carried its random target of tickets,
+      // stop preferring it so the next lease lands on a fresh IP. The browser
+      // stays put until then, amortising its launch across the whole batch.
+      if (
+        worker.stickyTarget > 0
+        && worker.lastProxyId !== undefined
+        && worker.stickyMintCount >= worker.stickyTarget
+      ) {
+        delete worker.lastProxyId;
+        worker.stickyTarget = 0;
+        worker.stickyMintCount = 0;
+      }
+      let lease = await this.requestLease(worker.lastProxyId);
       if (!lease) return;
-      worker.lastProxyId = lease.proxyId;
+      if (lease.proxyId !== worker.lastProxyId) {
+        // A genuinely new proxy: the browser restarts and the random rotation
+        // target is re-rolled for it.
+        worker.lastProxyId = lease.proxyId;
+        worker.stickyMintCount = 0;
+        worker.stickyTarget = this.rollStickyTarget();
+      } else if (worker.stickyTarget === 0) {
+        // Reconnected after the band was disabled, or a fresh deploy; only roll
+        // when stickiness is actually configured.
+        worker.stickyTarget = this.rollStickyTarget();
+      }
       let minted = 0;
       try {
         while (minted < batch && this.connected) {
@@ -315,6 +346,18 @@ export class MinterClient {
             ...(result.userAgent ? { userAgent: result.userAgent } : {}),
           });
           minted += 1;
+          worker.stickyMintCount += 1;
+          // Hit the rotation target mid-batch: release the lease now so the
+          // remaining tickets in this batch mint on a different IP.
+          if (worker.stickyTarget > 0 && worker.stickyMintCount >= worker.stickyTarget && minted < batch) {
+            this.send({ type: "lease.release", leaseId: lease.leaseId });
+            const next = await this.requestLease(undefined);
+            if (!next) return;
+            lease = next;
+            worker.lastProxyId = next.proxyId;
+            worker.stickyMintCount = 0;
+            worker.stickyTarget = this.rollStickyTarget();
+          }
         }
       } catch (error) {
         const { reason, message } = classifyMintFailure(error);
@@ -325,6 +368,14 @@ export class MinterClient {
     } finally {
       worker.busy = false;
     }
+  }
+
+  /** Picks this proxy's rotation target inside the configured band; 0 disables. */
+  private rollStickyTarget(): number {
+    const min = this.stickyMintsMin;
+    const max = Math.max(min, this.stickyMintsMax);
+    if (min <= 0) return 0;
+    return min + Math.floor(Math.random() * (max - min + 1));
   }
 
   private reportFailure(reason: MintFailureReason, leaseId: string | undefined, message: string): void {

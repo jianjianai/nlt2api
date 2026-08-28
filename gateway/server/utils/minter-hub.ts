@@ -249,13 +249,16 @@ export class MinterHub {
     connection.concurrency = message.concurrency;
 
     const config = getGatewayConfig();
+    const settings = this.settings.get();
     this.send(connection, {
       type: "welcome",
       sessionId,
       serverVersion: this.serverVersion,
       heartbeatIntervalMs: HEARTBEAT_INTERVAL_MS,
       siteKey: config.turnstileSiteKey,
-      ticketTtlSeconds: this.settings.get().ticketTtlSeconds,
+      ticketTtlSeconds: settings.ticketTtlSeconds,
+      stickyMintsMin: settings.stickyMintsMin,
+      stickyMintsMax: settings.stickyMintsMax,
     });
   }
 

@@ -459,6 +459,8 @@ flowchart TB
 | `MINTER_IDLE_RELEASE_MS` | 否 | 600000 | 空闲多久回收浏览器（每实例约 1.6 GB） |
 | `MINTER_MINT_TIMEOUT_MS` | 否 | 60000 | 单次铸票超时 |
 
+粘性铸造（同一 IP 连铸 N 张后换 IP，N 在区间内随机）不在 minter 环境变量里配，而是 gateway 的运行参数 `stickyMintsMin` / `stickyMintsMax`（默认 0/0 = 关闭），握手后在 `welcome` 里下发；运行中调整只影响新建立的会话。
+
 ### 5.2 铸票流程（HTML 劫持自渲染）
 
 按已验证设计实现，替换旧的「驱动官方页面 + 中止 chat 请求」：

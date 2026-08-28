@@ -56,6 +56,28 @@ test("the freshness floor must stay below the TTL", () => {
   }
 });
 
+test("an inverted sticky band is normalised instead of rejected", () => {
+  const harness = createHarness();
+  try {
+    const patched = harness.settings.patch({ stickyMintsMin: 5, stickyMintsMax: 2 });
+    assert.equal(patched.stickyMintsMin, 2);
+    assert.equal(patched.stickyMintsMax, 5);
+  } finally {
+    harness.close();
+  }
+});
+
+test("a half-set sticky band collapses to the single configured side", () => {
+  const harness = createHarness();
+  try {
+    const patched = harness.settings.patch({ stickyMintsMin: 3 });
+    assert.equal(patched.stickyMintsMin, 3);
+    assert.equal(patched.stickyMintsMax, 3);
+  } finally {
+    harness.close();
+  }
+});
+
 test("corrupt stored settings fall back to defaults instead of throwing", () => {
   const harness = createHarness();
   try {

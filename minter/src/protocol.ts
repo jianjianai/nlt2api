@@ -32,6 +32,12 @@ export interface WelcomeMessage {
   heartbeatIntervalMs: number;
   siteKey: string;
   ticketTtlSeconds: number;
+  /**
+   * Sticky-minting band from gateway settings: rotate the proxy after this many
+   * consecutive tickets. Absent/0 disables stickiness (legacy gateway).
+   */
+  stickyMintsMin?: number;
+  stickyMintsMax?: number;
 }
 
 export interface MintRequestMessage {
@@ -115,7 +121,18 @@ export function parseGatewayMessage(raw: string): GatewayMessage | undefined {
       const heartbeatIntervalMs = num(payload.heartbeatIntervalMs) ?? DEFAULT_HEARTBEAT_INTERVAL_MS;
       const ticketTtlSeconds = num(payload.ticketTtlSeconds) ?? 170;
       if (!sessionId || !siteKey) return undefined;
-      return { type: "welcome", sessionId, siteKey, serverVersion, heartbeatIntervalMs, ticketTtlSeconds };
+      const stickyMintsMin = num(payload.stickyMintsMin);
+      const stickyMintsMax = num(payload.stickyMintsMax);
+      return {
+        type: "welcome",
+        sessionId,
+        siteKey,
+        serverVersion,
+        heartbeatIntervalMs,
+        ticketTtlSeconds,
+        ...(stickyMintsMin !== undefined ? { stickyMintsMin: Math.max(0, Math.floor(stickyMintsMin)) } : {}),
+        ...(stickyMintsMax !== undefined ? { stickyMintsMax: Math.max(0, Math.floor(stickyMintsMax)) } : {}),
+      };
     }
     case "mint.request": {
       const id = str(payload.id);

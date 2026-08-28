@@ -154,6 +154,10 @@ export interface GatewaySettings {
   refillIntervalSeconds: number;
   mintRequestTimeoutSeconds: number;
   proxyLeaseSeconds: number;
+  /** Tickets minted through one proxy before the minter rotates; 0/0 disables stickiness. */
+  stickyMintsMin: number;
+  /** Upper bound of the random sticky target; equals min when the band is disabled or a single value. */
+  stickyMintsMax: number;
   proxyCheckIntervalSeconds: number;
   proxyCheckTimeoutSeconds: number;
   proxyCheckConcurrency: number;
@@ -167,27 +171,6 @@ export interface GatewaySettings {
   maxAttempts: number;
   upstreamTimeoutMs: number;
 }
-
-export type ErrorLogKind = "minter" | "forward";
-export type ErrorLogStatus = "failed" | "rejected";
-
-/** One row of the error journal shown in the admin console. */
-export interface ErrorLogEntry {
-  id: number;
-  at: number;
-  kind: ErrorLogKind;
-  status: ErrorLogStatus;
-  message: string;
-  /** Which minter session owns the failure; links back to the minters page. */
-  sessionId?: string;
-  /** Which proxy failed; links back to the proxies page. */
-  proxyId?: string;
-  agentId?: string;
-  /** Forward attempt number (1..N) when the failure was a retried attempt. */
-  attempt?: number;
-}
-
-export type ErrorLogSummary = Record<ErrorLogKind, Record<ErrorLogStatus, number>>;
 
 export interface OverviewSnapshot {
   proxies: Record<ProxyStatus, number>;

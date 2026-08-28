@@ -57,10 +57,14 @@ gateway 处理：按 `agentId` 复用或新建 `minter_sessions` 行，写 `conn
   heartbeatIntervalMs: number,   // minter 应按此间隔发 ping，默认 15000
   siteKey: string,               // 上游 Turnstile site key，由 gateway 下发，覆盖 minter 本地默认值
   ticketTtlSeconds: number,      // 仅供 minter 判断「铸完还剩多久值得回传」
+  stickyMintsMin?: number,       // 粘性铸造下限：同一代理至少连铸几张后换 IP；0/缺省 = 关闭
+  stickyMintsMax?: number,       // 粘性铸造上限：同一代理至多连铸几张；每张实际目标在 下限~上限 间随机
 }
 ```
 
 `siteKey` 由 gateway 集中下发：上游更换 site key 时只需改 gateway 设置，不必逐台重配授权服务。minter 本地 `MINTER_SITEKEY` 仅作为 gateway 未下发时的兜底。
+
+`stickyMintsMin/Max` 同样由 gateway 设置统一下发（运行参数 → 补充编排）：minter 在某条代理上连续铸满 N 张（N 为 `[min, max]` 内随机）后主动放弃 `preferProxyId`，下一张改走新 IP，浏览器随 `--proxy-server` 变化重启一次。两者均为 0（或旧 gateway 未下发）时关闭粘性，保持「只在代理不可续租时才换」的现有行为。min < max 形成区间；只设一端时按该端固定。
 
 ### 3.3 `ping` / `pong`
 

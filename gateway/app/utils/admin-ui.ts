@@ -63,6 +63,8 @@ export const SETTING_LABEL: Record<SettingKey, { label: string; hint: string }> 
   refillIntervalSeconds: { label: "补充检查周期（秒）", hint: "编排器计算缺口的频率。" },
   mintRequestTimeoutSeconds: { label: "铸票任务超时（秒）", hint: "超时后释放占用的并发计数。" },
   proxyLeaseSeconds: { label: "代理租约（秒）", hint: "授权服务独占一个代理的时长。" },
+  stickyMintsMin: { label: "粘性铸造下限", hint: "同一 IP 最少连铸几张后换 IP；0 表示关闭粘性（只在代理不可续租时才换）。" },
+  stickyMintsMax: { label: "粘性铸造上限", hint: "同一 IP 最多连铸几张后换 IP；每张实际目标在 下限~上限 间随机。" },
   proxyCheckIntervalSeconds: { label: "测活周期（秒）", hint: "后台探测待测活与不合格代理的间隔。" },
   proxyCheckTimeoutSeconds: { label: "单次测活超时（秒）", hint: "经代理拉取上游模型目录的超时。" },
   proxyCheckConcurrency: { label: "测活并发", hint: "同时进行的探测数量。" },
