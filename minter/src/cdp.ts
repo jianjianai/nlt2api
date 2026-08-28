@@ -1,3 +1,4 @@
+import { setTimeout as delay } from "node:timers/promises";
 import type { MintFailureReason } from "./protocol.ts";
 
 export class MintError extends Error {
@@ -52,10 +53,50 @@ export class CdpSession {
   }
 
   static async open(webSocketUrl: string): Promise<CdpSession> {
+    let lastError: MintError = new MintError("cdp_socket", `Failed to open the CDP socket at ${redactWebSocketUrl(webSocketUrl)}.`);
+    // The browser may have exposed the HTTP endpoint moments before it accepts
+    // socket upgrades, so an immediate ECONNREFUSED is worth a short retry
+    // instead of surfacing as a mint failure.
+    for (let attempt = 1; attempt <= OPEN_ATTEMPTS; attempt += 1) {
+      try {
+        return await CdpSession.openOnce(webSocketUrl);
+      } catch (error) {
+        if (error instanceof MintError) lastError = error;
+        if (attempt < OPEN_ATTEMPTS) await delay(OPEN_RETRY_DELAY_MS * attempt);
+      }
+    }
+    throw lastError;
+  }
+
+  private static async openOnce(webSocketUrl: string): Promise<CdpSession> {
     const socket = new WebSocket(webSocketUrl);
     await new Promise<void>((resolve, reject) => {
-      socket.onopen = () => resolve();
-      socket.onerror = () => reject(new MintError("cdp_socket", "Failed to open the CDP socket."));
+      const cleanup = () => {
+        clearTimeout(timer);
+        socket.onopen = null;
+        socket.onerror = null;
+        socket.onclose = null;
+      };
+      const timer = setTimeout(() => {
+        cleanup();
+        try { socket.close(); } catch { /* not yet open */ }
+        reject(new MintError("cdp_socket", `Timed out opening the CDP socket at ${redactWebSocketUrl(webSocketUrl)}.`));
+      }, OPEN_TIMEOUT_MS);
+      timer.unref?.();
+      socket.onopen = () => { cleanup(); resolve(); };
+      socket.onerror = () => {
+        cleanup();
+        reject(new MintError("cdp_socket", `Failed to open the CDP socket at ${redactWebSocketUrl(webSocketUrl)}.`));
+      };
+      // A refused connection may surface as close-without-open instead of an
+      // error event; report the close code so the two are distinguishable.
+      socket.onclose = (event: CloseEvent) => {
+        cleanup();
+        reject(new MintError(
+          "cdp_socket",
+          `The CDP socket at ${redactWebSocketUrl(webSocketUrl)} closed before opening (code ${event.code}).`,
+        ));
+      };
     });
     return new CdpSession(socket);
   }
@@ -169,5 +210,21 @@ export async function findPageTarget(port: number): Promise<CdpTarget | undefine
     return targets.find((target) => target.type === "page");
   } catch {
     return undefined;
+  }
+}
+
+const OPEN_ATTEMPTS = 3;
+const OPEN_RETRY_DELAY_MS = 250;
+const OPEN_TIMEOUT_MS = 10_000;
+
+/** Debugger URLs carry no credentials, but strip any userinfo defensively. */
+function redactWebSocketUrl(url: string): string {
+  try {
+    const parsed = new URL(url);
+    parsed.username = "";
+    parsed.password = "";
+    return parsed.toString();
+  } catch {
+    return url;
   }
 }
