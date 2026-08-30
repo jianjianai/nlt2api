@@ -175,7 +175,7 @@ export class LocalForwardProxy {
   }
 
   start(): Promise<number> {
-    if (this.boundPort !== undefined) return Promise.resolve(this.boundPort);
+    if (this.server) return Promise.resolve(this.boundPort as number);
     const server = net.createServer((socket) => void this.handleClient(socket));
     server.on("connection", (socket) => {
       this.sockets.add(socket);
@@ -183,9 +183,10 @@ export class LocalForwardProxy {
     });
     return new Promise((resolve, reject) => {
       server.once("error", reject);
-      // Port 0 lets the OS pick a free loopback port, so several browsers never
-      // collide regardless of the configured base port.
-      server.listen(0, "127.0.0.1", () => {
+      // Pause after the first bind: a port remembered from an earlier run is
+      // reused, so the browser's --proxy-server flag survives a restart.
+      const port = this.boundPort ?? 0;
+      server.listen(port, "127.0.0.1", () => {
         server.off("error", reject);
         const address = server.address();
         if (!address || typeof address === "string") {
@@ -199,10 +200,23 @@ export class LocalForwardProxy {
     });
   }
 
+  /**
+   * Closes the listener but keeps the bound port reserved for the next
+   * `start()`. The browser process holding `--proxy-server` restarts at the
+   * same time, so the loopback port it was launched with must stay identical.
+   */
+  async restart(): Promise<void> {
+    await this.teardown(false);
+  }
+
   async close(): Promise<void> {
+    await this.teardown(true);
+  }
+
+  private async teardown(releasePort: boolean): Promise<void> {
     const server = this.server;
     this.server = undefined;
-    this.boundPort = undefined;
+    if (releasePort) this.boundPort = undefined;
     for (const socket of this.sockets) socket.destroy();
     this.sockets.clear();
     if (!server) return;

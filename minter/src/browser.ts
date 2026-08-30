@@ -161,7 +161,16 @@ export class MinterBrowser {
         // whose result is actually reported.
         return await this.mintOnce(await this.ensureSession());
       }
-      return await this.mintOnce(session);
+      try {
+        return await this.mintOnce(session);
+      } catch (error) {
+        // The first failure may leave the browser bound to a dead loopback
+        // proxy port (or a zombie process) where every later attempt repeats
+        // the same "fetch failed". Tear down and retry once, which relaunches
+        // on the remembered port, before reporting the mint as failed.
+        this.dropSession();
+        return await this.mintOnce(await this.ensureSession());
+      }
     } finally {
       this.minting = false;
       this.scheduleIdleRelease();
@@ -381,6 +390,13 @@ export class MinterBrowser {
         ? process.env
         : { ...process.env, DISPLAY: process.env.DISPLAY ?? this.options.display },
     });
+    // A crashed child leaves a non-undefined handle behind; without clearing it
+    // the next launch() would treat the dead process as resident and skip
+    // spawning, which is exactly the "permanent fetch failed" state.
+    this.process.once("exit", () => {
+      this.process = undefined;
+      this.devtoolsReady = undefined;
+    });
     this.watchDevtoolsLine(this.process);
     // Wait for the CDP socket to accept connections. /json/list needs a moment
     // longer to register the page target, so the caller polls findPageTarget.
@@ -429,7 +445,9 @@ export class MinterBrowser {
     this.warmed = false;
     this.widgetSeq = 0;
     this.killProcess();
-    void this.forwardProxy.close().catch(() => undefined);
+    // The forwarder is only ever closed together with the browser above; it
+    // must remember its port so the relaunch keeps the same --proxy-server.
+    void this.forwardProxy.restart().catch(() => undefined);
   }
 
   /**
