@@ -318,7 +318,17 @@ export class MinterClient {
   /** Spreads a mint request over idle workers; ignored when none are free. */
   private async handleMintRequest(count: number): Promise<void> {
     const idle = this.workers.filter((worker) => !worker.busy).slice(0, count);
-    await Promise.all(idle.map((worker) => this.runWorker(worker, Math.ceil(count / Math.max(idle.length, 1)))));
+    if (idle.length === 0) return;
+    // Distribute exactly `count` tickets across the idle workers. Rounding up
+    // with ceil could hand out more than requested (e.g. count=5 over 2 workers
+    // → 3+3=6), over-minting and desyncing the gateway's inflight accounting,
+    // which settles one slot per submitted ticket.
+    const base = Math.floor(count / idle.length);
+    const remainder = count % idle.length;
+    await Promise.all(idle.map((worker, index) => {
+      const batch = base + (index < remainder ? 1 : 0);
+      return batch > 0 ? this.runWorker(worker, batch) : Promise.resolve();
+    }));
   }
 
   private async runWorker(worker: Worker, batch: number): Promise<void> {

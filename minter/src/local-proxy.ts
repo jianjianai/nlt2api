@@ -178,6 +178,9 @@ export class LocalForwardProxy {
     if (this.server) return Promise.resolve(this.boundPort as number);
     const server = net.createServer((socket) => void this.handleClient(socket));
     server.on("connection", (socket) => {
+      // Turnstile issues many small requests; Nagle's algorithm would add a
+      // round-trip of latency to each one on this loopback hop.
+      socket.setNoDelay(true);
       this.sockets.add(socket);
       socket.on("close", () => this.sockets.delete(socket));
     });
@@ -319,6 +322,8 @@ export class LocalForwardProxy {
         conn.once("error", () => resolve(undefined));
       });
       if (!socket) return undefined;
+      // Small CONNECT/handshake writes must not sit in a Nagle buffer.
+      socket.setNoDelay(true);
       const auth = basicAuthHeader(upstream);
       const lines = [
         `CONNECT ${host}:${port} HTTP/1.1`,
@@ -353,6 +358,7 @@ export class LocalForwardProxy {
         command: "connect",
         destination: { host, port },
       });
+      (socket as net.Socket).setNoDelay(true);
       return socket as net.Socket;
     } catch {
       return undefined;

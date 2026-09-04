@@ -511,6 +511,39 @@ test("a disconnect resolves pending lease requests instead of hanging", async ()
   }
 });
 
+test("a mint request never mints more tickets than asked across workers", async () => {
+  const harness = createHarness({ concurrency: 2 });
+  try {
+    await tick();
+    harness.welcome();
+    // Three tickets over two idle workers must total exactly three (2 + 1),
+    // not ceil(3/2) each which would over-mint to four and desync the
+    // gateway's inflight accounting.
+    harness.push({ type: "mint.request", id: "m1", count: 3, deadlineMs: Date.now() + 60_000 });
+    await tick();
+    const leases = harness.socket.all("proxy.lease");
+    assert.equal(leases.length, 2);
+    leases.forEach((lease, index) => {
+      harness.push({
+        type: "proxy.leased",
+        id: lease.id,
+        leaseId: `L${index + 1}`,
+        proxyId: `P${index + 1}`,
+        proxyUrl: `http://1.2.3.${index + 1}:8080`,
+        kind: "http",
+        expiresAt: Date.now() + 120_000,
+      });
+    });
+    for (let index = 0; index < 10; index += 1) await tick();
+
+    assert.equal(harness.socket.all("ticket.submit").length, 3);
+    const perWorker = harness.minters.map((minter) => minter.calls.length).sort();
+    assert.deepEqual(perWorker, [1, 2]);
+  } finally {
+    await harness.stop();
+  }
+});
+
 test("stop closes every worker's browser", async () => {
   const harness = createHarness({ concurrency: 2 });
   await tick();

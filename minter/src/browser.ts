@@ -286,11 +286,17 @@ export class MinterBrowser {
 
   private async waitForTrapPage(session: CdpSession): Promise<void> {
     const deadline = Date.now() + 30_000;
+    // Check first, then back off: the page is often ready within a couple of
+    // hundred ms, so a fixed 500ms pre-delay was pure latency on every session
+    // (and paid twice during the cold-profile warm-up). Poll tightly at first
+    // and ease off, capping the interval so a slow load still yields promptly.
+    let interval = 100;
     while (Date.now() < deadline) {
-      await delay(500);
       const ready = await session.evaluate<boolean>("typeof window.__ready === 'function' && window.__ready()")
         .catch(() => false);
       if (ready === true) return;
+      await delay(interval);
+      if (interval < 500) interval = Math.min(500, interval + 100);
     }
     throw new MintError("page_not_ready", "The trap page did not load the Turnstile script in time.");
   }
@@ -401,10 +407,16 @@ export class MinterBrowser {
     // Wait for the CDP socket to accept connections. /json/list needs a moment
     // longer to register the page target, so the caller polls findPageTarget.
     await this.devtoolsReady?.catch(() => undefined);
-    for (let attempt = 0; attempt < 30; attempt += 1) {
+    // The page target usually registers within a few hundred ms of the DevTools
+    // socket coming up, so poll tightly first and back off toward 500ms. The
+    // total budget (~15s) is unchanged; only the early latency is trimmed.
+    let interval = 100;
+    const deadline = Date.now() + 15_000;
+    while (Date.now() < deadline) {
       const target = await findPageTarget(this.options.port);
       if (target) return;
-      await delay(500);
+      await delay(interval);
+      if (interval < 500) interval = Math.min(500, interval + 100);
     }
     throw new MintError("browser_timeout", "The browser did not expose a page target.");
   }
