@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
-import { allRows, getRow, immediateTransaction } from "~/server/utils/database.ts";
+import { allRows, getRow, immediateTransaction, prepared } from "~/server/utils/database.ts";
 import { HttpError } from "~/server/utils/http.ts";
 import { evictProxyDispatcher, isMintableProxy, maskProxyUrl, parseProxyImportLine } from "~/server/utils/proxy.ts";
 import type { SettingsStore } from "~/server/utils/settings.ts";
@@ -143,7 +143,10 @@ export class ProxyPoolService {
   }
 
   mintableActiveCount(): number {
-    return this.listByStatus("active").filter((proxy) => isMintableProxy(proxy.url)).length;
+    // Only the URL is needed to test mintability, so avoid materialising every
+    // full ProxyRecord just to count.
+    return allRows<{ url: string }>(this.db, "SELECT url FROM proxies WHERE status = 'active'")
+      .filter((proxy) => isMintableProxy(proxy.url)).length;
   }
 
   listByStatus(status: ProxyStatus): ProxyRecord[] {
@@ -328,7 +331,7 @@ export class ProxyPoolService {
   markCooldown(id: string, cooldownMs: number, reason: ProxyCooldownReason): number {
     const now = this.now();
     const until = now + Math.max(0, cooldownMs);
-    this.db.prepare(`
+    prepared(this.db, `
       UPDATE proxies SET rate_limited_until = ?, cooldown_reason = ?, updated_at = ?
       WHERE id = ? AND (rate_limited_until IS NULL OR rate_limited_until < ?)
     `).run(until, reason, now, id, until);
@@ -337,7 +340,7 @@ export class ProxyPoolService {
 
   /** Stamps the rotation clock so the next request picks a different egress. */
   markUsed(id: string): void {
-    this.db.prepare("UPDATE proxies SET last_used_at = ? WHERE id = ?").run(this.now(), id);
+    prepared(this.db, "UPDATE proxies SET last_used_at = ? WHERE id = ?").run(this.now(), id);
   }
 
   /** Stamps the mint rotation clock; used by tests to set up a known ordering. */
@@ -424,7 +427,7 @@ export class ProxyPoolService {
       if (!isMintableProxy(candidate.url)) return { reason: "no_active_proxy" as const };
 
       const leaseId = randomUUID();
-      this.db.prepare("UPDATE proxies SET leased_by = ?, lease_id = ?, lease_expires = ?, last_minted_at = ?, updated_at = ? WHERE id = ?")
+      prepared(this.db, "UPDATE proxies SET leased_by = ?, lease_id = ?, lease_expires = ?, last_minted_at = ?, updated_at = ? WHERE id = ?")
         .run(sessionId, leaseId, expiresAt, now, now, candidate.id);
       return {
         leaseId,
@@ -440,7 +443,7 @@ export class ProxyPoolService {
     const settings = this.settings.get();
     const now = this.now();
     const expiresAt = now + settings.proxyLeaseSeconds * 1_000;
-    const result = this.db.prepare(`
+    const result = prepared(this.db, `
       UPDATE proxies SET lease_expires = ?, updated_at = ?
       WHERE lease_id = ? AND leased_by = ? AND status = 'active' AND lease_expires >= ?
     `).run(expiresAt, now, leaseId, sessionId, now);

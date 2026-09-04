@@ -1,6 +1,6 @@
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
-import { DatabaseSync } from "node:sqlite";
+import { DatabaseSync, type StatementSync } from "node:sqlite";
 import { getGatewayConfig } from "~/server/utils/config.ts";
 
 const DATABASE_FILE = "gateway.db";
@@ -169,6 +169,14 @@ function openDatabase(path: string): DatabaseSync {
   db.exec("PRAGMA journal_mode = WAL");
   db.exec("PRAGMA busy_timeout = 5000");
   db.exec("PRAGMA foreign_keys = ON");
+  // NORMAL is durable under WAL (only a power loss can lose the last committed
+  // transactions, not corrupt the file) and avoids an fsync on every ticket
+  // churn, which dominates this write-heavy workload. A larger page cache and a
+  // memory-mapped read window cut the per-query I/O the hot pools do.
+  db.exec("PRAGMA synchronous = NORMAL");
+  db.exec("PRAGMA cache_size = -16000");
+  db.exec("PRAGMA mmap_size = 268435456");
+  db.exec("PRAGMA wal_autocheckpoint = 1000");
   applyMigrations(db);
   return db;
 }
@@ -211,14 +219,48 @@ export function immediateTransaction<T>(db: DatabaseSync, body: () => T): T {
 }
 
 /**
+ * Prepared statements are reused: SQLite re-parses and re-plans on every
+ * `prepare`, which is wasteful for the fixed set of hot-path queries the pools
+ * run per request. Each unique SQL string is compiled once and the resulting
+ * StatementSync cached per database. The cache is keyed by the database
+ * instance so a fresh in-memory test database never sees a statement bound to a
+ * closed one.
+ */
+const statementCaches = new WeakMap<DatabaseSync, Map<string, StatementSync>>();
+
+function preparedStatement(db: DatabaseSync, sql: string): StatementSync {
+  let cache = statementCaches.get(db);
+  if (!cache) {
+    cache = new Map();
+    statementCaches.set(db, cache);
+  }
+  let statement = cache.get(sql);
+  if (!statement) {
+    statement = db.prepare(sql);
+    cache.set(sql, statement);
+  }
+  return statement;
+}
+
+/**
  * node:sqlite types every column as SQLOutputValue, so row shapes are asserted
  * at the query boundary. These helpers keep that single unchecked cast in one
- * place instead of scattering it across every call site.
+ * place instead of scattering it across every call site, and reuse the compiled
+ * statement across calls.
  */
 export function allRows<T>(db: DatabaseSync, sql: string, ...params: Array<string | number | null>): T[] {
-  return db.prepare(sql).all(...params) as unknown as T[];
+  return preparedStatement(db, sql).all(...params) as unknown as T[];
 }
 
 export function getRow<T>(db: DatabaseSync, sql: string, ...params: Array<string | number | null>): T | undefined {
-  return db.prepare(sql).get(...params) as unknown as T | undefined;
+  return preparedStatement(db, sql).get(...params) as unknown as T | undefined;
+}
+
+/**
+ * A reusable compiled statement for write paths (`run`) that would otherwise
+ * call `db.prepare` on every request. Shares the same per-database cache as the
+ * read helpers.
+ */
+export function prepared(db: DatabaseSync, sql: string): StatementSync {
+  return preparedStatement(db, sql);
 }

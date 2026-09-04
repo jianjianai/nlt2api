@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
 import { getGatewayConfig } from "~/server/utils/config.ts";
-import { allRows } from "~/server/utils/database.ts";
+import { allRows, prepared } from "~/server/utils/database.ts";
 import type { ErrorLogService } from "~/server/utils/error-log.ts";
 import { HttpError } from "~/server/utils/http.ts";
 import { maskProxyUrl, redactProxyUrls } from "~/server/utils/proxy.ts";
@@ -169,7 +169,7 @@ export class MinterHub {
     connection.inflight.clear();
     if (connection.sessionId) {
       this.proxies.releaseSessionLeases(connection.sessionId);
-      this.db.prepare("UPDATE minter_sessions SET disconnected_at = ?, last_seen_at = ? WHERE id = ?")
+      prepared(this.db, "UPDATE minter_sessions SET disconnected_at = ?, last_seen_at = ? WHERE id = ?")
         .run(this.now(), this.now(), connection.sessionId);
     }
     this.rejectPendingScreenshots(connection.sessionId);
@@ -189,7 +189,7 @@ export class MinterHub {
       return;
     }
     if (connection.sessionId) {
-      this.db.prepare("UPDATE minter_sessions SET last_seen_at = ? WHERE id = ?").run(connection.lastSeenAt, connection.sessionId);
+      prepared(this.db, "UPDATE minter_sessions SET last_seen_at = ? WHERE id = ?").run(connection.lastSeenAt, connection.sessionId);
     }
 
     switch (message.type) {
@@ -333,7 +333,7 @@ export class MinterHub {
       this.recordEvent("rejected", connection.sessionId, result.reason);
       return;
     }
-    this.db.prepare("UPDATE minter_sessions SET minted_count = minted_count + 1 WHERE id = ?").run(connection.sessionId);
+    prepared(this.db, "UPDATE minter_sessions SET minted_count = minted_count + 1 WHERE id = ?").run(connection.sessionId);
     this.recordEvent("minted", connection.sessionId);
     this.send(connection, { type: "ticket.accepted", id: message.id, ticketId: result.ticketId, expiresAt: result.expiresAt });
     this.onTicketAccepted?.();
@@ -371,7 +371,7 @@ export class MinterHub {
   }
 
   private recordEvent(outcome: "minted" | "failed" | "rejected", sessionId: string, reason?: string): void {
-    this.db.prepare("INSERT INTO mint_events (at, outcome, session_id, reason) VALUES (?, ?, ?, ?)")
+    prepared(this.db, "INSERT INTO mint_events (at, outcome, session_id, reason) VALUES (?, ?, ?, ?)")
       .run(this.now(), outcome, sessionId, reason ?? null);
   }
 

@@ -497,10 +497,10 @@ async function saveSettings(): Promise<void> {
   }
 }
 
-const proxyCounts = computed<Record<ProxyStatus, number>>(() => overview.value?.proxies ?? { active: 0, pending: 0, unavailable: 0 });
+const proxyCounts = computed<Record<ProxyStatus, number>>(() => overview.value?.proxies ?? { active: 0, pending: 0, unavailable: 0, rejected: 0 });
 const proxyGrandTotal = computed(() => {
   const counts = proxyCounts.value;
-  return counts.active + counts.pending + counts.unavailable;
+  return counts.active + counts.pending + counts.unavailable + counts.rejected;
 });
 
 function selectWorkspace(next: WorkspaceId): void {

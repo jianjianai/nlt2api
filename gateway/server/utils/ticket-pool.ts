@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
-import { allRows, getRow, immediateTransaction } from "~/server/utils/database.ts";
+import { allRows, getRow, immediateTransaction, prepared } from "~/server/utils/database.ts";
 import { maskProxyUrl } from "~/server/utils/proxy.ts";
 import type { ProxyPoolService } from "~/server/utils/proxy-pool.ts";
 import type { SettingsStore } from "~/server/utils/settings.ts";
@@ -89,7 +89,7 @@ export class TicketPoolService {
     }
 
     const id = randomUUID();
-    this.db.prepare(`
+    prepared(this.db, `
       INSERT INTO tickets (id, proxy_id, token, source, user_agent, minted_at, expires_at, minter_id)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
     `).run(id, proxy.id, submission.token, submission.source, submission.userAgent ?? null, mintedAt, expiresAt, submission.agentId);
@@ -123,15 +123,15 @@ export class TicketPoolService {
       // not stall the request, so fall back to the rotation order.
       const row = pinned ?? (strict && preferProxyId ? undefined : select());
       if (!row) return undefined;
-      this.db.prepare("UPDATE tickets SET claimed_at = ? WHERE id = ? AND claimed_at IS NULL").run(now, row.id);
-      this.db.prepare("UPDATE proxies SET last_used_at = ? WHERE id = ?").run(now, row.proxy_id);
+      prepared(this.db, "UPDATE tickets SET claimed_at = ? WHERE id = ? AND claimed_at IS NULL").run(now, row.id);
+      prepared(this.db, "UPDATE proxies SET last_used_at = ? WHERE id = ?").run(now, row.proxy_id);
       return { ticket: toRecord(row), proxyUrl: row.proxy_url };
     });
   }
 
   /** A consumed or upstream-redeemed ticket can never be reused; it is dropped. */
   drop(ticketId: string): void {
-    this.db.prepare("DELETE FROM tickets WHERE id = ?").run(ticketId);
+    prepared(this.db, "DELETE FROM tickets WHERE id = ?").run(ticketId);
   }
 
   availableCount(): number {

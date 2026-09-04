@@ -1,4 +1,5 @@
 import type { DatabaseSync } from "node:sqlite";
+import { prepared } from "~/server/utils/database.ts";
 import { redactProxyUrls } from "~/server/utils/proxy.ts";
 import type {
   ErrorLogEntry,
@@ -90,7 +91,7 @@ export class ErrorLogService {
     const upstreamBody = input.upstreamBody === undefined
       ? null
       : redactProxyUrls(input.upstreamBody).slice(0, MAX_UPSTREAM_BODY_LENGTH);
-    this.db.prepare(`
+    prepared(this.db, `
       INSERT INTO error_logs (at, kind, status, message, session_id, proxy_id, agent_id, attempt, upstream_status, upstream_body)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
